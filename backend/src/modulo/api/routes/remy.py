@@ -1755,7 +1755,9 @@ async def stream_chat(
                     return
 
                 backend = init.backend
-                assert backend is not None
+                if backend is None:
+                    yield f"event: error\ndata: {json.dumps({'detail': MSG_UNEXPECTED_ERROR})}\n\n"
+                    return
                 langchain_messages = init.messages
                 parent_msg_id = init.parent_msg_id
 
