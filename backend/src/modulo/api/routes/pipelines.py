@@ -1542,7 +1542,7 @@ async def update_pipeline_endpoint(
             # `updated_at` (onupdate=func.current_timestamp()) is loaded while
             # the transaction is active. Accessing it after commit with
             # autobegin=False raises InvalidRequestError -> 422 silent-success.
-            if pipeline is not None:
+if pipeline is not None:
                 await session.refresh(pipeline)
     except (HitlGateWeakeningDenied, GuardrailBindingStripDenied) as exc:
         await _handle_graph_write_denials(

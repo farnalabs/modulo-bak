@@ -3,6 +3,7 @@
 A user who is a member of Team B must NOT be able to read Team A's
 team-private pipeline (``visibility='team'``, ``owner_team_id=Team A``) via
 GET /pipelines/{id}. The DB root cause (an OR'd org-only RLS policy that made
+<<<<<<< HEAD
 the team policy dead weight) is fixed by migration ``0124_fix_team_rls_policies``;
 post-migration the resolver SELECT runs under RLS, so a non-member's row is
 invisible at the DB layer and GET returns 404. The app-layer defense-in-depth
@@ -82,6 +83,7 @@ class _ResolverRow:
     row's ``owner_team_id``/``visibility`` with a ``SELECT ... FROM pipelines``.
     This holder lets each test set what that resolver sees without rebuilding
     the whole mock session.
+<<<<<<< HEAD
 
     ``row_visible=False`` simulates post-migration RLS filtering: the resolver's
     SELECT returns no row (the DB layer hides it from a non-member), so the
@@ -107,6 +109,7 @@ def _make_mock_session(resolver: _ResolverRow) -> AsyncMock:
     async def _execute(stmt: Any, *args: Any, **kwargs: Any) -> Any:
         if isinstance(stmt, Select) and "FROM pipelines" in str(stmt):
             row = MagicMock()
+<<<<<<< HEAD
             if resolver.row_visible:
                 row.first.return_value = (resolver.owner_team_id, resolver.visibility)
             else:
@@ -131,6 +134,7 @@ def make_client() -> Generator[Callable[..., tuple[TestClient, _ResolverRow]], N
         org_role: str = "operator",
         owner_team_id: uuid.UUID | None = None,
         visibility: str = "org",
+<<<<<<< HEAD
         row_visible: bool = True,
     ) -> tuple[TestClient, _ResolverRow]:
         resolver = _ResolverRow(owner_team_id=owner_team_id, visibility=visibility, row_visible=row_visible)
@@ -173,6 +177,7 @@ class TestCrossTeamPipelineVisibility:
     def test_non_member_cannot_get_team_private_pipeline(
         self, make_client: Callable[..., tuple[TestClient, _ResolverRow]]
     ) -> None:
+<<<<<<< HEAD
         """Post-migration, a non-member gets 404, not 403.
 
         After migration ``0124_fix_team_rls_policies`` drops the org-only
