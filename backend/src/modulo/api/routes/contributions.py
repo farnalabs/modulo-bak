@@ -23,7 +23,7 @@ from modulo.core.library_service import (
     submit_contribution_for_review,
     submit_contribution_version,
 )
-from modulo.db.rls import set_rls_org
+from modulo.db.rls import set_rls_org, set_rls_user_context
 
 _MSG_CONTRIBUTION_FEATURE_TEMPORARILY_UNAVAILABLE = (
     "The contribution feature is temporarily unavailable due to a database issue. Please retry."
@@ -78,6 +78,7 @@ async def create_contribution(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
             prim = await contribute_fixture(
                 session,
                 org_id=principal.organisation_id,
@@ -248,6 +249,7 @@ async def submit_contribution_version_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
             prim = await submit_contribution_version(
                 session,
                 principal.organisation_id,
@@ -359,6 +361,7 @@ async def list_contributions_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
             result = await list_contributions(
                 session,
                 principal.organisation_id,
