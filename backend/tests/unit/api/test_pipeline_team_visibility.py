@@ -1,4 +1,4 @@
-﻿"""Regression tests for the cross-team pipeline visibility leak (GET).
+"""Regression tests for the cross-team pipeline visibility leak (GET).
 
 A user who is a member of Team B must NOT be able to read Team A's
 team-private pipeline (``visibility='team'``, ``owner_team_id=Team A``) via

@@ -1,4 +1,4 @@
-﻿"""Cross-tenant RLS isolation integration tests.
+"""Cross-tenant RLS isolation integration tests.
 
 Proves that set_config(is_local=true) is correctly scoped to the enclosing
 transaction and does not leak across transactions sharing a pooled connection.
