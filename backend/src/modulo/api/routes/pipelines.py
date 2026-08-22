@@ -780,7 +780,7 @@ class HitlGateConfig(BaseModel):
         default=None,
         description="Node ID routed to on HITL rejection for the FAR-210 single-node "
         "correction path. Accepted and persisted through the graph contract; the "
-        "rejectÔåÆcorrection dispatch seam is tracked as a follow-up (the graph "
+        "reject→correction dispatch seam is tracked as a follow-up (the graph "
         "compiler currently kicks a rejection back to reject_target).",
     )
     claim_expiry_minutes: int = Field(gt=0, le=1440)
