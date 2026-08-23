@@ -87,6 +87,7 @@ from modulo.core.node_output_split import (
     split_node_output,
 )
 from modulo.core.spend_ceiling import (
+    cents_from_usd,
     evaluate_spend_ceilings,
 )
 from modulo.db.crud.run import update_run_status
@@ -1011,8 +1012,12 @@ async def _ledger_block(
         await session.execute(select(Organisation).where(Organisation.id == org_id).with_for_update())
     ).scalar_one_or_none()
     if org_row is not None:
+        # Use the same ROUND_HALF_UP cents conversion as the API boundary so the
+        # gate value and the persisted org cumulative never diverge on sub-cent
+        # run costs (the accrual below also uses ``cents_from_usd``).
+        total_cents = cents_from_usd(total) or 0
         decision = evaluate_spend_ceilings(
-            run_cost_so_far_cents=int(total * 100),
+            run_cost_so_far_cents=total_cents,
             estimated_next_step_cents=0,
             max_run_cost_cents=org_row.max_run_cost_cents,
             org_cumulative_spend_cents=org_row.org_cumulative_spend_cents or 0,
@@ -1029,14 +1034,14 @@ async def _ledger_block(
                     "run_id": str(run_id),
                     "org_id": str(org_id),
                     "reason": decision.reason,
-                    "total_cents": int(total * 100),
+                    "total_cents": total_cents,
                 },
             )
             record_limit_refused("spend_ceiling")
             await session.flush()
             return
         # Success: accrue this run's cost into the org's lifetime consumed total.
-        org_row.org_cumulative_spend_cents = (org_row.org_cumulative_spend_cents or 0) + int(total * 100)
+        org_row.org_cumulative_spend_cents = (org_row.org_cumulative_spend_cents or 0) + total_cents
         await session.flush()
 
     try:

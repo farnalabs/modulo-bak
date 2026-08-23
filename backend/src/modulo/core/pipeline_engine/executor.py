@@ -1463,9 +1463,17 @@ class PipelineExecutor:
                 ).scalar_one_or_none()
                 if org is None:
                     return None
+                # Pass a minimal 1-cent charge as the "next run" so the gate
+                # honours the documented at-ceiling / kill-switch semantics: with
+                # zero remaining budget (cumulative >= ceiling, or ceiling == 0)
+                # the run must be terminalized BEFORE any billable work, not left
+                # to the finalize ledger block. A ceiling of 0 therefore blocks
+                # every new run, and an org exactly at its ceiling (1 cent would
+                # exceed it) is halted. A genuinely non-empty remaining budget
+                # (>= 1 cent) still passes so the run can execute.
                 decision = evaluate_org_spend_ceiling(
                     org_cumulative_spend_cents=org.org_cumulative_spend_cents or 0,
-                    additional_cents=0,
+                    additional_cents=1,
                     spend_ceiling_cents=org.spend_ceiling_cents,
                 )
                 if decision.allowed:

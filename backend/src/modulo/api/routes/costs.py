@@ -128,9 +128,14 @@ def _apply_cost_control_updates(org: Organisation, req: "UpdateCostControlsReque
     """
     if req.budget is not None:
         org.daily_spend_limit = Decimal(str(req.budget))
-    if req.max_run_cost is not None:
+    # ``exclude_unset`` lets an explicit ``null`` CLEAR a ceiling (back to
+    # unlimited) while an omitted field leaves the existing value untouched — so
+    # the two ceilings can be managed independently and "Empty = no limit" is
+    # honoured by the frontend.
+    provided = req.model_dump(exclude_unset=True)
+    if "max_run_cost" in provided:
         org.max_run_cost_cents = cents_from_usd(req.max_run_cost)
-    if req.spend_ceiling is not None:
+    if "spend_ceiling" in provided:
         org.spend_ceiling_cents = cents_from_usd(req.spend_ceiling)
 
     updates: dict[str, Any] = {
@@ -470,7 +475,10 @@ class CostControlsResponse(BaseModel):
 
 class UpdateCostControlsRequest(BaseModel):
     budget: float | None = None
-    # FAR-391 — hard spend ceilings in USD (None = no change; 0 = kill-switch).
+    # FAR-391 — hard spend ceilings in USD. ``None`` = clear this ceiling to no
+    # limit (explicit null in the body); omitting the field leaves the existing
+    # value unchanged so the two ceilings can be managed independently. 0 =
+    # kill-switch (block all runs).
     max_run_cost: float | None = None
     spend_ceiling: float | None = None
     alert_thresholds: list[float] | None = None
@@ -628,8 +636,16 @@ class SpendCeilingResponse(BaseModel):
 
 
 class SetSpendCeilingRequest(BaseModel):
-    max_run_cost: float | None = Field(None, ge=0, description="Per-run hard ceiling in USD. 0 = block all runs.")
-    spend_ceiling: float | None = Field(None, ge=0, description="Org lifetime budget in USD. 0 = block all runs.")
+    max_run_cost: float | None = Field(
+        None,
+        ge=0,
+        description="Per-run hard ceiling in USD. 0 = block all runs. null = no limit (clears an existing ceiling).",
+    )
+    spend_ceiling: float | None = Field(
+        None,
+        ge=0,
+        description="Org lifetime budget in USD. 0 = block all runs. null = no limit (clears an existing ceiling).",
+    )
 
 
 @router.get("/ceiling")
@@ -694,9 +710,14 @@ async def set_spend_ceiling(
             org = await get_organisation(session, current_user.organisation_id)
             if org is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
-            if req.max_run_cost is not None:
+            # ``exclude_unset`` distinguishes "field not sent" (leave unchanged,
+            # so a partial update never clobbers the other ceiling) from an
+            # explicit ``null`` (clear this ceiling back to unlimited). An empty
+            # frontend input maps to ``null``, so "Empty = no limit" is honoured.
+            provided = req.model_dump(exclude_unset=True)
+            if "max_run_cost" in provided:
                 org.max_run_cost_cents = cents_from_usd(req.max_run_cost)
-            if req.spend_ceiling is not None:
+            if "spend_ceiling" in provided:
                 org.spend_ceiling_cents = cents_from_usd(req.spend_ceiling)
             await session.flush()
     except ProgrammingError:

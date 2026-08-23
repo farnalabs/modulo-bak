@@ -81,7 +81,7 @@
 
                   <div class="flex items-center justify-between rounded-lg border bg-muted p-4">
                     <span class="text-sm font-medium">{{ $t('views.AdminSpendLimitsView.remaining_budget') }}</span>
-                    <span class="text-lg font-semibold" :class="ceilingRemaining === null ? '' : 'text-success'">
+                    <span class="text-lg font-semibold" :class="ceilingRemaining === null ? '' : (ceilingRemaining === 0 ? 'text-destructive' : 'text-success')">
                       {{ ceilingRemaining === null ? '—' : formatMoney(ceilingRemaining, currencyCode) }}
                     </span>
                   </div>

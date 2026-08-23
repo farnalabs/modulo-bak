@@ -1045,3 +1045,52 @@ class TestSpendCeilingEndpoints:
         assert org.max_run_cost_cents == 1234
         assert org.spend_ceiling_cents == 10000
         assert resp.json()["remaining_budget_usd"] == 100.0
+
+    def test_put_clears_ceiling_with_explicit_null(self, client: TestClient) -> None:
+        """FAR-391 Major 2 — an explicit null must CLEAR a set ceiling.
+
+        The frontend maps an empty input to ``null``; "Empty = no limit" must
+        round-trip. A non-null sibling field must be left untouched (the handler
+        uses ``exclude_unset`` so omitted fields are never clobbered).
+        """
+        org = MagicMock()
+        org.id = _ORG_ID
+        org.max_run_cost_cents = 1234  # pre-existing per-run ceiling
+        org.spend_ceiling_cents = 10000  # pre-existing org ceiling
+        org.org_cumulative_spend_cents = 0
+
+        with (
+            patch("modulo.api.routes.costs.get_organisation", return_value=org),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.put(
+                "/api/v1/admin/costs/ceiling",
+                json={"max_run_cost": None, "spend_ceiling": 100.0},
+            )
+
+        assert resp.status_code == 200
+        # per-run ceiling cleared to unlimited
+        assert org.max_run_cost_cents is None
+        # org ceiling preserved (explicit value)
+        assert org.spend_ceiling_cents == 10000
+
+    def test_put_omitted_field_is_left_unchanged(self, client: TestClient) -> None:
+        """A field absent from the body must NOT be reset to unlimited."""
+        org = MagicMock()
+        org.id = _ORG_ID
+        org.max_run_cost_cents = 1234
+        org.spend_ceiling_cents = 10000
+        org.org_cumulative_spend_cents = 0
+
+        with (
+            patch("modulo.api.routes.costs.get_organisation", return_value=org),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.put(
+                "/api/v1/admin/costs/ceiling",
+                json={"spend_ceiling": 200.0},
+            )
+
+        assert resp.status_code == 200
+        assert org.max_run_cost_cents == 1234  # untouched
+        assert org.spend_ceiling_cents == 20000
