@@ -327,7 +327,11 @@ describe('PipelineListView', () => {
     mockResponses['/api/v1/pipelines?page_size=100'] = { items: [pipeline], total: 1, page: 1, page_size: 100 }
     await router.push('/pipelines')
     await router.isReady()
+    // Attach to the document: @vue/test-utils mounts detached by default, but
+    // the focus-trap assertions below rely on document.activeElement, which only
+    // updates for elements that are part of the live document.
     const wrapper = mount(PipelineListView, {
+      attachTo: document.body,
       global: { plugins: [router], stubs: { ErrorAlert: true, FolderTree: true } },
     })
     await flushPromises()
@@ -362,5 +366,6 @@ describe('PipelineListView', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
     await nextTick()
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    wrapper.unmount()
   })
 })
