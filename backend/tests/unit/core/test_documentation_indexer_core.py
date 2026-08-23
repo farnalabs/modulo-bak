@@ -355,7 +355,7 @@ class TestBuild:
         manifest.write_text(_MANIFEST_WITH_FEATURES, encoding="utf-8")
         index = DocumentationIndex.build(manifest)
         by_path = {e.heading_path: e for e in index.entries}
-        assert by_path["/orphan"].features == []
+        assert not by_path["/orphan"].features
         assert "product_map=" not in by_path["/orphan"].first_paragraph
 
     def test_search_matches_feature_reference(self, tmp_path: Path) -> None:

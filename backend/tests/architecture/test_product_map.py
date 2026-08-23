@@ -51,9 +51,8 @@ def test_every_route_declares_product_map_reference():
             missing[path] = "<product_map is empty>"
         elif isinstance(refs, (list, tuple)) and not refs:
             missing[path] = "<product_map is empty list>"
-    assert not missing, (
-        "manifest routes must declare at least one product_map feature reference:\n"
-        + "\n".join(f"  {path} -> {ref}" for path, ref in sorted(missing.items()))
+    assert not missing, "manifest routes must declare at least one product_map feature reference:\n" + "\n".join(
+        f"  {path} -> {ref}" for path, ref in sorted(missing.items())
     )
 
 
@@ -70,9 +69,8 @@ def test_product_map_references_resolve_against_registry():
         unresolved = [r for r in refs if r not in registry]
         if unresolved:
             dangling[path] = unresolved
-    assert not dangling, (
-        "manifest routes reference features missing from the 'features' registry:\n"
-        + "\n".join(f"  {path} -> {refs}" for path, refs in sorted(dangling.items()))
+    assert not dangling, "manifest routes reference features missing from the 'features' registry:\n" + "\n".join(
+        f"  {path} -> {refs}" for path, refs in sorted(dangling.items())
     )
 
 
@@ -86,9 +84,8 @@ def test_every_registered_feature_is_referenced_by_a_route():
         if isinstance(ref, str)
     }
     unreferenced = sorted(set(data["features"]) - referenced)
-    assert not unreferenced, (
-        "registered features with no route reference (dead registry entries):\n"
-        + "\n".join(f"  {feat}" for feat in unreferenced)
+    assert not unreferenced, "registered features with no route reference (dead registry entries):\n" + "\n".join(
+        f"  {feat}" for feat in unreferenced
     )
 
 
@@ -100,13 +97,10 @@ def test_documentation_indexer_surfaces_product_map_features():
     assert by_path, "docs index built from the manifest must not be empty"
 
     missing_features = [
-        path
-        for path, entry in by_path.items()
-        if "features" in entry.__dataclass_fields__ and not entry.features
+        path for path, entry in by_path.items() if "features" in entry.__dataclass_fields__ and not entry.features
     ]
-    assert not missing_features, (
-        "docs index entries must carry their route's product_map features:\n"
-        + "\n".join(f"  {path}" for path in sorted(missing_features))
+    assert not missing_features, "docs index entries must carry their route's product_map features:\n" + "\n".join(
+        f"  {path}" for path in sorted(missing_features)
     )
 
     costs = by_path.get("/admin/costs")
