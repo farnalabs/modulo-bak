@@ -12,14 +12,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
+# Strip any sslmode parameter (disable, require, prefer, etc.) — asyncpg
+# defaults to "prefer" (try SSL, fall back to plain) on Fly's private
+# networks where Postgres doesn't expect SSL, causing ConnectionResetError.
+SSLMODE_RE = re.compile(r"[?&]sslmode=[^&]*")
+
 # Step 1: Fix DATABASE_ADMIN_URL and DATABASE_URL
 admin_url = os.environ.get("DATABASE_ADMIN_URL") or os.environ.get("DATABASE_URL", "")
 original = admin_url
 admin_url = admin_url.replace("postgres://", "postgresql+asyncpg://", 1)
-# Strip any sslmode parameter (disable, require, prefer, etc.) — asyncpg
-# defaults to "prefer" (try SSL, fall back to plain) on Fly's private
-# networks where Postgres doesn't expect SSL, causing ConnectionResetError.
-admin_url = re.sub(r"[?&]sslmode=[^&]*", "", admin_url).rstrip("?")
+admin_url = SSLMODE_RE.sub("", admin_url).rstrip("?")
 os.environ["DATABASE_ADMIN_URL"] = admin_url
 if admin_url != original:
     print("Fixed DATABASE_ADMIN_URL scheme + stripped sslmode")
@@ -28,7 +30,7 @@ if admin_url != original:
 runtime_url = os.environ.get("DATABASE_URL", "")
 if runtime_url:
     runtime_url = runtime_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    runtime_url = re.sub(r"[?&]sslmode=[^&]*", "", runtime_url).rstrip("?")
+    runtime_url = SSLMODE_RE.sub("", runtime_url).rstrip("?")
     os.environ["DATABASE_URL"] = runtime_url
 
 # Step 2: Create alembic_version table with VARCHAR(255)
@@ -71,7 +73,7 @@ with open("/tmp/database_admin_url.env", "w") as f:
 system_url = os.environ.get("MODULO_SYSTEM_DATABASE_URL", "")
 if system_url:
     system_url = system_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    system_url = re.sub(r"[?&]sslmode=[^&]*", "", system_url).rstrip("?")
+    system_url = SSLMODE_RE.sub("", system_url).rstrip("?")
 elif runtime_url:
     parts = urlsplit(runtime_url)
     userinfo, sep, hostport = parts.netloc.rpartition("@")
@@ -82,5 +84,7 @@ elif runtime_url:
 
 if system_url:
     os.environ["MODULO_SYSTEM_DATABASE_URL"] = system_url
-    with open("/tmp/system_database_url.env", "w") as f:
+    # Short-lived container bootstrap env file, consistent with the
+    # /tmp/database_url.env and /tmp/database_admin_url.env files written above.
+    with open("/tmp/system_database_url.env", "w") as f:  # NOSONAR
         f.write(system_url)
