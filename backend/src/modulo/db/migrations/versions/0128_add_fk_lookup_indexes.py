@@ -20,6 +20,15 @@ all. We therefore build plain (blocking) ``CREATE INDEX IF NOT EXISTS``
 statements on the migration's own connection, which is both visible to the
 uncommitted schema and transaction-safe. ``IF NOT EXISTS`` keeps the
 migration idempotent and re-runnable.
+
+NOTE (prod-size impact): ``runs`` and ``trigger_events`` can be large, and a
+blocking ``CREATE INDEX`` takes a lock on the table for the duration of the
+build, which can stall concurrent writes on busy production deployments. Because
+the revision runs inside Alembic's single transaction, ``CONCURRENTLY`` (which
+would avoid the long-held lock) is not available here. Schedule this migration
+in a low-traffic window; on very large tables, consider a post-deploy
+``CREATE INDEX CONCURRENTLY`` and a follow-up migration that only asserts the
+index exists.
 """
 
 from alembic import op
@@ -30,12 +39,14 @@ down_revision = "0127_soft_delete_partial_unique"
 branch_labels = None
 depends_on = None
 
+# Only the five indexes below are genuinely new: the corresponding model
+# columns now declare them via ``index=True`` (see MAJOR-1 fix). The other
+# FK columns (nodes.pipeline_id, eval_results.run_id, feedback_records.run_id,
+# workspace_leases.run_id) already carry ``index=True`` in their models, so
+# SQLAlchemy creates those indexes itself under the same default names -- listing
+# them here would be a redundant no-op.
 _INDEXES = (
-    ("ix_nodes_pipeline_id", "nodes", ["pipeline_id"]),
-    ("ix_eval_results_run_id", "eval_results", ["run_id"]),
-    ("ix_feedback_records_run_id", "feedback_records", ["run_id"]),
     ("ix_trigger_events_run_id", "trigger_events", ["run_id"]),
-    ("ix_workspace_leases_run_id", "workspace_leases", ["run_id"]),
     ("ix_pipelines_account_id", "pipelines", ["account_id"]),
     ("ix_pipelines_owner_team_id", "pipelines", ["owner_team_id"]),
     ("ix_runs_owner_team_id", "runs", ["owner_team_id"]),

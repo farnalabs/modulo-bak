@@ -72,6 +72,25 @@ def upgrade():
 
 
 def downgrade():
+    bind = op.get_bind()
     for table, old_name, new_name, columns in _PARTIAL_UNIQUES:
         op.drop_index(new_name, table_name=table, postgresql_drop_where=text("deleted_at IS NULL"))
+        # De-duplicate rows that share a business key before restoring the full
+        # unique constraint. After upgrade, the partial unique index permits an
+        # active row and one or more soft-deleted rows to coexist on the same key
+        # (the documented "soft-delete then re-create" flow). Re-adding the full
+        # constraint on that state would raise a unique-violation and abort the
+        # downgrade. Keep the active row when one exists, otherwise keep the most
+        # recently deleted row, and delete the remaining duplicates.
+        key_cols = ", ".join(columns)
+        # ``table`` / ``key_cols`` come from the hardcoded ``_PARTIAL_UNIQUES``
+        # constant below, never from user input, so the f-string is safe.
+        de_dup = (
+            f"DELETE FROM {table} WHERE id IN ("  # noqa: S608  # nosec B608
+            f"SELECT id FROM ("
+            f"SELECT id, ROW_NUMBER() OVER (PARTITION BY {key_cols} "
+            f"ORDER BY (deleted_at IS NULL) DESC, deleted_at DESC NULLS LAST) AS rn "
+            f"FROM {table}) sub WHERE rn > 1)"
+        )
+        bind.execute(text(de_dup))
         op.create_unique_constraint(old_name, table, columns)
