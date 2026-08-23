@@ -3940,7 +3940,7 @@ async def _reconcile_one_row(
             job_type = _reconcile_job_type(row.status)
             key_suffix = uuid.uuid4().hex
             try:
-                outcome, new_job_id = await _re_enqueue_run(
+                outcome, _ = await _re_enqueue_run(
                     q.name,
                     str(row.id),
                     str(org_id),
