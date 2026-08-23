@@ -132,7 +132,7 @@ class FernetSecretsBackend(SecretsBackend):
         The org ID is cached after the first read to avoid redundant queries.
 
         On non-Postgres backends (SQLite, MariaDB), ``current_setting()``
-        is not available — falls back to ``session.info["organisation_id"]``.
+        is not available — falls back to ``session.info["org_id"]``.
         """
         if self._org_id is not None:
             return self._org_id
