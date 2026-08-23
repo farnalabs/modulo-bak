@@ -594,3 +594,27 @@ class TestMaskOutputValueSecretValues:
         masked = mask_secret_values_in_text(straddle)
         assert "super%40secret" not in masked
         assert SENSITIVE_VALUE_MASK in masked
+
+    def test_masks_private_key_block_longer_than_slice_cap(self) -> None:
+        from modulo.core.secret_patterns import (
+            SECRET_VALUE_REDACT_CHAR_CAP,
+            mask_secret_values_in_text,
+        )
+
+        # A private-key block whose body exceeds the 5000-char ReDoS cap must
+        # still be masked in full. Previously its close delimiter fell outside
+        # the bounded window and the whole block leaked unmasked.
+        key = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            + ("MIIBOgIBAAJBAKj34GkxFhD" * 200)
+            + ("X" * 4000)
+            + "\n-----END RSA PRIVATE KEY-----"
+        )
+        assert len(key) > SECRET_VALUE_REDACT_CHAR_CAP
+        text = "a" * 1000 + key + "b" * 100
+        masked = mask_secret_values_in_text(text)
+        assert "BEGIN RSA PRIVATE KEY" not in masked
+        assert "END RSA PRIVATE KEY" not in masked
+        # Benign surrounding content is preserved in full (no truncation).
+        assert masked.startswith("a" * 1000)
+        assert masked.endswith("b" * 100)

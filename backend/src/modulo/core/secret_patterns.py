@@ -143,6 +143,24 @@ def mask_secret_values_in_text(text: str) -> str:
     return masked
 
 
+def _close_marker_end(text: str, pattern: re.Pattern[str], close_off: int, close: str) -> int:
+    """Return the index just past the COMPLETE close delimiter for *pattern*.
+
+    ``close`` is the short literal searched for in :data:`_BOUNDED_WINDOW_HINTS`
+    (e.g. ``"-----END "`` for private keys). For a private-key block the real
+    marker is ``-----END ... PRIVATE KEY-----``, so we extend past the short
+    close literal to the end of that full marker — otherwise masking would stop
+    after ``-----END `` and leak the ``... PRIVATE KEY-----`` tail. Connection
+    strings close on ``@`` (a single character), which needs no extension.
+    """
+    if pattern is CONNECTION_STRING_PATTERN:
+        return close_off + len(close)
+    idx = text.find("PRIVATE KEY-----", close_off)
+    if idx != -1:
+        return idx + len("PRIVATE KEY-----")
+    return close_off + len(close)
+
+
 def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any) -> str:
     """Mask *pattern* (a nested-quantifier pattern) without ReDoS or truncation.
 
@@ -152,6 +170,13 @@ def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any)
     secret (e.g. ``-----BEGIN `` for private keys) so a secret whose body crosses
     a fixed 5000-char slice boundary is still wholly contained in one window and
     gets masked. A short string with no anchor is masked in one pass.
+
+    A secret whose body is LONGER than the cap (e.g. an 8192-bit private key,
+    well over 5000 chars) is still located by finding its close delimiter in the
+    full text and masking the whole span directly — without ever running the
+    nested-quantifier regex over an unbounded string. Previously such a secret's
+    close fell outside the bounded window and the secret was skipped entirely,
+    leaking it unmasked.
     """
     if len(text) <= SECRET_VALUE_REDACT_CHAR_CAP:
         return pattern.sub(replacement, text)
@@ -167,18 +192,37 @@ def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any)
         # Include ``prefix`` chars before the anchor so the regex can match the
         # secret's leading context (e.g. the scheme before ``://``).
         window_start = max(0, off - prefix)
-        window = text[window_start : window_start + SECRET_VALUE_REDACT_CHAR_CAP]
-        # No possible match in this window — skip the (bounded) regex attempt.
-        if close not in window:
+        # Locate the close delimiter in the FULL text (a plain ``str.find``, not
+        # a regex) so a secret longer than the ReDoS cap is still found. If no
+        # close follows the anchor it is not a real secret — leave it untouched.
+        close_off = text.find(close, off + len(anchor))
+        if close_off == -1:
             continue
-        for match in pattern.finditer(window):
-            start = window_start + match.start()
-            end = window_start + match.end()
-            if start < last:
-                # Already covered by a previous replacement; avoid double-masking.
+        close_end = _close_marker_end(text, pattern, close_off, close)
+        # Run the precise regex over the secret span only when it fits the ReDoS
+        # cap, preserving formatting (e.g. connection-string scheme/host). When
+        # the secret is longer than the cap, mask the whole span directly: both
+        # delimiters are confirmed present and we never run the nested-quantifier
+        # regex over an unbounded string.
+        if close_end - window_start <= SECRET_VALUE_REDACT_CHAR_CAP:
+            window = text[window_start:close_end]
+            for match in pattern.finditer(window):
+                start = window_start + match.start()
+                end = window_start + match.end()
+                if start < last:
+                    # Already covered by a previous replacement; avoid double-masking.
+                    continue
+                result.append(text[last:start])
+                result.append(replacement(match) if callable(replacement) else replacement)
+                last = end
+        else:
+            if window_start < last:
                 continue
-            result.append(text[last:start])
-            result.append(replacement(match) if callable(replacement) else replacement)
-            last = end
+            result.append(text[last:window_start])
+            # A callable replacement (the connection-string formatter) needs a
+            # real match object; for an over-cap span we use the bare mask so we
+            # never run the unbounded regex. The whole secret span is masked.
+            result.append(SENSITIVE_VALUE_MASK if callable(replacement) else replacement)
+            last = close_end
     result.append(text[last:])
     return "".join(result)
