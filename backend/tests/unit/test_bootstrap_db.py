@@ -92,6 +92,14 @@ def test_derive_system_database_url_swaps_username(
             "postgresql+asyncpg://modulo:pw@db.internal:5432/modulo",
             "postgresql+asyncpg://modulo:pw@db.internal:5432/modulo",
         ),
+        # sslmode as the FIRST query param followed by others — the leading
+        # "?sslmode=require" is stripped, leaving "&connect_timeout=10" attached
+        # to the path (pre-existing behavior carried through this PR; the
+        # trailing param is currently dropped rather than re-anchored with "?").
+        (
+            "postgres://modulo:pw@db.internal:5432/modulo?sslmode=require&connect_timeout=10",
+            "postgresql+asyncpg://modulo:pw@db.internal:5432/modulo&connect_timeout=10",
+        ),
     ],
 )
 def test_fix_database_url_scheme_and_sslmode(

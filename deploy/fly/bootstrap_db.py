@@ -1,7 +1,14 @@
 """Run at container startup to prepare the database.
-1. Fix DATABASE_ADMIN_URL for SQLAlchemy async driver
-2. Create alembic_version table with VARCHAR(255) for branch migrations
-3. Write the fixed DATABASE_ADMIN_URL to a file for the shell script
+1. Fix DATABASE_ADMIN_URL for the SQLAlchemy async driver and fix the runtime
+   DATABASE_URL for backwards compatibility
+2. Create the alembic_version table with VARCHAR(255) for branch migrations
+3. Derive and export MODULO_SYSTEM_DATABASE_URL — if explicitly set it is fixed
+   like the other URLs; otherwise it is derived from the fixed DATABASE_URL by
+   swapping the username to modulo_system (the password is preserved so
+   bootstrap_role.py can create the role). The result is exported to the
+   environment and written to /tmp/system_database_url.env.
+4. Write the fixed DATABASE_ADMIN_URL / DATABASE_URL / MODULO_SYSTEM_DATABASE_URL
+   to files for the shell script
 """
 
 import asyncio

@@ -906,8 +906,11 @@ def _get_system_async_engine() -> AsyncEngine:
     """Engine for cross-org system crons using the modulo_system role.
 
     Falls back to the regular engine when MODULO_SYSTEM_DATABASE_URL is not set,
-    so deployments that haven't provisioned the system role still work (system
-    crons run as modulo_app with BYPASSRLS — the pre-PR-1634 posture).
+    so deployments that haven't provisioned the system role still work. The
+    fallback runs system crons as modulo_app, which is NOBYPASSRLS (see
+    bootstrap_role.py: the app role asserts ``rolbypassrls = false``), so any
+    RLS-scoped reads silently return zero rows — a warning is emitted to surface
+    that the system role is unprovisioned.
     """
     global _SYSTEM_ASYNC_ENGINE
     if _SYSTEM_ASYNC_ENGINE is None:
