@@ -16,7 +16,10 @@ from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature, require_permission
 from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
-from modulo.auth.team_rbac import ORG_ROLE_HIERARCHY, TEAM_ROLE_HIERARCHY
+from modulo.auth.team_rbac import (
+    org_role_level,
+    team_role_level,
+)
 from modulo.db.crud import account as _account_crud
 from modulo.db.crud.org_membership import get_membership_by_account_and_org
 from modulo.db.crud.team import (
@@ -103,10 +106,6 @@ async def _assert_not_last_operator(
         )
 
 
-def _role_level(hierarchy: dict[str, int], role: str) -> int:
-    return hierarchy.get(role, -1)
-
-
 async def _require_team_operator_caller(
     session: AsyncSession,
     team_id: uuid.UUID,
@@ -167,7 +166,7 @@ async def _add_team_member_checked(
     role: str,
 ) -> TeamMembership:
     """Authorise and add a team member, enforcing the org/team role ceilings."""
-    is_admin = _role_level(ORG_ROLE_HIERARCHY, current_user.org_role) >= _role_level(ORG_ROLE_HIERARCHY, "admin")
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
             session,
@@ -175,7 +174,7 @@ async def _add_team_member_checked(
             current_user.account_id,
             "Only admin users or team operators can add members",
         )
-        if _role_level(TEAM_ROLE_HIERARCHY, role) > _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role):
+        if team_role_level(role) > team_role_level(caller_membership.role):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Cannot grant role '{role}' above your own team role '{caller_membership.role}'",
@@ -185,7 +184,7 @@ async def _add_team_member_checked(
     target_membership = await get_membership_by_account_and_org(session, user_id, current_user.organisation_id)
     if target_account is None or target_membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in organisation")
-    if _role_level(TEAM_ROLE_HIERARCHY, role) > _role_level(ORG_ROLE_HIERARCHY, target_membership.role):
+    if team_role_level(role) > org_role_level(target_membership.role):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Team role '{role}' exceeds user's org role '{target_membership.role}'",
@@ -206,7 +205,7 @@ async def _remove_member_checked(
     membership_id: uuid.UUID,
 ) -> TeamMembership:
     """Authorise and remove a team member, enforcing the last-operator guard."""
-    is_admin = _role_level(ORG_ROLE_HIERARCHY, current_user.org_role) >= _role_level(ORG_ROLE_HIERARCHY, "admin")
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
     caller_membership = None
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
@@ -221,8 +220,8 @@ async def _remove_member_checked(
     # team role — prevents intra-org privilege interference.
     if not is_admin:
         assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
-        target_level = _role_level(TEAM_ROLE_HIERARCHY, membership.role)
-        caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
+        target_level = team_role_level(membership.role)
+        caller_level = team_role_level(caller_membership.role)
         if target_level >= caller_level:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -245,7 +244,7 @@ async def _change_member_role_checked(
     new_role: str,
 ) -> tuple[TeamMembership, str]:
     """Authorise and apply a member role change; returns (membership, old_role)."""
-    is_admin = _role_level(ORG_ROLE_HIERARCHY, current_user.org_role) >= _role_level(ORG_ROLE_HIERARCHY, "admin")
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
     caller_membership = None
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
@@ -254,7 +253,7 @@ async def _change_member_role_checked(
             current_user.account_id,
             "Only admin users or team operators can change member roles",
         )
-        if _role_level(TEAM_ROLE_HIERARCHY, new_role) > _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role):
+        if team_role_level(new_role) > team_role_level(caller_membership.role):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Cannot grant role '{new_role}' above your own team role '{caller_membership.role}'",
@@ -267,8 +266,8 @@ async def _change_member_role_checked(
     # team role — prevents intra-org privilege interference.
     if not is_admin:
         assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
-        target_level = _role_level(TEAM_ROLE_HIERARCHY, old_role)
-        caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
+        target_level = team_role_level(old_role)
+        caller_level = team_role_level(caller_membership.role)
         if target_level >= caller_level:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
