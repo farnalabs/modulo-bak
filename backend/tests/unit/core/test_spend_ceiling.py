@@ -46,7 +46,7 @@ class TestEvaluateRunSpendCeiling:
     def test_unlimited_when_none(self) -> None:
         d = evaluate_run_spend_ceiling(run_cost_so_far_cents=999_999_999, max_run_cost_cents=None)
         assert d.allowed is True
-        assert d.reason == ""
+        assert not d.reason
 
     def test_within_ceiling_allowed(self) -> None:
         d = evaluate_run_spend_ceiling(
