@@ -82,3 +82,15 @@ async def test_emit_autonomy_telemetry_is_fail_open(app_engine: object, test_org
         autonomy_level="manual_approval",
         gate_outcome="fired",
     )
+
+    # Fail-open means the broken call must neither raise (above) nor persist a
+    # malformed row. Confirm the rejected event was swallowed, not stored.
+    async with factory() as session, session.begin():
+        await set_rls_org(session, org_id)
+        result = await session.execute(
+            text("SELECT COUNT(*) FROM audit_events WHERE event_type = :et AND payload_json->>'gate_id' = :gid"),
+            {"et": at.AUTONOMY_LEVEL_APPLIED, "gid": "g-failopen"},
+        )
+        count = result.scalar()
+
+    assert count == 0, "fail-open telemetry should not persist a malformed event"
