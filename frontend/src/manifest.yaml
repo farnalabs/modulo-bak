@@ -52,7 +52,7 @@ routes:
         name: onboarding
         breadcrumb: Onboarding
         parent: /
-        product_map:
+        product_map: [feat-onboarding]
         sidebar_group:
         sidebar_order:
         type: form_page
@@ -675,7 +675,7 @@ routes:
         name: admin-product-analytics
         breadcrumb: Product Analytics
         parent: /
-        product_map:
+        product_map: [feat-product-analytics]
         sidebar_group:
         sidebar_order:
         type: page
@@ -686,7 +686,7 @@ routes:
         name: admin-system-config
         breadcrumb: System Config
         parent: /
-        product_map:
+        product_map: [feat-system-config]
         sidebar_group:
         sidebar_order:
         type: page
@@ -697,7 +697,7 @@ routes:
         name: admin-system-orgs
         breadcrumb: Organisations
         parent: /
-        product_map:
+        product_map: [feat-system-orgs]
         sidebar_group:
         sidebar_order:
         type: page
@@ -767,16 +767,6 @@ routes:
         <<: *community
         deprecated: false
 
-    /lifecycle-maps/new:
-        name: lifecycle-map-new
-        breadcrumb: New Map
-        parent: /lifecycle-maps
-        product_map: [feat-lifecycle-maps]
-        sidebar_group:
-        sidebar_order:
-        type: form_page
-        <<: *community
-        deprecated: false
     /environment-profiles:
         name: environment-profiles
         breadcrumb: Environment Profiles
@@ -900,12 +890,16 @@ features:
         description: Notifications, email delivery, and notification logs
     feat-observability:
         description: Error dashboard, monitoring, and observability exports
+    feat-onboarding:
+        description: First-run onboarding wizard for new users and organizations
     feat-org:
         description: Organization settings and feature flags
     feat-pipelines:
         description: Visual pipeline editor, composite editor, and node categories
     feat-plugins:
         description: Plugin registry
+    feat-product-analytics:
+        description: Product usage and adoption analytics for system administrators
     feat-remy:
         description: Remy assistant configuration and skills
     feat-runs:
@@ -916,6 +910,10 @@ features:
         description: Typed JSON schemas, schema editor, inference, and parameter schemas
     feat-sso:
         description: Single sign-on (SSO)
+    feat-system-config:
+        description: System-level configuration administration
+    feat-system-orgs:
+        description: System-level organization administration
     feat-teams:
         description: Users, teams, and role-based access
     feat-triggers:
