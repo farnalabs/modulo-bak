@@ -30,8 +30,8 @@ from typing import Literal
 # Machine-stable refusal reasons (consumed by the executor / finalize path and
 # surfaced as a run ``error_code``). Kept as plain strings so they serialise
 # cleanly and match ``cost_controller``'s ``daily_limit_exceeded`` convention.
-RUN_CEILING_EXCEEDED = "run_cost_ceiling_exceeded"
-ORG_CEILING_EXCEEDED = "org_spend_ceiling_exceeded"
+RUN_CEILING_EXCEEDED: Literal["run_cost_ceiling_exceeded"] = "run_cost_ceiling_exceeded"
+ORG_CEILING_EXCEEDED: Literal["org_spend_ceiling_exceeded"] = "org_spend_ceiling_exceeded"
 
 _CeilingReason = Literal["", "run_cost_ceiling_exceeded", "org_spend_ceiling_exceeded"]
 
