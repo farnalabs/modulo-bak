@@ -185,7 +185,7 @@ def parse_target(target: str) -> str:
 
 def _url_for_path(path: str) -> str:
     """Build the absolute GitHub API URL for *path* (or pass through full URLs)."""
-    if path.startswith("http://") or path.startswith("https://"):
+    if "://" in path:
         return path
     return f"{_GITHUB_API_BASE}{path.lstrip('/')}"
 
@@ -278,55 +278,65 @@ def _coerce_int(value: Any, *, field: str) -> int:
         raise GithubApiError(f"GitHub API returned a non-numeric {field}: {value!r}") from exc
 
 
-def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tuple[dict[str, Any], Any]:
-    """GET a GitHub REST API path, returning ``(parsed_json, response_headers)``.
+# Sentinel returned by :func:`_run_gh_once` when the `gh` CLI could not be
+# launched (OSError) or timed out -- both mean "fall through to requests".
+_TRANSIENT_GH = object()
 
-    Prefers the `gh` CLI (handles auth + rate-limit), falling back to
-    `requests` with a token from the environment. Raises
-    :class:`GithubApiError` on any unrecoverable failure. On HTTP 429 or 5xx,
-    retries up to :data:`_MAX_RETRIES` times with backoff (honouring a
-    ``Retry-After`` header when present) before giving up. A ``Retry-After``
-    hint is also honoured for the `gh` CLI path when it surfaces a transient
-    error.
 
-    *allow_codes* lists HTTP status codes that should be returned as an empty
-    dict ``{}`` instead of raising -- used so a 404 (e.g. "no LICENSE file")
-    can be distinguished from a genuine API failure (which must stay
-    INCONCLUSIVE, never a silent false reject).
+def _run_gh_once(path: str):
+    """Launch one `gh api -i` call.
+
+    Returns the :class:`subprocess.CompletedProcess` on success, or
+    :data:`_TRANSIENT_GH` when `gh` could not be launched or timed out.
     """
-    url = _url_for_path(path)
+    try:
+        return subprocess.run(  # nosec  # noqa: S603
+            ["gh", "api", "-i", path],  # noqa: S607
+            capture_output=True,
+            text=True,
+            timeout=_API_TIMEOUT_SECONDS,
+        )
+    except OSError:
+        # gh cannot even be launched (e.g. PermissionError) -> requests.
+        return _TRANSIENT_GH
+    except subprocess.TimeoutExpired:
+        return _TRANSIENT_GH
 
-    # 1. Try gh CLI. ``-i`` (``--include``) makes gh emit the response headers
-    #    so pagination (the ``Link`` header) works on the common gh path.
+
+def _gh_fetch_with_retries(path: str):
+    """Try the `gh` CLI with retries.
+
+    Returns ``(parsed_json, headers)`` on a successful call, or ``None`` when
+    `gh` cannot serve the request so the caller falls back to `requests`.
+    """
     for attempt in range(_MAX_RETRIES):
-        try:
-            result = subprocess.run(  # nosec  # noqa: S603
-                ["gh", "api", "-i", path],  # noqa: S607
-                capture_output=True,
-                text=True,
-                timeout=_API_TIMEOUT_SECONDS,
-            )
-        except OSError:
-            # gh cannot even be launched (e.g. PermissionError) -> requests.
-            break
-        except subprocess.TimeoutExpired:
+        result = _run_gh_once(path)
+        if result is _TRANSIENT_GH:
             if attempt < _MAX_RETRIES - 1:
                 _backoff(attempt, None)
                 continue
-            break
-
+            return None
         if result.returncode == 0 and result.stdout.strip():
             # _parse_gh_include_output raises GithubApiError on a non-JSON body
             # (unreliable evidence -> INCONCLUSIVE), which we let propagate.
             return _parse_gh_include_output(result.stdout)
-
         # gh errored. Retry only clearly transient failures, else fall through.
         if _gh_is_transient(result) and attempt < _MAX_RETRIES - 1:
             _backoff(attempt, _gh_retry_after(result))
             continue
-        break
+        return None
+    return None
 
-    # 2. Fall back to requests with a token.
+
+def _requests_fetch_with_retries(url: str, allow_codes: tuple[int, ...]) -> tuple[dict[str, Any], Any]:
+    """Fetch *url* with `requests`, retrying on 429/5xx.
+
+    Raises :class:`GithubApiError` on any unrecoverable failure. *allow_codes*
+    lists HTTP status codes that should be returned as an empty dict ``{}``
+    instead of raising (so a 404 "no LICENSE file" is distinguishable from a
+    genuine API failure -- which must stay INCONCLUSIVE, never a silent
+    false reject).
+    """
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     headers = {"Accept": "application/vnd.github+json"}
     if token:
@@ -344,23 +354,45 @@ def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tu
             raise GithubApiError("GitHub API rate limit exceeded.")
         if resp.status_code in (401, 403):
             raise GithubApiError(f"GitHub API auth/permission error: HTTP {resp.status_code}.")
-        if resp.status_code >= 400:
-            if resp.status_code in allow_codes:
-                return {}, resp.headers
-            # Retry only on rate-limit / server errors; never on other 4xx.
-            if (resp.status_code == 429 or resp.status_code >= 500) and attempt < _MAX_RETRIES - 1:
-                _backoff(attempt, resp.headers.get("Retry-After"))
-                continue
-            raise GithubApiError(f"GitHub API error: HTTP {resp.status_code}.")
-
-        try:
-            return resp.json(), resp.headers
-        except json.JSONDecodeError as exc:
-            raise GithubApiError(f"GitHub API returned non-JSON body: {exc}") from None
+        if resp.status_code < 400:
+            try:
+                return resp.json(), resp.headers
+            except json.JSONDecodeError as exc:
+                raise GithubApiError(f"GitHub API returned non-JSON body: {exc}") from None
+        if resp.status_code in allow_codes:
+            return {}, resp.headers
+        # Retry only on rate-limit / server errors; never on other 4xx.
+        if (resp.status_code == 429 or resp.status_code >= 500) and attempt < _MAX_RETRIES - 1:
+            _backoff(attempt, resp.headers.get("Retry-After"))
+            continue
+        raise GithubApiError(f"GitHub API error: HTTP {resp.status_code}.")
 
     if last_exc is not None:
         raise GithubApiError(f"GitHub API request failed: {last_exc}") from None
     raise GithubApiError("GitHub API request failed after retries.")
+
+
+def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tuple[dict[str, Any], Any]:
+    """GET a GitHub REST API path, returning ``(parsed_json, response_headers)``.
+
+    Prefers the `gh` CLI (handles auth + rate-limit), falling back to
+    `requests` with a token from the environment. Raises
+    :class:`GithubApiError` on any unrecoverable failure. On HTTP 429 or 5xx,
+    retries up to :data:`_MAX_RETRIES` times with backoff (honouring a
+    ``Retry-After`` header when present) before giving up. A ``Retry-After``
+    hint is also honoured for the `gh` CLI path when it surfaces a transient
+    error.
+
+    *allow_codes* lists HTTP status codes that should be returned as an empty
+    dict ``{}`` instead of raising -- used so a 404 (e.g. "no LICENSE file")
+    can be distinguished from a genuine API failure (which must stay
+    INCONCLUSIVE, never a silent false reject).
+    """
+    url = _url_for_path(path)
+    gh_result = _gh_fetch_with_retries(path)
+    if gh_result is not None:
+        return gh_result
+    return _requests_fetch_with_retries(url, allow_codes)
 
 
 def _api_get(path: str, *, allow_codes: tuple[int, ...] = ()) -> dict[str, Any]:
@@ -486,6 +518,24 @@ def _distinct_human_committers(commits: list[dict[str, Any]]) -> set[str]:
     return authors
 
 
+def _set_criterion(
+    criteria: dict[str, dict[str, str | None]],
+    name: str,
+    passed: bool,
+    fail_reason: str | None,
+    pass_reason: str | None = None,
+) -> None:
+    """Record a single criterion.
+
+    A passing criterion normally has ``reason=None``; *pass_reason* overrides
+    that for the licence-file fallback, which passes but records *why* it did.
+    """
+    criteria[name] = {
+        "status": STATUS_PASS if passed else STATUS_FAIL,
+        "reason": pass_reason if passed else fail_reason,
+    }
+
+
 def _evaluate_criteria(
     evidence: dict[str, Any],
     committers: set[str] | None = None,
@@ -496,13 +546,13 @@ def _evaluate_criteria(
 
     # 1. Visibility / fork / archived.
     if evidence["private"]:
-        criteria["public"] = {"status": STATUS_FAIL, "reason": RC_NOT_PUBLIC}
+        _set_criterion(criteria, "public", False, RC_NOT_PUBLIC)
     elif evidence["fork"]:
-        criteria["public"] = {"status": STATUS_FAIL, "reason": RC_IS_FORK}
+        _set_criterion(criteria, "public", False, RC_IS_FORK)
     elif evidence["archived"]:
-        criteria["public"] = {"status": STATUS_FAIL, "reason": RC_IS_ARCHIVED}
+        _set_criterion(criteria, "public", False, RC_IS_ARCHIVED)
     else:
-        criteria["public"] = {"status": STATUS_PASS, "reason": None}
+        _set_criterion(criteria, "public", True, None)
 
     # 2. Licence.
     #    (a) Accept a known OSI spdx_id regardless of case.
@@ -511,20 +561,19 @@ def _evaluate_criteria(
     spdx = evidence.get("spdx_id")
     spdx_upper = (spdx or "").upper()
     if spdx and spdx_upper not in ("NULL", "NOASSERTION") and spdx_upper in OSI_APPROVED_SPDX_IDS:
-        criteria["license"] = {"status": STATUS_PASS, "reason": None}
+        _set_criterion(criteria, "license", True, None)
     elif (spdx is None or spdx_upper in ("NULL", "NOASSERTION")) and evidence.get("license_file_present"):
-        criteria["license"] = {
-            "status": STATUS_PASS,
-            "reason": RC_LICENSE_FILE_FALLBACK,
-        }
+        _set_criterion(criteria, "license", True, RC_NO_OSI_LICENSE, pass_reason=RC_LICENSE_FILE_FALLBACK)
     else:
-        criteria["license"] = {"status": STATUS_FAIL, "reason": RC_NO_OSI_LICENSE}
+        _set_criterion(criteria, "license", False, RC_NO_OSI_LICENSE)
 
     # 3. Stars.
-    if evidence["stargazers_count"] >= MIN_STARS:
-        criteria["stars"] = {"status": STATUS_PASS, "reason": None}
-    else:
-        criteria["stars"] = {"status": STATUS_FAIL, "reason": RC_BELOW_STARS}
+    _set_criterion(
+        criteria,
+        "stars",
+        evidence["stargazers_count"] >= MIN_STARS,
+        RC_BELOW_STARS,
+    )
 
     # 4. Age.
     created_raw = evidence.get("created_at")
@@ -537,28 +586,25 @@ def _evaluate_criteria(
         # report INCONCLUSIVE rather than a hard TOO_YOUNG reject.
         raise GithubApiError(f"Repository created_at is unparseable: {created_raw!r}") from exc
     age_ok = (now - created) >= _dt.timedelta(days=MIN_AGE_DAYS)
-    if age_ok:
-        criteria["age"] = {"status": STATUS_PASS, "reason": None}
-    else:
-        criteria["age"] = {"status": STATUS_FAIL, "reason": RC_TOO_YOUNG}
+    _set_criterion(criteria, "age", age_ok, RC_TOO_YOUNG)
 
     # 5. Tagged release.
-    tag_count = len(evidence.get("tags", []))
-    if tag_count >= MIN_TAGGED_RELEASES:
-        criteria["release"] = {"status": STATUS_PASS, "reason": None}
-    else:
-        criteria["release"] = {"status": STATUS_FAIL, "reason": RC_NO_TAGGED_RELEASE}
+    _set_criterion(
+        criteria,
+        "release",
+        len(evidence.get("tags", [])) >= MIN_TAGGED_RELEASES,
+        RC_NO_TAGGED_RELEASE,
+    )
 
     # 6. Distinct human committers.
     if committers is None:
         committers = _distinct_human_committers(evidence.get("commits", []))
-    if len(committers) >= MIN_DISTINCT_COMMITTERS:
-        criteria["committers"] = {"status": STATUS_PASS, "reason": None}
-    else:
-        criteria["committers"] = {
-            "status": STATUS_FAIL,
-            "reason": RC_INSUFFICIENT_COMMITTERS,
-        }
+    _set_criterion(
+        criteria,
+        "committers",
+        len(committers) >= MIN_DISTINCT_COMMITTERS,
+        RC_INSUFFICIENT_COMMITTERS,
+    )
 
     return criteria
 
