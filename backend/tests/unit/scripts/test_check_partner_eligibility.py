@@ -426,3 +426,106 @@ def test_unparseable_created_at_is_inconclusive(now: _dt.datetime, monkeypatch: 
     result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
     assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
     assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+
+
+def test_gh_header_pagination_follows_next(monkeypatch: pytest.MonkeyPatch) -> None:
+    # G1: the gh CLI path must surface the Link header so pagination works.
+    # Simulate `gh api -i` output (headers + blank line + JSON body) where the
+    # first page of tags carries rel="next"; the second page has no Link. The
+    # paginator must follow to page 2 and aggregate both pages.
+    page1 = (
+        "HTTP/2 200\n"
+        "content-type: application/json\n"
+        'link: <https://api.github.com/repos/acme/widgets/tags?page=2&per_page=100>; rel="next"\n'
+        "\n" + json.dumps([{"name": "v1.0.0"}, {"name": "v1.1.0"}])
+    )
+    page2 = "HTTP/2 200\ncontent-type: application/json\n\n" + json.dumps([{"name": "v2.0.0"}])
+
+    def _run(*args, **_kwargs):
+        cmd = list(args[0])
+        path = cmd[3] if len(cmd) > 3 else ""
+        if "/tags" in path and "page=2" not in path:
+            stdout = page1
+        elif "/tags" in path and "page=2" in path:
+            stdout = page2
+        elif "/commits" in path:
+            stdout = "HTTP/2 200\n\n" + json.dumps([{"author": {"login": "alice"}}, {"author": {"login": "bob"}}])
+        elif "/license" in path:
+            stdout = "HTTP/2 200\n\n" + json.dumps({})
+        else:
+            stdout = "HTTP/2 200\n\n" + json.dumps(
+                {
+                    "id": 1,
+                    "full_name": "acme/widgets",
+                    "private": False,
+                    "fork": False,
+                    "archived": False,
+                    "stargazers_count": 1500,
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "license": {"spdx_id": "MIT"},
+                }
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", _run)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_ELIGIBLE
+    # 2 tags from page 1 + 1 from page 2 must be aggregated.
+    assert result["evidence"]["tag_count"] == 3
+
+
+def test_gh_link_header_unparseable_next_is_inconclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # G2: a Link header with rel="next" but a truncated/unparseable URL must
+    # be INCONCLUSIVE, never a silent "no more pages" undercount.
+    tags_block = 'HTTP/2 200\nlink: <https://api.github.com/repos/acme/widgets/tags?page=2 rel="next"\n\n' + json.dumps(
+        [{"name": "v1.0.0"}]
+    )
+
+    def _run(*args, **_kwargs):
+        cmd = list(args[0])
+        path = cmd[3] if len(cmd) > 3 else ""
+        if "/tags" in path:
+            stdout = tags_block
+        elif "/commits" in path:
+            stdout = "HTTP/2 200\n\n" + json.dumps([{"author": {"login": "alice"}}])
+        elif "/license" in path:
+            stdout = "HTTP/2 200\n\n" + json.dumps({})
+        else:
+            stdout = "HTTP/2 200\n\n" + json.dumps(
+                {
+                    "id": 1,
+                    "full_name": "acme/widgets",
+                    "private": False,
+                    "fork": False,
+                    "archived": False,
+                    "stargazers_count": 1500,
+                    "created_at": "2020-01-01T00:00:00Z",
+                    "license": {"spdx_id": "MIT"},
+                }
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", _run)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+
+
+def test_non_numeric_stargazers_count_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    # G3: a non-numeric stargazers_count from the API must be INCONCLUSIVE, not
+    # a crash (TypeError/ValueError escaping the narrow GithubApiError catch).
+    fake = _fake_api_get_factory(now)
+    fake.repos_payload = {  # type: ignore[attr-defined]
+        "id": 1,
+        "full_name": "acme/widgets",
+        "private": False,
+        "fork": False,
+        "archived": False,
+        "stargazers_count": "lots",
+        "created_at": "2020-01-01T00:00:00Z",
+        "license": {"spdx_id": "MIT"},
+    }
+    monkeypatch.setattr(mod, "_api_get_with_headers", fake)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE

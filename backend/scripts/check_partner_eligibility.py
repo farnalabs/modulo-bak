@@ -218,7 +218,13 @@ def _backoff(attempt: int, retry_after: str | None) -> None:
 
 
 def _extract_next_link(link_header: str | None) -> str | None:
-    """Return the `rel="next"` URL from a GitHub `Link` header, if any."""
+    """Return the `rel="next"` URL from a GitHub `Link` header, if any.
+
+    A `rel="next"` segment whose angle-bracketed URL is missing or
+    unparseable is evidence that pagination is unreliable -- it raises
+    :class:`GithubApiError` (→ INCONCLUSIVE) rather than being treated as
+    "no more pages".
+    """
     if not link_header:
         return None
     for part in link_header.split(","):
@@ -227,9 +233,49 @@ def _extract_next_link(link_header: str | None) -> str | None:
             continue
         start = segment.find("<")
         end = segment.find(">", start)
-        if start != -1 and end != -1:
+        if start != -1 and end != -1 and start + 1 < end:
             return segment[start + 1 : end]
+        raise GithubApiError(
+            'GitHub API Link header contains rel="next" with an unparseable URL; pagination cannot be trusted.'
+        )
     return None
+
+
+def _parse_gh_include_output(stdout: str) -> tuple[dict[str, Any], dict[str, str]]:
+    """Parse the combined stdout of ``gh api -i <endpoint>``.
+
+    ``gh api -i`` emits the response headers, a blank line, then the JSON
+    body. Returns ``(parsed_json, headers_dict)`` with header keys
+    lower-cased. Raises :class:`GithubApiError` if the body is not valid JSON.
+    """
+    parts = stdout.split("\n\n", 1)
+    header_block = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
+    headers: dict[str, str] = {}
+    for line in header_block.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        # Normalise to lower case so callers look up a stable key regardless of
+        # how the source capitalised it (``requests`` returns a case-insensitive
+        # dict, this one is plain -- lower-casing both makes the lookup uniform).
+        headers[key.strip().lower()] = value.strip()
+    try:
+        return json.loads(body), headers
+    except json.JSONDecodeError as exc:
+        raise GithubApiError(f"gh returned non-JSON body after headers: {exc}") from None
+
+
+def _coerce_int(value: Any, *, field: str) -> int:
+    """Coerce *value* to ``int`` or raise :class:`GithubApiError`.
+
+    Any non-numeric / missing value is treated as unreliable evidence (→
+    INCONCLUSIVE), never as a silent false reject.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise GithubApiError(f"GitHub API returned a non-numeric {field}: {value!r}") from exc
 
 
 def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tuple[dict[str, Any], Any]:
@@ -250,11 +296,12 @@ def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tu
     """
     url = _url_for_path(path)
 
-    # 1. Try gh CLI.
+    # 1. Try gh CLI. ``-i`` (``--include``) makes gh emit the response headers
+    #    so pagination (the ``Link`` header) works on the common gh path.
     for attempt in range(_MAX_RETRIES):
         try:
             result = subprocess.run(  # nosec  # noqa: S603
-                ["gh", "api", path],  # noqa: S607
+                ["gh", "api", "-i", path],  # noqa: S607
                 capture_output=True,
                 text=True,
                 timeout=_API_TIMEOUT_SECONDS,
@@ -269,10 +316,9 @@ def _api_get_with_headers(path: str, *, allow_codes: tuple[int, ...] = ()) -> tu
             break
 
         if result.returncode == 0 and result.stdout.strip():
-            try:
-                return json.loads(result.stdout), {}
-            except json.JSONDecodeError as exc:
-                raise GithubApiError(f"gh returned non-JSON stdout: {exc}") from None
+            # _parse_gh_include_output raises GithubApiError on a non-JSON body
+            # (unreliable evidence -> INCONCLUSIVE), which we let propagate.
+            return _parse_gh_include_output(result.stdout)
 
         # gh errored. Retry only clearly transient failures, else fall through.
         if _gh_is_transient(result) and attempt < _MAX_RETRIES - 1:
@@ -342,7 +388,13 @@ def _paginate(endpoint: str, *, max_pages: int = _MAX_PAGINATION_PAGES) -> list[
         if not isinstance(data, list):
             raise GithubApiError(f"GitHub API returned non-list payload for {next_path}.")
         results.extend(data)
-        nxt = _extract_next_link(headers.get("Link") if headers else None)
+        link_header = None
+        if headers:
+            for header_name in headers:
+                if header_name.lower() == "link":
+                    link_header = headers[header_name]
+                    break
+        nxt = _extract_next_link(link_header)
         if not nxt:
             return results
         next_path = nxt
@@ -371,6 +423,11 @@ def gather_repo_evidence(target: str) -> dict[str, Any]:
     if repo.get("stargazers_count") is None or repo.get("created_at") is None:
         raise GithubApiError("GitHub API /repos response missing essential evaluation fields.")
 
+    # The star count must be a valid integer. A non-numeric value (or any other
+    # coercion failure) is unreliable evidence and must surface as INCONCLUSIVE,
+    # never as a crash or a silent false reject.
+    stargazers_count = _coerce_int(repo.get("stargazers_count"), field="stargazers_count")
+
     # Licence: the /license endpoint returns 404 when no licence file exists
     # (legitimately "not present"); any other API error must propagate as
     # INCONCLUSIVE rather than be swallowed into a silent false reject.
@@ -392,7 +449,7 @@ def gather_repo_evidence(target: str) -> dict[str, Any]:
         "private": bool(repo.get("private", False)),
         "fork": bool(repo.get("fork", False)),
         "archived": bool(repo.get("archived", False)),
-        "stargazers_count": int(repo.get("stargazers_count", 0) or 0),
+        "stargazers_count": stargazers_count,
         "created_at": repo.get("created_at"),
         "spdx_id": spdx_id,
         "license_file_present": license_file_present,
