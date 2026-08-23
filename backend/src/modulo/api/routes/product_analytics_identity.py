@@ -27,8 +27,8 @@ from modulo.db.crud.system_config import get_config, update_config
 
 _log = logging.getLogger(__name__)
 
-_LOG_IDENTITY_GET = "product_analytics.get_identity"
-_LOG_IDENTITY_ROTATE = "product_analytics.rotate_secret"
+_LOG_IDENTITY = "product_analytics.get_identity"
+_LOG_ROTATE = "product_analytics.rotate_secret"
 
 router = APIRouter(
     prefix="/api/v1/product-analytics",
@@ -36,8 +36,8 @@ router = APIRouter(
 )
 
 # ── Rate limiter for rotation (in-memory, per-process) ─────────────────────
-# NOTE: this dict is per-process and ineffective behind a load balancer with
-# multiple workers — a Redis-backed limiter is the target for multi-worker.
+# Note: this rate limiter is per-process and not shared across workers behind
+# a load balancer; a Redis-backed limiter would be required for that.
 
 _rotation_timestamps: dict[str, list[float]] = defaultdict(list)
 _MAX_ROTATIONS = 5
@@ -110,19 +110,19 @@ async def get_identity(
     except asyncio.CancelledError:
         raise
     except ProgrammingError:
-        _log.exception(_LOG_IDENTITY_GET)
+        _log.exception(_LOG_IDENTITY)
         raise HTTPException(
             status_code=501,
             detail="Database not available. Run migrations.",
         ) from None
     except SQLAlchemyError:
-        _log.exception(_LOG_IDENTITY_GET)
+        _log.exception(_LOG_IDENTITY)
         raise HTTPException(
             status_code=503,
             detail="Database temporarily unavailable.",
         ) from None
     except Exception:
-        _log.exception(_LOG_IDENTITY_GET)
+        _log.exception(_LOG_IDENTITY)
         raise HTTPException(status_code=500, detail=MSG_INTERNAL_SERVER_ERROR) from None
 
 
@@ -194,19 +194,19 @@ async def rotate_identity_secret(
     except asyncio.CancelledError:
         raise
     except ProgrammingError:
-        _log.exception(_LOG_IDENTITY_ROTATE)
+        _log.exception(_LOG_ROTATE)
         raise HTTPException(
             status_code=501,
             detail="Database not available. Run migrations.",
         ) from None
     except SQLAlchemyError:
-        _log.exception(_LOG_IDENTITY_ROTATE)
+        _log.exception(_LOG_ROTATE)
         raise HTTPException(
             status_code=503,
             detail="Database temporarily unavailable.",
         ) from None
     except Exception:
-        _log.exception(_LOG_IDENTITY_ROTATE)
+        _log.exception(_LOG_ROTATE)
         raise HTTPException(status_code=500, detail=MSG_INTERNAL_SERVER_ERROR) from None
 
 

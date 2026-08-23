@@ -16,9 +16,12 @@ from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature, require_permission
 from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
-from modulo.auth.team_rbac import ORG_ROLE_HIERARCHY, TEAM_ROLE_HIERARCHY
-from modulo.db.crud import account as crud_account
-from modulo.db.crud import org_membership as crud_org_membership
+from modulo.auth.team_rbac import (
+    org_role_level,
+    team_role_level,
+)
+from modulo.db.crud import account as _account_crud
+from modulo.db.crud.org_membership import get_membership_by_account_and_org
 from modulo.db.crud.team import (
     TeamUpdateOutcome,
     create_team,
@@ -103,162 +106,182 @@ async def _assert_not_last_operator(
         )
 
 
+async def _require_team_operator_caller(
+    session: AsyncSession,
+    team_id: uuid.UUID,
+    account_id: uuid.UUID,
+    detail: str,
+) -> TeamMembership:
+    """Return the caller's team membership, requiring it to be an ``operator``."""
+    membership = await get_membership_by_team_and_account(session, team_id, account_id)
+    if membership is None or membership.role != "operator":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+    return membership
+
+
+async def _load_team_membership(session: AsyncSession, team_id: uuid.UUID, membership_id: uuid.UUID) -> TeamMembership:
+    """Load a membership scoped to ``team_id``, 404 on mismatch/absence."""
+    membership = await get_membership(session, membership_id)
+    if membership is None or membership.team_id != team_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MEMBERSHIP_NOT_FOUND)
+    return membership
+
+
 async def _apply_team_update(
     session: AsyncSession,
-    organisation_id: uuid.UUID,
+    org_id: uuid.UUID,
     team_id: uuid.UUID,
     updates: dict[str, Any],
-    req: "UpdateTeamRequest",
-) -> Team | None:
-    """Apply a team update, enforcing name uniqueness and optimistic locking."""
+    expected_updated_at: str | None,
+) -> Team:
+    """Apply name/description/optimistic-version updates, raising 409/404 on conflicts."""
     if "name" in updates:
-        existing = await get_team_by_name(session, organisation_id, updates["name"])
+        existing = await get_team_by_name(session, org_id, updates["name"])
         if existing is not None and existing.id != team_id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=_MSG_TEAM_NAME_ALREADY_EXISTS,
-            )
-    if req.expected_updated_at is not None:
-        outcome, team = await update_team_if_unchanged(session, team_id, updates, req.expected_updated_at)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_MSG_TEAM_NAME_ALREADY_EXISTS)
+
+    if expected_updated_at is not None:
+        outcome, team = await update_team_if_unchanged(session, team_id, updates, expected_updated_at)
         if outcome is TeamUpdateOutcome.NOT_FOUND:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
         if outcome is TeamUpdateOutcome.STALE:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Team was modified by another request. Refresh and try again (optimistic lock mismatch).",
+                detail=("Team was modified by another request. Refresh and try again (optimistic lock mismatch)."),
             )
+        if team is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
         return team
-    return await update_team(session, team_id, updates)
+    team = await update_team(session, team_id, updates)
+    if team is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
+    return team
 
 
-async def _authorize_membership_add(
+async def _add_team_member_checked(
     session: AsyncSession,
     current_user: TenantPrincipal,
     team_id: uuid.UUID,
     user_id: uuid.UUID,
     role: str,
-) -> Team:
-    """Resolve + authorize an add-member request; returns the target team."""
-    team = await get_team(session, team_id)
-    if team is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
-
-    # Authorise: admin (all-powerful) OR team operator of this team
-    is_admin = ORG_ROLE_HIERARCHY.get(current_user.org_role, -1) >= ORG_ROLE_HIERARCHY["admin"]
+) -> TeamMembership:
+    """Authorise and add a team member, enforcing the org/team role ceilings."""
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
     if not is_admin:
-        caller_membership = await get_membership_by_team_and_account(session, team_id, current_user.account_id)
-        if caller_membership is None or caller_membership.role != "operator":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only admin users or team operators can add members",
-            )
-        if TEAM_ROLE_HIERARCHY.get(role, -1) > TEAM_ROLE_HIERARCHY.get(caller_membership.role, -1):
+        caller_membership = await _require_team_operator_caller(
+            session,
+            team_id,
+            current_user.account_id,
+            "Only admin users or team operators can add members",
+        )
+        if team_role_level(role) > team_role_level(caller_membership.role):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"Cannot grant role '{role}' above your own team role '{caller_membership.role}'",
             )
 
-    target_account = await crud_account.get_account_by_id(session, user_id)
-    target_membership = await crud_org_membership.get_membership_by_account_and_org(
-        session, user_id, current_user.organisation_id
-    )
+    target_account = await _account_crud.get_account_by_id(session, user_id)
+    target_membership = await get_membership_by_account_and_org(session, user_id, current_user.organisation_id)
     if target_account is None or target_membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in organisation")
-    if TEAM_ROLE_HIERARCHY.get(role, -1) > ORG_ROLE_HIERARCHY.get(target_membership.role, -1):
+    if team_role_level(role) > org_role_level(target_membership.role):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Team role '{role}' exceeds user's org role '{target_membership.role}'",
         )
-    return team
+    return await add_team_member(
+        session,
+        org_id=current_user.organisation_id,
+        team_id=team_id,
+        account_id=user_id,
+        role=role,
+    )
 
 
-def _assert_operator_can_affect_member(
-    caller_membership: TeamMembership | None,
-    target_role: str,
-    action_verb: str,
-) -> None:
-    """SECURITY (#1194): operators cannot affect equal-or-higher team roles."""
-    if caller_membership is None:
-        raise RuntimeError("caller membership unexpectedly None on non-admin path")
-    target_level = TEAM_ROLE_HIERARCHY.get(target_role, -1)
-    caller_level = TEAM_ROLE_HIERARCHY.get(caller_membership.role, -1)
-    if target_level >= caller_level:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(f"Cannot {action_verb} member with role '{target_role}' — your role is '{caller_membership.role}'"),
+async def _remove_member_checked(
+    session: AsyncSession,
+    current_user: TenantPrincipal,
+    team_id: uuid.UUID,
+    membership_id: uuid.UUID,
+) -> TeamMembership:
+    """Authorise and remove a team member, enforcing the last-operator guard."""
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
+    caller_membership = None
+    if not is_admin:
+        caller_membership = await _require_team_operator_caller(
+            session,
+            team_id,
+            current_user.account_id,
+            "Only admin users or team operators can remove members",
         )
+    membership = await _load_team_membership(session, team_id, membership_id)
+
+    # SECURITY (#1194): operator cannot remove someone with equal or higher
+    # team role — prevents intra-org privilege interference.
+    if not is_admin:
+        assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
+        target_level = team_role_level(membership.role)
+        caller_level = team_role_level(caller_membership.role)
+        if target_level >= caller_level:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cannot remove member with role '{membership.role}' — your role is '{caller_membership.role}'"
+                ),
+            )
+
+    if membership.role == "operator":
+        await _assert_not_last_operator(session, team_id, membership_id)
+    await remove_team_member(session, membership_id)
+    return membership
 
 
-async def _authorize_member_removal(
+async def _change_member_role_checked(
     session: AsyncSession,
     current_user: TenantPrincipal,
     team_id: uuid.UUID,
     membership_id: uuid.UUID,
-) -> tuple[bool, TeamMembership]:
-    """Resolve + authorize a remove-member request.
-
-    Returns ``(is_admin, membership)``. Operators may only remove members with
-    strictly lower team roles (SECURITY #1194: prevents intra-org privilege
-    interference).
-    """
-    is_admin = ORG_ROLE_HIERARCHY.get(current_user.org_role, -1) >= ORG_ROLE_HIERARCHY["admin"]
-    caller_membership: TeamMembership | None = None
+    new_role: str,
+) -> tuple[TeamMembership, str]:
+    """Authorise and apply a member role change; returns (membership, old_role)."""
+    is_admin = org_role_level(current_user.org_role) >= org_role_level("admin")
+    caller_membership = None
     if not is_admin:
-        caller_membership = await get_membership_by_team_and_account(session, team_id, current_user.account_id)
-        if caller_membership is None or caller_membership.role != "operator":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only admin users or team operators can remove members",
-            )
-
-    membership = await get_membership(session, membership_id)
-    if membership is None or membership.team_id != team_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MEMBERSHIP_NOT_FOUND)
-
-    if not is_admin:
-        _assert_operator_can_affect_member(caller_membership, membership.role, "remove")
-    return is_admin, membership
-
-
-async def _authorize_role_change(
-    session: AsyncSession,
-    current_user: TenantPrincipal,
-    team_id: uuid.UUID,
-    membership_id: uuid.UUID,
-    role: str,
-) -> tuple[bool, TeamMembership]:
-    """Resolve + authorize a role-change request.
-
-    Returns ``(is_admin, existing membership)``. Operators may only assign
-    roles at or below their own team role, and may not change equal-or-higher
-    ranks (SECURITY #1194).
-    """
-    team = await get_team(session, team_id)
-    if team is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
-
-    is_admin = ORG_ROLE_HIERARCHY.get(current_user.org_role, -1) >= ORG_ROLE_HIERARCHY["admin"]
-    caller_membership: TeamMembership | None = None
-    if not is_admin:
-        caller_membership = await get_membership_by_team_and_account(session, team_id, current_user.account_id)
-        if caller_membership is None or caller_membership.role != "operator":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Only admin users or team operators can change member roles",
-            )
-        if TEAM_ROLE_HIERARCHY.get(role, -1) > TEAM_ROLE_HIERARCHY.get(caller_membership.role, -1):
+        caller_membership = await _require_team_operator_caller(
+            session,
+            team_id,
+            current_user.account_id,
+            "Only admin users or team operators can change member roles",
+        )
+        if team_role_level(new_role) > team_role_level(caller_membership.role):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=f"Cannot grant role '{role}' above your own team role '{caller_membership.role}'",
+                detail=f"Cannot grant role '{new_role}' above your own team role '{caller_membership.role}'",
             )
 
-    existing = await get_membership(session, membership_id)
-    if existing is None or existing.team_id != team_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MEMBERSHIP_NOT_FOUND)
+    existing = await _load_team_membership(session, team_id, membership_id)
+    old_role = existing.role
 
+    # SECURITY (#1194): operator cannot demote someone with equal or higher
+    # team role — prevents intra-org privilege interference.
     if not is_admin:
-        _assert_operator_can_affect_member(caller_membership, existing.role, "change role of")
-    return is_admin, existing
+        assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
+        target_level = team_role_level(old_role)
+        caller_level = team_role_level(caller_membership.role)
+        if target_level >= caller_level:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cannot change role of member with role '{old_role}' — your role is '{caller_membership.role}'"
+                ),
+            )
+
+    if old_role == "operator" and new_role != "operator":
+        await _assert_not_last_operator(session, team_id, membership_id)
+    membership = await update_member_role(session, membership_id, new_role)
+    if membership is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MEMBERSHIP_NOT_FOUND)
+    return membership, old_role
 
 
 class CreateTeamRequest(BaseModel):
@@ -605,13 +628,12 @@ async def update_team_endpoint(
         async with session.begin():
             await set_rls_org(session, current_user.organisation_id)
             await set_rls_user_context(session, current_user.account_id, current_user.org_role)
-
             team = await _apply_team_update(
                 session,
                 current_user.organisation_id,
                 team_id,
                 updates,
-                req,
+                req.expected_updated_at,
             )
     except IntegrityError as exc:
         _log.exception("teams.update_team_endpoint")
@@ -930,15 +952,11 @@ async def add_member_endpoint(
             await set_rls_org(session, current_user.organisation_id)
             await set_rls_user_context(session, current_user.account_id, current_user.org_role)
 
-            await _authorize_membership_add(session, current_user, team_id, user_id, req.role)
+            team = await get_team(session, team_id)
+            if team is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
 
-            membership = await add_team_member(
-                session,
-                org_id=current_user.organisation_id,
-                team_id=team_id,
-                account_id=user_id,
-                role=req.role,
-            )
+            membership = await _add_team_member_checked(session, current_user, team_id, user_id, req.role)
     except IntegrityError as exc:
         _log.exception("teams.add_member_endpoint")
         raise HTTPException(
@@ -1020,13 +1038,7 @@ async def remove_member_endpoint(
         async with session.begin():
             await set_rls_org(session, current_user.organisation_id)
             await set_rls_user_context(session, current_user.account_id, current_user.org_role)
-
-            _, membership = await _authorize_member_removal(session, current_user, team_id, membership_id)
-
-            if membership.role == "operator":
-                await _assert_not_last_operator(session, team_id, membership_id)
-
-            await remove_team_member(session, membership_id)
+            membership = await _remove_member_checked(session, current_user, team_id, membership_id)
     except IntegrityError as exc:
         _log.exception("teams.remove_member_endpoint")
         raise HTTPException(
@@ -1111,14 +1123,17 @@ async def change_member_role_endpoint(
             await set_rls_org(session, current_user.organisation_id)
             await set_rls_user_context(session, current_user.account_id, current_user.org_role)
 
-            _, existing = await _authorize_role_change(session, current_user, team_id, membership_id, req.role)
-            old_role = existing.role
+            team = await get_team(session, team_id)
+            if team is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_TEAM_NOT_FOUND)
 
-            if old_role == "operator" and req.role != "operator":
-                await _assert_not_last_operator(session, team_id, membership_id)
-            membership = await update_member_role(session, membership_id, req.role)
-            if membership is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MEMBERSHIP_NOT_FOUND)
+            membership, old_role = await _change_member_role_checked(
+                session,
+                current_user,
+                team_id,
+                membership_id,
+                req.role,
+            )
     except IntegrityError as exc:
         _log.exception("teams.change_member_role_endpoint")
         raise HTTPException(

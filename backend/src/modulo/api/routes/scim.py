@@ -118,6 +118,40 @@ async def _resolve_scim_admin_caller(session: AsyncSession, org_id: uuid.UUID) -
     return row[0] if row is not None else None
 
 
+async def _deactivate_scim_user(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> Account:
+    """Deactivate a SCIM user, resolving the caller and enforcing last-admin.
+
+    Raises ``_scim_error`` on conflict or not-found, mirroring the route-level
+    behaviour so callers (replace/patch/delete) share one implementation.
+    """
+    caller = await _resolve_scim_admin_caller(session, org_id)
+    if caller is None:
+        raise _scim_error(
+            status.HTTP_409_CONFLICT,
+            _MSG_NO_ACTIVE_ADMIN_EXISTS,
+        )
+    await assert_not_last_admin(
+        session,
+        org_id=org_id,
+        target_account_id=user_id,
+        target_role_after=None,
+        target_active_after=False,
+    )
+    account = await scim_deactivate_user(
+        session,
+        org_id,
+        user_id,
+        caller_account_id=caller,
+    )
+    if account is None:
+        raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
+    return account
+
+
 def _user_to_scim(account: Account, base_url: str) -> dict[str, object]:
     given_name = (account.display_name or "").split(" ")[0] if account.display_name else ""
     parts = (account.display_name or "").split(" ")
@@ -431,52 +465,6 @@ async def get_user(
     return _user_to_scim(account, _get_base_url(settings))
 
 
-async def _replace_user_fields(
-    session: AsyncSession,
-    organisation_id: uuid.UUID,
-    user_id: uuid.UUID,
-    account: Account,
-    req: ScimUserRequest,
-) -> Account:
-    """Apply a PUT (replace) to a SCIM user, handling the deactivation branch.
-
-    Deactivation requires an active non-break-glass admin caller and the
-    last-admin guard; activation updates the user in place.
-    """
-    if not req.active:
-        caller = await _resolve_scim_admin_caller(session, organisation_id)
-        if caller is None:
-            raise _scim_error(
-                status.HTTP_409_CONFLICT,
-                _MSG_NO_ACTIVE_ADMIN_EXISTS,
-            )
-        await assert_not_last_admin(
-            session,
-            org_id=organisation_id,
-            target_account_id=user_id,
-            target_role_after=None,
-            target_active_after=False,
-        )
-        updated = await scim_deactivate_user(
-            session,
-            organisation_id,
-            user_id,
-            caller_account_id=caller,
-        )
-        if updated is None:
-            raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
-        return updated
-    display_name = req.name.formatted if req.name and req.name.formatted else req.userName
-    return await scim_update_user(
-        session,
-        account,
-        org_id=organisation_id,
-        email=req.userName,
-        display_name=display_name,
-        active=req.active,
-    )
-
-
 @router.put("/Users/{user_id}", dependencies=[Depends(require_scim_feature)])
 async def replace_user(
     user_id: uuid.UUID,
@@ -492,7 +480,18 @@ async def replace_user(
             if account is None:
                 raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
 
-            account = await _replace_user_fields(session, principal.organisation_id, user_id, account, req)
+            if not req.active:
+                account = await _deactivate_scim_user(session, principal.organisation_id, user_id)
+            else:
+                display_name = req.name.formatted if req.name and req.name.formatted else req.userName
+                account = await scim_update_user(
+                    session,
+                    account,
+                    org_id=principal.organisation_id,
+                    email=req.userName,
+                    display_name=display_name,
+                    active=req.active,
+                )
     except LastAdminLockoutError as exc:
         raise _scim_error(status.HTTP_409_CONFLICT, exc.reason) from None
     except LastAdminLockoutUnavailableError:
@@ -539,101 +538,62 @@ async def replace_user(
 
 
 def _apply_user_replace_op(account: Account, op: ScimPatchOperation) -> bool:
-    """Apply a ``replace`` PATCH op to a user; True when deactivation was requested."""
+    """Apply a ``replace`` PATCH operation to a user; True when deactivation requested."""
     deactivate_requested = False
     if isinstance(op.value, dict):
         if "userName" in op.value:
             account.email = str(op.value["userName"])
         if "active" in op.value:
-            active = bool(op.value["active"])
-            account.active = active
-            deactivate_requested = not active
-        if isinstance(op.value.get("name"), dict):
-            name_data = op.value["name"]
+            account.active = bool(op.value["active"])
+            deactivate_requested = not bool(op.value["active"])
+        name_data = op.value.get("name")
+        if isinstance(name_data, dict):
             given = name_data.get("givenName") or ""
             family = name_data.get("familyName") or ""
             formatted = name_data.get("formatted") or (given + " " + family).strip()
             account.display_name = str(formatted).strip()
     if op.path == "active":
-        active = bool(op.value)
-        account.active = active
-        deactivate_requested = deactivate_requested or not active
+        account.active = bool(op.value)
+        deactivate_requested = deactivate_requested or not bool(op.value)
     return deactivate_requested
 
 
-def _apply_user_add_op(account: Account, op: ScimPatchOperation) -> bool:
-    """Apply an ``add`` PATCH op to a user; True when deactivation was requested."""
-    if isinstance(op.value, dict) and "userName" in op.value:
-        account.email = str(op.value["userName"])
-        if "active" in op.value:
-            active = bool(op.value["active"])
-            account.active = active
-            return not active
-    return False
-
-
 def _apply_user_remove_op(account: Account, op: ScimPatchOperation) -> bool:
-    """Apply a ``remove`` PATCH op to a user; True when deactivation was requested."""
+    """Apply a ``remove`` PATCH operation to a user; True when deactivation requested."""
     if op.path == "active":
         account.active = False
         return True
     return False
 
 
-_USER_PATCH_OP_DISPATCH: dict[str, Any] = {
-    "replace": _apply_user_replace_op,
-    "remove": _apply_user_remove_op,
-    "add": _apply_user_add_op,
-}
-
-
-def _apply_user_ops(account: Account, ops: list[ScimPatchOperation]) -> bool:
-    """Apply SCIM user PATCH operations; returns whether deactivation was requested."""
+def _apply_user_add_op(account: Account, op: ScimPatchOperation) -> bool:
+    """Apply an ``add`` PATCH operation to a user; True when deactivation requested."""
     deactivate_requested = False
-    for op in ops:
-        handler = _USER_PATCH_OP_DISPATCH.get(op.op)
-        if handler is None:
+    if isinstance(op.value, dict) and "userName" in op.value:
+        account.email = str(op.value["userName"])
+        if "active" in op.value:
+            account.active = bool(op.value["active"])
+            deactivate_requested = not bool(op.value["active"])
+    return deactivate_requested
+
+
+def _apply_user_patch_ops(account: Account, operations: list[ScimPatchOperation]) -> bool:
+    """Apply SCIM User PATCH operations to an account; True when deactivation requested."""
+    deactivate_requested = False
+    for op in operations:
+        if op.op not in ("replace", "remove", "add"):
             raise _scim_error(
                 status.HTTP_400_BAD_REQUEST,
                 f"Unsupported PATCH operation '{op.op}'. Supported: replace, remove, add",
             )
-        deactivate_requested = deactivate_requested or handler(account, op)
+        if op.op == "replace":
+            op_deactivate = _apply_user_replace_op(account, op)
+        elif op.op == "remove":
+            op_deactivate = _apply_user_remove_op(account, op)
+        else:
+            op_deactivate = _apply_user_add_op(account, op)
+        deactivate_requested = op_deactivate or deactivate_requested
     return deactivate_requested
-
-
-async def _maybe_deactivate_scim_user(
-    session: AsyncSession,
-    organisation_id: uuid.UUID,
-    user_id: uuid.UUID,
-    account: Account,
-    deactivate_requested: bool,
-) -> Account:
-    """Deactivate the user when the PATCH requested it; otherwise flush in place."""
-    if not deactivate_requested:
-        await session.flush()
-        return account
-    caller = await _resolve_scim_admin_caller(session, organisation_id)
-    if caller is None:
-        raise _scim_error(
-            status.HTTP_409_CONFLICT,
-            _MSG_NO_ACTIVE_ADMIN_EXISTS,
-        )
-    await assert_not_last_admin(
-        session,
-        org_id=organisation_id,
-        target_account_id=user_id,
-        target_role_after=None,
-        target_active_after=False,
-    )
-    updated = await scim_deactivate_user(
-        session,
-        organisation_id,
-        user_id,
-        caller_account_id=caller,
-    )
-    if updated is None:
-        raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
-    return updated
 
 
 @router.patch("/Users/{user_id}", dependencies=[Depends(require_scim_feature)])
@@ -651,14 +611,11 @@ async def patch_user(
             if account is None:
                 raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
 
-            deactivate_requested = _apply_user_ops(account, req.Operations)
-            account = await _maybe_deactivate_scim_user(
-                session,
-                principal.organisation_id,
-                user_id,
-                account,
-                deactivate_requested,
-            )
+            deactivate_requested = _apply_user_patch_ops(account, req.Operations)
+            if deactivate_requested:
+                account = await _deactivate_scim_user(session, principal.organisation_id, user_id)
+            else:
+                await session.flush()
     except LastAdminLockoutError as exc:
         raise _scim_error(status.HTTP_409_CONFLICT, exc.reason) from None
     except LastAdminLockoutUnavailableError:
