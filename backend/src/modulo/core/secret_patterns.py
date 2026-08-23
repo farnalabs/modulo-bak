@@ -56,6 +56,20 @@ PRIVATE_KEY_PATTERN = re.compile(
 # entire input string.
 _BOUNDED_REDACT_PATTERNS: frozenset[re.Pattern[str]] = frozenset({CONNECTION_STRING_PATTERN, PRIVATE_KEY_PATTERN})
 
+# For each bounded pattern, the literal that begins a secret (``anchor``), the
+# literal that must appear within the same bounded window for a match to be
+# possible (``close``), and how many chars BEFORE the anchor must be included in
+# the window so the regex can match the secret's full prefix (e.g. the scheme
+# before ``://``). We anchor each ReDoS-bounded window at the secret's START
+# rather than at fixed 5000-char boundaries: a private-key / connection string
+# that begins in one fixed slice and ends in the next would be contained by
+# neither slice (and so leak unmasked). Anchoring at the start guarantees the
+# secret's whole body falls inside one bounded window.
+_BOUNDED_WINDOW_HINTS: dict[re.Pattern[str], tuple[str, str, int]] = {
+    PRIVATE_KEY_PATTERN: ("-----BEGIN ", "-----END ", 0),
+    CONNECTION_STRING_PATTERN: ("://", "@", 40),
+}
+
 # Canonical gitleaks-style secret-VALUE redaction patterns. Each entry is
 # ``(compiled_pattern, replacement)`` where ``replacement`` is either a fixed
 # string or a callable receiving the match and returning the masked text.
@@ -119,16 +133,52 @@ def mask_secret_values_in_text(text: str) -> str:
         if pattern in _BOUNDED_REDACT_PATTERNS:
             continue
         masked = pattern.sub(replacement, masked)
-    # Bounded patterns: cap each slice fed to the regex to bound the ReDoS
-    # surface, then rejoin so non-secret content is preserved in full.
+    # Bounded patterns: feed each a ReDoS-bounded window anchored at the secret's
+    # start so secrets straddling a fixed slice boundary are still caught, while
+    # non-secret content is preserved in full (no truncation).
     for pattern, replacement in SECRET_VALUE_PATTERNS:
         if pattern not in _BOUNDED_REDACT_PATTERNS:
             continue
-        if len(masked) <= SECRET_VALUE_REDACT_CHAR_CAP:
-            masked = pattern.sub(replacement, masked)
-            continue
-        masked = "".join(
-            pattern.sub(replacement, masked[i : i + SECRET_VALUE_REDACT_CHAR_CAP])
-            for i in range(0, len(masked), SECRET_VALUE_REDACT_CHAR_CAP)
-        )
+        masked = _mask_bounded_pattern(masked, pattern, replacement)
     return masked
+
+
+def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any) -> str:
+    """Mask *pattern* (a nested-quantifier pattern) without ReDoS or truncation.
+
+    The pattern is only ever fed windows of at most
+    :data:`SECRET_VALUE_REDACT_CHAR_CAP` characters, which bounds the ReDoS
+    surface. Each window is anchored at a literal that begins a potential
+    secret (e.g. ``-----BEGIN `` for private keys) so a secret whose body crosses
+    a fixed 5000-char slice boundary is still wholly contained in one window and
+    gets masked. A short string with no anchor is masked in one pass.
+    """
+    if len(text) <= SECRET_VALUE_REDACT_CHAR_CAP:
+        return pattern.sub(replacement, text)
+    anchor, close, prefix = _BOUNDED_WINDOW_HINTS[pattern]
+    result: list[str] = []
+    last = 0
+    pos = 0
+    while True:
+        off = text.find(anchor, pos)
+        if off == -1:
+            break
+        pos = off + 1
+        # Include ``prefix`` chars before the anchor so the regex can match the
+        # secret's leading context (e.g. the scheme before ``://``).
+        window_start = max(0, off - prefix)
+        window = text[window_start : window_start + SECRET_VALUE_REDACT_CHAR_CAP]
+        # No possible match in this window — skip the (bounded) regex attempt.
+        if close not in window:
+            continue
+        for match in pattern.finditer(window):
+            start = window_start + match.start()
+            end = window_start + match.end()
+            if start < last:
+                # Already covered by a previous replacement; avoid double-masking.
+                continue
+            result.append(text[last:start])
+            result.append(replacement(match) if callable(replacement) else replacement)
+            last = end
+    result.append(text[last:])
+    return "".join(result)

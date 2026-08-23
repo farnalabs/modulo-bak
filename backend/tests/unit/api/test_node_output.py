@@ -571,3 +571,26 @@ class TestMaskOutputValueSecretValues:
         assert masked.endswith("y" * 8000)
         assert len(masked) == len(long_value) - len(token) + len(SENSITIVE_VALUE_MASK)
         assert _mask_output_value(long_value) == masked
+
+    def test_masks_private_key_straddling_slice_boundary(self) -> None:
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # A private key whose block begins in one 5000-char slice and ends in the
+        # next must still be masked in full (regression: it was contained by
+        # neither non-overlapping slice and leaked unmasked).
+        key = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD\n-----END RSA PRIVATE KEY-----"
+        straddle = "z" * 4990 + key + "q" * 100
+        masked = mask_secret_values_in_text(straddle)
+        assert "BEGIN RSA PRIVATE KEY" not in masked
+        assert "END RSA PRIVATE KEY" not in masked
+
+    def test_masks_connection_string_straddling_slice_boundary(self) -> None:
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # A connection string beginning near the end of one 5000-char slice must
+        # be masked even though its scheme prefix falls in the previous slice.
+        conn = "postgresql://admin:super%40secret%2Fpass@db.host:5432/x"
+        straddle = "w" * 4995 + conn + "e" * 50
+        masked = mask_secret_values_in_text(straddle)
+        assert "super%40secret" not in masked
+        assert SENSITIVE_VALUE_MASK in masked
