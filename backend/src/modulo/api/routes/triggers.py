@@ -233,6 +233,23 @@ def _encrypt_trigger_config_secrets(config: dict[str, Any] | None, fernet_key: s
     return result
 
 
+def _ongoing_fields_changing(req: "TriggerUpdate") -> bool:
+    """True when any ongoing pool-affecting field is part of the update."""
+    return (
+        any(x is not None for x in [req.max_concurrent_runs, req.config_json, req.active])
+        or "daily_spend_limit" in req.model_fields_set
+    )
+
+
+def _scan_interval_changed(trigger: Trigger, new_config: dict[str, Any] | None) -> bool:
+    """Compare the stored vs proposed scan interval for an ongoing trigger."""
+    if new_config is None:
+        return False
+    old_scan = int((trigger.config_json or {}).get("scan_interval_seconds") or 60)
+    new_scan = int(new_config.get("scan_interval_seconds") or 60)
+    return new_scan != old_scan
+
+
 async def _guard_and_resolve_ongoing_changes(
     session: AsyncSession,
     trigger: Trigger,
@@ -244,10 +261,7 @@ async def _guard_and_resolve_ongoing_changes(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="ongoing triggers require daily_spend_limit; clearing it is not allowed",
         )
-    ongoing_fields_changing = any(x is not None for x in [req.max_concurrent_runs, req.config_json, req.active]) or (
-        "daily_spend_limit" in req.model_fields_set
-    )
-    if ongoing_fields_changing:
+    if _ongoing_fields_changing(req):
         pipeline = await session.get(Pipeline, trigger.pipeline_id)
         pipeline_cap = pipeline.max_concurrent_runs if pipeline is not None else 0
         validate_ongoing_config(
@@ -261,10 +275,7 @@ async def _guard_and_resolve_ongoing_changes(
             config_json=(req.config_json if req.config_json is not None else trigger.config_json),
             pipeline_max_concurrent_runs=pipeline_cap,
         )
-    if req.config_json is not None:
-        old_scan = int((trigger.config_json or {}).get("scan_interval_seconds") or 60)
-        new_scan = int(req.config_json.get("scan_interval_seconds") or 60)
-        return new_scan != old_scan
+        return _scan_interval_changed(trigger, req.config_json)
     return False
 
 
@@ -420,6 +431,26 @@ def _validated_next_fire(cron_expression: str | None, cron_timezone: str | None)
     return compute_next_fire(cron_expression, timezone=timezone)
 
 
+def _apply_cron_update(trigger: Trigger, req: CronConfigUpdate) -> None:
+    """Apply a cron-config update to the trigger in place."""
+    next_fire_at: datetime.datetime | None = None
+    if req.cron_expression is not None or req.cron_timezone is not None:
+        next_fire_at = _validated_next_fire(
+            req.cron_expression if req.cron_expression is not None else trigger.cron_expression,
+            req.cron_timezone if req.cron_timezone is not None else trigger.cron_timezone,
+        )
+    if req.cron_expression is not None:
+        trigger.cron_expression = req.cron_expression
+    if req.cron_timezone is not None:
+        trigger.cron_timezone = req.cron_timezone
+    if next_fire_at is not None:
+        trigger.next_fire_at = next_fire_at
+    if req.snapshot_id is not None:
+        trigger.config_json = {**(trigger.config_json or {}), "snapshot_id": req.snapshot_id}
+    if req.input_template is not None:
+        trigger.config_json = {**(trigger.config_json or {}), "input_template": req.input_template}
+
+
 @router.patch(
     "/triggers/{trigger_id}/cron",
     status_code=status.HTTP_200_OK,
@@ -444,27 +475,8 @@ async def update_cron_config(
             trigger = await _load_trigger_for_update(session, principal.organisation_id, trigger_id)
 
             _require_trigger_type(trigger, "cron", _MSG_ONLY_CRON_TRIGGERS_CAN)
-
-            next_fire_at: datetime.datetime | None = None
-            if req.cron_expression is not None or req.cron_timezone is not None:
-                next_fire_at = _validated_next_fire(
-                    req.cron_expression if req.cron_expression is not None else trigger.cron_expression,
-                    req.cron_timezone if req.cron_timezone is not None else trigger.cron_timezone,
-                )
-
+            _apply_cron_update(trigger, req)
             prev_active = await _apply_active_state(session, trigger, req.active)
-            if req.cron_expression is not None:
-                trigger.cron_expression = req.cron_expression
-            if req.cron_timezone is not None:
-                trigger.cron_timezone = req.cron_timezone
-            if next_fire_at is not None:
-                trigger.next_fire_at = next_fire_at
-
-            if req.snapshot_id is not None:
-                trigger.config_json = {**(trigger.config_json or {}), "snapshot_id": req.snapshot_id}
-
-            if req.input_template is not None:
-                trigger.config_json = {**(trigger.config_json or {}), "input_template": req.input_template}
 
             await session.flush()
     except ProgrammingError:
@@ -534,7 +546,7 @@ async def preview_cron_schedule(
 
             times: list[str] = []
             next_fire = datetime.datetime.now(datetime.UTC)
-            for _ in range(count):
+            while len(times) < count:
                 next_fire = compute_next_fire(
                     trigger.cron_expression,
                     after=next_fire,
@@ -951,6 +963,74 @@ class TriggerUpdate(BaseModel):
     cron_timezone: str | None = None
 
 
+def _apply_update_fields(
+    trigger: Trigger,
+    req: TriggerUpdate,
+    settings: Settings,
+    next_fire_at: datetime.datetime | None,
+) -> None:
+    """Merge request fields into the trigger in place (mask/None-aware)."""
+    if req.max_concurrent_runs is not None:
+        trigger.max_concurrent_runs = req.max_concurrent_runs
+    if "daily_spend_limit" in req.model_fields_set:
+        trigger.daily_spend_limit = req.daily_spend_limit
+    if req.config_json is not None:
+        merged = _merge_trigger_config(trigger.config_json, req.config_json)
+        trigger.config_json = _encrypt_trigger_config_secrets(merged, settings.fernet_key)
+    if req.cron_expression is not None:
+        trigger.cron_expression = req.cron_expression
+    if req.cron_timezone is not None:
+        trigger.cron_timezone = req.cron_timezone
+    if next_fire_at is not None:
+        trigger.next_fire_at = next_fire_at
+
+
+async def _apply_trigger_update(
+    session: AsyncSession,
+    trigger: Trigger,
+    req: TriggerUpdate,
+    settings: Settings,
+) -> bool:
+    """Apply an update's mutations within the request transaction.
+
+    Runs the cron type-check, the FAR-158 ongoing guards, and all field
+    merges; returns the trigger's PREVIOUS ``active`` value for the post-commit
+    streak counter clear.
+    """
+    cron_changed = req.cron_expression is not None or req.cron_timezone is not None
+    if cron_changed:
+        _require_trigger_type(trigger, "cron", _MSG_ONLY_CRON_TRIGGERS_CAN)
+
+    # FAR-158 ongoing guards. The ongoing spend limit is REQUIRED — it can
+    # never be cleared to None (the DB partial CHECK would also reject the
+    # row). When any pool-affecting field changes, re-run the shared validator
+    # against the MERGED (post-update) values.
+    ongoing_scan_interval_changed = False
+    if trigger.trigger_type == "ongoing":
+        ongoing_scan_interval_changed = await _guard_and_resolve_ongoing_changes(session, trigger, req)
+
+    next_fire_at: datetime.datetime | None = None
+    if cron_changed:
+        next_fire_at = _validated_next_fire(
+            req.cron_expression if req.cron_expression is not None else trigger.cron_expression,
+            req.cron_timezone if req.cron_timezone is not None else trigger.cron_timezone,
+        )
+
+    # Pre-mutation snapshot for the ongoing next_fire_at reset decision (reset
+    # only when the pool/cadence/active actually CHANGES).
+    prev_max = trigger.max_concurrent_runs
+    prev_active = await _apply_active_state(session, trigger, req.active)
+    _apply_update_fields(trigger, req, settings, next_fire_at)
+
+    # Ongoing triggers recompute next_fire_at when the pool or cadence actually
+    # changes (NOT on metadata-only edits) so the new config takes effect
+    # promptly.
+    target_changed = req.max_concurrent_runs is not None and req.max_concurrent_runs != prev_max
+    activated = req.active is not None and trigger.active and not prev_active
+    _bump_ongoing_next_fire(trigger, target_changed or ongoing_scan_interval_changed or activated)
+    return prev_active
+
+
 @router.put("/triggers/{trigger_id}", status_code=status.HTTP_200_OK, dependencies=[Depends(deny_break_glass_mint)])
 @handle_db_errors("triggers.update_trigger")
 async def update_trigger(
@@ -961,55 +1041,14 @@ async def update_trigger(
     settings: Settings = Depends(get_settings),
 ) -> dict[str, Any]:
     """Update a trigger's general configuration."""
+    prev_active = False
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             trigger = await _load_trigger_for_update(session, principal.organisation_id, trigger_id)
 
-            cron_changed = req.cron_expression is not None or req.cron_timezone is not None
-            if cron_changed:
-                _require_trigger_type(trigger, "cron", _MSG_ONLY_CRON_TRIGGERS_CAN)
-
-            # FAR-158 ongoing guards. The ongoing spend limit is REQUIRED — it
-            # can never be cleared to None (the DB partial CHECK would also
-            # reject the row). When any pool-affecting field changes, re-run the
-            # shared validator against the MERGED (post-update) values.
-            ongoing_scan_interval_changed = False
-            if trigger.trigger_type == "ongoing":
-                ongoing_scan_interval_changed = await _guard_and_resolve_ongoing_changes(session, trigger, req)
-
-            next_fire_at: datetime.datetime | None = None
-            if cron_changed:
-                next_fire_at = _validated_next_fire(
-                    req.cron_expression if req.cron_expression is not None else trigger.cron_expression,
-                    req.cron_timezone if req.cron_timezone is not None else trigger.cron_timezone,
-                )
-
-            # Pre-mutation snapshot for the ongoing next_fire_at reset decision
-            # (reset only when the pool/cadence/active actually CHANGES).
-            prev_max = trigger.max_concurrent_runs
-            prev_active = await _apply_active_state(session, trigger, req.active)
-            if req.max_concurrent_runs is not None:
-                trigger.max_concurrent_runs = req.max_concurrent_runs
-            if "daily_spend_limit" in req.model_fields_set:
-                trigger.daily_spend_limit = req.daily_spend_limit
-            if req.config_json is not None:
-                merged = _merge_trigger_config(trigger.config_json, req.config_json)
-                trigger.config_json = _encrypt_trigger_config_secrets(merged, settings.fernet_key)
-            if req.cron_expression is not None:
-                trigger.cron_expression = req.cron_expression
-            if req.cron_timezone is not None:
-                trigger.cron_timezone = req.cron_timezone
-            if next_fire_at is not None:
-                trigger.next_fire_at = next_fire_at
-
-            # Ongoing triggers recompute next_fire_at when the pool or cadence
-            # actually changes (NOT on metadata-only edits) so the new config
-            # takes effect promptly.
-            target_changed = req.max_concurrent_runs is not None and req.max_concurrent_runs != prev_max
-            activated = req.active is not None and trigger.active and not prev_active
-            _bump_ongoing_next_fire(trigger, target_changed or ongoing_scan_interval_changed or activated)
+            prev_active = await _apply_trigger_update(session, trigger, req, settings)
 
             await session.flush()
             updated_in_flight = await _ongoing_in_flight(session, trigger)

@@ -108,6 +108,52 @@ def validate_forwarder_config(forwarder_type: str, config: dict[str, Any] | None
     return errors
 
 
+def _loki_url_candidates(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Loki's ``push_url`` is POSTed to directly."""
+    return [("push_url", config.get("push_url", ""))]
+
+
+def _sentry_url_candidates(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """Sentry's ``dsn`` hostname becomes the API base."""
+    dsn = config.get("dsn")
+    if isinstance(dsn, str) and dsn:
+        parsed = urlparse(dsn)
+        if parsed.scheme in ("http", "https") and parsed.hostname:
+            return [("dsn", f"{parsed.scheme}://{parsed.hostname}")]
+    return []
+
+
+def _datadog_url_candidates(config: dict[str, Any]) -> list[tuple[str, str]]:
+    """DataDog's ``site`` becomes the API base."""
+    site = config.get("site", "datadoghq.com")
+    if isinstance(site, str) and site:
+        return [("site", f"https://api.{site}")]
+    return []
+
+
+def _merge_sensitive_aware(current: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+    """Merge config dicts; a masked placeholder must never clobber a stored secret."""
+    merged = dict(current or {})
+    for k, v in incoming.items():
+        if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
+            continue
+        if v is None:
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
+
+
+def _validate_forwarder_config_or_raise(forwarder_type: str, config_json: dict[str, Any] | None) -> None:
+    """Validate a forwarder config; raise 422 with the collected error messages."""
+    config_errors = validate_forwarder_config(forwarder_type, config_json)
+    if config_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="; ".join(config_errors),
+        )
+
+
 async def _validate_forwarder_urls(forwarder_type: str, config: dict[str, Any]) -> None:
     """Validate outbound URLs in forwarder config to prevent SSRF.
 
@@ -118,19 +164,14 @@ async def _validate_forwarder_urls(forwarder_type: str, config: dict[str, Any]) 
                   (``https://{host}/api/0/...``).
       - datadog:  the ``site`` becomes the API base (``https://api.{site}/...``).
     """
-    candidates: list[tuple[str, str]] = []
     if forwarder_type == "loki":
-        candidates = [("push_url", config.get("push_url", ""))]
+        candidates = _loki_url_candidates(config)
     elif forwarder_type == "sentry":
-        dsn = config.get("dsn")
-        if isinstance(dsn, str) and dsn:
-            parsed = urlparse(dsn)
-            if parsed.scheme in ("http", "https") and parsed.hostname:
-                candidates = [("dsn", f"{parsed.scheme}://{parsed.hostname}")]
+        candidates = _sentry_url_candidates(config)
     elif forwarder_type == "datadog":
-        site = config.get("site", "datadoghq.com")
-        if isinstance(site, str) and site:
-            candidates = [("site", f"https://api.{site}")]
+        candidates = _datadog_url_candidates(config)
+    else:
+        candidates = []
 
     for key, url_value in candidates:
         if isinstance(url_value, str) and url_value:
@@ -153,6 +194,92 @@ def _is_configured(forwarder_type: str, config_json: dict[str, Any] | None) -> b
     if not keys:
         return False
     return all(config_json.get(k) for k in keys)
+
+
+async def _merge_stored_forwarder_config(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    forwarder_type: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge the stored DB config under the request config for a forwarder test."""
+    merged = dict(config)
+    try:
+        async with session.begin():
+            await set_rls_org(session, org_id)
+            result = await session.execute(
+                select(ErrorForwarderConfig).where(
+                    ErrorForwarderConfig.organisation_id == org_id,
+                    ErrorForwarderConfig.forwarder_type == forwarder_type,
+                    ErrorForwarderConfig.deleted_at.is_(None),
+                )
+            )
+            db_cfg = result.scalar_one_or_none()
+            if db_cfg and db_cfg.config_json:
+                merged = {**db_cfg.config_json, **config}
+    except ProgrammingError as exc:
+        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=_MSG_ERROR_TRACKING_NOT_AVAILABLE,
+        ) from exc
+    except SQLAlchemyError as exc:
+        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
+        _log.warning("error_tracking.test_forwarder_db_error")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_MSG_ERROR_TRACKING_TEMPORARILY_UNAVAILABLE,
+        ) from exc
+    except Exception as exc:
+        _log.exception("error_tracking.test_forwarder_config_read_error")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_MSG_UNEXPECTED_ERROR_OCCURRED_WHILE,
+        ) from exc
+    return merged
+
+
+async def _record_forwarder_test_result(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    forwarder_type: str,
+    ok: bool,
+) -> None:
+    """Persist the outcome of a forwarder test on the stored config row."""
+    try:
+        async with session.begin():
+            await set_rls_org(session, org_id)
+            result = await session.execute(
+                select(ErrorForwarderConfig).where(
+                    ErrorForwarderConfig.organisation_id == org_id,
+                    ErrorForwarderConfig.forwarder_type == forwarder_type,
+                    ErrorForwarderConfig.deleted_at.is_(None),
+                )
+            )
+            db_cfg = result.scalar_one_or_none()
+            if db_cfg:
+                db_cfg.last_test_at = datetime.now(UTC)
+                db_cfg.last_test_ok = ok
+                await session.flush()
+    except ProgrammingError as exc:
+        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=_MSG_ERROR_TRACKING_NOT_AVAILABLE,
+        ) from exc
+    except SQLAlchemyError as exc:
+        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
+        _log.warning("error_tracking.test_forwarder_save_db_error")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_MSG_ERROR_TRACKING_TEMPORARILY_UNAVAILABLE,
+        ) from exc
+    except Exception as exc:
+        _log.exception("error_tracking.test_forwarder_save_error")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_MSG_UNEXPECTED_ERROR_OCCURRED_WHILE,
+        ) from exc
 
 
 @router.get("", dependencies=[require_feature("error_forwarders")])
@@ -232,13 +359,7 @@ async def configure_forwarder(
             detail=f"Unknown forwarder type: {forwarder_type}",
         )
 
-    if req.config_json is not None:
-        config_errors = validate_forwarder_config(forwarder_type, req.config_json)
-        if config_errors:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="; ".join(config_errors),
-            )
+    _validate_forwarder_config_or_raise(forwarder_type, req.config_json)
 
     try:
         async with session.begin():
@@ -264,18 +385,7 @@ async def configure_forwarder(
             if req.enabled is not None:
                 cfg.enabled = req.enabled
             if req.config_json is not None:
-                current_cfg = cfg.config_json or {}
-                merged_cfg = dict(current_cfg)
-                for k, v in req.config_json.items():
-                    if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
-                        # A masked placeholder must never clobber the stored secret
-                        # (read-modify-write round-trip guard). Keep the existing value.
-                        continue
-                    if v is None:
-                        merged_cfg.pop(k, None)
-                    else:
-                        merged_cfg[k] = v
-                cfg.config_json = merged_cfg
+                cfg.config_json = _merge_sensitive_aware(cfg.config_json, req.config_json)
 
             cfg.updated_at = datetime.now(UTC)
             await session.flush()
@@ -328,38 +438,7 @@ async def test_forwarder(
 
     config = req.config_json or {}
     if not _is_configured(forwarder_type, config):
-        try:
-            async with session.begin():
-                await set_rls_org(session, org_id)
-                result = await session.execute(
-                    select(ErrorForwarderConfig).where(
-                        ErrorForwarderConfig.organisation_id == org_id,
-                        ErrorForwarderConfig.forwarder_type == forwarder_type,
-                        ErrorForwarderConfig.deleted_at.is_(None),
-                    )
-                )
-                db_cfg = result.scalar_one_or_none()
-                if db_cfg and db_cfg.config_json:
-                    config = {**db_cfg.config_json, **config}
-        except ProgrammingError as exc:
-            _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
-            raise HTTPException(
-                status_code=status.HTTP_501_NOT_IMPLEMENTED,
-                detail=_MSG_ERROR_TRACKING_NOT_AVAILABLE,
-            ) from exc
-        except SQLAlchemyError as exc:
-            _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
-            _log.warning("error_tracking.test_forwarder_db_error")
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=_MSG_ERROR_TRACKING_TEMPORARILY_UNAVAILABLE,
-            ) from exc
-        except Exception as exc:
-            _log.exception("error_tracking.test_forwarder_config_read_error")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=_MSG_UNEXPECTED_ERROR_OCCURRED_WHILE,
-            ) from exc
+        config = await _merge_stored_forwarder_config(session, org_id, forwarder_type, config)
 
     # SSRF guard: validate outbound URL before forward()
     await _validate_forwarder_urls(forwarder_type, config)
@@ -388,40 +467,7 @@ async def test_forwarder(
         _log.exception("forwarder.test_connection_failed", extra={"type": forwarder_type})
         ok = False
 
-    try:
-        async with session.begin():
-            await set_rls_org(session, org_id)
-            result = await session.execute(
-                select(ErrorForwarderConfig).where(
-                    ErrorForwarderConfig.organisation_id == org_id,
-                    ErrorForwarderConfig.forwarder_type == forwarder_type,
-                    ErrorForwarderConfig.deleted_at.is_(None),
-                )
-            )
-            db_cfg = result.scalar_one_or_none()
-            if db_cfg:
-                db_cfg.last_test_at = datetime.now(UTC)
-                db_cfg.last_test_ok = ok
-                await session.flush()
-    except ProgrammingError as exc:
-        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=_MSG_ERROR_TRACKING_NOT_AVAILABLE,
-        ) from exc
-    except SQLAlchemyError as exc:
-        _log.exception(_CODE_ERROR_FORWARDER_CONFIG_TEST)
-        _log.warning("error_tracking.test_forwarder_save_db_error")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=_MSG_ERROR_TRACKING_TEMPORARILY_UNAVAILABLE,
-        ) from exc
-    except Exception as exc:
-        _log.exception("error_tracking.test_forwarder_save_error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=_MSG_UNEXPECTED_ERROR_OCCURRED_WHILE,
-        ) from exc
+    await _record_forwarder_test_result(session, org_id, forwarder_type, ok)
 
     name = _FORWARDER_DISPLAY_NAMES.get(forwarder_type, forwarder_type)
     if ok:
