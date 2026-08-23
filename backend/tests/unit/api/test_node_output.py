@@ -462,9 +462,30 @@ class TestMaskOutputValueSecretValues:
 
         value = {"note": "postgres://app_user:S3cr3tP@ss@db.example.com:5432/app"}
         result = _mask_output_value(value)
-        assert "S3cr3tP@ss" not in result["note"]
+        # The whole password (including the '@'-separated tail) must be masked.
+        assert "S3cr3tP" not in result["note"]
+        assert "ss" not in result["note"]
         assert "app_user" in result["note"]
         assert "db.example.com:5432/app" in result["note"]
+
+    def test_masks_connection_string_password_with_at_in_password(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        # Password itself contains '@' — the greedy capture must consume up to
+        # the FINAL '@' (host separator), not the first one.
+        value = {"note": "postgres://u:pa@ss@host:5432/db"}
+        result = _mask_output_value(value)
+        assert "pa@ss" not in result["note"]
+        assert "host:5432/db" in result["note"]
+
+    def test_masks_connection_string_password_with_colon_slash(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        # Password contains ':' and '/' — must be wholly masked.
+        value = {"note": "mysql://root:P@ass:word!@1.2.3.4/app"}
+        result = _mask_output_value(value)
+        assert "P@ass:word!" not in result["note"]
+        assert "1.2.3.4/app" in result["note"]
 
     def test_masks_bearer_token_in_free_text(self) -> None:
         from modulo.api.routes.runs import _mask_output_value
@@ -524,3 +545,29 @@ class TestMaskOutputValueSecretValues:
         value = {"note": "github_pat_11ABC"}
         result = _mask_output_value(value)
         assert result["note"] == "github_pat_11ABC"
+
+    def test_does_not_truncate_long_non_secret_string(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # Regression: a long, benign string must be returned in full — the
+        # masking helper must not silently truncate content beyond 5000 chars.
+        long_plain = "plain " + "x" * 8000
+        assert mask_secret_values_in_text(long_plain) == long_plain
+        result = _mask_output_value(long_plain)
+        assert result == long_plain
+        assert len(result) == len(long_plain)
+
+    def test_masks_secret_in_long_string_without_truncating_tail(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # A secret near the start of a long string must be masked while the
+        # trailing benign content is preserved in full.
+        token = "eyJaaa.eyJbbb.ccc"
+        long_value = f"token {token} leaked " + "y" * 8000
+        masked = mask_secret_values_in_text(long_value)
+        assert token not in masked
+        assert masked.endswith("y" * 8000)
+        assert len(masked) == len(long_value) - len(token) + len(SENSITIVE_VALUE_MASK)
+        assert _mask_output_value(long_value) == masked

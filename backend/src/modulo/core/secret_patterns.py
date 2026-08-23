@@ -1,17 +1,24 @@
-"""Canonical secret-format redaction patterns (single source of truth).
+"""Canonical secret-format VALUE redaction patterns (single source of truth).
 
-Every redaction site in the codebase — agent-output masking
-(:mod:`modulo.api.routes.runs`), error-text sanitizing
-(:mod:`modulo.core.pipeline_engine.error_codes`), raw-output retention
-(:mod:`modulo.core.pipeline_engine.node_runner`) and SOC 2 guardrails
-(:mod:`modulo.core.guardrails.packs.soc2`) — imports the secret-format
-knowledge from HERE so it is never duplicated or drifted.
+The secret-VALUE redaction knowledge — the gitleaks-style
+``SECRET_VALUE_PATTERNS`` list and the shared ``AWS_ACCESS_KEY_PATTERN`` /
+``GITHUB_PAT_PATTERN`` raw patterns — is defined ONCE here so the AWS-key and
+fine-grained-GitHub-PAT coverage is never duplicated or drifted across
+redaction sites. Agent-output masking (:mod:`modulo.api.routes.runs`) and the
+API-layer :mod:`modulo.api.middleware.sensitive_mask` import these names
+directly.
+
+Key-NAME masking (matching on config keys such as ``token`` / ``password``)
+remains a separate concern owned by each read surface (``error_codes.py``,
+``node_runner.py``, ``soc2.py``), because those sites mask by key rather than
+by secret value and some run under import-linter contracts that this leaf
+module must not pull in.
 
 This module lives in ``modulo.core`` (a leaf with no ``modulo.*`` imports) so
 that core redaction sites can use it without violating the
 ``core-does-not-import-api`` architecture contract. The API-layer
-:mod:`modulo.api.middleware.sensitive_mask` re-exports these names so callers
-in the API layer keep importing from the documented location.
+:mod:`modulo.api.middleware.sensitive_mask` re-exports ``SENSITIVE_VALUE_MASK``
+so callers in the API layer keep importing from the documented location.
 """
 
 import re
@@ -30,6 +37,24 @@ SECRET_VALUE_REDACT_CHAR_CAP = 5000
 # the github_pat_ / AWS key knowledge lives ONLY here.
 GITHUB_PAT_PATTERN = re.compile(r"github_pat_[0-9A-Za-z_]{50,}")
 AWS_ACCESS_KEY_PATTERN = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
+
+# Connection strings with inline credentials: scheme://user:PASSWORD@host.
+# The password group is greedy (``.*``) so it consumes every character up to the
+# FINAL ``@`` (the host separator) — including passwords that themselves contain
+# ``@`` / ``:`` / ``/``. This masks the whole secret, not just the first chunk.
+CONNECTION_STRING_PATTERN = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]+:)(.*)(@)")
+# Private key blocks (multiline, any flavour). Uses a nested quantifier, so it
+# is fed bounded slices of :data:`SECRET_VALUE_REDACT_CHAR_CAP` at masking time.
+PRIVATE_KEY_PATTERN = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----[^-]*"
+    r"(?:-[^-]*)*-----END (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+# Patterns that use nested quantifiers and must be fed bounded slices (ReDoS
+# guard). Every other pattern is a flat char-class pattern, safe to run over the
+# entire input string.
+_BOUNDED_REDACT_PATTERNS: frozenset[re.Pattern[str]] = frozenset({CONNECTION_STRING_PATTERN, PRIVATE_KEY_PATTERN})
 
 # Canonical gitleaks-style secret-VALUE redaction patterns. Each entry is
 # ``(compiled_pattern, replacement)`` where ``replacement`` is either a fixed
@@ -57,17 +82,10 @@ SECRET_VALUE_PATTERNS: list[tuple[re.Pattern[str], Any]] = [
         SENSITIVE_VALUE_MASK,
     ),
     # Private key blocks (multiline, any flavour)
-    (
-        re.compile(
-            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----[^-]*"
-            r"(?:-[^-]*)*-----END (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----",
-            re.DOTALL,
-        ),
-        SENSITIVE_VALUE_MASK,
-    ),
+    (PRIVATE_KEY_PATTERN, SENSITIVE_VALUE_MASK),
     # Connection strings carrying inline credentials: scheme://user:PASSWORD@host
     (
-        re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]+:)([^\s:/@]+)(@)"),
+        CONNECTION_STRING_PATTERN,
         lambda m: f"{m.group(1)}{SENSITIVE_VALUE_MASK}{m.group(3)}",
     ),
     # Standalone Bearer tokens in free text
@@ -83,17 +101,34 @@ def mask_secret_values_in_text(text: str) -> str:
 
     Unlike key-name masking, this matches the secret's VALUE content, so it
     catches secrets in free text and under non-sensitive keys alike. Text
-    without a matching secret pattern is returned unchanged.
+    without a matching secret pattern is returned unchanged — and crucially,
+    non-secret content is NEVER truncated (an earlier 5000-char cap silently
+    dropped long benign strings such as LLM answers, code blocks or log tails).
 
-    Input is capped at :data:`SECRET_VALUE_REDACT_CHAR_CAP` code points BEFORE
-    any regex runs (ReDoS defense) — bounds the worst case on the
-    connection-string / private-key patterns. Non-str input passes through
-    unchanged.
+    ReDoS defense: flat char-class patterns run over the whole string; the two
+    patterns with nested quantifiers (private-key block, connection-string) are
+    fed bounded slices of :data:`SECRET_VALUE_REDACT_CHAR_CAP` chars and the
+    slices rejoined — so the returned string is always the full input with only
+    secret matches replaced. Non-str input passes through unchanged.
     """
     if not isinstance(text, str) or not text:
         return text
-    capped = text[:SECRET_VALUE_REDACT_CHAR_CAP]
-    masked = capped
+    # Flat patterns: safe to run over the whole string (no nested quantifiers).
+    masked = text
     for pattern, replacement in SECRET_VALUE_PATTERNS:
+        if pattern in _BOUNDED_REDACT_PATTERNS:
+            continue
         masked = pattern.sub(replacement, masked)
+    # Bounded patterns: cap each slice fed to the regex to bound the ReDoS
+    # surface, then rejoin so non-secret content is preserved in full.
+    for pattern, replacement in SECRET_VALUE_PATTERNS:
+        if pattern not in _BOUNDED_REDACT_PATTERNS:
+            continue
+        if len(masked) <= SECRET_VALUE_REDACT_CHAR_CAP:
+            masked = pattern.sub(replacement, masked)
+            continue
+        masked = "".join(
+            pattern.sub(replacement, masked[i : i + SECRET_VALUE_REDACT_CHAR_CAP])
+            for i in range(0, len(masked), SECRET_VALUE_REDACT_CHAR_CAP)
+        )
     return masked
