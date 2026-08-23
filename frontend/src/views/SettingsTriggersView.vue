@@ -9,9 +9,11 @@
       </Button>
     </header>
 
-    <output
+    <div
       v-if="orgTriggersPaused"
       data-testid="settings-triggers-paused-banner"
+      role="status"
+      aria-live="polite"
       :aria-label="$t('views.SettingsTriggersView.paused_banner_title')"
       class="mb-4 block rounded-lg border border-amber-500/40 bg-amber-500/10 p-4"
     >
@@ -20,7 +22,7 @@
       <p v-if="orgPausedAt" class="mt-1 text-xs text-muted-foreground">
         {{ $t('views.SettingsTriggersView.paused_at_label', { at: formatTimestamp(orgPausedAt) }) }}
       </p>
-    </output>
+    </div>
 
     <div v-if="isOrgAdmin" class="mb-4 rounded-lg border bg-card p-4">
       <div class="flex items-center justify-between">
@@ -87,14 +89,16 @@
                   >
                     {{ $t('views.SettingsTriggersView.streak_display', { streak: t.streak_status.streak ?? 0, threshold: t.streak_status.threshold ?? 0 }) }}
                   </span>
-                  <output
+                  <div
                     v-if="isDeactivatedOngoing(t)"
                     data-testid="settings-triggers-deactivated-badge"
+                    role="status"
+                    aria-live="polite"
                     :aria-label="$t('views.SettingsTriggersView.deactivated_badge', { reason: deactivatedReasonLabel(t) })"
                     class="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive"
                   >
                     {{ $t('views.SettingsTriggersView.deactivated_badge', { reason: deactivatedReasonLabel(t) }) }}
-                  </output>
+                  </div>
                   <div class="flex items-center gap-2">
                     <button
                       type="button"
