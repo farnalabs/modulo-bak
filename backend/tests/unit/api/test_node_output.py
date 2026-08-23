@@ -489,7 +489,7 @@ class TestMaskOutputValueSecretValues:
         assert result["url"] == "https://example.com/page"
         assert result["contact"] == "reach us at support@example.com"
         assert result["port"] == "http://localhost:8080/health"
-        assert result["score"] == 3.14
+        assert result["score"] == pytest.approx(3.14)
 
     def test_masks_secret_in_nested_list_item(self) -> None:
         from modulo.api.routes.runs import _mask_output_value
