@@ -30,6 +30,7 @@ from modulo.core.cost_settings import (
     SUPPORTED_BILLING_PERIODS,
     SUPPORTED_CURRENCIES,
 )
+from modulo.core.spend_ceiling import cents_from_usd
 from modulo.db.crud.organisation import get_organisation
 from modulo.db.crud.scheduled_report import (
     create_scheduled_report,
@@ -62,6 +63,20 @@ def _coerce_spend_limit_usd(value: Decimal | None) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_cents_usd(value: int | None) -> float | None:
+    """Convert an integer-cents column to float USD, or None when absent.
+
+    Mirrors ``_coerce_spend_limit_usd`` for the FAR-391 cents columns
+    (``max_run_cost_cents`` / ``spend_ceiling_cents`` / ``org_cumulative_spend_cents``).
+    """
+    if value is None:
+        return None
+    try:
+        return value / 100.0
     except (TypeError, ValueError):
         return None
 
@@ -106,10 +121,17 @@ def _apply_cost_control_updates(org: Organisation, req: "UpdateCostControlsReque
     """Persist the budget and cost-control settings from ``req`` onto ``org``.
 
     ``settings_json`` is a JSON column that may hold arbitrary shapes, so the
-    persisted cost-control settings are re-read defensively before merging.
+    persisted cost-control settings are re-read defensively before merging. The
+    FAR-391 hard spend ceilings (``max_run_cost`` / ``spend_ceiling``) are stored
+    as integer cents on dedicated columns (exact, allocation-free comparison at
+    the gate).
     """
     if req.budget is not None:
         org.daily_spend_limit = Decimal(str(req.budget))
+    if req.max_run_cost is not None:
+        org.max_run_cost_cents = cents_from_usd(req.max_run_cost)
+    if req.spend_ceiling is not None:
+        org.spend_ceiling_cents = cents_from_usd(req.spend_ceiling)
 
     updates: dict[str, Any] = {
         "currency": req.currency,
@@ -436,6 +458,10 @@ async def set_team_spend_limit(
 class CostControlsResponse(BaseModel):
     teams: list[dict[str, object]]
     budget: float | None = None
+    # FAR-391 — hard spend ceilings (USD at the API boundary; stored as cents).
+    max_run_cost: float | None = None
+    spend_ceiling: float | None = None
+    org_cumulative_spend_usd: float = 0.0
     alert_thresholds: list[float] = Field(default_factory=lambda: list(DEFAULT_ALERT_THRESHOLDS))
     circuit_breaker_enabled: bool = False
     currency: str = "USD"
@@ -444,6 +470,9 @@ class CostControlsResponse(BaseModel):
 
 class UpdateCostControlsRequest(BaseModel):
     budget: float | None = None
+    # FAR-391 — hard spend ceilings in USD (None = no change; 0 = kill-switch).
+    max_run_cost: float | None = None
+    spend_ceiling: float | None = None
     alert_thresholds: list[float] | None = None
     circuit_breaker_enabled: bool | None = None
     currency: Literal["USD", "EUR", "GBP"] | None = None
@@ -509,6 +538,11 @@ async def get_cost_controls(
             for t in teams_result.items
         ],
         budget=_coerce_spend_limit_usd(org.daily_spend_limit) if org is not None else None,
+        max_run_cost=_coerce_cents_usd(org.max_run_cost_cents) if org is not None else None,
+        spend_ceiling=_coerce_cents_usd(org.spend_ceiling_cents) if org is not None else None,
+        org_cumulative_spend_usd=_coerce_cents_usd(org.org_cumulative_spend_cents or 0) or 0.0
+        if org is not None
+        else 0.0,
         alert_thresholds=_read_alert_thresholds(org),
         circuit_breaker_enabled=_read_circuit_breaker(org),
         currency=_read_currency(org),
@@ -568,10 +602,137 @@ async def update_cost_controls(
             for t in teams_result.items
         ],
         budget=_coerce_spend_limit_usd(org.daily_spend_limit),
+        max_run_cost=_coerce_cents_usd(org.max_run_cost_cents),
+        spend_ceiling=_coerce_cents_usd(org.spend_ceiling_cents),
+        org_cumulative_spend_usd=_coerce_cents_usd(org.org_cumulative_spend_cents or 0) or 0.0,
         alert_thresholds=_read_alert_thresholds(org),
         circuit_breaker_enabled=_read_circuit_breaker(org),
         currency=_read_currency(org),
         billing_period=_read_billing_period(org),
+    )
+
+
+# ── FAR-391: dedicated hard spend-ceiling endpoints ───────────────────────────
+#
+# A focused surface for the per-run / per-org hard ceilings so the org-settings
+# frontend (and any admin tooling) can read + set them without the full
+# cost-controls payload. Ceilings are USD at the API boundary and stored as
+# integer cents.
+
+
+class SpendCeilingResponse(BaseModel):
+    max_run_cost: float | None = None
+    spend_ceiling: float | None = None
+    org_cumulative_spend_usd: float = 0.0
+    remaining_budget_usd: float | None = None
+
+
+class SetSpendCeilingRequest(BaseModel):
+    max_run_cost: float | None = Field(None, ge=0, description="Per-run hard ceiling in USD. 0 = block all runs.")
+    spend_ceiling: float | None = Field(None, ge=0, description="Org lifetime budget in USD. 0 = block all runs.")
+
+
+@router.get("/ceiling")
+@handle_db_errors("costs.get_spend_ceiling")
+async def get_spend_ceiling(
+    _: object = require_feature("admin_cost_controls"),
+    current_user: TenantPrincipal = require_permission(_CODE_COST_MANAGE),
+    session: AsyncSession = Depends(get_db_session),
+) -> SpendCeilingResponse:
+    try:
+        async with session.begin():
+            await set_rls_org(session, current_user.organisation_id)
+            org = await get_organisation(session, current_user.organisation_id)
+    except ProgrammingError:
+        _log.exception("get_spend_ceiling ProgrammingError (org_id=%s)", current_user.organisation_id)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=MSG_FEATURE_NOT_AVAILABLE,
+        ) from None
+    except SQLAlchemyError:
+        _log.exception("get_spend_ceiling SQLAlchemyError (org_id=%s)", current_user.organisation_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_MSG_DATABASE_ERROR_OCCURRED_PLEASE,
+        ) from None
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("Unexpected error in get_spend_ceiling")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=MSG_INTERNAL_SERVER_ERROR,
+        ) from None
+
+    max_run_cost = _coerce_cents_usd(org.max_run_cost_cents) if org is not None else None
+    spend_ceiling = _coerce_cents_usd(org.spend_ceiling_cents) if org is not None else None
+    cumulative = _coerce_cents_usd(org.org_cumulative_spend_cents or 0) or 0.0 if org is not None else 0.0
+    remaining = None
+    if spend_ceiling is not None:
+        remaining = max(spend_ceiling - cumulative, 0.0)
+    return SpendCeilingResponse(
+        max_run_cost=max_run_cost,
+        spend_ceiling=spend_ceiling,
+        org_cumulative_spend_usd=cumulative,
+        remaining_budget_usd=remaining,
+    )
+
+
+@router.put("/ceiling")
+@handle_db_errors("costs.set_spend_ceiling")
+async def set_spend_ceiling(
+    req: SetSpendCeilingRequest,
+    _: object = require_feature("admin_cost_controls"),
+    current_user: TenantPrincipal = require_permission(_CODE_COST_MANAGE),
+    session: AsyncSession = Depends(get_db_session),
+) -> SpendCeilingResponse:
+    try:
+        async with session.begin():
+            await set_rls_org(session, current_user.organisation_id)
+            org = await get_organisation(session, current_user.organisation_id)
+            if org is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organisation not found")
+            if req.max_run_cost is not None:
+                org.max_run_cost_cents = cents_from_usd(req.max_run_cost)
+            if req.spend_ceiling is not None:
+                org.spend_ceiling_cents = cents_from_usd(req.spend_ceiling)
+            await session.flush()
+    except ProgrammingError:
+        _log.exception("set_spend_ceiling ProgrammingError (org_id=%s)", current_user.organisation_id)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=MSG_FEATURE_NOT_AVAILABLE,
+        ) from None
+    except SQLAlchemyError:
+        _log.exception("set_spend_ceiling SQLAlchemyError (org_id=%s)", current_user.organisation_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=_MSG_DATABASE_ERROR_OCCURRED_PLEASE,
+        ) from None
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("Unexpected error in set_spend_ceiling")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=MSG_INTERNAL_SERVER_ERROR,
+        ) from None
+
+    max_run_cost = _coerce_cents_usd(org.max_run_cost_cents)
+    spend_ceiling = _coerce_cents_usd(org.spend_ceiling_cents)
+    cumulative = _coerce_cents_usd(org.org_cumulative_spend_cents or 0) or 0.0
+    remaining = None
+    if spend_ceiling is not None:
+        remaining = max(spend_ceiling - cumulative, 0.0)
+    return SpendCeilingResponse(
+        max_run_cost=max_run_cost,
+        spend_ceiling=spend_ceiling,
+        org_cumulative_spend_usd=cumulative,
+        remaining_budget_usd=remaining,
     )
 
 

@@ -981,3 +981,67 @@ class TestOrgSettingsCurrency:
 
         assert resp.status_code == 200
         assert resp.json() == {"currency": "USD"}
+
+
+class TestSpendCeilingEndpoints:
+    """FAR-391 — GET/PUT /api/v1/admin/costs/ceiling."""
+
+    def test_get_returns_ceilings_and_remaining(self, client: TestClient) -> None:
+        org = MagicMock()
+        org.id = _ORG_ID
+        org.max_run_cost_cents = 1234  # $12.34
+        org.spend_ceiling_cents = 10000  # $100.00
+        org.org_cumulative_spend_cents = 4000  # $40.00 consumed
+
+        with (
+            patch("modulo.api.routes.costs.get_organisation", return_value=org),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.get("/api/v1/admin/costs/ceiling")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["max_run_cost"] == 12.34
+        assert data["spend_ceiling"] == 100.0
+        assert data["org_cumulative_spend_usd"] == 40.0
+        assert data["remaining_budget_usd"] == 60.0
+
+    def test_get_null_ceilings_serialise_as_none(self, client: TestClient) -> None:
+        org = MagicMock()
+        org.id = _ORG_ID
+        org.max_run_cost_cents = None
+        org.spend_ceiling_cents = None
+        org.org_cumulative_spend_cents = 0
+
+        with (
+            patch("modulo.api.routes.costs.get_organisation", return_value=org),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.get("/api/v1/admin/costs/ceiling")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["max_run_cost"] is None
+        assert data["spend_ceiling"] is None
+        assert data["remaining_budget_usd"] is None
+
+    def test_put_persists_cents(self, client: TestClient) -> None:
+        org = MagicMock()
+        org.id = _ORG_ID
+        org.max_run_cost_cents = None
+        org.spend_ceiling_cents = None
+        org.org_cumulative_spend_cents = 0
+
+        with (
+            patch("modulo.api.routes.costs.get_organisation", return_value=org),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.put(
+                "/api/v1/admin/costs/ceiling",
+                json={"max_run_cost": 12.34, "spend_ceiling": 100.0},
+            )
+
+        assert resp.status_code == 200
+        assert org.max_run_cost_cents == 1234
+        assert org.spend_ceiling_cents == 10000
+        assert resp.json()["remaining_budget_usd"] == 100.0
