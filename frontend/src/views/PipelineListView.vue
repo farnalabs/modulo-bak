@@ -233,6 +233,10 @@
 
       <!-- Move to Folder dialog -->
       <div
+        role="button"
+        tabindex="0"
+        @keydown.enter="($event.currentTarget as HTMLElement).click()"
+        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showMoveToFolder"
         class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
         @click.self="showMoveToFolder = false"
@@ -275,6 +279,10 @@
 
       <!-- Rename dialog -->
       <div
+        role="button"
+        tabindex="0"
+        @keydown.enter="($event.currentTarget as HTMLElement).click()"
+        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showRenameDialog"
         class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
         @click.self="showRenameDialog = false"
@@ -311,6 +319,10 @@
 
       <!-- Delete confirmation dialog -->
       <div
+        role="button"
+        tabindex="0"
+        @keydown.enter="($event.currentTarget as HTMLElement).click()"
+        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showDeleteConfirm"
         class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
         @click.self="showDeleteConfirm = false"
