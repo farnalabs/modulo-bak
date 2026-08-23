@@ -46,7 +46,7 @@ def upgrade():
     bind = op.get_bind()
     for index_name, table, columns in _INDEXES:
         cols = ", ".join(columns)
-        with bind.connect() as conn:
+        with bind.engine.connect() as conn:
             conn = conn.execution_options(isolation_level="AUTOCOMMIT")
             conn.execute(text(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} ON {table} ({cols})"))
 
@@ -54,6 +54,6 @@ def upgrade():
 def downgrade():
     bind = op.get_bind()
     for index_name, _table, _columns in _INDEXES:
-        with bind.connect() as conn:
+        with bind.engine.connect() as conn:
             conn = conn.execution_options(isolation_level="AUTOCOMMIT")
             conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"))
