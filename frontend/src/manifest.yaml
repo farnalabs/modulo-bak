@@ -48,6 +48,18 @@ routes:
         deprecated: false
         exact: true
 
+    /onboarding:
+        name: onboarding
+        breadcrumb: Onboarding
+        parent: /
+        product_map:
+        sidebar_group:
+        sidebar_order:
+        type: form_page
+        exact: true
+        <<: *community
+        deprecated: false
+
     /library/:id/create-pipeline:
         name: library-pipeline-wizard
         breadcrumb: Create Pipeline
@@ -433,6 +445,7 @@ routes:
         sidebar_order: 4
         type: form_page
         <<: *community
+        deprecated: false
 
     /admin/users:
         name: admin-users
@@ -573,7 +586,7 @@ routes:
         parent: /
         product_map: [feat-environments, feat-runtime]
         sidebar_group: admin
-        sidebar_order: 8
+        sidebar_order: 9
         type: list_page
         <<: *team
         deprecated: false
@@ -617,7 +630,7 @@ routes:
         parent: /
         product_map: [feat-dashboard]
         sidebar_group: admin
-        sidebar_order: 7
+        sidebar_order: 8
         type: list_page
         <<: *team
         deprecated: false
@@ -656,6 +669,39 @@ routes:
         sidebar_order: 3
         type: list_page
         <<: *team
+        deprecated: false
+
+    /admin/product-analytics:
+        name: admin-product-analytics
+        breadcrumb: Product Analytics
+        parent: /
+        product_map:
+        sidebar_group:
+        sidebar_order:
+        type: page
+        <<: *community
+        deprecated: false
+
+    /admin/system/config:
+        name: admin-system-config
+        breadcrumb: System Config
+        parent: /
+        product_map:
+        sidebar_group:
+        sidebar_order:
+        type: page
+        <<: *community
+        deprecated: false
+
+    /admin/system/orgs:
+        name: admin-system-orgs
+        breadcrumb: Organisations
+        parent: /
+        product_map:
+        sidebar_group:
+        sidebar_order:
+        type: page
+        <<: *community
         deprecated: false
 
     /admin/plugins:
@@ -701,7 +747,7 @@ routes:
         parent: /
         product_map: [feat-feedback]
         sidebar_group: admin
-        sidebar_order: 9
+        sidebar_order: 10
         type: list_page
         <<: *community
         visibility: private_preview
@@ -731,7 +777,6 @@ routes:
         type: form_page
         <<: *community
         deprecated: false
-
     /environment-profiles:
         name: environment-profiles
         breadcrumb: Environment Profiles
