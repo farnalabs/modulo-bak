@@ -26,6 +26,15 @@ class TestConnectorInitialisation:
         assert isinstance(t, ConnectorType), f"Expected ConnectorType, got {type(t).__name__}"
         assert t in ConnectorType, f"{t!r} is not a known ConnectorType member"
 
+    def test_connector_type_identity_matches_registration(
+        self, connector_type: str, conformance_connector: ConnectorBase
+    ) -> None:
+        expected = ConnectorType(connector_type)
+        assert conformance_connector.connector_type == expected, (
+            f"Connector registered as {connector_type!r} identifies as "
+            f"{conformance_connector.connector_type!r} (expected {expected!r})"
+        )
+
     def test_connector_type_is_json_serializable(
         self, connector_type: str, conformance_connector: ConnectorBase
     ) -> None:

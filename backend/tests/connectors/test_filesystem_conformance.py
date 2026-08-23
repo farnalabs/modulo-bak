@@ -141,6 +141,21 @@ class TestFilesystemConnector:
         assert len(result.records) == 2
         assert result.total == 2
 
+    async def test_write_empty_content_creates_empty_file(self, fs_connector: FilesystemConnector) -> None:
+        result = await fs_connector.write(ConnectorPayload(resource="file", data={"path": "empty.txt", "content": ""}))
+        assert_write_result_shape(result)
+        assert result.get("bytes_written") == 0
+        read_result = await fs_connector.query(ConnectorQuery(resource="file", filters={"path": "empty.txt"}))
+        assert not read_result.records[0]["content"]
+
+    async def test_browse_subdirectory_with_path_filter(self, fs_connector: FilesystemConnector) -> None:
+        await fs_connector.write(ConnectorPayload(resource="file", data={"path": "sub/a.txt", "content": "x"}))
+        await fs_connector.write(ConnectorPayload(resource="file", data={"path": "root.txt", "content": "x"}))
+        result = await fs_connector.query(ConnectorQuery(resource="directory", filters={"path": "sub"}))
+        paths = [r.get("name", r.get("path", "")) for r in result.records]
+        assert "a.txt" in paths
+        assert result.total == 1
+
     async def test_overwrite_existing_file(self, fs_connector: FilesystemConnector) -> None:
         first_write = await fs_connector.write(
             ConnectorPayload(resource="file", data={"path": "overwrite.txt", "content": "original"})

@@ -54,8 +54,12 @@ def assert_result_shape(result: Any) -> None:
     assert isinstance(result, ConnectorResult), f"Expected ConnectorResult, got {type(result).__name__}"
     assert isinstance(result.records, list), f"ConnectorResult.records must be a list, got {type(result.records)}"
     assert all(isinstance(r, dict) for r in result.records), "ConnectorResult.records must contain only dicts"
-    assert result.next_cursor is None or isinstance(result.next_cursor, str)
-    assert result.total is None or isinstance(result.total, int)
+    assert result.next_cursor is None or isinstance(result.next_cursor, str), (
+        f"ConnectorResult.next_cursor must be None or str, got {type(result.next_cursor).__name__}"
+    )
+    assert result.total is None or isinstance(result.total, int), (
+        f"ConnectorResult.total must be None or int, got {type(result.total).__name__}"
+    )
     if result.total is not None:
         assert result.total >= 0, f"ConnectorResult.total must be non-negative, got {result.total}"
     assert isinstance(result.metadata, dict), (
