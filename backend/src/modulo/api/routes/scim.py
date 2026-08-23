@@ -587,7 +587,7 @@ _USER_PATCH_OP_DISPATCH: dict[str, Any] = {
 }
 
 
-async def _apply_user_ops(account: Account, ops: list[ScimPatchOperation]) -> bool:
+def _apply_user_ops(account: Account, ops: list[ScimPatchOperation]) -> bool:
     """Apply SCIM user PATCH operations; returns whether deactivation was requested."""
     deactivate_requested = False
     for op in ops:
@@ -651,7 +651,7 @@ async def patch_user(
             if account is None:
                 raise _scim_error(status.HTTP_404_NOT_FOUND, f"User {user_id} not found")
 
-            deactivate_requested = await _apply_user_ops(account, req.Operations)
+            deactivate_requested = _apply_user_ops(account, req.Operations)
             account = await _maybe_deactivate_scim_user(
                 session,
                 principal.organisation_id,

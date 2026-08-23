@@ -211,6 +211,7 @@ def _merge_trigger_config(current: dict[str, Any] | None, update: dict[str, Any]
 
 
 _SECRET_CONFIG_KEYS = frozenset({"hmac_secret", "signing_secret"})
+_MAX_CRON_PREVIEW_COUNT = 50
 
 
 def _encrypt_trigger_config_secrets(config: dict[str, Any] | None, fernet_key: str) -> dict[str, Any]:
@@ -546,7 +547,9 @@ async def preview_cron_schedule(
 
             times: list[str] = []
             next_fire = datetime.datetime.now(datetime.UTC)
-            while len(times) < count:
+            for _ in range(_MAX_CRON_PREVIEW_COUNT):
+                if len(times) >= count:
+                    break
                 next_fire = compute_next_fire(
                     trigger.cron_expression,
                     after=next_fire,
