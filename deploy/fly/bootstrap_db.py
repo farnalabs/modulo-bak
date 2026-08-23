@@ -8,6 +8,7 @@ import asyncio
 import os
 import re
 import sys
+from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
 
@@ -60,3 +61,26 @@ with open("/tmp/database_url.env", "w") as f:
 
 with open("/tmp/database_admin_url.env", "w") as f:
     f.write(admin_url)
+
+# MODULO_SYSTEM_DATABASE_URL: the modulo_system role (LOGIN, BYPASSRLS) URL used
+# by system crons (metrics_dump, analytics_facts_maintenance, journey_reconcile,
+# retention_cleanup, dispatcher_reconcile) and the SSO pre-auth provider lookup.
+# If set, fix it like the others. If not, derive it from the fixed DATABASE_URL
+# by swapping the username to modulo_system -- the password stays the same, and
+# bootstrap_role.py reads it from the URL to create the role.
+system_url = os.environ.get("MODULO_SYSTEM_DATABASE_URL", "")
+if system_url:
+    system_url = system_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    system_url = re.sub(r"[?&]sslmode=[^&]*", "", system_url).rstrip("?")
+elif runtime_url:
+    parts = urlsplit(runtime_url)
+    userinfo, sep, hostport = parts.netloc.rpartition("@")
+    if sep:
+        new_userinfo = f"modulo_system:{userinfo.partition(':')[2]}" if ":" in userinfo else "modulo_system"
+        parts = parts._replace(netloc=f"{new_userinfo}@{hostport}")
+        system_url = urlunsplit(parts)
+
+if system_url:
+    os.environ["MODULO_SYSTEM_DATABASE_URL"] = system_url
+    with open("/tmp/system_database_url.env", "w") as f:
+        f.write(system_url)

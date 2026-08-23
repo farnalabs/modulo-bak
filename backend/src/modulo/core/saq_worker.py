@@ -933,6 +933,15 @@ def _get_system_async_engine() -> AsyncEngine:
                 connect_args={"ssl": False, "statement_cache_size": 0},
             )
         else:
+            _log.warning(
+                "saq_worker.system_engine_fallback",
+                extra={
+                    "reason": (
+                        "MODULO_SYSTEM_DATABASE_URL not set — system crons run as modulo_app "
+                        "(NOBYPASSRLS); RLS-scoped reads return zero rows"
+                    )
+                },
+            )
             _SYSTEM_ASYNC_ENGINE = _get_async_engine()
     return _SYSTEM_ASYNC_ENGINE
 
