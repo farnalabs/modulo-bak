@@ -9,19 +9,18 @@
       </Button>
     </header>
 
-    <div
+    <output
       v-if="orgTriggersPaused"
       data-testid="settings-triggers-paused-banner"
-      role="status"
-      aria-live="polite"
-      class="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 p-4"
+      :aria-label="$t('views.SettingsTriggersView.paused_banner_title')"
+      class="mb-4 block rounded-lg border border-amber-500/40 bg-amber-500/10 p-4"
     >
       <p class="text-sm font-medium">{{ $t('views.SettingsTriggersView.paused_banner_title') }}</p>
       <p class="mt-1 text-sm text-muted-foreground">{{ $t('views.SettingsTriggersView.paused_banner_body') }}</p>
       <p v-if="orgPausedAt" class="mt-1 text-xs text-muted-foreground">
         {{ $t('views.SettingsTriggersView.paused_at_label', { at: formatTimestamp(orgPausedAt) }) }}
       </p>
-    </div>
+    </output>
 
     <div v-if="isOrgAdmin" class="mb-4 rounded-lg border bg-card p-4">
       <div class="flex items-center justify-between">
@@ -88,17 +87,17 @@
                   >
                     {{ $t('views.SettingsTriggersView.streak_display', { streak: t.streak_status.streak ?? 0, threshold: t.streak_status.threshold ?? 0 }) }}
                   </span>
-                  <span
+                  <output
                     v-if="isDeactivatedOngoing(t)"
                     data-testid="settings-triggers-deactivated-badge"
-                    role="status"
-                    aria-live="polite"
+                    :aria-label="$t('views.SettingsTriggersView.deactivated_badge', { reason: deactivatedReasonLabel(t) })"
                     class="inline-flex items-center gap-1 rounded-full bg-destructive/10 px-2.5 py-0.5 text-xs font-medium text-destructive"
                   >
                     {{ $t('views.SettingsTriggersView.deactivated_badge', { reason: deactivatedReasonLabel(t) }) }}
-                  </span>
+                  </output>
                   <div class="flex items-center gap-2">
                     <button
+                      type="button"
                       class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors disabled:opacity-50"
                       :class="t.active ? 'bg-success/10 text-success hover:bg-success/20' : 'bg-muted text-muted-foreground hover:bg-muted/80'"
                       :disabled="triggerToggling[t.id]"
@@ -135,6 +134,7 @@
                 <div class="flex items-center justify-end gap-2">
                   <TableActions :actions="triggerActions(t)" />
                   <button
+                    type="button"
                     v-if="hasOutcomes(t)"
                     data-testid="settings-triggers-outcomes-toggle"
                     class="text-xs text-muted-foreground hover:text-foreground"
@@ -541,7 +541,7 @@ async function togglePauseAll() {
     )
     if (res && typeof res.paused === 'boolean') {
       triggersData.value = {
-        ...(triggersData.value ?? {}),
+        ...triggersData.value,
         triggers_paused: res.paused,
         paused_at: res.paused_at ?? null,
       } as typeof triggersData.value
