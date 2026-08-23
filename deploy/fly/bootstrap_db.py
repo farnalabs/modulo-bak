@@ -17,74 +17,99 @@ import asyncpg
 # networks where Postgres doesn't expect SSL, causing ConnectionResetError.
 SSLMODE_RE = re.compile(r"[?&]sslmode=[^&]*")
 
-# Step 1: Fix DATABASE_ADMIN_URL and DATABASE_URL
-admin_url = os.environ.get("DATABASE_ADMIN_URL") or os.environ.get("DATABASE_URL", "")
-original = admin_url
-admin_url = admin_url.replace("postgres://", "postgresql+asyncpg://", 1)
-admin_url = SSLMODE_RE.sub("", admin_url).rstrip("?")
-os.environ["DATABASE_ADMIN_URL"] = admin_url
-if admin_url != original:
-    print("Fixed DATABASE_ADMIN_URL scheme + stripped sslmode")
 
-# Also fix DATABASE_URL (the runtime URL) for backwards compat
-runtime_url = os.environ.get("DATABASE_URL", "")
-if runtime_url:
-    runtime_url = runtime_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    runtime_url = SSLMODE_RE.sub("", runtime_url).rstrip("?")
-    os.environ["DATABASE_URL"] = runtime_url
+def fix_database_url(url: str) -> str:
+    """Convert a Postgres URL to the SQLAlchemy async driver form.
 
-# Step 2: Create alembic_version table with VARCHAR(255)
-# Branch migration IDs exceed the default VARCHAR(32).
+    Replaces ``postgres://`` with ``postgresql+asyncpg://`` and strips any
+    ``sslmode`` query parameter (asyncpg defaults to "prefer" on Fly's
+    private networks where Postgres doesn't expect SSL, causing
+    ConnectionResetError).
+    """
+    fixed = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    return SSLMODE_RE.sub("", fixed).rstrip("?")
 
 
-async def _bootstrap():
-    pg_url = admin_url.replace("postgresql+asyncpg://", "postgres://")
-    conn = await asyncpg.connect(pg_url, ssl=False)
-    try:
-        await conn.execute(
-            "CREATE TABLE IF NOT EXISTS alembic_version (  version_num VARCHAR(255) NOT NULL PRIMARY KEY)"
-        )
-        print("alembic_version table ready (VARCHAR(255))")
-    finally:
-        await conn.close()
+def derive_system_database_url(runtime_url: str) -> str:
+    """Derive the modulo_system URL from the runtime DATABASE_URL.
 
-
-try:
-    asyncio.run(_bootstrap())
-except Exception as exc:
-    print(
-        f"WARNING: Could not bootstrap alembic_version: [{type(exc).__name__}] {exc}",
-        file=sys.stderr,
-    )
-
-# Step 3: Write the fixed URLs to files for the shell
-with open("/tmp/database_url.env", "w") as f:
-    f.write(runtime_url)
-
-with open("/tmp/database_admin_url.env", "w") as f:
-    f.write(admin_url)
-
-# MODULO_SYSTEM_DATABASE_URL: the modulo_system role (LOGIN, BYPASSRLS) URL used
-# by system crons (metrics_dump, analytics_facts_maintenance, journey_reconcile,
-# retention_cleanup, dispatcher_reconcile) and the SSO pre-auth provider lookup.
-# If set, fix it like the others. If not, derive it from the fixed DATABASE_URL
-# by swapping the username to modulo_system -- the password stays the same, and
-# bootstrap_role.py reads it from the URL to create the role.
-system_url = os.environ.get("MODULO_SYSTEM_DATABASE_URL", "")
-if system_url:
-    system_url = system_url.replace("postgres://", "postgresql+asyncpg://", 1)
-    system_url = SSLMODE_RE.sub("", system_url).rstrip("?")
-elif runtime_url:
+    Swaps the username to ``modulo_system``, preserving the password (so
+    bootstrap_role.py can create the role with the same credential), the
+    host/port, the scheme, and any query params. Returns an empty string
+    when the netloc has no ``@`` separator.
+    """
     parts = urlsplit(runtime_url)
     userinfo, sep, hostport = parts.netloc.rpartition("@")
     if sep:
         new_userinfo = f"modulo_system:{userinfo.partition(':')[2]}" if ":" in userinfo else "modulo_system"
         parts = parts._replace(netloc=f"{new_userinfo}@{hostport}")
-        system_url = urlunsplit(parts)
+        return urlunsplit(parts)
+    return ""
 
-if system_url:
-    os.environ["MODULO_SYSTEM_DATABASE_URL"] = system_url
-    # Short-lived container bootstrap env file, consistent with the
-    # /tmp/database_url.env and /tmp/database_admin_url.env files written above.
-    with open("/tmp/system_database_url.env", "w") as f:  # NOSONAR
-        f.write(system_url)
+
+def main() -> None:
+    # Step 1: Fix DATABASE_ADMIN_URL and DATABASE_URL
+    admin_url = os.environ.get("DATABASE_ADMIN_URL") or os.environ.get("DATABASE_URL", "")
+    original = admin_url
+    admin_url = fix_database_url(admin_url)
+    os.environ["DATABASE_ADMIN_URL"] = admin_url
+    if admin_url != original:
+        print("Fixed DATABASE_ADMIN_URL scheme + stripped sslmode")
+
+    # Also fix DATABASE_URL (the runtime URL) for backwards compat
+    runtime_url = os.environ.get("DATABASE_URL", "")
+    if runtime_url:
+        runtime_url = fix_database_url(runtime_url)
+        os.environ["DATABASE_URL"] = runtime_url
+
+    # Step 2: Create alembic_version table with VARCHAR(255)
+    # Branch migration IDs exceed the default VARCHAR(32).
+
+    async def _bootstrap():
+        pg_url = admin_url.replace("postgresql+asyncpg://", "postgres://")
+        conn = await asyncpg.connect(pg_url, ssl=False)
+        try:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS alembic_version (  version_num VARCHAR(255) NOT NULL PRIMARY KEY)"
+            )
+            print("alembic_version table ready (VARCHAR(255))")
+        finally:
+            await conn.close()
+
+    try:
+        asyncio.run(_bootstrap())
+    except Exception as exc:
+        print(
+            f"WARNING: Could not bootstrap alembic_version: [{type(exc).__name__}] {exc}",
+            file=sys.stderr,
+        )
+
+    # Step 3: Write the fixed URLs to files for the shell
+    with open("/tmp/database_url.env", "w") as f:
+        f.write(runtime_url)
+
+    with open("/tmp/database_admin_url.env", "w") as f:
+        f.write(admin_url)
+
+    # MODULO_SYSTEM_DATABASE_URL: the modulo_system role (LOGIN, BYPASSRLS) URL used
+    # by system crons (metrics_dump, analytics_facts_maintenance, journey_reconcile,
+    # retention_cleanup, dispatcher_reconcile) and the SSO pre-auth provider lookup.
+    # If set, fix it like the others. If not, derive it from the fixed DATABASE_URL
+    # by swapping the username to modulo_system -- the password stays the same, and
+    # bootstrap_role.py reads it from the URL to create the role.
+    system_url = os.environ.get("MODULO_SYSTEM_DATABASE_URL", "")
+    if system_url:
+        system_url = fix_database_url(system_url)
+    elif runtime_url:
+        system_url = derive_system_database_url(runtime_url)
+
+    if system_url:
+        os.environ["MODULO_SYSTEM_DATABASE_URL"] = system_url
+        # Short-lived container bootstrap env file, consistent with the
+        # /tmp/database_url.env and /tmp/database_admin_url.env files written above.
+        with open("/tmp/system_database_url.env", "w") as f:  # NOSONAR
+            f.write(system_url)
+
+
+if __name__ == "__main__":
+    main()
