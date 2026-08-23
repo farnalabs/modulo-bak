@@ -25,6 +25,10 @@ from modulo.db.models.sso_provider import SsoProvider
 from modulo.db.rls import set_rls_org, set_rls_user_context
 from modulo.settings import Settings, get_settings
 
+# Re-exported so API-layer callers can import from the documented location.
+# Required because mypy runs under `strict` (no_implicit_reexport = True).
+__all__ = ["SENSITIVE_VALUE_MASK"]
+
 _log = logging.getLogger(__name__)
 
 # The DOM-side mask constant lives in :mod:`modulo.core.secret_patterns` (the
