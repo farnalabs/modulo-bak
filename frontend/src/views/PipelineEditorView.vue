@@ -74,6 +74,7 @@
               class="absolute left-0 top-full mt-1 w-48 rounded-lg border bg-card py-1 shadow-lg"
             >
               <button
+                type="button"
                 class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent"
                 @click="openSaveAsComposite"
               >
@@ -84,9 +85,9 @@
           </div>
           <span class="mx-2 h-4 w-px bg-border" />
           <div class="flex items-center gap-1">
-            <button v-if="!pipeline?.archived_at" class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent" @click="handleArchive">{{ $t('views.PipelineEditorView.archive') }}</button>
-            <button v-else class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent" @click="handleUnarchive">{{ $t('views.PipelineEditorView.unarchive') }}</button>
-            <button v-if="planStore.featureEnabled('pipeline_delete')" class="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/20" @click="showDeleteConfirm = true">{{ $t('common.delete') }}</button>
+            <button v-if="!pipeline?.archived_at" type="button" class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent" @click="handleArchive">{{ $t('views.PipelineEditorView.archive') }}</button>
+            <button v-else type="button" class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent" @click="handleUnarchive">{{ $t('views.PipelineEditorView.unarchive') }}</button>
+            <button v-if="planStore.featureEnabled('pipeline_delete')" type="button" class="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-1 text-xs font-medium text-destructive hover:bg-destructive/20" @click="showDeleteConfirm = true">{{ $t('common.delete') }}</button>
           </div>
           <span class="mx-2 h-4 w-px bg-border" />
           <div class="flex items-center gap-1">
@@ -104,6 +105,7 @@
           <span class="mx-2 h-4 w-px bg-border" />
           <div class="relative">
             <button
+              type="button"
               ref="retryPolicyToggleRef"
               :id="retryPolicyToggleId"
               class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent flex items-center gap-1"
@@ -115,12 +117,12 @@
             >
               {{ $t('views.PipelineEditorView.retry_policy') }}
             </button>
-            <div
+            <dialog
               v-if="retryPolicyOpen"
+              open
               :id="retryPolicyPanelId"
               ref="retryPolicyPanelRef"
-              class="absolute right-0 top-full z-50 mt-1 w-72 rounded-lg border border-border bg-card p-3 shadow-lg"
-              role="dialog"
+              class="absolute right-0 left-auto top-full z-50 mt-1 w-72 rounded-lg border border-border bg-card p-3 shadow-lg"
               tabindex="-1"
               :aria-label="$t('views.PipelineEditorView.retry_policy')"
               data-testid="pipeline-editor-retry-policy-panel"
@@ -177,12 +179,14 @@
               </div>
               <div class="mt-3 flex justify-end gap-2">
                 <button
+                  type="button"
                   class="rounded border border-input bg-background px-2 py-1 text-xs hover:bg-accent"
                   @click="closeRetryPolicy"
                 >
                   {{ $t('views.PipelineEditorView.cancel') }}
                 </button>
                 <button
+                  type="button"
                   class="rounded border border-input bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                   :disabled="retryPolicySaving"
                   @click="saveRetryPolicy"
@@ -191,10 +195,11 @@
                   {{ retryPolicySaving ? $t('views.PipelineEditorView.saving') : $t('views.PipelineEditorView.save') }}
                 </button>
               </div>
-            </div>
+            </dialog>
           </div>
           <span class="mx-2 h-4 w-px bg-border" />
           <button
+            type="button"
             class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent flex items-center gap-1"
             @click="addNode"
             title="Add node"
@@ -204,6 +209,7 @@
           </button>
           <span class="mx-2 h-4 w-px bg-border" />
           <button
+            type="button"
             class="rounded-md border border-input bg-background px-2 py-1 text-xs font-medium hover:bg-accent flex items-center gap-1"
             @click="() => fitView()"
             title="Fit view"
@@ -222,6 +228,7 @@
             <div class="flex items-center justify-between">
               <h2 class="text-base font-semibold text-foreground">{{ $t('views.PipelineEditorView.run_dialog_title') }}</h2>
               <button
+                type="button"
                 class="text-muted-foreground hover:text-foreground transition-colors"
                 @click="closeRunDialog"
                 aria-label="Close"
@@ -253,6 +260,7 @@
             </div>
             <div class="flex justify-end gap-2 pt-2">
               <button
+                type="button"
                 class="px-4 py-2 border border-input bg-background text-foreground text-sm font-medium rounded-lg hover:bg-accent transition-colors"
                 @click="closeRunDialog"
               >
@@ -488,6 +496,7 @@
                   <span v-else class="text-xs text-muted-foreground">—</span>
                 </div>
                 <button
+                  type="button"
                   class="mt-1 text-xs text-indigo-500 hover:text-indigo-400"
                   data-testid="pipeline-save-param-set"
                   @click="saveAsNewParamSet"
@@ -573,6 +582,7 @@
           </Button>
           <button
             v-if="selectedNodeData.node_type === 'agent'"
+            type="button"
             data-testid="pipeline-editor-revert-to-manual"
             class="inline-flex w-full items-center justify-center rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent"
             @click="openRevertDialog"
@@ -773,6 +783,7 @@
               {{ savingEdge ? 'Saving...' : 'Save Edge' }}
             </Button>
             <button
+              type="button"
               class="rounded-lg border border-input bg-background px-4 py-2 text-sm hover:bg-accent"
               @click="selectedEdgeData = null"
             >

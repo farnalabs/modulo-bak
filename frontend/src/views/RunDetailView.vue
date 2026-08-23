@@ -102,6 +102,7 @@
               />
               <div class="flex gap-2">
                 <button
+                  type="button"
                   :disabled="Boolean(actioning)"
                   data-testid="run-detail-approve"
                   class="flex-1 rounded-lg bg-success px-4 py-2 text-sm font-medium text-white hover:bg-success/90 disabled:opacity-50"
@@ -110,6 +111,7 @@
                   {{ actioning === 'approve' ? 'Approving...' : 'Approve' }}
                 </button>
                 <button
+                  type="button"
                   :disabled="Boolean(actioning)"
                   data-testid="run-detail-reject"
                   class="flex-1 rounded-lg bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
@@ -121,6 +123,7 @@
             </div>
           </template>
           <button
+            type="button"
             v-else
             :disabled="claimLoading"
             class="w-full rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
@@ -246,6 +249,7 @@
       <!-- Cancel button for non-terminal runs -->
       <div v-if="canCancel" class="my-4">
         <button
+          type="button"
           :disabled="cancelling"
           data-testid="run-detail-cancel"
           class="inline-flex items-center gap-2 rounded-lg border border-destructive/50 bg-destructive/10 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
@@ -263,6 +267,7 @@
         <span class="text-xs text-muted-foreground">{{ $t('views.RunDetailView.otel_trace_id') }}</span>
         <code class="select-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs" :title="run.trace_id">{{ shortId(run.trace_id) }}</code>
         <button
+          type="button"
           data-testid="run-detail-copy-trace-id"
           :aria-label="$t('views.RunDetailView.copy_trace_id')"
           class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary hover:bg-primary/10"
@@ -287,6 +292,7 @@
         <div class="flex items-center justify-between mb-3">
           <h2 class="text-base font-semibold text-foreground">{{ $t('views.RunDetailView.final_output') }}</h2>
           <button
+            type="button"
             class="px-3 py-1.5 text-xs font-medium rounded-lg border border-input bg-background hover:bg-accent transition-colors"
             @click="copyOutput"
             data-testid="run-detail-copy-output"
@@ -393,6 +399,7 @@
               <td class="py-3 pr-4 font-medium" :title="node.name">
                 <span class="select-all">{{ nodeLabel(node.name) }}</span>
                 <button
+                  type="button"
                   data-testid="run-detail-copy-node-id"
                   :aria-label="$t('views.RunDetailView.copy_node_id')"
                   class="ml-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-primary hover:bg-primary/10"
@@ -419,6 +426,7 @@
               <td class="py-3 pr-4">
                 <button
                   v-if="node.traceId"
+                  type="button"
                   data-testid="run-detail-node-trace-id"
                   :aria-label="node.isNodeSpanId ? $t('views.RunDetailView.copy_node_span_id') : $t('views.RunDetailView.copy_node_trace_id')"
                   class="cursor-pointer rounded bg-muted px-1.5 py-0.5 font-mono text-xs"
@@ -432,6 +440,7 @@
               <td class="py-3">
                 <button
                   v-if="node.io"
+                  type="button"
                   data-testid="run-detail-toggle-io"
                   class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary hover:bg-primary/10"
                   @click="toggleNodeIO(node.name)"
@@ -443,6 +452,7 @@
               <td class="py-3">
                 <button
                   v-if="node.hasLogs || node.telemetry"
+                  type="button"
                   data-testid="run-detail-toggle-logs"
                   class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary hover:bg-primary/10"
                   @click="toggleNodeLogs(node.name)"
@@ -453,6 +463,7 @@
               </td>
               <td class="py-3">
                 <button
+                  type="button"
                   data-testid="run-detail-show-prompt"
                   class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary hover:bg-primary/10 disabled:opacity-50"
                   :disabled="promptLoading.has(node.name)"
