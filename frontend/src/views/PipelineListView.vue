@@ -233,15 +233,18 @@
 
       <!-- Move to Folder dialog -->
       <div
-        role="button"
-        tabindex="0"
-        @keydown.enter="($event.currentTarget as HTMLElement).click()"
-        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showMoveToFolder"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-        @click.self="showMoveToFolder = false"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
       >
-        <div class="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+        <div class="absolute inset-0 bg-black/50" @click="closeMoveToFolder" aria-hidden="true" />
+        <div
+          ref="moveDialogRef"
+          class="relative z-10 w-full max-w-md rounded-lg border bg-card p-6 shadow-lg"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="$t('views.PipelineListView.move_to_folder')"
+          tabindex="-1"
+        >
           <h3 class="mb-4 text-lg font-semibold">{{ $t('views.PipelineListView.move_to_folder') }}</h3>
           <div class="space-y-3">
             <button
@@ -267,7 +270,7 @@
             {{ moveError }}
           </div>
           <div class="mt-4 flex justify-end gap-2">
-            <button class="rounded-lg border border-input bg-background px-4 py-2 text-sm hover:bg-accent" @click="showMoveToFolder = false">
+            <button class="rounded-lg border border-input bg-background px-4 py-2 text-sm hover:bg-accent" @click="closeMoveToFolder">
               {{ $t('common.cancel') }}
             </button>
             <Button :disabled="moving" @click="handleMoveToFolder">
@@ -279,15 +282,18 @@
 
       <!-- Rename dialog -->
       <div
-        role="button"
-        tabindex="0"
-        @keydown.enter="($event.currentTarget as HTMLElement).click()"
-        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showRenameDialog"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-        @click.self="showRenameDialog = false"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
       >
-        <div class="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+        <div class="absolute inset-0 bg-black/50" @click="closeRename" aria-hidden="true" />
+        <div
+          ref="renameDialogRef"
+          class="relative z-10 w-full max-w-md rounded-lg border bg-card p-6 shadow-lg"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="$t('views.PipelineListView.rename_pipeline')"
+          tabindex="-1"
+        >
           <h3 class="mb-4 text-lg font-semibold">{{ $t('views.PipelineListView.rename_pipeline') }}</h3>
           <div class="space-y-4">
             <div>
@@ -305,7 +311,7 @@
             <div class="flex justify-end gap-2">
               <button
                 class="rounded-lg border border-input bg-background px-4 py-2 text-sm hover:bg-accent"
-                @click="showRenameDialog = false"
+                @click="closeRename"
               >
                 Cancel
               </button>
@@ -319,15 +325,18 @@
 
       <!-- Delete confirmation dialog -->
       <div
-        role="button"
-        tabindex="0"
-        @keydown.enter="($event.currentTarget as HTMLElement).click()"
-        @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
         v-if="showDeleteConfirm"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-        @click.self="showDeleteConfirm = false"
+        class="fixed inset-0 z-50 flex items-center justify-center p-4"
       >
-        <div class="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+        <div class="absolute inset-0 bg-black/50" @click="closeDelete" aria-hidden="true" />
+        <div
+          ref="deleteDialogRef"
+          class="relative z-10 w-full max-w-md rounded-lg border bg-card p-6 shadow-lg"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="$t('views.PipelineListView.delete_pipeline')"
+          tabindex="-1"
+        >
           <h3 class="mb-4 text-lg font-semibold text-destructive">{{ $t('views.PipelineListView.delete_pipeline') }}</h3>
           <p class="mb-4 text-sm text-muted-foreground">
             Are you sure? This permanently deletes the pipeline and all its runs.
@@ -338,7 +347,7 @@
           <div class="flex justify-end gap-2">
             <button
               class="rounded-lg border border-input bg-background px-4 py-2 text-sm hover:bg-accent"
-              @click="showDeleteConfirm = false"
+              @click="closeDelete"
             >
               Cancel
             </button>
@@ -357,7 +366,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick, type Ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/shared/PageHeader.vue'
@@ -598,6 +607,73 @@ const showDeleteConfirm = ref(false)
 const deleteTarget = ref<PipelineItem | null>(null)
 const deleteError = ref<string | null>(null)
 
+// Accessible modal dialog helpers: capture/restore focus, move initial focus
+// into the open panel, and trap Tab focus within the active dialog.
+const lastFocusedBeforeDialog = ref<HTMLElement | null>(null)
+const moveDialogRef = ref<HTMLElement | null>(null)
+const renameDialogRef = ref<HTMLElement | null>(null)
+const deleteDialogRef = ref<HTMLElement | null>(null)
+const activeDialogPanel = ref<HTMLElement | null>(null)
+
+function openDialog(show: Ref<boolean>, panel: Ref<HTMLElement | null>) {
+  lastFocusedBeforeDialog.value = document.activeElement as HTMLElement | null
+  show.value = true
+  nextTick(() => {
+    if (panel.value) {
+      panel.value.focus()
+      activeDialogPanel.value = panel.value
+    }
+  })
+}
+
+function closeDialog(show: Ref<boolean>) {
+  show.value = false
+  activeDialogPanel.value = null
+  nextTick(() => lastFocusedBeforeDialog.value?.focus())
+}
+
+function closeMoveToFolder() { closeDialog(showMoveToFolder) }
+function closeRename() { closeDialog(showRenameDialog) }
+function closeDelete() { closeDialog(showDeleteConfirm) }
+
+function trapKeydown(e: KeyboardEvent) {
+  if (!activeDialogPanel.value) return
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    if (showMoveToFolder.value) closeMoveToFolder()
+    else if (showRenameDialog.value) closeRename()
+    else if (showDeleteConfirm.value) closeDelete()
+    return
+  }
+  if (e.key !== 'Tab') return
+  const focusables = activeDialogPanel.value.querySelectorAll<HTMLElement>(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )
+  if (focusables.length === 0) {
+    e.preventDefault()
+    return
+  }
+  const first = focusables[0]
+  const last = focusables[focusables.length - 1]
+  const active = document.activeElement
+  if (e.shiftKey) {
+    if (active === first || !activeDialogPanel.value.contains(active)) {
+      e.preventDefault()
+      last.focus()
+    }
+  } else if (active === last || !activeDialogPanel.value.contains(active)) {
+    e.preventDefault()
+    first.focus()
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('keydown', trapKeydown)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('keydown', trapKeydown)
+})
+
 const search = ref('')
 
 const FOLDERS_STORAGE_KEY = 'modulo.pipelines.expandedFolders'
@@ -733,14 +809,14 @@ function openRename(p: PipelineItem) {
   renameTarget.value = p
   renameName.value = p.name
   renameError.value = null
-  showRenameDialog.value = true
+  openDialog(showRenameDialog, renameDialogRef)
 }
 
 function openMoveToFolder(p: PipelineItem) {
   moveTarget.value = p
   moveToFolderId.value = p.folder_id ?? null
   moveError.value = null
-  showMoveToFolder.value = true
+  openDialog(showMoveToFolder, moveDialogRef)
 }
 
 async function handleMoveToFolder() {
@@ -753,7 +829,7 @@ async function handleMoveToFolder() {
     await patchUntyped(`/api/v1/pipelines/${targetId}/folder`, {
       folder_id: folderId,
     })
-    showMoveToFolder.value = false
+    closeMoveToFolder()
     moveTarget.value = null
     await loadPipelines()
     await loadFolders()
@@ -774,7 +850,7 @@ async function handleRename() {
       params: { path: { pipeline_id: renameTarget.value.id } },
       body: { name: renameName.value.trim() },
     })
-    showRenameDialog.value = false
+    closeRename()
     await loadPipelines()
   } catch (e: unknown) {
     renameError.value = formatApiError(e)
@@ -804,7 +880,7 @@ async function handleUnarchive(p: PipelineItem) {
 function openDelete(p: PipelineItem) {
   deleteTarget.value = p
   deleteError.value = null
-  showDeleteConfirm.value = true
+  openDialog(showDeleteConfirm, deleteDialogRef)
 }
 
 async function handleDelete() {
@@ -814,7 +890,7 @@ async function handleDelete() {
     await api.DELETE('/api/v1/pipelines/{pipeline_id}', {
       params: { path: { pipeline_id: deleteTarget.value.id } },
     })
-    showDeleteConfirm.value = false
+    closeDelete()
     deleteTarget.value = null
     router.push('/pipelines')
     await loadPipelines()
