@@ -93,11 +93,13 @@ def register_human_eval_set(eval_set: HumanEvalSet) -> None:
 
 def get_human_eval_set(name: str) -> HumanEvalSet | None:
     """Look up a registered human eval set by name."""
+    _ensure_builtin_sets()
     return HUMAN_EVAL_SETS.get(name)
 
 
 def list_human_eval_sets() -> list[HumanEvalSet]:
     """Return all registered human eval sets (for selection UIs / docs)."""
+    _ensure_builtin_sets()
     return list(HUMAN_EVAL_SETS.values())
 
 
@@ -236,7 +238,16 @@ DEMO_CLASSIFICATION_V1 = HumanEvalSet(
     ],
 )
 
-register_human_eval_set(DEMO_CLASSIFICATION_V1)
+
+def _ensure_builtin_sets() -> None:
+    """Register the shipped built-in eval sets on first use.
+
+    Registration is deferred from module import to keep this module free of
+    import-time side effects (the architecture test forbids module-level calls
+    that execute on import). Calling it is idempotent.
+    """
+    if DEMO_CLASSIFICATION_V1.name not in HUMAN_EVAL_SETS:
+        register_human_eval_set(DEMO_CLASSIFICATION_V1)
 
 
 def run_human_eval_set(
