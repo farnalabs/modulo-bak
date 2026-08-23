@@ -2,15 +2,15 @@
 
 Two worker processes (plan F1/F2):
 
-* ``runs_settings`` — queue ``runs``, concurrency (SAQ_WORKER_CONCURRENCY,
+* ``runs_settings`` â€” queue ``runs``, concurrency (SAQ_WORKER_CONCURRENCY,
   default 5, deployed at 20 in prod/staging; the Redis pool must stay strictly
-  larger — see :func:`_effective_redis_pool_size`), no web UI. Executes
+  larger â€” see :func:`_effective_redis_pool_size`), no web UI. Executes
   ``execute_run``/``resume_run`` jobs and the per-item fire jobs
   (``fire_cron_trigger``/``fire_polling_trigger``/``fire_report_trigger``/
   ``fire_ongoing_trigger``).
-* ``system_settings`` — queue ``system``, concurrency (SAQ_WORKER_CONCURRENCY,
+* ``system_settings`` â€” queue ``system``, concurrency (SAQ_WORKER_CONCURRENCY,
   default 5, deployed at 20 in prod/staging; the Redis pool must stay strictly
-  larger — see :func:`_effective_redis_pool_size`), web UI on 8081 bound
+  larger â€” see :func:`_effective_redis_pool_size`), web UI on 8081 bound
   to 127.0.0.1 (``fly ssh`` only), FAIL-CLOSED auth: refuses to boot unless
   ``SAQ_AUTH_PASSWORD`` and ``SAQ_AUTH_USERNAME`` are set. Owns the system
   crons: fire_due_triggers, dispatcher_reconcile, claim-expiry, retention,
@@ -26,13 +26,13 @@ Staging configures the queue names via ``SAQ_RUNS_QUEUE=staging-runs``; the
 worker queue names ALWAYS derive from ``settings.saq_runs_queue`` so workers,
 ``dispatch_run``, ``fire_due_triggers``, and the health gate stay in sync.
 
-SAQ 0.26.4 CLI invocation (no ``worker`` subcommand — the settings path is the
+SAQ 0.26.4 CLI invocation (no ``worker`` subcommand â€” the settings path is the
 only positional arg)::
 
     python -m saq core.saq_worker.runs_settings
 
 The ``runs`` worker has no web UI and uses the plain CLI. The ``system`` worker
-MUST NOT use ``python -m saq core.saq_worker.system_settings --web`` — the plain
+MUST NOT use ``python -m saq core.saq_worker.system_settings --web`` â€” the plain
 ``--web`` CLI binds 0.0.0.0 (aiohttp ``run_app`` has no ``host`` flag) and does
 NOT set the ``AUTH_PASSWORD``/``AUTH_USER`` env vars that ``saq/web/aiohttp.py``
 requires for BasicAuth. The system worker therefore ships a CUSTOM RUNNER
@@ -78,7 +78,7 @@ _DEQUEUE_TIMEOUT = 5
 # worker_info:89 -> TTL 90 (timer+1 is ALWAYS the TTL in saq 0.26.4).
 _TIMERS: dict[str, float] = {"schedule": 5, "worker_info": 89, "sweep": 60, "abort": 1}
 
-# System-cron cadences (5-field form — croniter parses 5 fields, so the 30s
+# System-cron cadences (5-field form â€” croniter parses 5 fields, so the 30s
 # intent is not achievable; every minute is the floor).
 _CRON_EVERY_MINUTE = "* * * * *"
 _CRON_EVERY_5_MINUTES = "*/5 * * * *"
@@ -107,7 +107,7 @@ def _sync_interval_to_cron(interval_seconds: int) -> str:
 _SYSTEM_WEB_HOST = "127.0.0.1"
 _SYSTEM_WEB_PORT = 8081
 
-# Engine for run execution (SAQ path) — the shared per-process engine (D4).
+# Engine for run execution (SAQ path) â€” the shared per-process engine (D4).
 # ``get_shared_engine`` builds ONE engine per process with the Fly/HAProxy
 # knobs (pool_pre_ping, statement_cache_size=0); the per-worker pool budget
 # (``saq_worker_db_pool_size``) is passed as the creation-time override. The
@@ -146,12 +146,12 @@ def _get_async_engine() -> AsyncEngine:
 def _max_concurrent_ops(pool_size: int) -> int:
     """Clamp SAQ's ``max_concurrent_ops`` strictly below the Redis pool size.
 
-    The semaphore must never exhaust all available connections — leaving
+    The semaphore must never exhaust all available connections â€” leaving
     reserve connections for SAQ operations that bypass the semaphore
     (``schedule``, ``sweep``, ``dequeue``, ``notify``). The old
     ``max(pool_size - 5, 5)`` clamp was broken: at pool_size 5 it allowed
     ``max_ops == pool_size`` (zero reserve) and for pool_size < 5 it allowed
-    ``max_ops > pool_size`` — the exact 'Too many connections' exhaustion it
+    ``max_ops > pool_size`` â€” the exact 'Too many connections' exhaustion it
     claims to prevent.
 
     The correct clamp always leaves at least one reserve connection: small
@@ -169,7 +169,7 @@ def _effective_redis_pool_size(pool_size: int, concurrency: int) -> int:
     """Guarantee the SAQ Redis pool is large enough for blocking dequeue.
 
     SAQ's ``dequeue()`` uses a blocking ``blmove`` (``_DEQUEUE_TIMEOUT``) that
-    is NOT gated by ``max_concurrent_ops`` — every concurrent ``_process``
+    is NOT gated by ``max_concurrent_ops`` â€” every concurrent ``_process``
     task holds one pool connection while blocked. When the queue drains, all
     ``concurrency`` connections can be held simultaneously, leaving nothing
     for the Upkeep tasks (``schedule``/``sweep``/``abort``/``worker_info``),
@@ -183,32 +183,43 @@ def _effective_redis_pool_size(pool_size: int, concurrency: int) -> int:
     return max(pool_size, concurrency + reserve)
 
 
+# Estimated DB connections drawn per in-flight run. A single run is not one
+# connection: ``load_and_setup`` opens its own session, the executor holds a
+# connection through ``execute``/``resume``, and the heartbeat/watchdog
+# terminalize path (``fail_run_terminal``) needs a slot to fail a run that
+# wedges in setup. Sizing the floor for this fan-out (rather than assuming 1
+# connection/run) is what prevents the pool from being exhausted in pre-node
+# setup â€” the agent.stall root cause.
+CONNS_PER_RUN = 3
+
+
 def _effective_db_pool_size(pool_size: int, concurrency: int) -> int:
     """Guarantee the worker async DB pool is large enough for concurrent runs.
 
-    Every concurrent run holds one DB connection through pre-node setup
-    (``claim_run_async`` / ``load_and_setup`` / ``executor.execute``), and the
-    zombie watchdog's terminalize write (``fail_run_terminal``) needs a
-    connection to fail a run that wedges in that window. With
-    ``SAQ_WORKER_CONCURRENCY=20`` and a pool smaller than ``concurrency + 5``,
-    the worker can exhaust its pool in setup and the watchdog cannot get a slot
-    to terminalize — the run rides to the 35-min ``dispatcher_reconcile``
-    backstop as a nodeless zombie (the agent.stall symptom).
+    Each concurrent run draws multiple DB connections (see :data:`CONNS_PER_RUN`),
+    and the zombie watchdog's terminalize write (``fail_run_terminal``) needs a
+    connection to fail a run that wedges in pre-node setup. With
+    ``SAQ_WORKER_CONCURRENCY=20`` and 1 connection/run assumed (as the old
+    ``concurrency + 5`` floor did), a 30-conn pool is exhausted (20 runs Ã— 2-3
+    conns = 40-60 > 30) and ``load_and_setup`` wedges awaiting a connection â€”
+    the run rides to the 35-min ``dispatcher_reconcile`` backstop as a nodeless
+    zombie (the agent.stall symptom).
 
     Mirror :func:`_effective_redis_pool_size`: enforce
-    ``pool >= concurrency + 5`` where the reserve covers the watchdog
-    terminalize writes plus any system-cron connections sharing the same
-    engine.
+    ``pool >= concurrency * CONNS_PER_RUN + reserve`` so the floor covers the
+    per-run connection fan-out plus a reserve for the watchdog terminalize
+    writes and any system-cron connections sharing the same engine.
     """
     reserve = 5
-    return max(pool_size, concurrency + reserve)
+    floor = concurrency * CONNS_PER_RUN + reserve
+    return max(pool_size, floor)
 
 
 def _build_queue(queue_name: str) -> RedisQueue:
     """Build an SAQ RedisQueue with the Upstash-pinned client knobs (F2).
 
     ``max_concurrent_ops`` is set below the pool size so the semaphore never
-    exhausts all available connections — leaving reserve connections for SAQ
+    exhausts all available connections â€” leaving reserve connections for SAQ
     operations that bypass the semaphore (``schedule``, ``sweep``, ``dequeue``,
     ``notify``).
 
@@ -244,7 +255,7 @@ def _build_queue(queue_name: str) -> RedisQueue:
 def _check_redis_connection(redis_client: aioredis.Redis, max_retries: int = 3) -> None:
     """Validate Redis connectivity on worker startup with exponential backoff.
 
-    Synchronous — called from the settings factory before the event loop is
+    Synchronous â€” called from the settings factory before the event loop is
     available. The async ``redis_client`` handed to SAQ is NOT pinged here:
     ``redis.asyncio`` pools are loop-affine, so awaiting its ``ping()`` in a
     throwaway probe loop would bind the pool to a discarded loop and break the
@@ -269,7 +280,7 @@ def _check_redis_connection(redis_client: aioredis.Redis, max_retries: int = 3) 
                 if attempt < max_retries:
                     delay = 2**attempt
                     _log.warning(
-                        "Redis ping failed (attempt %d/%d): %s — retrying in %ds",
+                        "Redis ping failed (attempt %d/%d): %s â€” retrying in %ds",
                         attempt,
                         max_retries,
                         exc,
@@ -277,7 +288,7 @@ def _check_redis_connection(redis_client: aioredis.Redis, max_retries: int = 3) 
                     )
                     time.sleep(delay)
         _log.error(
-            "Redis unreachable after %d attempts: %s — worker proceeding anyway",
+            "Redis unreachable after %d attempts: %s â€” worker proceeding anyway",
             max_retries,
             last_exc,
         )
@@ -288,9 +299,9 @@ def _check_redis_connection(redis_client: aioredis.Redis, max_retries: int = 3) 
 def _probe_database() -> None:
     """Run a lightweight DB probe (``SELECT 1``) on worker startup.
 
-    Uses a synchronous SQLAlchemy connection with a short timeout. Non-fatal —
+    Uses a synchronous SQLAlchemy connection with a short timeout. Non-fatal â€”
     the DB may recover before the first real job arrives. Logs a warning on
-    failure. The sync URL maps to ``psycopg`` (v3, the installed driver) — NOT
+    failure. The sync URL maps to ``psycopg`` (v3, the installed driver) â€” NOT
     ``psycopg2``, which is not in the dependency tree.
     """
     from sqlalchemy import create_engine, text
@@ -304,21 +315,21 @@ def _probe_database() -> None:
             conn.execute(text("SELECT 1"))
         _log.info("Database connection probe passed")
     except Exception as exc:
-        _log.warning("Database probe failed (non-fatal): %s — DB may recover before first job", exc)
+        _log.warning("Database probe failed (non-fatal): %s â€” DB may recover before first job", exc)
     finally:
         if engine is not None:
             engine.dispose()
 
 
 # ---------------------------------------------------------------------------
-# Job functions — execute / resume (plan F4 / F6a)
+# Job functions â€” execute / resume (plan F4 / F6a)
 # ---------------------------------------------------------------------------
 
 
 async def execute_run(
     ctx: dict[str, Any], *, run_id: str, org_id: str, claim_token: str | None = None
 ) -> dict[str, Any]:
-    """SAQ ``execute_run`` job — claim + execute + complete (SAQ claim window).
+    """SAQ ``execute_run`` job â€” claim + execute + complete (SAQ claim window).
 
     Zombie protection (2026-08-05): the heartbeat loop starts BEFORE
     ``executor.execute``, so a run hung in the pre-node setup window (checkpointer
@@ -332,7 +343,7 @@ async def execute_run(
 
     The ``claim_token`` kwarg is the stale token stamped into this job's kwargs
     by a previous attempt (PR #1003). SAQ retries re-invoke this function with
-    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here —
+    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here â€”
     a fresh claim is taken inside via ``claim_run_async`` and the fresh token is
     re-stamped.
     """
@@ -368,8 +379,27 @@ async def execute_run(
         except Exception:
             _log.warning("SAQ execute_run: job kwargs stamp failed for run %s", rid)
 
+    settings = get_settings()
     try:
-        run, executor = await load_and_setup(aeng, rid, oid)
+        run, executor = await asyncio.wait_for(
+            load_and_setup(aeng, rid, oid),
+            timeout=settings.saq_setup_grace_seconds,
+        )
+    except TimeoutError:
+        _log.exception("SAQ execute_run: load_and_setup timed out for run %s", rid)
+        await fail_run_terminal(
+            aeng,
+            run_id,
+            org_id,
+            error_code=EXECUTOR_SETUP_FAILED_ERROR_CODE,
+            error_detail=(
+                f"load_and_setup (pre-node setup) exceeded setup grace "
+                f"({settings.saq_setup_grace_seconds}s) â€” likely DB connection "
+                "exhaustion or a wedged worker; was riding to the 35-min "
+                "agent.stall backstop"
+            ),
+        )
+        return {"status": "setup_failed"}
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -417,11 +447,11 @@ async def resume_run(
     resume_data: dict[str, Any] | None = None,
     claim_token: str | None = None,
 ) -> dict[str, Any]:
-    """SAQ ``resume_run`` job — claim (awaiting_human/claimed or stale-running) + resume.
+    """SAQ ``resume_run`` job â€” claim (awaiting_human/claimed or stale-running) + resume.
 
     The ``claim_token`` kwarg is the stale token stamped into this job's kwargs
     by a previous attempt (PR #1003). SAQ retries re-invoke this function with
-    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here —
+    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here â€”
     the core claim (``claim_resume_run_async``) generates its own fresh token.
     """
     from modulo.core.pipeline_execution import resume_run as resume_run_core
@@ -437,7 +467,7 @@ async def resume_run(
 
 
 # ---------------------------------------------------------------------------
-# Job functions — per-item fire jobs (plan F1)
+# Job functions â€” per-item fire jobs (plan F1)
 # ---------------------------------------------------------------------------
 
 
@@ -471,7 +501,7 @@ async def fire_cron_trigger(
     cron_expression: str,
     snapshot_id: str = "",
 ) -> dict[str, Any]:
-    """Per-item cron fire job — fire + dispatch the created run (SAQ)."""
+    """Per-item cron fire job â€” fire + dispatch the created run (SAQ)."""
     from modulo.core import cron_helpers as _ch
 
     result = await _ch.fire_cron_trigger(
@@ -494,7 +524,7 @@ async def fire_polling_trigger(
     poll_query: str,
     condition_expression: str | None = None,
 ) -> dict[str, Any]:
-    """Per-item polling fire job — fire + dispatch the created run (SAQ)."""
+    """Per-item polling fire job â€” fire + dispatch the created run (SAQ)."""
     from modulo.core import cron_helpers as _ch
 
     result = await _ch.fire_polling_trigger(
@@ -509,7 +539,7 @@ async def fire_polling_trigger(
 
 
 async def fire_report_trigger(ctx: dict[str, Any], *, report_id: str, org_id: str) -> dict[str, Any]:
-    """Per-item report fire job — generate + deliver (SAQ bounded job)."""
+    """Per-item report fire job â€” generate + deliver (SAQ bounded job)."""
     from modulo.core import cron_helpers as _ch
 
     return await _ch.fire_report_trigger(report_id=uuid.UUID(report_id), org_id=uuid.UUID(org_id))
@@ -523,7 +553,7 @@ async def fire_ongoing_trigger(
     pipeline_id: str,
     latest_snapshot_id: str = "",
 ) -> dict[str, Any]:
-    """Per-item ongoing fire job — top up + dispatch the created runs (SAQ).
+    """Per-item ongoing fire job â€” top up + dispatch the created runs (SAQ).
 
     Thin wrapper mirroring ``fire_polling_trigger``: delegates to
     ``cron_helpers.fire_ongoing_trigger``, which performs the DB top-up in one
@@ -542,26 +572,26 @@ async def fire_ongoing_trigger(
 
 
 # ---------------------------------------------------------------------------
-# Job functions — system worker (plan F1 / F3c / PR B step 6)
+# Job functions â€” system worker (plan F1 / F3c / PR B step 6)
 # ---------------------------------------------------------------------------
 
 
 async def fire_due_triggers(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — read due rows, atomic next_fire_at advance, enqueue fire jobs."""
+    """System cron â€” read due rows, atomic next_fire_at advance, enqueue fire jobs."""
     from modulo.core import cron_helpers as _ch
 
     return await _ch.fire_due_triggers()
 
 
 async def dispatcher_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — re-dispatch runs whose SAQ job is missing (every 60s)."""
+    """System cron â€” re-dispatch runs whose SAQ job is missing (every 60s)."""
     from modulo.core import cron_helpers as _ch
 
     return await _ch.dispatcher_reconcile()
 
 
 async def claim_expiry(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — expire stale HITL claims (SAQ SOLE writer/notifier, F1)."""
+    """System cron â€” expire stale HITL claims (SAQ SOLE writer/notifier, F1)."""
     from modulo.core.hitl_manager.expiry_job import expire_stale_claims
     from modulo.core.notifier import Notifier
 
@@ -571,13 +601,13 @@ async def claim_expiry(ctx: dict[str, Any]) -> dict[str, Any]:
     try:
         notifier = Notifier(_get_async_engine(), settings.fernet_key)
     except Exception:
-        _log.exception("claim_expiry: notifier init failed — DB expiry still runs")
+        _log.exception("claim_expiry: notifier init failed â€” DB expiry still runs")
     expired = await expire_stale_claims(factory, notifier=notifier)
     return {"expired": len(expired)}
 
 
 async def hitl_overdue(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — dispatch ``hitl_overdue`` notifications for HITL gates that
+    """System cron â€” dispatch ``hitl_overdue`` notifications for HITL gates that
     have been waiting past the overdue threshold (idempotent per claim).
     """
     from modulo.core.hitl_manager.overdue_warning import dispatch_overdue_notifications
@@ -589,13 +619,13 @@ async def hitl_overdue(ctx: dict[str, Any]) -> dict[str, Any]:
     try:
         notifier = Notifier(_get_async_engine(), settings.fernet_key)
     except Exception:
-        _log.exception("hitl_overdue: notifier init failed — overdue dispatch still runs")
+        _log.exception("hitl_overdue: notifier init failed â€” overdue dispatch still runs")
     dispatched = await dispatch_overdue_notifications(factory, notifier=notifier)
     return {"dispatched": len(dispatched)}
 
 
 async def retention_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — batch-delete terminal runs and old LangGraph checkpoint rows.
+    """System cron â€” batch-delete terminal runs and old LangGraph checkpoint rows.
 
     Deletes terminal ``runs`` rows older than the retention window (via
     ``batch_delete_old_terminal_runs``) AND purges LangGraph checkpoint rows
@@ -610,8 +640,8 @@ async def retention_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
     wrapper for the DBAPI's missing-table/column errors, e.g. psycopg's
     ``UndefinedTable``/``UndefinedColumn``) is caught, logged as a warning, and
     the job still reports the runs purge count (``checkpoints_deleted=0``)
-    without failing — the app boot creates the schema later. The retention
-    session is system-scoped (modulo_system role, LOGIN, BYPASSRLS) — checkpoint
+    without failing â€” the app boot creates the schema later. The retention
+    session is system-scoped (modulo_system role, LOGIN, BYPASSRLS) â€” checkpoint
     retention is cross-org by design and operates on the saver's unqualified
     tables.
     """
@@ -643,7 +673,7 @@ async def retention_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def webhook_dedup_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — purge old webhook trigger events (30-day retention).
+    """System cron â€” purge old webhook trigger events (30-day retention).
 
     The system session factory is ``autobegin=False`` (the codebase DI
     convention), so every batch needs an explicit transaction: the first
@@ -666,7 +696,7 @@ async def webhook_dedup_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def trigger_events_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — age-based retention for trigger_events (90-day default).
+    """System cron â€” age-based retention for trigger_events (90-day default).
 
     Deletes ``trigger_events`` rows whose ``received_at`` is older than the
     retention window (default 90 days, aligned with the run-retention policy)
@@ -675,7 +705,7 @@ async def trigger_events_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
 
     Mirrors ``webhook_dedup_cleanup``: the system session factory is
     ``autobegin=False`` (the codebase DI convention), so every batch needs an
-    explicit transaction — the first ``session.execute`` would otherwise raise
+    explicit transaction â€” the first ``session.execute`` would otherwise raise
     ``InvalidRequestError: Autobegin is disabled on this Session``. The
     transaction must begin PER BATCH (not once around the loop) because
     ``cleanup_old_trigger_events`` commits at the end of each pass.
@@ -705,7 +735,7 @@ STALE_RUN_RECOVERY_STALE_SECONDS = 15 * 60
 
 
 async def stale_run_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — legacy stale-run sweep, scoped to non-SAQ rows (F1).
+    """System cron â€” legacy stale-run sweep, scoped to non-SAQ rows (F1).
 
     The sweep itself (``pipeline_execution.stale_run_recovery_sweep``) returns a
     plain integer count; this wrapper ALSO persists a stats dict to the shared
@@ -736,7 +766,7 @@ async def stale_run_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def cost_probe(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — the cost-tracking probe (spec §4.7, every 5 min, retries=0).
+    """System cron â€” the cost-tracking probe (spec Â§4.7, every 5 min, retries=0).
 
     The verification canary for the ledger/report system: samples the N=50 most
     recent terminal runs per org, checks ``total == sum``, asserts the org-row
@@ -750,7 +780,7 @@ async def cost_probe(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def analytics_facts_maintenance(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — daily run-facts backfill + reconcile + retention (ADR 020).
+    """System cron â€” daily run-facts backfill + reconcile + retention (ADR 020).
 
     System cron: uses modulo_system role (LOGIN, BYPASSRLS) for cross-org access.
     modulo_app is NOBYPASSRLS. Non-Postgres backends no-op.
@@ -761,7 +791,7 @@ async def analytics_facts_maintenance(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def journey_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — hourly bounded journey reconciliation sweep (FAR-143).
+    """System cron â€” hourly bounded journey reconciliation sweep (FAR-143).
 
     Re-derives ``journeys`` evidence from terminal runs whose journey rows are
     MISSING or STALE (see ``modulo.core.lifecycle_map.reconcile``). System cron:
@@ -779,13 +809,13 @@ async def journey_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def check_missed_fire_alerts_cron(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — hourly missed-fire probe for silent low-cadence triggers.
+    """System cron â€” hourly missed-fire probe for silent low-cadence triggers.
 
     Delegates to :func:`modulo.core.error_tracking.check_missed_fire_alerts`,
     which alerts for active cron/polling triggers whose cadence is >= 1h and
     whose ``last_fired_at`` is stale (throttled by an in-memory cooldown).
 
-    Uses the 5-field expression ``"0 * * * *"`` — NOT the 6-field form, which
+    Uses the 5-field expression ``"0 * * * *"`` â€” NOT the 6-field form, which
     croniter parses with a leading seconds field and fires on the wrong cadence
     (the bug class documented on ``cost_probe`` / bug #680).
     """
@@ -798,7 +828,7 @@ async def check_missed_fire_alerts_cron(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def library_sync(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — periodic community-library sync (FAR-363).
+    """System cron â€” periodic community-library sync (FAR-363).
 
     No-op when ``modulo_library_endpoint`` is empty (library not configured).
     Never raises (fail-open): ``sync_library`` already returns a result on every
@@ -828,7 +858,7 @@ async def library_sync(ctx: dict[str, Any]) -> dict[str, Any]:
 
 
 async def metrics_dump(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — daily product analytics metrics dump (FAR-356).
+    """System cron â€” daily product analytics metrics dump (FAR-356).
 
     Builds an aggregate payload from all consenting orgs and POSTs it to
     the vendor endpoint.  Skips when: no consenting orgs or instance switch
@@ -847,7 +877,7 @@ _HOSTNAME = os.environ.get("FLY_MACHINE_ID") or os.environ.get("HOSTNAME") or "u
 
 
 def _runs_queue_name() -> str:
-    """Runs worker queue — derives from ``SAQ_RUNS_QUEUE`` (settings).
+    """Runs worker queue â€” derives from ``SAQ_RUNS_QUEUE`` (settings).
 
     ``dispatch_run``, ``fire_due_triggers``, and the health gate all enqueue/
     check this exact queue name; the worker MUST listen on the same one or jobs
@@ -857,7 +887,7 @@ def _runs_queue_name() -> str:
 
 
 def _system_queue_name() -> str:
-    """System worker queue — derived from the runs queue.
+    """System worker queue â€” derived from the runs queue.
 
     Matches ``health._configured_queues`` (``runs_queue.replace("runs",
     "system")``) so the readiness gate checks the queues the workers actually
@@ -896,7 +926,7 @@ def _make_session_factory() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# System cron engine — dedicated modulo_system role (LOGIN, BYPASSRLS)
+# System cron engine â€” dedicated modulo_system role (LOGIN, BYPASSRLS)
 # ---------------------------------------------------------------------------
 
 _SYSTEM_ASYNC_ENGINE: AsyncEngine | None = None
@@ -909,7 +939,7 @@ def _get_system_async_engine() -> AsyncEngine:
     so deployments that haven't provisioned the system role still work. The
     fallback runs system crons as modulo_app, which is NOBYPASSRLS (see
     bootstrap_role.py: the app role asserts ``rolbypassrls = false``), so any
-    RLS-scoped reads silently return zero rows — a warning is emitted to surface
+    RLS-scoped reads silently return zero rows â€” a warning is emitted to surface
     that the system role is unprovisioned.
     """
     global _SYSTEM_ASYNC_ENGINE
@@ -940,7 +970,7 @@ def _get_system_async_engine() -> AsyncEngine:
                 "saq_worker.system_engine_fallback",
                 extra={
                     "reason": (
-                        "MODULO_SYSTEM_DATABASE_URL not set — system crons run as modulo_app "
+                        "MODULO_SYSTEM_DATABASE_URL not set â€” system crons run as modulo_app "
                         "(NOBYPASSRLS); RLS-scoped reads return zero rows"
                     )
                 },
@@ -952,7 +982,7 @@ def _get_system_async_engine() -> AsyncEngine:
 def _make_system_session_factory() -> Any:
     """Session factory for cross-org system crons (modulo_system role).
 
-    Does NOT include the RLS reset hook — system crons operate cross-org
+    Does NOT include the RLS reset hook â€” system crons operate cross-org
     intentionally and never call set_rls_org.
     """
     from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -998,10 +1028,10 @@ def _system_functions() -> list[Any]:
 
 
 def _system_cron_jobs() -> list[CronJob[Any]]:
-    """System cron jobs (plan F1) — all knobs explicit."""
+    """System cron jobs (plan F1) â€” all knobs explicit."""
     return [
         # fire_due_triggers: every 60s (croniter parses 5-field cron, so the
-        # 30s intent is not achievable — every minute); the atomic next_fire_at
+        # 30s intent is not achievable â€” every minute); the atomic next_fire_at
         # advance makes multi-machine ticks safe (unique=True only prevents overlap).
         CronJob(
             fire_due_triggers,
@@ -1022,7 +1052,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=3,
             ttl=300,
         ),
-        # claim-expiry: every 60s — SAQ cron is the SOLE writer/notifier (F1).
+        # claim-expiry: every 60s â€” SAQ cron is the SOLE writer/notifier (F1).
         CronJob(
             claim_expiry,
             cron=_CRON_EVERY_MINUTE,
@@ -1032,7 +1062,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=2,
             ttl=300,
         ),
-        # hitl-overdue: every 5 minutes — overdue thresholds are hour-scale, so
+        # hitl-overdue: every 5 minutes â€” overdue thresholds are hour-scale, so
         # a 5-min tick keeps latency low while avoiding contention with the
         # claim-expiry sweep; unique so overlapping ticks cannot double-dispatch.
         CronJob(
@@ -1065,7 +1095,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             ttl=300,
         ),
         # trigger_events retention: hourly, unique=True so overlapping ticks
-        # cannot interleave (bounded + idempotent — a second instance can only
+        # cannot interleave (bounded + idempotent â€” a second instance can only
         # find nothing left to delete).
         CronJob(
             trigger_events_cleanup,
@@ -1087,10 +1117,10 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=2,
             ttl=300,
         ),
-        # cost_probe: every 5 min, retries=0 (pinned — a dead probe is caught
+        # cost_probe: every 5 min, retries=0 (pinned â€” a dead probe is caught
         # separately by the heartbeat/staleness alert), unique=True so a second
-        # overlapping instance cannot double-advance probe_state (§4.7).
-        # NOTE: must be the 5-field form "*/5 * * * *" — croniter parses a
+        # overlapping instance cannot double-advance probe_state (Â§4.7).
+        # NOTE: must be the 5-field form "*/5 * * * *" â€” croniter parses a
         # 6-field expression ("0 */5 * * * *") differently and the probe fires
         # per-5-hours instead of per-5-minutes (bug class #680).
         CronJob(
@@ -1102,7 +1132,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=0,
             ttl=300,
         ),
-        # analytics_facts_maintenance: daily (idempotent — the anti-join +
+        # analytics_facts_maintenance: daily (idempotent â€” the anti-join +
         # ON CONFLICT DO NOTHING make overlap harmless), unique=True so a
         # second instance cannot double-run a maintenance day-slice.
         CronJob(
@@ -1114,7 +1144,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=1,
             ttl=900,
         ),
-        # journey_reconcile: hourly (bounded + idempotent — a second instance
+        # journey_reconcile: hourly (bounded + idempotent â€” a second instance
         # cannot double-advance because a reconciled ref is no longer drift),
         # unique=True so overlapping ticks cannot interleave. The sweep drains
         # oldest-first across ticks.
@@ -1129,7 +1159,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
         ),
         # check_missed_fire_alerts: hourly (the probe only targets triggers
         # with a >= 1h cadence, so an hourly tick with its own cooldown is
-        # ample). NOTE: must be the 5-field form "0 * * * *" — croniter parses
+        # ample). NOTE: must be the 5-field form "0 * * * *" â€” croniter parses
         # a 6-field expression with a leading seconds field differently (bug
         # class #680).
         CronJob(
@@ -1198,12 +1228,12 @@ def system_settings() -> dict[str, Any]:
 
 
 def staging_runs_settings() -> dict[str, Any]:
-    """Staging ``runs`` worker — queue derives from ``SAQ_RUNS_QUEUE=staging-runs``."""
+    """Staging ``runs`` worker â€” queue derives from ``SAQ_RUNS_QUEUE=staging-runs``."""
     return _base_worker_settings(_runs_queue_name(), _runs_functions())
 
 
 def staging_system_settings() -> dict[str, Any]:
-    """Staging ``system`` worker — queue derives from the staging runs queue."""
+    """Staging ``system`` worker â€” queue derives from the staging runs queue."""
     _assert_system_auth_configured()
     return {**_base_worker_settings(_system_queue_name(), _system_functions()), "cron_jobs": _system_cron_jobs()}
 
@@ -1214,7 +1244,7 @@ def run_system_web() -> None:
     aiohttp ``run_app`` has no ``host`` flag and defaults to 0.0.0.0; this
     runner passes ``host="127.0.0.1"`` so the web UI is only reachable via
     ``fly ssh`` (plan F8). SAQ's web reads ``AUTH_PASSWORD`` / ``AUTH_USER``
-    from the environment (``saq/web/aiohttp.py``) — map the settings values
+    from the environment (``saq/web/aiohttp.py``) â€” map the settings values
     there. Auth is fail-closed: boot raises if either value is unset.
     """
     from aiohttp import web
@@ -1253,7 +1283,7 @@ def run_system_web() -> None:
         except asyncio.CancelledError:
             raise
         except Exception:
-            _log.exception("SAQ system worker failed to start — exiting gracefully")
+            _log.exception("SAQ system worker failed to start â€” exiting gracefully")
             sys.exit(1)
         finally:
             await worker.queue.disconnect()
