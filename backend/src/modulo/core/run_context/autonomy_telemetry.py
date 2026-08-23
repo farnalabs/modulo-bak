@@ -51,6 +51,7 @@ metrics derived from this event stream.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Callable
@@ -105,8 +106,17 @@ async def emit_autonomy_telemetry(
         return
     try:
         from modulo.core.audit_logger import append_audit_event
+        from modulo.db.rls import set_rls_execution_context, set_rls_org
 
-        async with session_factory() as session:
+        async with session_factory() as session, session.begin():
+            # STRICT RLS guards audit_events: without the org + execution-context
+            # settings established inside the transaction the INSERT is rejected
+            # by the rls_org_isolation policy (app.organisation_id must equal
+            # organisation_id), and without session.begin() the open transaction
+            # is rolled back on close so the event never persists. This mirrors
+            # the sibling mid-run helper _append_conformance_audit exactly.
+            await set_rls_org(session, org_id)
+            await set_rls_execution_context(session)
             await append_audit_event(
                 session,
                 org_id=org_id,
@@ -123,5 +133,7 @@ async def emit_autonomy_telemetry(
                 },
                 request_id=None,
             )
+    except asyncio.CancelledError:
+        raise
     except Exception:  # pragma: no cover - fail-open telemetry
         _log.exception("autonomy_telemetry: failed to record event (ignored)")

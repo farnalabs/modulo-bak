@@ -11,7 +11,23 @@ from modulo.core.run_context import autonomy_telemetry as at
 pytestmark = pytest.mark.asyncio
 
 
+class _NullBegin:
+    """Async context manager returned by ``_NullSession.begin()``."""
+
+    async def __aenter__(self) -> Any:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
 class _NullSession:
+    """Minimal session stand-in: supports ``async with session_factory() as
+    session, session.begin():`` without a real DB."""
+
+    def begin(self) -> Any:
+        return _NullBegin()
+
     async def __aenter__(self) -> Any:
         return self
 
@@ -26,8 +42,12 @@ def _session_factory() -> Any:
 async def test_emits_event_with_expected_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     import modulo.core.audit_logger as al
 
-    mock = AsyncMock()
-    monkeypatch.setattr(al, "append_audit_event", mock)
+    append = AsyncMock()
+    monkeypatch.setattr(al, "append_audit_event", append)
+    set_org = AsyncMock()
+    set_ctx = AsyncMock()
+    monkeypatch.setattr("modulo.db.rls.set_rls_org", set_org)
+    monkeypatch.setattr("modulo.db.rls.set_rls_execution_context", set_ctx)
 
     org_id = uuid.uuid4()
     run_id = uuid.uuid4()
@@ -43,8 +63,15 @@ async def test_emits_event_with_expected_payload(monkeypatch: pytest.MonkeyPatch
         pipeline_id=pipeline_id,
     )
 
-    assert mock.await_count == 1
-    _, kwargs = mock.call_args
+    # RLS context MUST be established on the session before the audit write,
+    # otherwise the INSERT into the STRICT-RLS audit_events table is rejected in
+    # production and the event silently never lands (the original bug).
+    assert set_org.await_count == 1
+    assert set_org.call_args.args[1] == org_id
+    assert set_ctx.await_count == 1
+
+    assert append.await_count == 1
+    _, kwargs = append.call_args
     captured = kwargs
     assert captured["event_type"] == at.AUTONOMY_LEVEL_APPLIED
     assert captured["org_id"] == org_id
@@ -61,6 +88,10 @@ async def test_noop_when_session_factory_missing(monkeypatch: pytest.MonkeyPatch
 
     mock = AsyncMock()
     monkeypatch.setattr(al, "append_audit_event", mock)
+    set_org = AsyncMock()
+    set_ctx = AsyncMock()
+    monkeypatch.setattr("modulo.db.rls.set_rls_org", set_org)
+    monkeypatch.setattr("modulo.db.rls.set_rls_execution_context", set_ctx)
 
     await at.emit_autonomy_telemetry(
         None,
@@ -71,6 +102,8 @@ async def test_noop_when_session_factory_missing(monkeypatch: pytest.MonkeyPatch
         gate_outcome="fired",
     )
     assert mock.await_count == 0
+    assert set_org.await_count == 0
+    assert set_ctx.await_count == 0
 
 
 async def test_invalid_gate_outcome_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,6 +111,10 @@ async def test_invalid_gate_outcome_is_skipped(monkeypatch: pytest.MonkeyPatch) 
 
     mock = AsyncMock()
     monkeypatch.setattr(al, "append_audit_event", mock)
+    set_org = AsyncMock()
+    set_ctx = AsyncMock()
+    monkeypatch.setattr("modulo.db.rls.set_rls_org", set_org)
+    monkeypatch.setattr("modulo.db.rls.set_rls_execution_context", set_ctx)
 
     await at.emit_autonomy_telemetry(
         _session_factory,
@@ -88,6 +125,8 @@ async def test_invalid_gate_outcome_is_skipped(monkeypatch: pytest.MonkeyPatch) 
         gate_outcome="bogus",
     )
     assert mock.await_count == 0
+    assert set_org.await_count == 0
+    assert set_ctx.await_count == 0
 
 
 async def test_failure_is_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -97,6 +136,10 @@ async def test_failure_is_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
         raise RuntimeError("db down")
 
     monkeypatch.setattr(al, "append_audit_event", _boom)
+    set_org = AsyncMock()
+    set_ctx = AsyncMock()
+    monkeypatch.setattr("modulo.db.rls.set_rls_org", set_org)
+    monkeypatch.setattr("modulo.db.rls.set_rls_execution_context", set_ctx)
 
     # Must not raise — telemetry failures must never break a run.
     await at.emit_autonomy_telemetry(
@@ -107,3 +150,7 @@ async def test_failure_is_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
         autonomy_level="notify_on_complete",
         gate_outcome="auto_approved",
     )
+
+    # RLS context is still set before the (failing) write.
+    assert set_org.await_count == 1
+    assert set_ctx.await_count == 1
