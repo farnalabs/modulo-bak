@@ -17,6 +17,8 @@ from typing import Any, ClassVar
 
 import yaml
 
+from modulo.core.manifest import _load_manifest_yaml, get_manifest_path
+
 _log = logging.getLogger(__name__)
 
 
@@ -63,19 +65,15 @@ class DocumentationIndex:
 
     @classmethod
     def build(cls, manifest_path: str | Path | None = None) -> DocumentationIndex:
-        if manifest_path:
-            path = Path(manifest_path)
-        else:
-            path = Path(__file__).resolve().parents[4] / "frontend" / "src" / "manifest.yaml"
+        path = Path(manifest_path) if manifest_path else get_manifest_path()
 
         if not path.exists():
             _log.warning("Manifest not found at %s — returning empty index", path)
             return cls()
 
         try:
-            with path.open("r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh)
-        except (yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
+            data = _load_manifest_yaml(path)
+        except (yaml.YAMLError, OSError) as exc:
             _log.error("Failed to load manifest at %s: %s", path, exc)
             return cls()
 
