@@ -23,11 +23,11 @@ def _session_factory() -> Any:
     return _NullSession()
 
 
-async def test_emits_event_with_expected_payload() -> None:
+async def test_emits_event_with_expected_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     import modulo.core.audit_logger as al
 
-    captured: dict[str, Any] = {}
-    al.append_audit_event = AsyncMock()
+    mock = AsyncMock()
+    monkeypatch.setattr(al, "append_audit_event", mock)
 
     org_id = uuid.uuid4()
     run_id = uuid.uuid4()
@@ -43,8 +43,8 @@ async def test_emits_event_with_expected_payload() -> None:
         pipeline_id=pipeline_id,
     )
 
-    assert al.append_audit_event.await_count == 1
-    _, kwargs = al.append_audit_event.call_args
+    assert mock.await_count == 1
+    _, kwargs = mock.call_args
     captured = kwargs
     assert captured["event_type"] == at.AUTONOMY_LEVEL_APPLIED
     assert captured["org_id"] == org_id
@@ -56,10 +56,11 @@ async def test_emits_event_with_expected_payload() -> None:
     assert str(captured["payload_json"]["pipeline_id"]) == str(pipeline_id)
 
 
-async def test_noop_when_session_factory_missing() -> None:
+async def test_noop_when_session_factory_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     import modulo.core.audit_logger as al
 
-    al.append_audit_event = AsyncMock()
+    mock = AsyncMock()
+    monkeypatch.setattr(al, "append_audit_event", mock)
 
     await at.emit_autonomy_telemetry(
         None,
@@ -69,13 +70,14 @@ async def test_noop_when_session_factory_missing() -> None:
         autonomy_level="manual_approval",
         gate_outcome="fired",
     )
-    assert al.append_audit_event.await_count == 0
+    assert mock.await_count == 0
 
 
-async def test_invalid_gate_outcome_is_skipped() -> None:
+async def test_invalid_gate_outcome_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     import modulo.core.audit_logger as al
 
-    al.append_audit_event = AsyncMock()
+    mock = AsyncMock()
+    monkeypatch.setattr(al, "append_audit_event", mock)
 
     await at.emit_autonomy_telemetry(
         _session_factory,
@@ -85,16 +87,16 @@ async def test_invalid_gate_outcome_is_skipped() -> None:
         autonomy_level="manual_approval",
         gate_outcome="bogus",
     )
-    assert al.append_audit_event.await_count == 0
+    assert mock.await_count == 0
 
 
-async def test_failure_is_fail_open() -> None:
+async def test_failure_is_fail_open(monkeypatch: pytest.MonkeyPatch) -> None:
     import modulo.core.audit_logger as al
 
     async def _boom(*args: Any, **kwargs: Any) -> None:
         raise RuntimeError("db down")
 
-    al.append_audit_event = _boom
+    monkeypatch.setattr(al, "append_audit_event", _boom)
 
     # Must not raise — telemetry failures must never break a run.
     await at.emit_autonomy_telemetry(
