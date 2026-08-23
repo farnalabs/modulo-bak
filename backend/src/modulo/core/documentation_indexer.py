@@ -73,7 +73,7 @@ class DocumentationIndex:
 
         try:
             data = _load_manifest_yaml(path)
-        except (yaml.YAMLError, OSError) as exc:
+        except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
             _log.error("Failed to load manifest at %s: %s", path, exc)
             return cls()
 
