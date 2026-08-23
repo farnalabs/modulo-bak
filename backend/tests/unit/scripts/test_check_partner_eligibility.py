@@ -127,6 +127,121 @@ def test_no_osi_license_fails(now: _dt.datetime) -> None:
     assert result["criteria"]["license"]["reason"] == mod.RC_NO_OSI_LICENSE
 
 
+def test_no_osi_license_with_unknown_spdx_id(now: _dt.datetime) -> None:
+    # A non-OSI spdx id (e.g. LicenseRef-Unknown) with no LICENSE file -> fail.
+    ev = _base_evidence(now)
+    ev["spdx_id"] = "LicenseRef-Unknown"
+    ev["license_file_present"] = False
+    result = mod.evaluate_evidence(ev)
+    assert result["criteria"]["license"]["status"] == mod.STATUS_FAIL
+    assert result["criteria"]["license"]["reason"] == mod.RC_NO_OSI_LICENSE
+
+
+def test_license_file_fallback_with_null_spdx(now: _dt.datetime) -> None:
+    # spdx_id null (GitHub returned no license object) but a LICENSE file is
+    # detected -> the fallback path still passes the licence criterion.
+    ev = _base_evidence(now)
+    ev["spdx_id"] = None
+    ev["license_file_present"] = True
+    result = mod.evaluate_evidence(ev)
+    assert result["criteria"]["license"]["status"] == mod.STATUS_PASS
+    assert result["criteria"]["license"]["reason"] == mod.RC_LICENSE_FILE_FALLBACK
+
+
+def test_age_boundary_exactly_eligible(now: _dt.datetime) -> None:
+    # A repo exactly MIN_AGE_DAYS old is old enough to pass.
+    ev = _base_evidence(now)
+    ev["created_at"] = (now - _dt.timedelta(days=mod.MIN_AGE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = mod.evaluate_evidence(ev)
+    assert result["criteria"]["age"]["status"] == mod.STATUS_PASS
+    assert result["verdict"] == mod.VERDICT_ELIGIBLE
+
+
+def test_age_boundary_just_below_ineligible(now: _dt.datetime) -> None:
+    # One day under the boundary -> TOO_YOUNG (covers the ~5 months 29 days case).
+    ev = _base_evidence(now)
+    ev["created_at"] = (now - _dt.timedelta(days=mod.MIN_AGE_DAYS - 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result = mod.evaluate_evidence(ev)
+    assert result["criteria"]["age"]["status"] == mod.STATUS_FAIL
+    assert result["criteria"]["age"]["reason"] == mod.RC_TOO_YOUNG
+
+
+def test_reason_code_surfaced_in_human_output(
+    now: _dt.datetime, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ev = _base_evidence(now)
+    ev["private"] = True
+
+    def _fake(target: str) -> dict:
+        return ev
+
+    monkeypatch.setattr(mod, "gather_repo_evidence", _fake)
+    mod.main(["acme/widgets"])
+    out = capsys.readouterr().out
+    assert mod.RC_NOT_PUBLIC in out
+
+
+def test_reason_code_surfaced_in_json_output(
+    now: _dt.datetime, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ev = _base_evidence(now)
+    ev["private"] = True
+
+    def _fake(target: str) -> dict:
+        return ev
+
+    monkeypatch.setattr(mod, "gather_repo_evidence", _fake)
+    mod.main(["acme/widgets", "--json"])
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["criteria"]["public"]["reason"] == mod.RC_NOT_PUBLIC
+
+
+def _patch_api_responses(monkeypatch, status_code: int, headers: dict) -> None:
+    """Force ``gather_repo_evidence`` through the requests fallback with a fixed HTTP response."""
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self.headers = headers
+
+        def json(self) -> dict:
+            return {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def _run(*_args, **_kwargs):
+        # gh CLI unavailable -> fall through to the requests path.
+        raise FileNotFoundError()
+
+    def _get(*_args, **_kwargs):
+        return _Resp()
+
+    monkeypatch.setattr(mod.subprocess, "run", _run)
+    monkeypatch.setattr(mod.requests, "get", _get)
+
+
+def test_403_rate_limit_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_api_responses(
+        monkeypatch,
+        status_code=403,
+        headers={"X-RateLimit-Remaining": "0"},
+    )
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+    # Never a false reject.
+    assert result["verdict"] != mod.VERDICT_INELIGIBLE
+
+
+def test_401_token_expiry_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_api_responses(monkeypatch, status_code=401, headers={})
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+    assert result["verdict"] != mod.VERDICT_INELIGIBLE
+
+
 def test_api_failure_is_inconclusive(monkeypatch, now: _dt.datetime) -> None:
     def _raise(target: str) -> dict:
         raise GithubApiError("rate limit")
