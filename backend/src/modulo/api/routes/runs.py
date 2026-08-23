@@ -30,7 +30,6 @@ from modulo.api.dependencies import (
     require_permission_any_credential,
 )
 from modulo.api.middleware.sensitive_mask import (
-    SENSITIVE_VALUE_MASK,
     is_sensitive_key,
     mask_sensitive_value,
 )
@@ -56,6 +55,7 @@ from modulo.core.pipeline_engine.recovery import (
     recover_node,
 )
 from modulo.core.rate_limiter import TokenBucketRegistry
+from modulo.core.secret_patterns import mask_secret_values_in_text
 from modulo.core.trigger_engine import TriggerEngine
 from modulo.db.crud.node_observation import observe_node
 from modulo.db.crud.observability import get_otel_config
@@ -1632,68 +1632,6 @@ async def get_run_workspace_events(
 # ---------------------------------------------------------------------------
 
 
-# Gitleaks-style VALUE patterns: match a secret by its VALUE content,
-# independent of the JSON key it appears under. These run on every string in
-# agent output (including free text and values under non-sensitive keys) so
-# secrets that don't sit under a recognised ``secret``/``key`` key name are
-# still masked before display/return. Each entry is ``(compiled_pattern,
-# replacement)`` where ``replacement`` is either a fixed string or a callable
-# receiving the match and returning the masked text.
-_SECRET_VALUE_PATTERNS: list[tuple[re.Pattern[str], Any]] = [
-    # AWS access key id
-    (re.compile(r"AKIA[0-9A-Z]{16}"), SENSITIVE_VALUE_MASK),
-    # Google API key
-    (re.compile(r"AIza[0-9A-Za-z_\-]{35}"), SENSITIVE_VALUE_MASK),
-    # GitHub tokens (pat, oauth, app, refresh, user-to-server)
-    (re.compile(r"gh[pousr]_[0-9A-Za-z]{36,}"), SENSITIVE_VALUE_MASK),
-    # Slack tokens
-    (re.compile(r"xox[baprs]-[0-9A-Za-z-]{8,}"), SENSITIVE_VALUE_MASK),
-    # Stripe live secret / restricted keys
-    (re.compile(r"(?:sk|rk)_live_[0-9A-Za-z]{16,}"), SENSITIVE_VALUE_MASK),
-    # OpenAI / generic sk- prefixed keys
-    (re.compile(r"sk-[A-Za-z0-9]{20,}"), SENSITIVE_VALUE_MASK),
-    # Anthropic keys
-    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{20,}"), SENSITIVE_VALUE_MASK),
-    # JSON Web Tokens (three base64url segments)
-    (
-        re.compile(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
-        SENSITIVE_VALUE_MASK,
-    ),
-    # Private key blocks (multiline, any flavour)
-    (
-        re.compile(
-            r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----[^-]*"
-            r"(?:-[^-]*)*-----END (?:RSA |EC |OPENSSH |DSA |PGP |)PRIVATE KEY-----",
-            re.DOTALL,
-        ),
-        SENSITIVE_VALUE_MASK,
-    ),
-    # Connection strings carrying inline credentials: scheme://user:PASSWORD@host
-    (
-        re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]+:)([^\s:/@]+)(@)"),
-        lambda m: f"{m.group(1)}{SENSITIVE_VALUE_MASK}{m.group(3)}",
-    ),
-    # Standalone Bearer tokens in free text
-    (
-        re.compile(r"(?i)(Bearer\s+)[^\n\"'}\s]+"),
-        lambda m: f"{m.group(1)}{SENSITIVE_VALUE_MASK}",
-    ),
-]
-
-
-def _mask_secret_values_in_text(text: str) -> str:
-    """Mask gitleaks-style secret VALUES embedded in *text*.
-
-    Unlike key-name masking, this matches the secret's VALUE content, so it
-    catches secrets in free text and under non-sensitive keys alike.  Text
-    without a matching secret pattern is returned unchanged.
-    """
-    masked = text
-    for pattern, replacement in _SECRET_VALUE_PATTERNS:
-        masked = pattern.sub(replacement, masked)
-    return masked
-
-
 def _mask_output_value(value: Any, *, _depth: int = 0) -> Any:
     """Recursively mask sensitive string fields in *value*.
 
@@ -1711,7 +1649,7 @@ def _mask_output_value(value: Any, *, _depth: int = 0) -> Any:
     if _depth > 20:
         return value
     if isinstance(value, str):
-        return _mask_secret_values_in_text(value)
+        return mask_secret_values_in_text(value)
     if isinstance(value, dict):
         return {
             k: (
@@ -2287,7 +2225,6 @@ def _mask_prompt_text(text: str) -> str:
     password, key, credential) with bullet characters. Also redacts
     Authorization/Bearer headers and JWT-like tokens regardless of key name.
     """
-    import re
 
     masked = text
     for pattern, replacement in _SENSITIVE_MASK_PATTERNS:

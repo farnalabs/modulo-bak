@@ -28,6 +28,16 @@ _log = logging.getLogger(__name__)
 
 SENSITIVE_VALUE_MASK = "\u2022\u2022\u2022\u2022\u2022\u2022"
 
+# The canonical secret-format redaction patterns, the value-pattern list, the
+# capped masking helper and the shared raw patterns (``SECRET_VALUE_PATTERNS``,
+# ``mask_secret_values_in_text``, ``GITHUB_PAT_PATTERN``,
+# ``AWS_ACCESS_KEY_PATTERN``) are defined ONCE in
+# :mod:`modulo.core.secret_patterns`. The API layer (runs.py) imports them
+# directly from there; they live in ``core`` (not here) so that the core
+# redaction sites (error_codes.py, node_runner.py, soc2.py) can use the same
+# definitions without violating the ``core-does-not-import-api`` contract. This
+# module keeps owning the DOM-side ``SENSITIVE_VALUE_MASK`` constant.
+
 _SENSITIVE_ENV_KEYS: frozenset[str] = frozenset(
     {
         "MODULO_USERS",

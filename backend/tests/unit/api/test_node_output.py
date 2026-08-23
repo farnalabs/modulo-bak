@@ -498,3 +498,29 @@ class TestMaskOutputValueSecretValues:
         result = _mask_output_value(value)
         assert SENSITIVE_VALUE_MASK in result[0]["message"]
         assert "xoxb-1234567890" not in result[0]["message"]
+
+    def test_masks_fine_grained_github_pat(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        token = "github_pat_" + "A" * 50
+        value = {"log": f"cloned with {token}"}
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result["log"]
+        assert token not in result["log"]
+
+    def test_masks_aws_temp_access_key(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = {"log": "temp creds ASIAABCDEFGHIJKLMNOP leaked"}
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result["log"]
+        assert "ASIAABCDEFGHIJKLMNOP" not in result["log"]
+
+    def test_does_not_mask_short_github_pat_like_string(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        # github_pat_ with a short (non-secret) suffix must NOT be masked by the
+        # value pattern (it requires 50+ chars after the prefix).
+        value = {"note": "github_pat_11ABC"}
+        result = _mask_output_value(value)
+        assert result["note"] == "github_pat_11ABC"
