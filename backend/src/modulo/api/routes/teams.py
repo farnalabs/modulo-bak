@@ -109,7 +109,6 @@ def _role_level(hierarchy: dict[str, int], role: str) -> int:
 
 async def _require_team_operator_caller(
     session: AsyncSession,
-    org_id: uuid.UUID,
     team_id: uuid.UUID,
     account_id: uuid.UUID,
     detail: str,
@@ -172,7 +171,6 @@ async def _add_team_member_checked(
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
             session,
-            current_user.organisation_id,
             team_id,
             current_user.account_id,
             "Only admin users or team operators can add members",
@@ -213,7 +211,6 @@ async def _remove_member_checked(
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
             session,
-            current_user.organisation_id,
             team_id,
             current_user.account_id,
             "Only admin users or team operators can remove members",
@@ -223,8 +220,6 @@ async def _remove_member_checked(
     # SECURITY (#1194): operator cannot remove someone with equal or higher
     # team role — prevents intra-org privilege interference.
     if not is_admin:
-        if caller_membership is None:
-            raise RuntimeError("caller membership unexpectedly None on non-admin path")
         target_level = _role_level(TEAM_ROLE_HIERARCHY, membership.role)
         caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
         if target_level >= caller_level:
@@ -254,7 +249,6 @@ async def _change_member_role_checked(
     if not is_admin:
         caller_membership = await _require_team_operator_caller(
             session,
-            current_user.organisation_id,
             team_id,
             current_user.account_id,
             "Only admin users or team operators can change member roles",
@@ -271,8 +265,6 @@ async def _change_member_role_checked(
     # SECURITY (#1194): operator cannot demote someone with equal or higher
     # team role — prevents intra-org privilege interference.
     if not is_admin:
-        if caller_membership is None:
-            raise RuntimeError("caller membership unexpectedly None on non-admin path")
         target_level = _role_level(TEAM_ROLE_HIERARCHY, old_role)
         caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
         if target_level >= caller_level:
