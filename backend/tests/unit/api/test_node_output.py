@@ -426,3 +426,75 @@ class TestMaskOutputValue:
             deep_ref = deep_ref.get("a", {}) if isinstance(deep_ref, dict) else {}
         # Check we stopped recursing; the innermost value was NOT masked
         assert deep_ref.get("api_key") == "deep"
+
+
+class TestMaskOutputValueSecretValues:
+    """FAR-392: value-pattern masking catches secrets regardless of key name."""
+
+    def test_masks_secret_value_under_non_sensitive_key(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = {"result": "the key is AKIAIOSFODNN7EXAMPLE and also sk-Zk9f2Lm8QpXr4Tn6WbVc"}
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result["result"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["result"]
+        assert "sk-Zk9f2Lm8QpXr4Tn6WbVc" not in result["result"]
+
+    def test_masks_secret_value_in_free_text(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = "logs show token eyJhbGciOiJIUzI1Ni.eyJzdWIiOiIxMjM0NTY3ODk.wiOWw40dij8"
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result
+        assert "eyJhbGciOiJIUzI1Ni" not in result
+
+    def test_masks_private_key_block(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        key = "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAKj34GkxFhD\n-----END RSA PRIVATE KEY-----"
+        value = {"debug": key}
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result["debug"]
+        assert "BEGIN RSA PRIVATE KEY" not in result["debug"]
+
+    def test_masks_connection_string_password(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = {"note": "postgres://app_user:S3cr3tP@ss@db.example.com:5432/app"}
+        result = _mask_output_value(value)
+        assert "S3cr3tP@ss" not in result["note"]
+        assert "app_user" in result["note"]
+        assert "db.example.com:5432/app" in result["note"]
+
+    def test_masks_bearer_token_in_free_text(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = "Authorization failed: Bearer ya29.freshtokenvalue1234567890"
+        result = _mask_output_value(value)
+        assert "ya29.freshtokenvalue1234567890" not in result
+        assert SENSITIVE_VALUE_MASK in result
+
+    def test_does_not_overmask_legitimate_content(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = {
+            "summary": "processed 42 records successfully",
+            "url": "https://example.com/page",
+            "contact": "reach us at support@example.com",
+            "port": "http://localhost:8080/health",
+            "score": 3.14,
+        }
+        result = _mask_output_value(value)
+        assert result["summary"] == "processed 42 records successfully"
+        assert result["url"] == "https://example.com/page"
+        assert result["contact"] == "reach us at support@example.com"
+        assert result["port"] == "http://localhost:8080/health"
+        assert result["score"] == 3.14
+
+    def test_masks_secret_in_nested_list_item(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        value = [{"message": "xoxb-1234567890-abcdefghij-klmnopqrstuvwxyz"}]
+        result = _mask_output_value(value)
+        assert SENSITIVE_VALUE_MASK in result[0]["message"]
+        assert "xoxb-1234567890" not in result[0]["message"]
