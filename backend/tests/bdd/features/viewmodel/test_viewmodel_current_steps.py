@@ -193,15 +193,15 @@ def _get_viewmodel(client: Any, ctx: dict[str, Any], params: dict[str, str] | No
 # ---------------------------------------------------------------------------
 
 
-@given(parsers.parse('the organisation "{_name}" is named "{display_name}" with daily spend limit {limit:g}'))
-def _given_org_with_limit(_name: str, display_name: str, limit: float, ctx) -> None:
+@given(parsers.parse('the organisation "{org_name}" is named "{display_name}" with daily spend limit {limit:g}'))
+def _given_org_with_limit(org_name: str, display_name: str, limit: float, ctx) -> None:
     org = _default_org()
     org.name = display_name
     org.daily_spend_limit = limit
     ctx["org"] = org
 
 
-@given(parsers.parse('the account has preferences {preferences_json}'))
+@given(parsers.parse("the account has preferences {preferences_json}"))
 def _given_account_preferences(preferences_json: str, ctx) -> None:
     account = _default_account()
     account.preferences = json.loads(preferences_json)
@@ -292,6 +292,9 @@ def _when_get_viewmodel_current(request, ctx, mock_session) -> None:
 
 @when("I GET /api/v1/viewmodel/current without authentication")
 def _when_get_viewmodel_current_unauth(request, unauth_client) -> None:
+    from modulo.auth.dependencies import get_current_user
+
+    unauth_client.app.dependency_overrides.pop(get_current_user, None)
     request.node._resp = unauth_client.get("/api/v1/viewmodel/current")
 
 
