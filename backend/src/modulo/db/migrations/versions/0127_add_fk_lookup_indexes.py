@@ -10,15 +10,16 @@ eval/feedback/trigger/lease-for-run) had no secondary index, forcing
 sequential scans on what are core read paths. The ``OrgScoped`` mixin only
 indexes ``organisation_id``; these indexes cover the join/lookup keys.
 
-Indexes are created ``CONCURRENTLY`` so they do not take a prolonged
-``SHARE`` lock that blocks writes on production data. ``CREATE INDEX
-CONCURRENTLY`` cannot run inside a transaction, so each statement is issued
-on a separate autocommit connection. ``IF NOT EXISTS`` keeps the migration
-idempotent and re-runnable.
-
-Postgres-only: the deprecated SQLite / MariaDB backends ignore
-``CONCURRENTLY`` (they run it as a normal blocking index build, which is
-harmless for those environments).
+The migration runs inside Alembic's single ``engine.begin()`` transaction
+(``env.py`` wraps every revision in one transaction), so the referenced
+tables are still uncommitted when this revision executes. A separate
+autocommit connection (required by ``CREATE INDEX CONCURRENTLY``) therefore
+cannot see those tables and fails with ``relation "<table>" does not exist``.
+``CREATE INDEX CONCURRENTLY`` also cannot run inside a transaction block at
+all. We therefore build plain (blocking) ``CREATE INDEX IF NOT EXISTS``
+statements on the migration's own connection, which is both visible to the
+uncommitted schema and transaction-safe. ``IF NOT EXISTS`` keeps the
+migration idempotent and re-runnable.
 """
 
 from alembic import op
@@ -46,14 +47,10 @@ def upgrade():
     bind = op.get_bind()
     for index_name, table, columns in _INDEXES:
         cols = ", ".join(columns)
-        with bind.engine.connect() as conn:
-            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-            conn.execute(text(f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} ON {table} ({cols})"))
+        bind.execute(text(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({cols})"))
 
 
 def downgrade():
     bind = op.get_bind()
     for index_name, _table, _columns in _INDEXES:
-        with bind.engine.connect() as conn:
-            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"))
+        bind.execute(text(f"DROP INDEX IF EXISTS {index_name}"))
