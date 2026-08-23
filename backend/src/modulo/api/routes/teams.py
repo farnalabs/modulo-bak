@@ -220,6 +220,7 @@ async def _remove_member_checked(
     # SECURITY (#1194): operator cannot remove someone with equal or higher
     # team role — prevents intra-org privilege interference.
     if not is_admin:
+        assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
         target_level = _role_level(TEAM_ROLE_HIERARCHY, membership.role)
         caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
         if target_level >= caller_level:
@@ -265,6 +266,7 @@ async def _change_member_role_checked(
     # SECURITY (#1194): operator cannot demote someone with equal or higher
     # team role — prevents intra-org privilege interference.
     if not is_admin:
+        assert caller_membership is not None  # nosec B101 -- genuine invariant: when not is_admin, caller_membership is set to the operator membership above
         target_level = _role_level(TEAM_ROLE_HIERARCHY, old_role)
         caller_level = _role_level(TEAM_ROLE_HIERARCHY, caller_membership.role)
         if target_level >= caller_level:
