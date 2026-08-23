@@ -1,6 +1,6 @@
 """dismissals — add organisation_id + RLS (org isolation) to the dismissals table.
 
-Revision ID: 0127_dismissals_org_rls
+Revision ID: 0130_dismissals_org_rls
 Revises: 0126_human_set_eval_type
 Create Date: 2026-08-23
 
@@ -54,8 +54,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0127_dismissals_org_rls"
-down_revision: str | None = "0126_human_set_eval_type"
+revision: str = "0130_dismissals_org_rls"
+down_revision: str | None = "0128_add_fk_lookup_indexes"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -138,11 +138,11 @@ def upgrade() -> None:
         # Make the column NOT NULL now that every row has an org.
         op.execute(sa.text("ALTER TABLE dismissals ALTER COLUMN organisation_id SET NOT NULL"))
 
-        op.execute(f"ALTER TABLE {_TABLE} ENABLE ROW LEVEL SECURITY")
-        op.execute(f"ALTER TABLE {_TABLE} FORCE ROW LEVEL SECURITY")
-        op.execute(f"CREATE POLICY rls_org_isolation ON {_TABLE} FOR ALL USING ({_ORG_SCOPE})")
+        op.execute("ALTER TABLE dismissals ENABLE ROW LEVEL SECURITY")
+        op.execute("ALTER TABLE dismissals FORCE ROW LEVEL SECURITY")
+        op.execute(f"CREATE POLICY rls_org_isolation ON dismissals FOR ALL USING ({_ORG_SCOPE})")
         if app_role:
-            op.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {_TABLE} TO {_APP_ROLE}")
+            op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON dismissals TO modulo_app")
 
 
 def downgrade() -> None:
@@ -150,8 +150,8 @@ def downgrade() -> None:
     pg = _is_postgres(bind)
 
     if pg:
-        op.execute(f"DROP POLICY IF EXISTS rls_org_isolation ON {_TABLE}")
-        op.execute(f"ALTER TABLE {_TABLE} DISABLE ROW LEVEL SECURITY")
+        op.execute("DROP POLICY IF EXISTS rls_org_isolation ON dismissals")
+        op.execute("ALTER TABLE dismissals DISABLE ROW LEVEL SECURITY")
 
     op.drop_constraint(f"{_TABLE}_organisation_id_fkey", _TABLE, type_="foreignkey")
     op.drop_index(f"ix_{_TABLE}_organisation_id", table_name=_TABLE)
