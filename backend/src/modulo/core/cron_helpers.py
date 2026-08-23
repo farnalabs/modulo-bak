@@ -3092,21 +3092,28 @@ def _should_redispatch_nodeless(row: Any) -> bool:
     double-execute, and these pipelines only create PRs after a node runs.
 
     Retry budgeting (FAR — nodeless safe re-dispatch):
-      * ``retry_policy`` present with ``"stall"`` in ``on``: honor the
+      * ``retry_policy`` present (non-empty) with ``"stall"`` in ``on``: honor the
         ``max_retries`` budget. ``claim_count`` is 1 for the initial claim, so a
         re-dispatch is allowed while ``claim_count <= max_retries`` (initial
         attempt + up to ``max_retries`` retries).
-      * ``retry_policy`` absent/None: re-dispatch ONCE only, bounded by
-        ``claim_count <= 1`` (the original claim has not yet been re-dispatched).
+      * ``retry_policy`` absent/None OR an empty policy (the column defaults to
+        ``{}``): re-dispatch ONCE only, bounded by ``claim_count <= 1`` (the
+        original claim has not yet been re-dispatched).
+      * ``retry_policy`` present (non-empty) but WITHOUT ``"stall"`` in ``on``:
+        terminal-fail — never re-dispatch a nodeless zombie for a trigger it does
+        not cover.
     """
     retry_policy = getattr(row, "retry_policy", None)
-    if isinstance(retry_policy, dict):
+    if isinstance(retry_policy, dict) and retry_policy:
         on = retry_policy.get("on") or []
-        if "stall" not in on:
-            return False
-        max_retries = int(retry_policy.get("max_retries", 0) or 0)
-        return bool(row.claim_count <= max_retries)
-    # No retry policy: re-dispatch exactly once (only the un-re-dispatched claim).
+        if "stall" in on:
+            max_retries = int(retry_policy.get("max_retries", 0) or 0)
+            return bool(row.claim_count <= max_retries)
+        # A non-empty policy that does not cover "stall" must NOT re-dispatch a
+        # nodeless zombie — terminal-fail it.
+        return False
+    # No stall retry policy (or no/empty policy): re-dispatch exactly once
+    # (only the un-re-redispatched claim).
     return bool(row.claim_count <= 1)
 
 
@@ -3734,6 +3741,7 @@ async def _reconcile_org(
     terminalized_run_ids: list[tuple[uuid.UUID, uuid.UUID]],
 ) -> int:
     """Run one org's reconcile pass (terminalizers + row select + per-row loop)."""
+    from modulo.db.models.pipeline import Pipeline
     from modulo.db.models.run import Run
 
     async with factory() as session, session.begin():
@@ -3770,7 +3778,10 @@ async def _reconcile_org(
                         Run.claim_count,
                         Run.dispatcher,
                         text("runs.enqueue_failed_at AS enqueue_failed_at"),
-                    ).where(
+                        Pipeline.retry_policy,
+                    )
+                    .join(Pipeline, Pipeline.id == Run.pipeline_id, isouter=True)
+                    .where(
                         Run.organisation_id == org_id,
                         Run.status.in_(("pending", "running", "awaiting_human", "claimed")),
                         re_dispatch_predicate,
