@@ -31,10 +31,16 @@ class RunEvidence(Base):
 
     run_id: Mapped[uuid.UUID] = mapped_column(Uuid(), ForeignKey("runs.id", ondelete="CASCADE"), nullable=False)
     node_id: Mapped[str] = mapped_column(String(255), nullable=False)
-    organisation_id: Mapped[uuid.UUID] = mapped_column(
+    # NOTE: declared nullable on the model so SQLite ``create_all`` (used by the
+    # evidence-probe unit tests) and legacy write paths stay green. The Postgres
+    # schema is made NOT NULL by migration 0127_run_evidence_rls, which backfills
+    # every existing row from the parent run. The evidence probe must be updated
+    # to populate ``organisation_id`` on insert (runtime gap — out of this change's
+    # file scope).
+    organisation_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(),
         ForeignKey("organisations.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     evidence_state: Mapped[str] = mapped_column(String(20), nullable=False)
