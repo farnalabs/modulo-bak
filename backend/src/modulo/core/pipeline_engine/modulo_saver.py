@@ -669,7 +669,10 @@ class ModuloPostgresSaver(AsyncPostgresSaver):
         before: dict[str, Any] | None = None,
         limit: int | None = None,
     ) -> list[CheckpointTuple]:  # type: ignore[valid-type]
-        return [item async for item in self.alist(config, filter=filter, before=before, limit=limit)]
+        results: list[CheckpointTuple] = []
+        async for item in self.alist(config, filter=filter, before=before, limit=limit):
+            results.append(item)
+        return results
 
     def put(  # type: ignore[override]
         self,
