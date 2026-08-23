@@ -56,7 +56,7 @@ import time
 import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from redis import asyncio as aioredis
 from saq import CronJob, Worker
@@ -1300,7 +1300,7 @@ def run_system_web() -> None:
     async def _worker_start() -> None:
         try:
             await worker.queue.connect()
-            await reconcile_cron_registrations(worker.queue, worker.cron_jobs)
+            await reconcile_cron_registrations(cast(RedisQueue, worker.queue), worker.cron_jobs)
             await worker.start()
         except asyncio.CancelledError:
             raise
