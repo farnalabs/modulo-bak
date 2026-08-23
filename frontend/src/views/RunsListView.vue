@@ -112,11 +112,12 @@
               class="whitespace-nowrap tabular-nums text-muted-foreground"
               :data-testid="`runs-list-duration-${row.run_id}`"
             >
-              <output
+              <span
                 v-if="isNonTerminalStatus(row.status as string) && row.started_at"
+                role="status"
                 aria-live="polite"
                 class="tabular-nums"
-              >{{ formatElapsed(row.started_at as string) }}</output>
+              >{{ formatElapsed(row.started_at as string) }}</span>
               <span v-else>{{ formatDuration(row.started_at as string, row.completed_at as string) }}</span>
             </span>
           </template>
