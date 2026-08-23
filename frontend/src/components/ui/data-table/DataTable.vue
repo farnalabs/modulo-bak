@@ -85,15 +85,15 @@ function onRowKeydown(event: KeyboardEvent, row: DataTableRow) {
 </script>
 
 <template>
-  <div class="overflow-x-auto">
-    <table class="w-full">
+  <div class="relative w-full overflow-x-auto">
+    <table class="w-full caption-bottom text-sm">
       <thead>
-        <tr>
+        <tr class="border-b transition-colors hover:bg-muted/50">
           <th
             v-for="col in columns"
             :key="col.key"
             :class="cn(
-              'px-4 py-3 text-xs font-medium uppercase tracking-wider text-left',
+              'h-12 px-4 text-left align-middle font-medium text-muted-foreground',
               col.numeric && 'text-right tabular-nums',
               col.sortable && 'cursor-pointer select-none hover:text-foreground',
               sortColumn === col.key ? 'text-foreground' : 'text-muted-foreground',
@@ -104,27 +104,27 @@ function onRowKeydown(event: KeyboardEvent, row: DataTableRow) {
           </th>
         </tr>
       </thead>
-      <tbody v-if="loading" class="divide-y divide-border">
-        <tr v-for="i in loadingRows" :key="i">
-          <td v-for="col in columns" :key="col.key" :class="cn('px-4 py-3', col.numeric && 'text-right')">
+      <tbody v-if="loading" class="[&_tr:last-child]:border-0">
+        <tr v-for="i in loadingRows" :key="i" class="border-b transition-colors">
+          <td v-for="col in columns" :key="col.key" :class="cn('p-4 align-middle', col.numeric && 'text-right')">
             <div class="h-4 animate-pulse rounded bg-muted" :style="{ width: `${30 + (i * 7) % 50}%` }" />
           </td>
         </tr>
       </tbody>
-      <tbody v-else-if="rows.length === 0" class="divide-y divide-border">
-        <tr>
-          <td :colspan="columns.length" class="px-4 py-8 text-center text-sm text-muted-foreground">
+      <tbody v-else-if="rows.length === 0" class="[&_tr:last-child]:border-0">
+        <tr class="border-b transition-colors">
+          <td :colspan="columns.length" class="p-4 align-middle text-center text-sm text-muted-foreground">
             <slot name="empty">
               No data available.
             </slot>
           </td>
         </tr>
       </tbody>
-      <tbody v-else class="divide-y divide-border">
+      <tbody v-else class="[&_tr:last-child]:border-0">
         <tr
           v-for="(row, index) in sortedRows"
           :key="index"
-          class="transition-colors hover:bg-muted/30"
+          class="border-b transition-colors hover:bg-muted/50"
           :class="props.rowClickable && 'cursor-pointer'"
           :role="props.rowClickable ? 'button' : undefined"
           :tabindex="props.rowClickable ? 0 : undefined"
@@ -135,7 +135,7 @@ function onRowKeydown(event: KeyboardEvent, row: DataTableRow) {
             v-for="col in columns"
             :key="col.key"
             :class="cn(
-              'px-4 py-3 text-sm',
+              'p-4 align-middle text-sm',
               col.numeric && 'text-right tabular-nums',
             )"
           >
