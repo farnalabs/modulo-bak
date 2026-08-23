@@ -14582,12 +14582,12 @@ export interface components {
         SetSpendCeilingRequest: {
             /**
              * Max Run Cost
-             * @description Per-run hard ceiling in USD. 0 = block all runs.
+             * @description Per-run hard ceiling in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
              */
             max_run_cost?: number | null;
             /**
              * Spend Ceiling
-             * @description Org lifetime budget in USD. 0 = block all runs.
+             * @description Org lifetime budget in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
              */
             spend_ceiling?: number | null;
         };
