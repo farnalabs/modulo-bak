@@ -1503,6 +1503,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/costs/ceiling": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Spend Ceiling */
+        get: operations["get_spend_ceiling_api_v1_admin_costs_ceiling_get"];
+        /** Set Spend Ceiling */
+        put: operations["set_spend_ceiling_api_v1_admin_costs_ceiling_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/costs/circuit-breaker/{pipeline_id}/reset": {
         parameters: {
             query?: never;
@@ -9325,6 +9343,15 @@ export interface components {
             }[];
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
             /** Alert Thresholds */
             alert_thresholds?: number[];
             /**
@@ -14551,6 +14578,19 @@ export interface components {
              */
             account_id: string;
         };
+        /** SetSpendCeilingRequest */
+        SetSpendCeilingRequest: {
+            /**
+             * Max Run Cost
+             * @description Per-run hard ceiling in USD. 0 = block all runs.
+             */
+            max_run_cost?: number | null;
+            /**
+             * Spend Ceiling
+             * @description Org lifetime budget in USD. 0 = block all runs.
+             */
+            spend_ceiling?: number | null;
+        };
         /** SetSpendLimitRequest */
         SetSpendLimitRequest: {
             /** Daily Spend Limit */
@@ -14764,6 +14804,20 @@ export interface components {
             tag?: string | null;
             /** Notes */
             notes?: string | null;
+        };
+        /** SpendCeilingResponse */
+        SpendCeilingResponse: {
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
+            /** Remaining Budget Usd */
+            remaining_budget_usd?: number | null;
         };
         /** SpendLimitResponse */
         SpendLimitResponse: {
@@ -15304,6 +15358,10 @@ export interface components {
         UpdateCostControlsRequest: {
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
             /** Alert Thresholds */
             alert_thresholds?: number[] | null;
             /** Circuit Breaker Enabled */
@@ -19824,6 +19882,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CostControlsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_spend_ceiling_api_v1_admin_costs_ceiling_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_spend_ceiling_api_v1_admin_costs_ceiling_put: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSpendCeilingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
                 };
             };
             /** @description Validation Error */
