@@ -18,7 +18,7 @@ from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.team_rbac import ORG_ROLE_HIERARCHY, TEAM_ROLE_HIERARCHY
 from modulo.db.crud import account as _account_crud
-from modulo.db.crud import org_membership as _org_membership_crud
+from modulo.db.crud.org_membership import get_membership_by_account_and_org
 from modulo.db.crud.team import (
     TeamUpdateOutcome,
     create_team,
@@ -184,9 +184,7 @@ async def _add_team_member_checked(
             )
 
     target_account = await _account_crud.get_account_by_id(session, user_id)
-    target_membership = await _org_membership_crud.get_membership_by_account_and_org(
-        session, user_id, current_user.organisation_id
-    )
+    target_membership = await get_membership_by_account_and_org(session, user_id, current_user.organisation_id)
     if target_account is None or target_membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in organisation")
     if _role_level(TEAM_ROLE_HIERARCHY, role) > _role_level(ORG_ROLE_HIERARCHY, target_membership.role):
