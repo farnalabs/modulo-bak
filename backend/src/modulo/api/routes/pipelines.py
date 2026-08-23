@@ -478,7 +478,10 @@ class PipelineResponse(BaseModel):
     node_timeout_seconds: int
     run_context_defaults: dict[str, Any]
     default_autonomy_level: str | None = None
-    max_duration_seconds: int = 3600
+    # TODO: Make this non-optional (int = 3600) once migration
+    # 0029_fix_pipeline_max_duration_non_null has run on all production DBs and there's no risk
+    # of NULL values from rollbacks or pre-migration data.
+    max_duration_seconds: int | None = None
     stale_run_timeout_minutes: int = 30
     rate_limit_config: dict[str, Any] | None = None
     retry_policy: dict[str, Any] = Field(default_factory=dict, json_schema_extra={"default": {}})
