@@ -112,12 +112,11 @@
               class="whitespace-nowrap tabular-nums text-muted-foreground"
               :data-testid="`runs-list-duration-${row.run_id}`"
             >
-              <span
+              <output
                 v-if="isNonTerminalStatus(row.status as string) && row.started_at"
-                role="status"
                 aria-live="polite"
                 class="tabular-nums"
-              >{{ formatElapsed(row.started_at as string) }}</span>
+              >{{ formatElapsed(row.started_at as string) }}</output>
               <span v-else>{{ formatDuration(row.started_at as string, row.completed_at as string) }}</span>
             </span>
           </template>
@@ -134,6 +133,7 @@
           <template #cell-actions="{ row }">
             <div class="text-right">
               <button
+                type="button"
                 v-if="isNonTerminalStatus(row.status as string)"
                 :disabled="cancellingIds.has(row.run_id as string)"
                 :data-testid="`runs-list-cancel-${row.run_id}`"
@@ -162,6 +162,7 @@
         </span>
         <div class="flex items-center gap-2">
           <button
+            type="button"
             :disabled="page <= 1"
             class="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent disabled:opacity-30 disabled:cursor-not-allowed"
             @click="prevPage"
@@ -172,6 +173,7 @@
             Page {{ page }}
           </span>
           <button
+            type="button"
             :disabled="page * pageSize >= total"
             class="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent disabled:opacity-30 disabled:cursor-not-allowed"
             @click="nextPage"
@@ -406,7 +408,7 @@ function formatDuration(startIso: string | null | undefined, endIso: string | nu
   if (!startIso || !endIso) return '—'
   const start = new Date(startIso)
   const end = new Date(endIso)
-  if (isNaN(start.getTime()) || isNaN(end.getTime())) return '—'
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '—'
   let totalSeconds = Math.max(0, Math.round((end.getTime() - start.getTime()) / 1000))
   const hours = Math.floor(totalSeconds / 3600)
   totalSeconds -= hours * 3600
