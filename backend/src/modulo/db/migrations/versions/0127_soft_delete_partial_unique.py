@@ -1,7 +1,7 @@
 """Convert full unique constraints to partial unique indexes for soft-delete keys.
 
-Revision ID: 0126_soft_delete_partial_unique
-Revises: 0125_soft_delete_lookup_indexes
+Revision ID: 0127_soft_delete_partial_unique
+Revises: 0126_human_set_eval_type
 Create Date: 2026-08-23
 
 Several OrgScoped + SoftDeleteMixin tables declared a *full* UNIQUE
@@ -24,8 +24,8 @@ SQLite / MariaDB backends, where the index is created without the predicate.
 from alembic import op
 from sqlalchemy import text
 
-revision = "0126_soft_delete_partial_unique"
-down_revision = "0125_soft_delete_lookup_indexes"
+revision = "0127_soft_delete_partial_unique"
+down_revision = "0126_human_set_eval_type"
 branch_labels = None
 depends_on = None
 

@@ -1,7 +1,7 @@
 """Add missing foreign-key lookup indexes on high-traffic join columns.
 
-Revision ID: 0127_add_fk_lookup_indexes
-Revises: 0126_soft_delete_partial_unique
+Revision ID: 0128_add_fk_lookup_indexes
+Revises: 0127_soft_delete_partial_unique
 Create Date: 2026-08-23
 
 Several foreign-key columns that are heavily used in JOINs and filter
@@ -25,8 +25,8 @@ migration idempotent and re-runnable.
 from alembic import op
 from sqlalchemy import text
 
-revision = "0127_add_fk_lookup_indexes"
-down_revision = "0126_soft_delete_partial_unique"
+revision = "0128_add_fk_lookup_indexes"
+down_revision = "0127_soft_delete_partial_unique"
 branch_labels = None
 depends_on = None
 
