@@ -1371,7 +1371,15 @@ export default {
       "current_spend": "Current Spend",
       "org_total": "Org Total",
       "no_team_cost_data_available": "No team cost data available.",
-      "todays_accrued_costs_across_all_teams": "Today's accrued costs across all teams"
+      "todays_accrued_costs_across_all_teams": "Today's accrued costs across all teams",
+      "hard_spend_ceilings": "Hard Spend Ceilings",
+      "hard_spend_ceilings_subtitle": "Hard limits that halt a run before it incurs billable cost (LLM / sandbox). A per-run ceiling caps a single run; an org ceiling caps lifetime spend.",
+      "per_run_ceiling_usd": "Per-run ceiling (USD)",
+      "per_run_ceiling_help": "Maximum cost for a single run. 0 blocks all runs. Empty = no limit.",
+      "org_lifetime_ceiling_usd": "Org lifetime ceiling (USD)",
+      "org_lifetime_ceiling_help": "Maximum lifetime spend for the organisation. 0 blocks all runs. Empty = no limit.",
+      "remaining_budget": "Remaining budget",
+      "ceiling_updated": "Ceilings updated."
     },
     "CostComponentsView": {
       "cost_components": "Cost Components",

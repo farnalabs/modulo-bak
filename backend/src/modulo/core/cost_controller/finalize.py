@@ -86,10 +86,14 @@ from modulo.core.node_output_split import (
     node_telemetry,
     split_node_output,
 )
+from modulo.core.spend_ceiling import (
+    evaluate_spend_ceilings,
+)
 from modulo.db.crud.run import update_run_status
 from modulo.db.models.agent import Agent
 from modulo.db.models.cost_component import CostComponent
 from modulo.db.models.journey import Journey
+from modulo.db.models.organisation import Organisation
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import Run
 from modulo.db.models.run_daily_facts import JourneyFact
@@ -995,6 +999,45 @@ async def _ledger_block(
         record_duplicate_terminal()
         await _record_duplicate_terminal_event(session, run_id)
         return
+
+    # --- FAR-391: hard spend-ceiling gate (per-run + per-org) ---
+    # Runs BEFORE the daily-ledger write so a ceiling breach refuses the ledger
+    # (the run is never billed beyond its ceiling) AND terminalizes the run as
+    # ``cost_ceiling_exceeded`` — a run that exceeds its per-run ceiling is
+    # halted (never resumed to spawn further billable steps), and an org at its
+    # lifetime budget stops spawning new runs. On the success path the org's
+    # consumed total is incremented by this run's cost.
+    org_row = (
+        await session.execute(select(Organisation).where(Organisation.id == org_id).with_for_update())
+    ).scalar_one_or_none()
+    if org_row is not None:
+        decision = evaluate_spend_ceilings(
+            run_cost_so_far_cents=int(total * 100),
+            estimated_next_step_cents=0,
+            max_run_cost_cents=org_row.max_run_cost_cents,
+            org_cumulative_spend_cents=org_row.org_cumulative_spend_cents or 0,
+            spend_ceiling_cents=org_row.spend_ceiling_cents,
+        )
+        if not decision.allowed:
+            locked.ledger_refused_at = datetime.now(UTC)
+            locked.status = "cost_ceiling_exceeded"
+            locked.error_code = decision.reason
+            locked.error_detail = decision.message
+            _log.info(
+                "cost_ledger.ceiling_exceeded",
+                extra={
+                    "run_id": str(run_id),
+                    "org_id": str(org_id),
+                    "reason": decision.reason,
+                    "total_cents": int(total * 100),
+                },
+            )
+            record_limit_refused("spend_ceiling")
+            await session.flush()
+            return
+        # Success: accrue this run's cost into the org's lifetime consumed total.
+        org_row.org_cumulative_spend_cents = (org_row.org_cumulative_spend_cents or 0) + int(total * 100)
+        await session.flush()
 
     try:
         ok, reason = await _record_ledger_with_retry(
