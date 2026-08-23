@@ -1,7 +1,7 @@
 """Convert ``runs`` JSON columns to JSONB (dist db-runs-jsonb).
 
-Revision ID: 0127_runs_json_to_jsonb
-Revises: 0126_human_set_eval_type
+Revision ID: 0129_runs_json_to_jsonb
+Revises: 0128_add_fk_lookup_indexes
 Create Date: 2026-08-23
 
 The ``runs`` table carries a set of JSON-typed payload columns. Four of them
@@ -39,8 +39,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0127_runs_json_to_jsonb"
-down_revision: str | None = "0126_human_set_eval_type"
+revision: str = "0129_runs_json_to_jsonb"
+down_revision: str | None = "0128_add_fk_lookup_indexes"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
