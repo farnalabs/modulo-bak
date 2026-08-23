@@ -374,6 +374,7 @@ import FilterBar from '../components/shared/FilterBar.vue'
 import FolderTree from '../components/pipelines/FolderTree.vue'
 import { useDataFetch } from '../composables/useDataFetch'
 import { usePlanStore } from '../stores/planStore'
+import { FOCUSABLE_SELECTOR, trapTabInElement } from '../composables/useFocusTrap'
 import ErrorAlert from '../components/shared/ErrorAlert.vue'
 import { formatApiError } from '../lib/api/formatError'
 import Button from 'primevue/button'
@@ -608,7 +609,8 @@ const deleteTarget = ref<PipelineItem | null>(null)
 const deleteError = ref<string | null>(null)
 
 // Accessible modal dialog helpers: capture/restore focus, move initial focus
-// into the open panel, and trap Tab focus within the active dialog.
+// into the first meaningful control of the open panel, and trap Tab focus
+// within the active dialog using the shared focus-trap primitive.
 const lastFocusedBeforeDialog = ref<HTMLElement | null>(null)
 const moveDialogRef = ref<HTMLElement | null>(null)
 const renameDialogRef = ref<HTMLElement | null>(null)
@@ -619,10 +621,14 @@ function openDialog(show: Ref<boolean>, panel: Ref<HTMLElement | null>) {
   lastFocusedBeforeDialog.value = document.activeElement as HTMLElement | null
   show.value = true
   nextTick(() => {
-    if (panel.value) {
-      panel.value.focus()
-      activeDialogPanel.value = panel.value
-    }
+    if (!panel.value) return
+    activeDialogPanel.value = panel.value
+    // Focus the first meaningful control, not the tabindex="-1" wrapper, so
+    // keyboard users see a focus indicator immediately and the trap guard
+    // (which only fires for focusables inside the panel) stays armed.
+    const first = panel.value.querySelector<HTMLElement>(FOCUSABLE_SELECTOR)
+    if (first) first.focus()
+    else panel.value.focus()
   })
 }
 
@@ -646,25 +652,7 @@ function trapKeydown(e: KeyboardEvent) {
     return
   }
   if (e.key !== 'Tab') return
-  const focusables = activeDialogPanel.value.querySelectorAll<HTMLElement>(
-    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
-  )
-  if (focusables.length === 0) {
-    e.preventDefault()
-    return
-  }
-  const first = focusables[0]
-  const last = focusables[focusables.length - 1]
-  const active = document.activeElement
-  if (e.shiftKey) {
-    if (active === first || !activeDialogPanel.value.contains(active)) {
-      e.preventDefault()
-      last.focus()
-    }
-  } else if (active === last || !activeDialogPanel.value.contains(active)) {
-    e.preventDefault()
-    first.focus()
-  }
+  trapTabInElement(e, activeDialogPanel.value)
 }
 
 onMounted(() => {
