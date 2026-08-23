@@ -32,7 +32,7 @@ import datetime as _dt
 import json
 import os
 import re
-import subprocess
+import subprocess  # nosec B404
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -123,7 +123,7 @@ VERDICT_ELIGIBLE = "ELIGIBLE"
 VERDICT_INELIGIBLE = "INELIGIBLE"
 VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
 
-STATUS_PASS = "PASS"
+STATUS_PASS = "PASS"  # nosec B105
 STATUS_FAIL = "FAIL"
 STATUS_INCONCLUSIVE = "INCONCLUSIVE"
 
@@ -164,18 +164,23 @@ def parse_target(target: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _api_get(path: str) -> dict[str, Any]:
+def _api_get(path: str, *, allow_codes: tuple[int, ...] = ()) -> dict[str, Any]:
     """GET a GitHub REST API path, returning parsed JSON.
 
     Prefers the `gh` CLI (handles auth + rate-limit), falling back to
     `requests` with a token from the environment. Raises
     :class:`GithubApiError` on any failure.
+
+    *allow_codes* lists HTTP status codes that should be returned as an empty
+    dict `{}` instead of raising -- used so a 404 (e.g. "no LICENSE file")
+    can be distinguished from a genuine API failure (which must stay
+    INCONCLUSIVE, never a silent false reject).
     """
     full_url = f"https://api.github.com/{path.lstrip('/')}"
 
     # 1. Try gh CLI.
     try:
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(  # nosec  # noqa: S603
             ["gh", "api", path],  # noqa: S607
             capture_output=True,
             text=True,
@@ -202,6 +207,8 @@ def _api_get(path: str) -> dict[str, Any]:
     if resp.status_code in (401, 403):
         raise GithubApiError(f"GitHub API auth/permission error: HTTP {resp.status_code}.")
     if resp.status_code >= 400:
+        if resp.status_code in allow_codes:
+            return {}
         raise GithubApiError(f"GitHub API error: HTTP {resp.status_code}.")
 
     try:
@@ -225,16 +232,14 @@ def gather_repo_evidence(target: str) -> dict[str, Any]:
     if repo_id is None:
         raise GithubApiError("GitHub API response missing repo id.")
 
-    # Licence: the /license endpoint returns 404 when no licence file exists.
+    # Licence: the /license endpoint returns 404 when no licence file exists
+    # (legitimately "not present"); any other API error must propagate as
+    # INCONCLUSIVE rather than be swallowed into a silent false reject.
     license_file_present = False
     spdx_id = None
     if isinstance(repo.get("license"), dict):
         spdx_id = repo["license"].get("spdx_id")
-    try:
-        _api_get(f"repos/{owner_repo}/license")
-        license_file_present = True
-    except GithubApiError:
-        license_file_present = False
+    license_file_present = bool(_api_get(f"repos/{owner_repo}/license", allow_codes=(404,)))
 
     # Tags (>= 1 tagged release).
     tags = _api_get(f"repos/{owner_repo}/tags?per_page=100")
