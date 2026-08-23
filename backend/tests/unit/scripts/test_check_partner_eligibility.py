@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import subprocess
 
 import check_partner_eligibility as mod
 import pytest
@@ -148,6 +149,35 @@ def test_license_file_fallback_with_null_spdx(now: _dt.datetime) -> None:
     assert result["criteria"]["license"]["reason"] == mod.RC_LICENSE_FILE_FALLBACK
 
 
+def test_lowercase_osi_spdx_is_eligible(now: _dt.datetime) -> None:
+    # Licence match must be case-insensitive: "mit" (lowercase) is accepted.
+    ev = _base_evidence(now)
+    ev["spdx_id"] = "mit"
+    result = mod.evaluate_evidence(ev)
+    assert result["verdict"] == mod.VERDICT_ELIGIBLE
+    assert result["criteria"]["license"]["status"] == mod.STATUS_PASS
+    assert result["criteria"]["license"]["reason"] is None
+
+
+def test_known_non_osi_spdx_with_license_file_is_ineligible(now: _dt.datetime) -> None:
+    # A KNOWN non-OSI spdx id (GPL-1.0) must be rejected even when a LICENSE
+    # file is present -- it must not be false-accepted via the fallback.
+    ev = _base_evidence(now)
+    ev["spdx_id"] = "GPL-1.0"
+    ev["license_file_present"] = True
+    result = mod.evaluate_evidence(ev)
+    assert result["verdict"] == mod.VERDICT_INELIGIBLE
+    assert result["criteria"]["license"]["status"] == mod.STATUS_FAIL
+    assert result["criteria"]["license"]["reason"] == mod.RC_NO_OSI_LICENSE
+
+
+def test_exit_code_mapping() -> None:
+    # The CLI must distinguish verdicts via distinct exit codes.
+    assert mod._exit_code(mod.VERDICT_ELIGIBLE) == 0
+    assert mod._exit_code(mod.VERDICT_INELIGIBLE) == 1
+    assert mod._exit_code(mod.VERDICT_INCONCLUSIVE) == 2
+
+
 def test_age_boundary_exactly_eligible(now: _dt.datetime) -> None:
     # A repo exactly MIN_AGE_DAYS old is old enough to pass.
     ev = _base_evidence(now)
@@ -281,3 +311,118 @@ def test_parse_target_variants() -> None:
     assert mod.parse_target("foo/bar.git") == "foo/bar"
     with pytest.raises(ValueError):
         mod.parse_target("not-a-repo")
+
+
+def test_gh_nonjson_stdout_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    # gh returns 0 but emits non-JSON stdout -> must degrade to INCONCLUSIVE.
+    cp = subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="not json", stderr="")
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: cp)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+
+
+def test_gh_oserror_falls_through_to_requests(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    # gh cannot be launched (OSError) -> the requests path must be used.
+    calls = {"gh": 0, "requests": 0}
+
+    class _Resp:
+        status_code = 200
+
+        def __init__(self, payload: dict | list) -> None:
+            self.headers: dict = {}
+            self._payload = payload
+
+        def json(self) -> dict | list:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    def _run(*_args, **_kwargs):
+        calls["gh"] += 1
+        raise PermissionError("denied")
+
+    def _get(url, *_args, **_kwargs):
+        calls["requests"] += 1
+        if "/tags" in url:
+            return _Resp([{"name": "v1"}])
+        if "/commits" in url:
+            return _Resp([{"author": {"login": "alice"}}, {"author": {"login": "bob"}}])
+        if "/license" in url:
+            return _Resp({})
+        return _Resp(
+            {
+                "id": 1,
+                "full_name": "acme/widgets",
+                "private": False,
+                "fork": False,
+                "archived": False,
+                "stargazers_count": 1500,
+                "created_at": "2020-01-01T00:00:00Z",
+                "license": {"spdx_id": "MIT"},
+            }
+        )
+
+    monkeypatch.setattr(mod.subprocess, "run", _run)
+    monkeypatch.setattr(mod.requests, "get", _get)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert calls["gh"] >= 1
+    assert calls["requests"] >= 1
+    assert result["verdict"] == mod.VERDICT_ELIGIBLE
+
+
+def _fake_api_get_factory(now: _dt.datetime):
+    """Build an ``_api_get_with_headers`` fake that returns per-path fixtures."""
+
+    def _fake(path: str, *, allow_codes: tuple[int, ...] = ()):
+        if path.startswith("repos/") and not any(p in path for p in ("/tags", "/commits", "/license")):
+            return _fake.repos_payload, {}  # type: ignore[attr-defined]
+        if "/license" in path:
+            return {}, {}
+        if "/tags" in path:
+            return [{"name": "v1"}], {}
+        if "/commits" in path:
+            return [{"author": {"login": "alice"}}, {"author": {"login": "bob"}}], {}
+        return {}, {}
+
+    return _fake
+
+
+def test_partial_repos_response_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A /repos response missing stargazers_count must be INCONCLUSIVE, not a
+    # definitive reject.
+    fake = _fake_api_get_factory(now)
+    fake.repos_payload = {  # type: ignore[attr-defined]
+        "id": 1,
+        "full_name": "acme/widgets",
+        "private": False,
+        "fork": False,
+        "archived": False,
+        "created_at": "2020-01-01T00:00:00Z",
+        "license": {"spdx_id": "MIT"},
+    }
+    monkeypatch.setattr(mod, "_api_get_with_headers", fake)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
+
+
+def test_unparseable_created_at_is_inconclusive(now: _dt.datetime, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An unparseable created_at from the API must be INCONCLUSIVE, never a
+    # hard TOO_YOUNG reject.
+    fake = _fake_api_get_factory(now)
+    fake.repos_payload = {  # type: ignore[attr-defined]
+        "id": 1,
+        "full_name": "acme/widgets",
+        "private": False,
+        "fork": False,
+        "archived": False,
+        "stargazers_count": 1500,
+        "created_at": "definitely-not-a-date",
+        "license": {"spdx_id": "MIT"},
+    }
+    monkeypatch.setattr(mod, "_api_get_with_headers", fake)
+    result = mod.check_eligibility("acme/widgets", fetcher=mod.gather_repo_evidence)
+    assert result["verdict"] == mod.VERDICT_INCONCLUSIVE
+    assert result["criteria"]["api"]["reason"] == mod.RC_API_FAILURE
