@@ -17,8 +17,8 @@ from modulo.api.dependencies import get_db_session, require_feature, require_per
 from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.team_rbac import ORG_ROLE_HIERARCHY, TEAM_ROLE_HIERARCHY
-from modulo.db.crud.account import get_account_by_id
-from modulo.db.crud.org_membership import get_membership_by_account_and_org
+from modulo.db.crud import account as crud_account
+from modulo.db.crud import org_membership as crud_org_membership
 from modulo.db.crud.team import (
     TeamUpdateOutcome,
     create_team,
@@ -158,8 +158,10 @@ async def _authorize_membership_add(
                 detail=f"Cannot grant role '{role}' above your own team role '{caller_membership.role}'",
             )
 
-    target_account = await get_account_by_id(session, user_id)
-    target_membership = await get_membership_by_account_and_org(session, user_id, current_user.organisation_id)
+    target_account = await crud_account.get_account_by_id(session, user_id)
+    target_membership = await crud_org_membership.get_membership_by_account_and_org(
+        session, user_id, current_user.organisation_id
+    )
     if target_account is None or target_membership is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found in organisation")
     if TEAM_ROLE_HIERARCHY.get(role, -1) > ORG_ROLE_HIERARCHY.get(target_membership.role, -1):

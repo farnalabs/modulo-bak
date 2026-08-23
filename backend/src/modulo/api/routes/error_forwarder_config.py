@@ -359,7 +359,8 @@ async def configure_forwarder(
             detail=f"Unknown forwarder type: {forwarder_type}",
         )
 
-    _validate_forwarder_config_or_raise(forwarder_type, req.config_json)
+    if req.config_json is not None:
+        _validate_forwarder_config_or_raise(forwarder_type, req.config_json)
 
     try:
         async with session.begin():
