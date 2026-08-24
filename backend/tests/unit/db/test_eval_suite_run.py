@@ -150,7 +150,8 @@ def test_definition_checksum_deterministic_and_order_insensitive() -> None:
     definition_id = uuid.uuid4()
     left = compute_definition_checksum([{"id": definition_id, "config_json": {"pattern": "a|b"}}])
     right = compute_definition_checksum([{"id": definition_id, "config_json": {"pattern": "a|b"}}])
-    assert left == right and len(left) == 64
+    assert left == right
+    assert len(left) == 64
     changed = compute_definition_checksum([{"id": definition_id, "config_json": {"pattern": "a|c"}}])
     assert changed != left
     # membership order does not matter (sorted by id).
@@ -168,7 +169,8 @@ def test_scenario_signature_null_when_scenarios_unused() -> None:
     assert compute_scenario_signature(None) is None
     assert compute_scenario_signature({}) is None
     sig = compute_scenario_signature({"user": {"lang": "en"}, "k": [1, 2]})
-    assert sig is not None and len(sig) == 64
+    assert sig is not None
+    assert len(sig) == 64
     # canonical (key-order free)
     assert compute_scenario_signature({"b": 1, "a": 2}) == compute_scenario_signature({"a": 2, "b": 1})
 
@@ -198,9 +200,13 @@ def test_legal_transition_chain() -> None:
     session.add(run)
     session.flush()
     v1 = transition_state(session, run, SuiteRunState.RUNNING)
-    assert v1 == 1 and run.state == "running" and run.version == 1
+    assert v1 == 1
+    assert run.state == "running"
+    assert run.version == 1
     v2 = transition_state(session, run, SuiteRunState.COMPLETED, completed_at=datetime.now(UTC))
-    assert v2 == 2 and run.state == "completed" and run.completed_at is not None
+    assert v2 == 2
+    assert run.state == "completed"
+    assert run.completed_at is not None
     session.close()
 
 
@@ -285,7 +291,8 @@ async def test_baseline_first_run_warns_and_skips() -> None:
     current = _completed(uuid.uuid4(), created_at=datetime.now(UTC), tuple_sig="sig")
     baseline, warning = await _resolve(current, [])
     assert baseline is None
-    assert warning is not None and "comparison skipped" in warning
+    assert warning is not None
+    assert "comparison skipped" in warning
 
 
 async def test_baseline_picks_latest_completed_same_tuple_prior() -> None:
@@ -295,7 +302,8 @@ async def test_baseline_picks_latest_completed_same_tuple_prior() -> None:
     latest = _completed(org, created_at=now - timedelta(hours=1), tuple_sig="sig")
     current = _completed(org, created_at=now, tuple_sig="sig")
     baseline, warning = await _resolve(current, [earlier, latest])
-    assert baseline is not None and baseline.id == latest.id
+    assert baseline is not None
+    assert baseline.id == latest.id
     assert warning is None
 
 
@@ -329,7 +337,8 @@ async def test_baseline_tiebreak_is_lexical_id() -> None:
     low, high = sorted([low_id, high_id], key=lambda r: str(r.id))
     current = _completed(org, created_at=now, tuple_sig="sig")
     baseline, _ = await _resolve(current, [low, high])
-    assert baseline is not None and baseline.id == high.id
+    assert baseline is not None
+    assert baseline.id == high.id
 
 
 # --------------------------------------------------------------------------- #
@@ -356,7 +365,7 @@ def test_org_isolation_positive_control() -> None:
 
     # Cross-org: an org that owns none of the rows sees zero.
     session.info[_TENANT_KEY] = uuid.uuid4()
-    assert session.scalars(select(SuiteRun)).all() == []
+    assert not session.scalars(select(SuiteRun)).all()
     session.close()
 
 
