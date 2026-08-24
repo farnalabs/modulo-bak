@@ -13,7 +13,9 @@ tenant-isolation gap:
   * ENABLE + FORCE ROW LEVEL SECURITY so even the table owner is confined.
   * Add the canonical ``rls_org_isolation`` policy (org-scope USING on
     ``app.organisation_id``), mirroring every other tenant table.
-  * GRANT full DML to ``modulo_app`` (the runtime role).
+  * GRANT full DML to ``modulo_app`` (the runtime role) — conditional on the
+    role existing (fresh dev/BDD databases where ``alembic upgrade heads`` runs
+    before role bootstrap skip it).
 
 ``run_evidence`` already exists, so this is an ALTER (not a ``modulo_migrate``
 ownership ceremony): FORCE RLS is what confines the app/owner role here, which
@@ -77,8 +79,14 @@ def upgrade() -> None:
     op.execute(sa.text('ALTER TABLE public."run_evidence" FORCE ROW LEVEL SECURITY'))
     op.execute(sa.text(f'CREATE POLICY rls_org_isolation ON public."run_evidence" USING ({_ORG_SCOPE})'))
 
-    # 5. Runtime role needs DML.
-    op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
+    # 5. Runtime role needs DML — only when the role has been bootstrapped
+    # (the BDD suite runs migrations before bootstrap_role.py creates it).
+    app_role_exists = (
+        bind.execute(sa.text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": _APP_ROLE}).scalar_one_or_none()
+        is not None
+    )
+    if app_role_exists:
+        op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
 
 
 def downgrade() -> None:
