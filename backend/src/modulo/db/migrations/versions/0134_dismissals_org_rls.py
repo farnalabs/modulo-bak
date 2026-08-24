@@ -15,8 +15,10 @@ ROLE WIRING (the 0066 ceremony, verbatim from 0115): the migration connects via
 ``DATABASE_ADMIN_URL`` (env.py — the superuser/owner URL). ``modulo_migrate`` is
 a NOLOGIN role (bootstrap_role.py), so it cannot be CONNECTED to — the migration
 executes ``SET ROLE modulo_migrate`` BEFORE ``op.add_column`` + the FK constraint
-(the ``dismissals`` table is already owned by ``modulo_migrate`` from 0110, and
-the new column/FK must be created under that role so ownership stays consistent),
+(the ``dismissals`` table was originally owned by the migration caller from
+0003/0110; ownership is re-homed to ``modulo_migrate`` just before ``SET ROLE``
+so the new column/FK can be created under that role and ownership stays
+consistent),
 then ``RESET ROLE`` AFTER (the RLS-enable + policy + grant steps run as the
 migration's caller). The post-add ownership assertion verifies the table's owner
 is still ``modulo_migrate`` — the owner-bypasses-RLS precondition for ``dismissals``
@@ -99,6 +101,13 @@ def upgrade() -> None:
         migrate_role = _role_exists(bind, _MIGRATE_ROLE)
         app_role = _role_exists(bind, _APP_ROLE)
         if migrate_role:
+            # ``dismissals`` was created in 0003 (and had columns added in 0110)
+            # under the migration caller, so it is NOT yet owned by
+            # ``modulo_migrate``. Re-home ownership here (as the superuser caller)
+            # so that ``SET ROLE modulo_migrate`` below can ALTER it — and so the
+            # table ends up owned by ``modulo_migrate`` (the RLS-confinement
+            # precondition the post-add assertion checks for).
+            op.execute(f"ALTER TABLE public.dismissals OWNER TO {_MIGRATE_ROLE}")
             op.execute(f"GRANT REFERENCES ON TABLE public.organisations TO {_MIGRATE_ROLE}")
             op.execute(f"SET ROLE {_MIGRATE_ROLE}")
     else:
