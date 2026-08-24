@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0133_run_evidence_rls"
-down_revision: str | None = "0132_agent_connector_report_soft_delete_audit"
+down_revision: str | None = "0131_eval_dataset_corpus"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
