@@ -1,6 +1,6 @@
 """dismissals — add organisation_id + RLS (org isolation) to the dismissals table.
 
-Revision ID: 0130_dismissals_org_rls
+Revision ID: 0134_dismissals_org_rls
 Revises: 0126_human_set_eval_type
 Create Date: 2026-08-23
 
@@ -54,8 +54,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0130_dismissals_org_rls"
-down_revision: str | None = "0128_add_fk_lookup_indexes"
+revision: str = "0134_dismissals_org_rls"
+down_revision: str | None = "0129_runs_json_to_jsonb"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
