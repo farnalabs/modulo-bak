@@ -1,7 +1,7 @@
 """Register ``cost_ceiling_exceeded`` as a valid terminal run status (FAR-391).
 
-Revision ID: 0130_extend_runs_status_cost_ceiling
-Revises: 0129_spend_ceiling
+Revision ID: 0138_extend_runs_status_cost_ceiling
+Revises: 0137_spend_ceiling
 Create Date: 2026-08-23
 
 The FAR-391 spend-ceiling enforcement writes ``status = 'cost_ceiling_exceeded'``
@@ -25,8 +25,8 @@ constraint in lock-step with those sets.
 
 from alembic import op
 
-revision = "0130_extend_runs_status_cost_ceiling"
-down_revision = "0129_spend_ceiling"
+revision = "0138_extend_runs_status_cost_ceiling"
+down_revision = "0137_spend_ceiling"
 branch_labels = None
 depends_on = None
 
