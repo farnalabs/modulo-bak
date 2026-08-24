@@ -12,12 +12,16 @@ tenant-scoped egress allowlist layering, non-canonical IP-literal rejection,
 fail-closed any-IP-blocked semantics, and redirect safety.
 """
 
+import asyncio
 import datetime
 import http.server
+import logging
 import ssl
 import threading
+import time
 from pathlib import Path
 
+import httpx
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -356,51 +360,45 @@ def test_tenant_allowlist_does_not_weaken_loopback(monkeypatch: pytest.MonkeyPat
 # --- pinned-IP transport ---------------------------------------------------
 
 
-async def test_pinned_transport_uses_validated_ip_despite_rebind(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The transport must resolve exactly once, then pin that validated IP.
+async def test_pinned_transport_uses_validated_ip_despite_rebind() -> None:
+    """The transport pins the validated IP and never re-resolves.
 
-    A resolver that "flips" to a metadata address between validation and connect
-    is used: because the transport pins the first (validated) result and the
-    connect never re-resolves, the metadata address is never reached and the
-    request reaches the validated address.
+    loopback is now a NON-NEGOTIABLE floor at the validation layer, so the
+    high-level ``pinned_async_client`` can no longer validate a host that
+    resolves to 127.0.0.1. The transport is therefore built here with the
+    explicit pin map ``pinned_async_transport`` produces for a public origin —
+    the mechanism-under-test is the pinning+connect substitution, not the
+    validation gate. The key guarantee stays: connect goes to the pinned
+    address, never re-resolving to a different one, and any unpinned host is
+    refused.
     """
-    seen = _patch_resolver(monkeypatch, [["127.0.0.1"], ["169.254.169.254"]])
     server, port = _start_http_server()
     try:
-        client = await ssrf.pinned_async_client(
-            f"http://rebind.example:{port}/",
-            allow_networks=["127.0.0.0/8"],
-        )
-        # Building the client resolves exactly once (the validation).
-        assert len(seen) == 1
-        backend = client._transport._pool._network_backend
+        transport = ssrf.PinnedAsyncHTTPTransport({"rebind.example": "127.0.0.1"})
+        backend = transport._pool._network_backend
         assert backend._pinned_hosts == {"rebind.example": "127.0.0.1"}
+        client = httpx.AsyncClient(transport=transport)
         async with client:
             resp = await client.get(f"http://rebind.example:{port}/")
             assert resp.status_code == 200
             assert resp.text == "pinned-ok"
-        # The request connected to the validated address WITHOUT a second
-        # resolution, so the metadata flip was never reached.
-        assert len(seen) == 1
+        # The request connected to the pinned address and NEVER re-resolved: the
+        # pin map is unchanged afterwards, and an unpinned host is refused.
+        assert backend._pinned_hosts == {"rebind.example": "127.0.0.1"}
+        with pytest.raises(ssrf.UnpinnedHostError):
+            await backend.connect_tcp("metadata.example", port)
     finally:
         server.shutdown()
         server.server_close()
 
 
-async def test_pinned_transport_connects_to_pinned_validated_ip(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end: a made-up host is pinned to a validated loopback address and
-    the request reaches that address. Without pinning, the host would not resolve."""
-    _patch_resolver(monkeypatch, [["127.0.0.1"]])
+async def test_pinned_transport_connects_to_pinned_validated_ip() -> None:
+    """End-to-end: a made-up host is pinned to a loopback address and the
+    request reaches that address. Without pinning, the host would not resolve."""
     server, port = _start_http_server()
     try:
-        client = await ssrf.pinned_async_client(
-            f"http://pinned.example:{port}/",
-            allow_networks=["127.0.0.0/8"],
-        )
+        transport = ssrf.PinnedAsyncHTTPTransport({"pinned.example": "127.0.0.1"})
+        client = httpx.AsyncClient(transport=transport)
         async with client:
             resp = await client.get(f"http://pinned.example:{port}/")
             assert resp.status_code == 200
@@ -410,7 +408,7 @@ async def test_pinned_transport_connects_to_pinned_validated_ip(
         server.server_close()
 
 
-async def test_pinned_transport_sni_matches_hostname(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_pinned_transport_sni_matches_hostname(tmp_path: Path) -> None:
     """The pinned connection uses the ORIGINAL hostname for SNI + cert verify.
 
     An HTTPS server presents a cert whose SAN is ``ssrf-host.test``; the client
@@ -423,13 +421,9 @@ async def test_pinned_transport_sni_matches_hostname(monkeypatch: pytest.MonkeyP
     _make_self_signed_cert(hostname, cert_pem, key_pem)
     server, port = _start_tls_server(cert_pem, key_pem)
     try:
-        _patch_resolver(monkeypatch, [["127.0.0.1"]])
         verify_ctx = ssl.create_default_context(cafile=str(cert_pem))
-        client = await ssrf.pinned_async_client(
-            f"https://{hostname}:{port}/",
-            allow_networks=["127.0.0.0/8"],
-            verify=verify_ctx,
-        )
+        transport = ssrf.PinnedAsyncHTTPTransport({hostname: "127.0.0.1"}, verify=verify_ctx)
+        client = httpx.AsyncClient(transport=transport, verify=verify_ctx)
         async with client:
             resp = await client.get(f"https://{hostname}:{port}/")
             assert resp.status_code == 200
@@ -455,3 +449,183 @@ async def test_redirect_to_internal_is_blocked_when_revalidated(
     _patch_resolver(monkeypatch, [["169.254.169.254"]])
     with pytest.raises(ValueError, match="private/internal"):
         await ssrf.validate_outbound_url_async("http://redirect-target.example/")
+
+
+# --- FAR-409 security hardening: non-negotiable floor, fail-closed pinning,
+#     trust_env, DNS timeout, empty resolution, and dotted/hex literals ---------
+
+
+def test_allowlist_cannot_override_loopback_or_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A tenant/global allowlist that names loopback or cloud metadata must not
+    make those ranges reachable — they are a NON-NEGOTIABLE floor."""
+    monkeypatch.setenv("SSRF_ALLOW_PRIVATE_RANGES", "127.0.0.0/8,169.254.0.0/16,10.0.0.0/8")
+    with pytest.raises(ValueError, match="private/internal"):
+        ssrf.validate_outbound_url("http://127.0.0.1/")
+    with pytest.raises(ValueError, match="private/internal"):
+        ssrf.validate_outbound_url("http://169.254.169.254/")
+    # The floor does not break a legit allowlist for other private ranges.
+    assert ssrf.validate_outbound_url("http://10.1.2.3/") is None
+
+
+def test_non_negotiable_floor_applies_to_tenant_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SSRF_ALLOW_PRIVATE_RANGES", "192.168.0.0/16")
+    # Even a tenant-scoped allowlist explicitly naming loopback + metadata is
+    # overridden by the floor.
+    with pytest.raises(ValueError, match="private/internal"):
+        ssrf.validate_outbound_url("http://169.254.169.254/", allow_networks=["169.254.0.0/16"])
+    with pytest.raises(ValueError, match="private/internal"):
+        ssrf.validate_outbound_url("http://127.0.0.1/", allow_networks=["127.0.0.0/8"])
+
+
+def test_ipv6_site_local_and_multicast_blocked() -> None:
+    # fec0::/10 (IPv6 site-local) and ff00::/8 (IPv6 multicast) are never valid
+    # egress targets and are blocked like loopback/metadata.
+    for url in ("http://[fec0::1]/", "http://[ff02::1]/", "http://[::1]/"):
+        with pytest.raises(ValueError, match="private/internal"):
+            ssrf.validate_outbound_url(url)
+
+
+def test_hex_like_hostname_not_spuriously_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a genuine hostname beginning with ``0x`` is NOT a hex IP
+    literal and must be resolved (and pass) rather than rejected."""
+    seen: list[str] = []
+
+    def fake_resolve(host: str) -> list[str]:
+        seen.append(host)
+        assert host == "0x.mydomain.com"
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", fake_resolve)
+    assert ssrf.validate_outbound_url("http://0x.mydomain.com/") is None
+    assert seen == ["0x.mydomain.com"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0x1.0.1/",  # dotted-numeric with a hex octet
+        "http://dead.beef/",  # all-hex dotted labels => encoded literal
+        "http://1.2.3.4.5/",  # overlong dotted-quad
+    ],
+)
+def test_dotted_numeric_literals_rejected(url: str) -> None:
+    with pytest.raises(ValueError):
+        ssrf.validate_outbound_url(url)
+
+
+async def test_pinned_transport_refuses_unpinned_host() -> None:
+    """Fail-closed: a host that is NOT in the pin map is refused, never connected.
+
+    A 302 -> 169.254.169.254 would otherwise fall through ``connect_tcp`` to the
+    unpinned host (the old ``.get(host, host)`` fallback); that must not happen.
+    """
+    transport = ssrf.PinnedAsyncHTTPTransport({"good.example": "127.0.0.1"})
+    backend = transport._pool._network_backend
+    with pytest.raises(ssrf.UnpinnedHostError):
+        await backend.connect_tcp("evil.example", 443)
+    # The pin map is authoritative and unchanged.
+    assert backend._pinned_hosts == {"good.example": "127.0.0.1"}
+
+
+async def test_trailing_dot_host_still_pins() -> None:
+    """httpx passes a trailing-dot host to ``connect_tcp``; it must still match
+    the pin map (normalised host key on both sides) rather than be refused."""
+    server, port = _start_http_server()
+    try:
+        transport = ssrf.PinnedAsyncHTTPTransport({"rebind.example": "127.0.0.1"})
+        backend = transport._pool._network_backend
+        assert backend._pinned_hosts == {"rebind.example": "127.0.0.1"}
+        client = httpx.AsyncClient(transport=transport)
+        async with client:
+            resp = await client.get(f"http://rebind.example.:{port}/")
+            assert resp.status_code == 200
+            assert resp.text == "pinned-ok"
+        assert backend._pinned_hosts == {"rebind.example": "127.0.0.1"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_pinned_transport_proxy_env_ignored_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """trust_env defaults False, so a proxy env var does not defeat pinning."""
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.local:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:8080")
+    transport = ssrf.PinnedAsyncHTTPTransport({"rebind.example": "127.0.0.1"})
+    assert transport._pool._network_backend._pinned_hosts == {"rebind.example": "127.0.0.1"}
+
+
+def test_pinned_transport_honks_on_proxy_trust_with_env(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Opting into proxy trust while a proxy env var is present honks loudly."""
+    monkeypatch.setenv("ALL_PROXY", "http://proxy.local:8080")
+    with caplog.at_level(logging.WARNING):
+        ssrf.PinnedAsyncHTTPTransport({"x.example": "93.184.216.34"}, trust_env=True)
+    assert any("ssrf.pinned_transport_proxy_env" in r.message for r in caplog.records)
+    assert any("ALL_PROXY" in (getattr(r, "proxy_vars", "") or "") for r in caplog.records)
+
+
+async def test_dns_resolution_timeout_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SSRF_DNS_TIMEOUT", "0.05")
+
+    async def hanging_getaddrinfo(*_args: object, **_kwargs: object) -> list[tuple[object, ...]]:
+        await asyncio.sleep(5)  # far longer than the configured timeout
+        return []
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", hanging_getaddrinfo)
+    with pytest.raises(ValueError, match="timed out"):
+        await ssrf.validate_outbound_url_async("http://slow.example/")
+
+
+def test_dns_resolution_sync_timeout_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SSRF_DNS_TIMEOUT", "0.05")
+    monkeypatch.setattr(ssrf, "_getaddrinfo_sync", lambda _host: time.sleep(1.0) or [])
+    with pytest.raises(ValueError, match="timed out"):
+        ssrf.validate_outbound_url("http://slow.example/")
+
+
+async def test_empty_resolution_raises_value_error_not_index_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_empty(_host: str) -> list[str]:
+        return []
+
+    monkeypatch.setattr(ssrf, "_resolve_all_async", fake_empty)
+    with pytest.raises(ValueError, match="resolved to no addresses"):
+        await ssrf.resolve_pinned_ip("http://empty.example/")
+    with pytest.raises(ValueError, match="resolved to no addresses"):
+        await ssrf.validate_outbound_url_async("http://empty.example/")
+
+
+def test_empty_resolution_sync_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: [])
+    with pytest.raises(ValueError, match="resolved to no addresses"):
+        ssrf.validate_outbound_url("http://empty.example/")
+
+
+async def test_pin_registry_survives_request_and_reopen() -> None:
+    """Smoke test: the pin registry is still populated after a request and after
+    close/re-open — catches a silent un-pin (e.g. if httpcore ever dropped or
+    replaced the network backend).
+    """
+    server, port = _start_http_server()
+    try:
+        transport = ssrf.PinnedAsyncHTTPTransport({"smoke.example": "127.0.0.1"})
+        backend = transport._pool._network_backend
+        assert backend._pinned_hosts == {"smoke.example": "127.0.0.1"}
+        client = httpx.AsyncClient(transport=transport)
+        async with client:
+            resp = await client.get(f"http://smoke.example:{port}/")
+            assert resp.status_code == 200
+        # The pin map survives the request — a silent un-pin would be caught here.
+        assert transport._pool._network_backend is backend
+        assert backend._pinned_hosts == {"smoke.example": "127.0.0.1"}
+        await client.aclose()
+        # Re-opening on a fresh transport re-establishes the pin.
+        transport2 = ssrf.PinnedAsyncHTTPTransport({"smoke.example": "127.0.0.1"})
+        assert transport2._pool._network_backend._pinned_hosts == {"smoke.example": "127.0.0.1"}
+    finally:
+        server.shutdown()
+        server.server_close()
