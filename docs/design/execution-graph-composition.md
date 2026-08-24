@@ -134,12 +134,15 @@ Adding `COMPENSATION_FAILED`, `ROUTER_NO_MATCH`, or adopting `UNKNOWN` requires 
 12. Semgrep `raw-status-complete` rule (`classify.py:119-122`) expectations.
 **Recommendation:** refactor to a single canonical, **attribute-driven** run-status registry (each status = metadata object with `is_terminal`, `sets_completed_at`, `advances_journey`, `is_countable_failure`, `is_active` flags) imported by all sites — eliminates the duplication leak. Mandated as a prerequisite refactor; until done, the migration plan lists all 12 sites.
 
-## 11. Open questions for the user
-1. Port model depth: full port-addressed state (F1) vs keep flat dict + ports only where fan-in needs them?
-2. Router vs edge-conditions: fully replace `condition_expression` edges with Router nodes, or keep both (Router is sugar)?
-3. HITL node vs edge gate: make `hitl` the primary authoring surface and deprecate edge-gate HITL, or run both indefinitely?
-4. Live edit history: store as a new `pipeline_versions` table, or reuse snapshot machinery with a "draft" flag?
-5. Fork/merge: alpha or v1+?
+## 11. Design decisions (resolved)
+
+The following were open questions; resolutions are locked into the design.
+
+1. **Port model depth → Full port-addressed state (F1).** Ports are additive metadata over the flat `run_context`/`artifact` dict (no rename); a non-Join target port accepts at most one incoming edge. The "ports only where fan-in needs them" hybrid was rejected — it creates two code paths (port-addressed vs flat) and a migration boundary. Full ports is consistent; the lazy backfill is zero-break.
+2. **Router vs edge-conditions → Keep both; Router is primary, `conditional` deprecated-but-compile-supported.** Existing conditional edges ship and compile; forcing a migration to Router nodes is a breaking change. Router lowers to the same conditional compile path, so they are functionally equivalent. New authoring uses Router (visual builder); `conditional` edge_type is deprecated for authoring only.
+3. **HITL node vs edge gate → `hitl` node is the primary authoring surface; edge-gate HITL deprecated-but-compile-supported (auto-convert on backfill).** Edge-gate HITL is invisible on the canvas; `hitl` makes it first-class. Existing edge-gate graphs auto-convert; edge-gate authoring is deprecated.
+4. **Live edit history → Reuse the snapshot machinery with a `draft` flag (not a new table).** Snapshots already pin the full graph + bindings and provide diff/rollback. A `draft` boolean + `version_kind` (edit vs run) reuses `pipeline_snapshot_versioning.py` and the immutable-chain semantics, avoiding duplication of the snapshot schema and diff/rollback logic.
+5. **Fork/merge → Deferred to v1+.** "Git for pipelines" is a large, independent feature (branch/edit/merge/conflict-resolution) with its own UX and risk; not required for the alpha composition win. P1–P6 cover ergonomics without it.
 
 ---
 
