@@ -27,7 +27,7 @@ NEW_STATUS = "cost_ceiling_exceeded"
 def _migration_0128():
     # The migration module name starts with a digit, so it cannot be imported
     # with a normal ``import`` statement — load it by string instead.
-    return importlib.import_module("modulo.db.migrations.versions.0130_extend_runs_status_cost_ceiling")
+    return importlib.import_module("modulo.db.migrations.versions.0138_extend_runs_status_cost_ceiling")
 
 
 def test_cost_ceiling_exceeded_registered_in_vocabularies() -> None:
