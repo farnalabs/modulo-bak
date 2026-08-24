@@ -279,7 +279,10 @@ _HEX_CHARS = "0123456789abcdef"
 
 def _is_hex_run(label: str) -> bool:
     """True when ``label`` is a non-empty run of hexadecimal digits."""
-    return bool(label) and all(char in _HEX_CHARS for char in label.lower())
+    lowered = label.lower()
+    if not lowered:
+        return False
+    return all(char in _HEX_CHARS for char in lowered)
 
 
 def _is_numeric_literal_label(label: str) -> bool:
@@ -306,7 +309,9 @@ def _is_dotted_numeric_literal(host: str) -> bool:
     an encoded address.
     """
     labels = host.split(".")
-    return bool(labels) and all(_is_numeric_literal_label(label) for label in labels)
+    if not labels:
+        return False
+    return all(_is_numeric_literal_label(label) for label in labels)
 
 
 def _validate_port(parsed: object) -> int | None:
