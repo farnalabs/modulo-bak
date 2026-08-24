@@ -11,12 +11,28 @@ import httpx
 import pytest
 
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery, ConnectorType
-from modulo.connectors.rest import RestConnector
+from modulo.connectors.rest import (
+    RESTConnectError,
+    RestConnector,
+    RESTResponseTooLargeError,
+    RESTStatusError,
+    SecurityGuard,
+)
 from tests.connectors._conformance import assert_result_shape, assert_write_result_shape
 
 
 def _default_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={})
+
+
+def _noop_guard() -> SecurityGuard:
+    async def validate_url(url: str) -> None:
+        return None
+
+    def filter_strings(values: list[str], resource: str) -> None:
+        return None
+
+    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
 
 
 def _make_connector(
@@ -29,6 +45,7 @@ def _make_connector(
         creds,
         transport=httpx.MockTransport(_default_handler),
         ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
     )
 
 
@@ -318,6 +335,189 @@ def test_hub_ciphertext_round_trips_multi_field_json_dict() -> None:
     assert connector.connector_type is ConnectorType.REST
     assert connector._inner._auth["mode"] == "bearer"
     assert connector._inner._auth["token"] == "secret-token"
+
+
+def test_health_check_sends_credentials_and_validates() -> None:
+    """health_check must send creds (not a bare probe) and validate the target."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.headers))
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/items",
+            "allowed_hosts": ["api.example.com"],
+        },
+        {"auth_mode": "bearer", "token": "sec-token"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    health = asyncio_run(c.health_check())
+    assert health.ok is True
+    assert captured.get("authorization") == "Bearer sec-token"
+
+
+def test_health_check_reports_bad_status_as_unok() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text="unauthorized")
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "sec-token"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    health = asyncio_run(c.health_check())
+    assert health.ok is False
+
+
+def test_api_key_query_rendered_param_collision_rejected() -> None:
+    """A rendered/config param must never shadow the api_key credential param."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "params": {"api_key": "{{ v }}"}},
+        {"auth_mode": "api_key", "api_key": "k456", "in": "query", "query_param_name": "api_key"},
+    )
+    with pytest.raises(ValueError, match="collides with the api_key credential"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
+
+
+def test_api_key_query_always_overrides_rendered_param() -> None:
+    """A rendered param of a DIFFERENT name must never shadow the credential param."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "params": {"api_key": "rendered"}},
+        {"auth_mode": "api_key", "api_key": "the-secret", "in": "query", "query_param_name": "auth_token"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert captured["params"]["api_key"] == "rendered"
+    assert captured["params"]["auth_token"] == "the-secret"
+
+
+def test_three_xx_is_a_distinct_error() -> None:
+    """3xx (redirects not followed) must surface as an error, not a passthrough record."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, text="", headers={"location": "https://api.example.com/new"})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(ValueError, match="location"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
+
+
+def test_query_honours_limit() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"items": [{"id": i} for i in range(5)]}})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "records_path": "data.items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(c.query(ConnectorQuery(resource="default", limit=2)))
+    assert len(result.records) == 2
+    assert result.total == 2
+
+
+def test_query_rejects_non_none_cursor() -> None:
+    """Pagination is response-driven — a direct start cursor is not supported."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    with pytest.raises(ValueError, match="pagination is response-driven"):
+        asyncio_run(c.query(ConnectorQuery(resource="default", cursor="abc")))
+
+
+def test_query_passthrough_forces_wrap_for_json() -> None:
+    """passthrough=True forces a single-record wrap even for a JSON body."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "passthrough": True},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"data": [1, 2, 3]}))
+    result = asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert len(result.records) == 1
+    assert '"data"' in result.records[0]["body"]
+
+
+def test_retry_get_retries_on_429_then_succeeds() -> None:
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < 3:
+            return httpx.Response(429, text="throttled", headers={"Retry-After": "0"})
+        return httpx.Response(200, json={"ok": True})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert result.metadata["status_code"] == 200
+    assert len(attempts) == 3
+
+
+def test_write_does_not_retry_non_idempotent() -> None:
+    """A POST without an idempotency header is a single attempt, never retried."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(429, text="throttled", headers={"Retry-After": "0"})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/users", "body": {"name": "{{ name }}"}},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(ValueError, match="429"):
+        asyncio_run(c.write(ConnectorPayload(resource="default", data={"name": "Ada"})))
+    assert len(attempts) == 1
+
+
+def test_retry_delay_honours_retry_after() -> None:
+    exc = RESTStatusError("boom", status_code=429, retry_after=2.5)
+    assert RestConnector._retry_delay(exc, 0) == 2.5
+    assert RestConnector._retry_delay(RESTStatusError("boom", status_code=429, retry_after=None), 1) >= 1.0
+
+
+def test_response_size_cap_aborts() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="x" * 500, headers={"content-type": "text/plain"})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "max_response_size": 50},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(RESTResponseTooLargeError, match="too large"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
+
+
+def test_transport_errors_are_typed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(RESTConnectError, match="transport error"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 
 def asyncio_run(coro: Any) -> Any:

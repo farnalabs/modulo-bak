@@ -65,7 +65,7 @@ from modulo.connectors.onepassword import OnePasswordConnector
 from modulo.connectors.opsgenie import OpsgenieConnector
 from modulo.connectors.pagerduty import PagerDutyConnector
 from modulo.connectors.pypi import PyPIConnector
-from modulo.connectors.rest import RestConnector
+from modulo.connectors.rest import RestConnector, SecurityGuard
 from modulo.connectors.sentry import SentryConnector
 from modulo.connectors.sharepoint import SharePointConnector
 from modulo.connectors.shell import ShellConnector
@@ -468,6 +468,34 @@ def _require_config(config: dict[str, Any] | None, key: str, label: str) -> str:
     return value
 
 
+def _core_security_guard() -> SecurityGuard:
+    """Wire the production ``modulo.core`` SSRF + output-injection guards at the root.
+
+    The REST connector depends on the (connector-local) ``SecurityGuard`` port
+    rather than importing ``modulo.core`` directly; this is the single place that
+    binds the port to the real ``modulo.core`` implementations. Imports are lazy
+    to avoid pulling ``pipeline_engine`` / ``ssrf`` at connector-hub import time.
+    """
+
+    async def validate_url(url: str) -> None:
+        from modulo.core.ssrf import validate_outbound_url_async
+
+        await validate_outbound_url_async(url)
+
+    def filter_strings(values: Sequence[str], resource: str) -> None:
+        from modulo.core.pipeline_engine.output_filter import (
+            OutputRejectedError,
+            filter_output_for_injection,
+        )
+
+        for value in values:
+            result = filter_output_for_injection(value)
+            if not result.passed:
+                raise OutputRejectedError(f"{result.reason} (REST resource: {resource!r})")
+
+    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
+
+
 def _build_connector(
     type_id: str,
     config: dict[str, Any] | None,
@@ -633,7 +661,7 @@ def _build_connector(
             # Multi-field auth (auth_mode/token/api_key/username/password/...)
             # arrives as a JSON dict via secrets_backend OR credentials_ciphertext
             # — not the single api_key fallback (see initialise()).
-            return RestConnector(config=config, creds=creds)
+            return RestConnector(config=config, creds=creds, security_guard=_core_security_guard())
         case "ticket-tracker":
             provider = config.get("provider", "github")
             if provider == "github":

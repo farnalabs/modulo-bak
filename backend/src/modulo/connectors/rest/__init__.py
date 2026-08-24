@@ -15,19 +15,23 @@ the runtime variables supplied per call:
 ``ConnectorQuery.filters`` for ``query()`` and ``ConnectorPayload.data`` for
 ``write()``.
 
-    base_url:      "https://api.example.com"            # required
-    method:        "GET"                                # default verb (query path)
-    path:          "/v1/users/{{ user_id }}"            # URL template
-    headers:       {"Accept": "application/json"}       # header templates
-    params:        {"page": "{{ page }}"}               # query params (URL-encoded by httpx)
-    body:          {"name": "{{ name }}"}               # JSON body template (write path)
-    operations:    { "<resource>": { "method": ..., "path": ..., "headers": {},
-                                      "params": {}, "body": {}, "records_path": ...,
-                                      "next_cursor_path": ..., "passthrough": ... } }
-    records_path:      "data.items"                     # dot-path into JSON response for records
-    next_cursor_path:  "data.next_cursor"               # optional pagination cursor (no JMESPath)
-    allowed_hosts:     ["api.example.com"]              # optional scheme/host allowlist
-    passthrough:       false                            # wrap non-JSON/raw bodies as a single record
+    base_url:             "https://api.example.com"            # required
+    method:               "GET"                                # default verb (query path)
+    path:                 "/v1/users/{{ user_id }}"            # URL template
+    headers:              {"Accept": "application/json"}       # header templates
+    params:               {"page": "{{ page }}"}               # query params (URL-encoded by httpx)
+    body:                 {"name": "{{ name }}"}               # JSON body template (write path)
+    operations:           { "<resource>": { "method": ..., "path": ..., "headers": {},
+                                             "params": {}, "body": {}, "records_path": ...,
+                                             "next_cursor_path": ..., "passthrough": ...,
+                                             "idempotency_header": ... } }
+    records_path:         "data.items"                         # JMESPath expression into JSON response for records
+    next_cursor_path:     "data.next_cursor"                   # optional pagination cursor (JMESPath)
+    allowed_hosts:        ["api.example.com"]                  # optional scheme/host allowlist
+    passthrough:          false                                # force single-record wrap of the raw body when set
+    max_response_size:    <bytes>                              # optional max response body size (default 10 MiB)
+    idempotency_header:   <header-name>                        # optional header that makes a
+                                                                #   non-GET/HEAD request safe to retry
 
 VERB-AGNOSTIC READ/WRITE MAPPING
 --------------------------------
@@ -60,7 +64,23 @@ single ``api_key`` fallback. Read ``auth_mode`` + named fields from that dict:
     # basic   -> username + password
 
 Templating uses the existing ``node_runner`` ``jinja2.sandbox.SandboxedEnvironment``;
-the only runtime dependencies added here are ``httpx`` and ``jinja2``.
+the only runtime dependencies added here are ``httpx``, ``jinja2`` and
+``jmespath``.
+
+TRANSPORT
+---------
+A single lazily-created, connection-pooled ``httpx.AsyncClient`` is reused
+across calls and closed via :meth:`RestConnector.close`. The client never
+follows redirects, so HTTP 3xx responses are surfaced as errors (with
+``Retry-After``/``location`` metadata) rather than silently passing through.
+
+RETRY
+-----
+Idempotent verbs (``GET``/``HEAD``) are retried up to 3x with exponential
+backoff + jitter, honouring ``Retry-After`` and the retryable status set
+(``429``/``5xx``). Mutating verbs are retried only when the operation declares
+an ``idempotency_header``. Transport failures are retried for idempotent verbs
+and surface as a typed :class:`RESTConnectError`.
 """
 
 from __future__ import annotations
@@ -70,11 +90,16 @@ import base64
 import inspect
 import json
 import logging
-from collections.abc import Callable
-from typing import Any
+import random
+import re
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Any, cast
 from urllib.parse import urlparse
 
 import httpx
+import jmespath
 from jinja2.sandbox import SandboxedEnvironment
 
 from modulo.connectors._retry_headers import parse_retry_after
@@ -102,29 +127,21 @@ _AUTH_PROTECTED_HEADERS = frozenset({"authorization", "proxy-authorization", "ho
 _CONTROL_CHARS = frozenset({chr(c) for c in range(0x20) if c != 0x09} | {"\x7f"})
 
 _DEFAULT_TIMEOUT = 30.0
+_DEFAULT_MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10 MiB
+_MAX_RETRIES = 3
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 
-SsrfValidator = Callable[[str], Any]
+# ``.0`` (dot-number) segments are legacy ``_dot_get`` index syntax; JMESPath
+# wants ``[0]``. Coerce ``items.0`` -> ``items[0]`` so old configs keep working.
+_JMESPATH_INDEX = re.compile(r"\.(\d+)")
+
+SsrfValidator = Callable[[str], Awaitable[None] | None]
 
 
-def _dot_get(data: Any, path: str | None) -> Any:
-    """Navigate a dot-path (``"data.items"``) into a JSON structure.
-
-    Lists are indexable via a numeric segment (``"items.0"``). Replaces JMESPath
-    so the connector adds no JQ-style runtime dependency; the fields that carry
-    it are the connector-only ``records_path`` / ``next_cursor_path``.
-    """
-    if not path:
-        return data
-    current = data
-    for segment in path.split("."):
-        if isinstance(current, dict):
-            current = current.get(segment)
-        elif isinstance(current, list) and segment.isdigit():
-            idx = int(segment)
-            current = current[idx] if 0 <= idx < len(current) else None
-        else:
-            return None
-    return current
+def _coerce_jmespath(path: str) -> str:
+    """Translate legacy dot-index syntax (``items.0``) into JMESPath (``items[0]``)."""
+    return _JMESPATH_INDEX.sub(r"[\1]", path)
 
 
 def _collect_strings(value: Any) -> list[str]:
@@ -149,25 +166,106 @@ def _reject_control_chars(value: str, *, what: str) -> None:
         raise ValueError(f"REST {what} contains control characters (header injection): {offending}")
 
 
-def _filter_injection_strings(values: list[str], *, resource: str) -> None:
-    """Reject LLM-output injection markers in any string that will reach the wire.
+class RESTError(ValueError):
+    """Base class for RestConnector request errors."""
 
-    The write path already applies ``filter_payload_for_injection`` to the
-    ``ConnectorPayload``; the query path has no payload, so this applies the
-    same ``filter_output_for_injection`` check to every rendered string that
-    goes into the request (URL, params, headers, body). Reuses the existing
-    output-filter machinery —     no new tooling.
+
+class RESTStatusError(RESTError):
+    """A non-2xx HTTP status (3xx included — redirects are not silently followed)."""
+
+    def __init__(self, message: str, *, status_code: int, location: str = "", retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.location = location
+        self.retry_after = retry_after
+
+
+class RESTConnectError(RESTError):
+    """A transport-level failure (connect/timeout/read) — never retried here."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class RESTResponseTooLargeError(RESTError):
+    """The response body exceeded the configured ``max_response_size`` cap."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class SecurityGuard:
+    """Connector-local port for the SSRF + output-injection guards (FAR-408 layering).
+
+    Injected at the composition root (see ``connector_hub._build_connector``) so the
+    connector does not reach into ``modulo.core`` directly. ``validate_url`` is
+    awaited (or called) and raises on a disallowed target; ``filter_strings``
+    raises on a string that fails the injection filter. A convenience
+    :class:`_DefaultSecurityGuard` keeps direct construction (tests, ad-hoc use)
+    safety-preserving by wiring the lazy ``modulo.core`` implementations.
     """
-    # Lazy import: output_filter sits behind modulo.core.pipeline_engine, whose
-    # package __init__ imports the executor -> connector_hub -> connectors.
-    # Importing it at module load here would create a circular import, so it is
-    # resolved only when a request is actually built.
-    from modulo.core.pipeline_engine.output_filter import OutputRejectedError, filter_output_for_injection
 
-    for value in values:
-        result = filter_output_for_injection(value)
-        if not result.passed:
-            raise OutputRejectedError(f"{result.reason} (REST resource: {resource!r})")
+    def __init__(
+        self,
+        *,
+        validate_url: Callable[[str], Awaitable[None] | None],
+        filter_strings: Callable[[Sequence[str], str], None],
+    ) -> None:
+        self._validate_url = validate_url
+        self._filter_strings = filter_strings
+
+    async def validate_url(self, url: str) -> None:
+        result = self._validate_url(url)
+        if inspect.isawaitable(result):
+            await result
+
+    def filter_strings(self, values: Sequence[str], *, resource: str) -> None:
+        self._filter_strings(values, resource)
+
+
+class _DefaultSecurityGuard(SecurityGuard):
+    """Lazy ``modulo.core``-backed guard used when no guard is injected."""
+
+    def __init__(self) -> None:
+        super().__init__(validate_url=self._core_validate, filter_strings=self._core_filter)
+
+    @staticmethod
+    async def _core_validate(url: str) -> None:
+        from modulo.core.ssrf import validate_outbound_url_async
+
+        await validate_outbound_url_async(url)
+
+    @staticmethod
+    def _core_filter(values: Sequence[str], resource: str) -> None:
+        from modulo.core.pipeline_engine.output_filter import (
+            OutputRejectedError,
+            filter_output_for_injection,
+        )
+
+        for value in values:
+            result = filter_output_for_injection(value)
+            if not result.passed:
+                raise OutputRejectedError(f"{result.reason} (REST resource: {resource!r})")
+
+
+@dataclass(frozen=True)
+class RestRequest:
+    """A fully-rendered, validated request (the stringly-typed dict is gone).
+
+    ``records_path`` / ``next_cursor_path`` are JMESPath expressions;
+    ``passthrough`` forces a single-record raw-body wrap; ``idempotency_header``
+    marks the request safe to retry even when the verb is mutating.
+    """
+
+    method: str
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
+    body: Any = None
+    records_path: str | None = None
+    next_cursor_path: str | None = None
+    passthrough: bool = False
+    idempotency_header: str | None = None
 
 
 class RestConnector(ConnectorBase):
@@ -176,6 +274,8 @@ class RestConnector(ConnectorBase):
     ``config`` is the ``config_json`` and ``creds`` the decrypted credentials
     dict (see the module docstring for both shapes). ``transport`` and
     ``ssrf_validator`` are test seams — production callers pass neither.
+    ``security_guard`` is the injection/SSRF port; the composition root wires the
+    production ``modulo.core`` implementation.
     """
 
     def __init__(
@@ -185,18 +285,27 @@ class RestConnector(ConnectorBase):
         *,
         transport: httpx.BaseTransport | None = None,
         ssrf_validator: SsrfValidator | None = None,
+        security_guard: SecurityGuard | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        max_connections: int = 10,
+        max_keepalive_connections: int = 5,
     ) -> None:
         self._config = config or {}
         self._creds = creds or {}
         self._transport = transport
         self._timeout = float(timeout or _DEFAULT_TIMEOUT)
         self._ssrf_validator = ssrf_validator
+        self._security_guard = security_guard or _DefaultSecurityGuard()
         self._base_url = str(self._config.get("base_url", "")).rstrip("/")
         if not self._base_url:
             raise ValueError("REST connector requires 'base_url' in config_json")
         self._env = SandboxedEnvironment()
         self._auth = self._normalise_auth(self._creds)
+        raw_size = self._config.get("max_response_size", _DEFAULT_MAX_RESPONSE_SIZE)
+        self._max_response_size = int(raw_size)
+        self._max_connections = int(max_connections)
+        self._max_keepalive = int(max_keepalive_connections)
+        self._cached_client: httpx.AsyncClient | None = None
 
     # ── ConnectorBase surface ──────────────────────────────────────────────
 
@@ -205,42 +314,67 @@ class RestConnector(ConnectorBase):
         return ConnectorType.REST
 
     def _client(self) -> httpx.AsyncClient:
-        kwargs: dict[str, Any] = {"timeout": self._timeout, "follow_redirects": False}
-        if self._transport is not None:
-            kwargs["transport"] = self._transport
-        return httpx.AsyncClient(**kwargs)
+        """Return the lazily-created, connection-pooled client (never closed here)."""
+        if self._cached_client is None:
+            kwargs: dict[str, Any] = {
+                "timeout": self._timeout,
+                "follow_redirects": False,
+                "limits": httpx.Limits(
+                    max_connections=self._max_connections,
+                    max_keepalive_connections=self._max_keepalive,
+                ),
+            }
+            if self._transport is not None:
+                kwargs["transport"] = self._transport
+            self._cached_client = httpx.AsyncClient(**kwargs)
+        return self._cached_client
+
+    async def close(self) -> None:
+        """Release the pooled client (idempotent; safe to call after an exception)."""
+        client = self._cached_client
+        self._cached_client = None
+        if client is not None:
+            await client.aclose()
 
     async def health_check(self) -> HealthResult:
         """Verify the target is reachable and the credentials are accepted.
 
-        Issues a ``HEAD`` (falling back to a ``GET``) against ``base_url``. A
-        sub-400 status means the endpoint + credentials are live; any other
-        status is a non-OK result. Never raises — like the other connectors.
+        Issues a ``GET`` against ``base_url`` + the configured ``path`` after
+        validating the target through the SSRF/allowlist guard, sending the
+        credentials (``apply_auth`` headers + query params). A sub-400 status
+        means the endpoint + credentials are live; any other status is a non-OK
+        result. Never raises — like the other connectors.
         """
         try:
-            async with self._client() as client:
-                resp: httpx.Response | None = None
-                for method in ("HEAD", "GET"):
-                    resp = await client.request(method, self._base_url)
-                    if resp.status_code < 400:
-                        return HealthResult(ok=True, detail=f"HTTP {resp.status_code}: {self._base_url}")
-                assert resp is not None
-                return HealthResult(ok=False, detail=f"HTTP {resp.status_code}: {self._base_url}")
-        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
-            return HealthResult(ok=False, detail=f"Cannot connect to {self._base_url}: {exc}")
+            request = await self._build_health_request()
+            client = self._client()
+            resp, _body_text = await self._send(client, request)
+            if resp.status_code < 400:
+                return HealthResult(ok=True, detail=f"HTTP {resp.status_code}: {request.url}")
+            return HealthResult(ok=False, detail=f"HTTP {resp.status_code}: {request.url}")
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+        except (RESTError, ValueError) as exc:
+            return HealthResult(ok=False, detail=self._redact(str(exc))[:200])
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         """Read surface. Renders the operation from ``q.filters`` and issues it."""
         resource = q.resource
         self._require_resource(resource)
+        if q.cursor is not None:
+            raise ValueError(
+                "REST connector pagination is response-driven: supply the idempotent filter "
+                "that the operation templates, not a direct start cursor; use the returned "
+                "next_cursor for the next page"
+            )
         context = dict(q.filters or {})
         context.setdefault("resource", resource)
         request = await self._build_request(resource, context, surface="read")
-        return await self._send_and_transform(request)
+        result = cast(ConnectorResult, await self._execute(request, surface="read"))
+        if q.limit is not None:
+            result.records = result.records[: q.limit]
+            result.total = len(result.records)
+        return result
 
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         """Write surface. Renders the operation from ``payload.data`` and issues it."""
@@ -249,7 +383,7 @@ class RestConnector(ConnectorBase):
         context = dict(payload.data or {})
         context.setdefault("resource", resource)
         request = await self._build_request(resource, context, surface="write")
-        return await self._send_write(request)
+        return cast(dict[str, Any], await self._execute(request, surface="write"))
 
     # ── Operation resolution ───────────────────────────────────────────────
 
@@ -261,22 +395,29 @@ class RestConnector(ConnectorBase):
             raise ValueError(f"Unsupported REST resource: {resource!r}")
 
     def _operation_spec(self, resource: str, *, default_method: str) -> dict[str, Any]:
+        """Merge the top-level config with the per-resource operation (dict-spread).
+
+        Reads every key uniformly from a single ``{**self._config, **spec}`` merge
+        so per-resource overrides land cleanly without the previous special-casing.
+        """
         ops = self._config.get("operations")
         spec: dict[str, Any] = {}
-        if isinstance(ops, dict) and resource in ops and isinstance(ops[resource], dict):
+        if isinstance(ops, dict) and isinstance(ops.get(resource), dict):
             spec = ops[resource]
-        method = str(spec.get("method") or self._config.get("method") or default_method).upper()
+        merged: dict[str, Any] = {**self._config, **spec}
+        method = str(merged.get("method") or default_method).upper()
         if method not in _ALLOWED_METHODS:
             raise ValueError(f"REST method {method!r} is not allowed (expected one of {sorted(_ALLOWED_METHODS)})")
         return {
             "method": method,
-            "path": spec.get("path") if "path" in spec else self._config.get("path"),
-            "headers": spec.get("headers") if "headers" in spec else self._config.get("headers", {}),
-            "params": spec.get("params") if "params" in spec else self._config.get("params", {}),
-            "body": spec.get("body", self._config.get("body")) if "body" in spec else self._config.get("body"),
-            "records_path": spec.get("records_path", self._config.get("records_path")),
-            "next_cursor_path": spec.get("next_cursor_path", self._config.get("next_cursor_path")),
-            "passthrough": bool(spec.get("passthrough", self._config.get("passthrough", False))),
+            "path": merged.get("path"),
+            "headers": merged.get("headers", {}),
+            "params": merged.get("params", {}),
+            "body": merged.get("body"),
+            "records_path": merged.get("records_path"),
+            "next_cursor_path": merged.get("next_cursor_path"),
+            "passthrough": bool(merged.get("passthrough", False)),
+            "idempotency_header": merged.get("idempotency_header"),
         }
 
     # ── Auth ───────────────────────────────────────────────────────────────
@@ -320,11 +461,6 @@ class RestConnector(ConnectorBase):
             names.add("x-api-key")
         return frozenset(names)
 
-    def _auth_query_params(self) -> dict[str, Any]:
-        if self._auth["mode"] == "api_key" and self._auth["in"] == "query":
-            return {self._auth["query_param_name"]: self._auth["api_key"]}
-        return {}
-
     def apply_auth(self, headers: dict[str, str]) -> dict[str, str]:
         """Inject the credential headers into *headers* (post-injection-guard)."""
         mode = self._auth["mode"]
@@ -336,6 +472,26 @@ class RestConnector(ConnectorBase):
         elif mode == "api_key" and self._auth["in"] == "header":
             headers[self._auth["header_name"]] = self._auth["api_key"]
         return headers
+
+    def _secret_values(self) -> list[str]:
+        """Credential strings that must be redacted from error detail.
+
+        Values shorter than 4 chars are ignored — redacting a 1-2 char secret
+        would mangle every occurrence of the common substring it appears in.
+        """
+        secrets: list[str] = []
+        for key in ("token", "api_key", "password", "secret"):
+            value = self._creds.get(key)
+            if isinstance(value, str) and len(value) >= 4:
+                secrets.append(value)
+        return secrets
+
+    def _redact(self, text: str) -> str:
+        """Strip credential values from *text* so error detail never echoes secrets."""
+        redacted = text
+        for secret in self._secret_values():
+            redacted = redacted.replace(secret, "***")
+        return redacted
 
     # ── Templating ─────────────────────────────────────────────────────────
 
@@ -366,8 +522,8 @@ class RestConnector(ConnectorBase):
         context: dict[str, Any],
         *,
         surface: str,
-    ) -> dict[str, Any]:
-        """Render the operation into a validated request dict.
+    ) -> RestRequest:
+        """Render the operation into a validated :class:`RestRequest`.
 
         The injection guard runs "write-path-style" filtering on EVERY surface:
         (a) header names/values must not contain CR/LF or control chars;
@@ -397,8 +553,16 @@ class RestConnector(ConnectorBase):
             for key, value in rendered_params.items():
                 if value is not None:
                     params[str(key)] = value
-        # API-key-in-query creds are applied after the guard (never overridable).
-        params.update({k: v for k, v in self._auth_query_params().items() if k not in params})
+        # api_key-in-query creds are applied unconditionally AFTER the guard so a
+        # rendered/context param can never shadow the secret; a collision is a
+        # hard error rather than a silent override.
+        if self._auth["mode"] == "api_key" and self._auth["in"] == "query":
+            auth_param = self._auth["query_param_name"]
+            if auth_param in params:
+                raise ValueError(
+                    f"REST param name {auth_param!r} collides with the api_key credential query param name"
+                )
+            params[auth_param] = self._auth["api_key"]
 
         body: Any = None
         if spec["body"] is not None:
@@ -416,25 +580,33 @@ class RestConnector(ConnectorBase):
         screened.extend(headers.values())
         screened.extend(str(v) for v in params.values())
         screened.extend(_collect_strings(body))
-        _filter_injection_strings(screened, resource=resource)
+        self._security_guard.filter_strings(screened, resource=resource)
 
-        return {
-            "method": spec["method"],
-            "url": url,
-            "headers": headers,
-            "params": params,
-            "body": body,
-            "records_path": spec["records_path"],
-            "next_cursor_path": spec["next_cursor_path"],
-            "passthrough": spec["passthrough"],
-        }
+        return RestRequest(
+            method=spec["method"],
+            url=url,
+            headers=headers,
+            params=params,
+            body=body,
+            records_path=spec["records_path"],
+            next_cursor_path=spec["next_cursor_path"],
+            passthrough=spec["passthrough"],
+            idempotency_header=spec["idempotency_header"],
+        )
+
+    async def _build_health_request(self) -> RestRequest:
+        """Build the health-probe request against ``base_url`` + the configured path."""
+        path = self._config.get("path")
+        url = self._base_url + (str(self._render(path, {})) if path else "")
+        await self._validate_target_url(url)
+        return RestRequest(method="GET", url=url, headers={}, params={}, body=None)
 
     async def _validate_target_url(self, url: str) -> None:
         """Enforce the scheme/host allowlist and SSRF safety on *url*.
 
         Scheme must be ``http``/``https``. When ``config['allowed_hosts']`` is
         set, the host must be in that list (or a subdomain of an entry). Always
-        runs SSRF validation (default ``validate_outbound_url_async``) to block
+        runs SSRF validation (via the injected guard's ``validate_url``) to block
         private/loopback/metadata targets — unless a test seam is injected.
         """
         parsed = urlparse(url)
@@ -455,50 +627,132 @@ class RestConnector(ConnectorBase):
             if inspect.isawaitable(result):
                 await result
             return
-        from modulo.core.ssrf import validate_outbound_url_async
-
-        await validate_outbound_url_async(url)
+        await self._security_guard.validate_url(url)
 
     # ── Send + transform ───────────────────────────────────────────────────
 
-    async def _send_and_transform(self, request: dict[str, Any]) -> ConnectorResult:
-        async with self._client() as client:
-            resp = await self._request(client, request)
-            return self._transform(resp, request)
+    async def _execute(self, request: RestRequest, *, surface: str) -> ConnectorResult | dict[str, Any]:
+        """Resolve + send + surface-map — the one shared dispatch used by query/write."""
+        client = self._client()
+        resp, body_text = await self._send(client, request)
+        if surface == "read":
+            return self._transform(request, resp, body_text)
+        return self._write_result(resp, body_text)
 
-    async def _send_write(self, request: dict[str, Any]) -> dict[str, Any]:
-        async with self._client() as client:
-            resp = await self._request(client, request)
-            return self._write_result(resp)
+    async def _send(self, client: httpx.AsyncClient, request: RestRequest) -> tuple[httpx.Response, str]:
+        """Run the request with retry/backoff for idempotent verbs.
 
-    async def _request(self, client: httpx.AsyncClient, request: dict[str, Any]) -> httpx.Response:
-        kwargs: dict[str, Any] = {
-            "headers": self.apply_auth(dict(request["headers"])),
-            "params": dict(request["params"]),
-        }
-        body = request["body"]
-        if body is not None:
-            if isinstance(body, (dict, list)):
-                kwargs["json"] = body
+        GET/HEAD (and any verb with a declared ``idempotency_header``) retries on
+        ``429``/``5xx`` and transient transport failures, honouring ``Retry-After``.
+        Mutating verbs without an idempotency header never retry.
+        """
+        kwargs = self._request_kwargs(request)
+        if not self._is_retryable(request):
+            return await self._perform_request(client, request, kwargs)
+        last_delay = 0.0
+        for attempt in range(_MAX_RETRIES):
+            if attempt:
+                await asyncio.sleep(last_delay)
+            try:
+                return await self._perform_request(client, request, kwargs)
+            except RESTStatusError as exc:
+                if exc.status_code not in _RETRYABLE_STATUS or attempt == _MAX_RETRIES - 1:
+                    raise
+                last_delay = self._retry_delay(exc, attempt)
+            except RESTConnectError:
+                if attempt == _MAX_RETRIES - 1:
+                    raise
+                last_delay = self._backoff(attempt)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _request_kwargs(self, request: RestRequest) -> dict[str, Any]:
+        """Build the httpx kwargs, injecting auth headers + idempotency key once."""
+        headers = self.apply_auth(dict(request.headers))
+        if request.idempotency_header:
+            headers[request.idempotency_header] = str(uuid.uuid4())
+        kwargs: dict[str, Any] = {"headers": headers, "params": dict(request.params)}
+        if request.body is not None:
+            if isinstance(request.body, (dict, list)):
+                kwargs["json"] = request.body
             else:
-                kwargs["content"] = str(body)
-        resp = await client.request(request["method"], request["url"], **kwargs)
-        if resp.status_code >= 400:
-            raise ValueError(f"REST HTTP {resp.status_code}: {resp.text[:200]}")
-        return resp
+                kwargs["content"] = str(request.body)
+        return kwargs
 
-    def _transform(self, resp: httpx.Response, request: dict[str, Any]) -> ConnectorResult:
+    def _is_retryable(self, request: RestRequest) -> bool:
+        if request.method in _RETRYABLE_METHODS:
+            return True
+        return request.idempotency_header is not None
+
+    async def _perform_request(
+        self,
+        client: httpx.AsyncClient,
+        request: RestRequest,
+        kwargs: dict[str, Any],
+    ) -> tuple[httpx.Response, str]:
+        """A single HTTP attempt: stream, cap the body, then classify the status."""
+        body_text = ""
+        try:
+            async with client.stream(request.method, request.url, **kwargs) as resp:
+                body_text = await self._consume_body(resp)
+        except httpx.HTTPError as exc:
+            raise RESTConnectError(
+                self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}")
+            ) from exc
+        if resp.status_code >= 300:
+            raise RESTStatusError(
+                self._status_detail(resp, request, body_text),
+                status_code=resp.status_code,
+                location=resp.headers.get("location", ""),
+                retry_after=parse_retry_after(resp),
+            )
+        return resp, body_text
+
+    async def _consume_body(self, resp: httpx.Response) -> str:
+        """Read the body, aborting past ``max_response_size`` (never unbounded)."""
+        cap = self._max_response_size
+        content_length = resp.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > cap:
+            raise RESTResponseTooLargeError(
+                f"REST response too large: Content-Length {content_length} exceeds cap {cap} bytes"
+            )
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in resp.aiter_bytes():
+            total += len(chunk)
+            if total > cap:
+                raise RESTResponseTooLargeError(f"REST response too large: exceeded cap {cap} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        """Exponential backoff with jitter (0.5s, 1.0s, 2.0s)."""
+        base = 0.5 * (2**attempt)
+        return float(base + random.uniform(0, 0.25))  # noqa: S311 — jitter, not a security secret
+
+    @staticmethod
+    def _retry_delay(exc: RESTStatusError, attempt: int) -> float:
+        if exc.retry_after is not None:
+            return max(0.0, exc.retry_after)
+        return RestConnector._backoff(attempt)
+
+    def _status_detail(self, resp: httpx.Response, request: RestRequest, body_text: str) -> str:
+        location = resp.headers.get("location", "")
+        location_part = f" (location: {location})" if location else ""
+        body = self._redact(body_text[:200])
+        return f"REST HTTP {resp.status_code} for {request.method} {request.url}{location_part}: {body}"
+
+    def _transform(self, request: RestRequest, resp: httpx.Response, body_text: str) -> ConnectorResult:
         """Map a REST response onto :class:`ConnectorResult`.
 
-        JSON responses yield a list of dicts for ``records`` (via
-        ``records_path`` when configured, else a top-level array, else the whole
-        object as a single record). Raw/passthrough content-types (text, CSV,
-        binary) yield a single ``{"body": ..., "content_type": ...,
-        "status_code": ..., "headers": ...}`` record so the downstream JMESPath
-        consumer still gets a uniform list-of-dicts shape.
+        JSON responses yield a list of dicts for ``records`` (via the
+        ``records_path`` JMESPath expression when configured, else a top-level
+        array, else the whole object as a single record). ``passthrough`` forces
+        a single ``{"body": ..., "content_type": ..., "status_code": ...,
+        "headers": ...}`` record wrap even for JSON bodies, so the downstream
+        JMESPath consumer still gets a uniform list-of-dicts shape.
         """
         content_type = resp.headers.get("content-type", "")
-        body_text = resp.text
         parsed: Any = None
         if "json" in content_type.lower() or body_text.lstrip().startswith(("{", "[")):
             try:
@@ -508,27 +762,29 @@ class RestConnector(ConnectorBase):
 
         records: list[dict[str, Any]] = []
         next_cursor: str | None = None
-        if isinstance(parsed, list):
+        if request.passthrough:
+            records = self._passthrough_record(resp, body_text, content_type)
+        elif isinstance(parsed, list):
             records = safe_records_list(parsed)
         elif isinstance(parsed, dict):
-            records_path = request.get("records_path")
+            records_path = request.records_path
             if records_path:
-                source = _dot_get(parsed, records_path)
+                source = jmespath.search(_coerce_jmespath(records_path), parsed)
                 if isinstance(source, list):
                     records = safe_records_list(source)
                 elif isinstance(source, dict):
                     records = [source]
             else:
                 records = [parsed] if parsed else []
-            next_cursor = self._extract_cursor(resp, parsed, request.get("next_cursor_path"))
-        elif parsed is None and not request.get("records_path"):
+            next_cursor = self._extract_cursor(parsed, request.next_cursor_path)
+        elif parsed is None and not request.records_path:
             records = self._passthrough_record(resp, body_text, content_type)
 
         metadata: dict[str, Any] = {
             "status_code": resp.status_code,
             "content_type": content_type,
-            "url": str(request["url"]),
-            "method": str(request["method"]),
+            "url": str(request.url),
+            "method": str(request.method),
         }
         retry_after = parse_retry_after(resp)
         if retry_after is not None:
@@ -556,15 +812,14 @@ class RestConnector(ConnectorBase):
         ]
 
     @staticmethod
-    def _extract_cursor(resp: httpx.Response, parsed: dict[str, Any], path: str | None) -> str | None:
+    def _extract_cursor(parsed: dict[str, Any], path: str | None) -> str | None:
         if not path:
             return None
-        value = _dot_get(parsed, path)
+        value = jmespath.search(_coerce_jmespath(path), parsed)
         return str(value) if isinstance(value, str) and value else None
 
-    def _write_result(self, resp: httpx.Response) -> dict[str, Any]:
+    def _write_result(self, resp: httpx.Response, body_text: str) -> dict[str, Any]:
         """Map a REST write response onto a JSON-serialisable result dict."""
-        body_text = resp.text
         if body_text:
             try:
                 parsed = json.loads(body_text)
