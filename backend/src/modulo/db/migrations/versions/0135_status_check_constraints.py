@@ -12,10 +12,11 @@ values actually produced by the application:
 * ``connector_instances.status`` -> ``('active', 'disabled')``
   ("active" is the server default; the graph validator treats any non-active
   value as INACTIVE, and the disable path writes "disabled".)
-* ``notification_delivery_log.status`` -> ``('delivered', 'failed', 'dead_lettered')``
-  ("delivered" is the server default; the notifier writes "dead_lettered" on
-  final failure and "delivered" on success; the admin retry path records
-  "failed".)
+* ``notification_delivery_log.status`` -> ``('delivered', 'failed', 'dead_lettered', 'in_app')``
+   ("delivered" is the server default; the notifier writes "dead_lettered" on
+   final failure and "delivered" on success; the admin retry path records
+   "failed"; the error-tracking alert dispatcher writes "in_app" for in-app
+   notifications — see ``modulo.core.error_tracking.alert_dispatcher``.)
 
 Postgres-only, matching the repo's existing CHECK-constraint migrations
 (ck_connector_instances_*, ck_eval_definitions_type).
@@ -46,7 +47,7 @@ def upgrade() -> None:
             "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_notification_delivery_log_status') "
             "THEN ALTER TABLE public.notification_delivery_log ADD CONSTRAINT ck_notification_delivery_log_status "
             "CHECK (status::text = ANY (ARRAY['delivered'::character varying, 'failed'::character varying, "
-            "'dead_lettered'::character varying]::text[])); "
+            "'dead_lettered'::character varying, 'in_app'::character varying]::text[])); "
             "END IF; END $$;"
         )
     )

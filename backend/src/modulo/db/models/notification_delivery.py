@@ -11,7 +11,7 @@ class NotificationDeliveryLog(OrgScoped):
     __tablename__ = "notification_delivery_log"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('delivered', 'failed', 'dead_lettered')",
+            "status IN ('delivered', 'failed', 'dead_lettered', 'in_app')",
             name="ck_notification_delivery_log_status",
         ),
     )
