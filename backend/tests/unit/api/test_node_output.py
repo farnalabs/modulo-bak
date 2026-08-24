@@ -595,6 +595,30 @@ class TestMaskOutputValueSecretValues:
         assert "super%40secret" not in masked
         assert SENSITIVE_VALUE_MASK in masked
 
+    def test_masks_connection_string_password_with_at_in_password_straddling(self) -> None:
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # Regression: a connection-string password that itself contains ``@``
+        # (e.g. ``pa@ss``) must be masked in full even when the string is longer
+        # than the 5000-char ReDoS cap. The bounded window must span to the FINAL
+        # ``@`` (the host separator), not the first — otherwise the password tail
+        # after the first ``@`` leaks unmasked.
+        conn = "postgres://u:pa@ss@host:5432/db"
+        straddle = "w" * 4995 + conn + "e" * 100
+        masked = mask_secret_values_in_text(straddle)
+        assert "pa@ss" not in masked
+        assert "ss@host" not in masked
+        assert SENSITIVE_VALUE_MASK in masked
+
+    def test_masks_redis_connection_string_with_empty_username(self) -> None:
+        from modulo.core.secret_patterns import mask_secret_values_in_text
+
+        # A broker/Redis URL with an empty username (``redis://:PASSWORD@host``)
+        # must still have its password masked — the user segment may be blank.
+        masked = mask_secret_values_in_text("redis://:supersecretpass@host:6379")
+        assert "supersecretpass" not in masked
+        assert SENSITIVE_VALUE_MASK in masked
+
     def test_masks_private_key_block_longer_than_slice_cap(self) -> None:
         from modulo.core.secret_patterns import (
             SECRET_VALUE_REDACT_CHAR_CAP,

@@ -42,7 +42,7 @@ AWS_ACCESS_KEY_PATTERN = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
 # The password group is greedy (``.*``) so it consumes every character up to the
 # FINAL ``@`` (the host separator) — including passwords that themselves contain
 # ``@`` / ``:`` / ``/``. This masks the whole secret, not just the first chunk.
-CONNECTION_STRING_PATTERN = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]+:)(.*)(@)")
+CONNECTION_STRING_PATTERN = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]*:)(.*)(@)")
 # Private key blocks (multiline, any flavour). Uses a nested quantifier, so it
 # is fed bounded slices of :data:`SECRET_VALUE_REDACT_CHAR_CAP` at masking time.
 PRIVATE_KEY_PATTERN = re.compile(
@@ -195,7 +195,22 @@ def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any)
         # Locate the close delimiter in the FULL text (a plain ``str.find``, not
         # a regex) so a secret longer than the ReDoS cap is still found. If no
         # close follows the anchor it is not a real secret — leave it untouched.
-        close_off = text.find(close, off + len(anchor))
+        if pattern is CONNECTION_STRING_PATTERN:
+            # The connection-string regex is greedy on ``(.*)`` so it masks up to
+            # the FINAL ``@`` (the host separator), not the first. A password may
+            # itself contain ``@`` (e.g. ``pa@ss``), so the bounded window must
+            # span to that final ``@`` — otherwise the password tail leaks. Search
+            # the bounded region for the LAST ``@`` rather than the first.
+            region_end = window_start + SECRET_VALUE_REDACT_CHAR_CAP
+            last_at = text.find(close, off + len(anchor))
+            while True:
+                nxt = text.find(close, last_at + 1)
+                if nxt == -1 or nxt + 1 > region_end:
+                    break
+                last_at = nxt
+            close_off = last_at
+        else:
+            close_off = text.find(close, off + len(anchor))
         if close_off == -1:
             continue
         close_end = _close_marker_end(text, pattern, close_off, close)
