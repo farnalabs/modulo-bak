@@ -49,8 +49,10 @@ _CODE_CAPACITY_ORG = "capacity.org"
 # FAR-410: a connector write was cancelled mid-send (per-attempt timeout), so
 # the upstream side-effect state is unknowable. This is a DISTINCT terminal
 # outcome — never collapsed into generic failure (it must surface for manual
-# confirm and be re-runnable with the same persisted idempotency key).
-_CODE_CONNECTOR_UNKNOWN = "connector.unknown"
+# confirm and be re-runnable with the same persisted idempotency key). The
+# dotted spelling mirrors the ``script.side_effect_unknown`` taxonomy pattern
+# ("side-effect state unknown; never retried").
+_CODE_CONNECTOR_UNKNOWN = "connector.side_effect_unknown"
 
 
 ERROR_CODE_REGISTRY: dict[str, ErrorCodeSpec] = {
@@ -454,9 +456,14 @@ LEGACY_ALIASES: dict[str, str] = {
     # FAR-228 raw code used by the executor's retry-suppression write.
     "idempotency_gate": "harness.idempotency_gate",
     # FAR-410: connector write-timeout / mid-send cancellation → distinct
-    # ``connector.unknown`` (never collapsed into generic failure).
-    # ``connector_unknown`` is the raw exception/snake_case spelling.
+    # ``connector.side_effect_unknown`` (never collapsed into generic failure).
+    # ``connector_unknown`` is the raw exception/snake_case spelling;
+    # ``ConnectorUnknownError`` is the exception class name the executor's
+    # generic catch publishes (``type(exc).__name__``); ``connector.unknown`` is
+    # the prior dotted spelling kept for backward-compat.
     "connector_unknown": _CODE_CONNECTOR_UNKNOWN,
+    "ConnectorUnknownError": _CODE_CONNECTOR_UNKNOWN,
+    "connector.unknown": _CODE_CONNECTOR_UNKNOWN,
     # Provider (model backend) exception class names published by executor's
     # generic catch (``type(exc).__name__``) on LLM-node failures.
     "RateLimitError": "provider.rate_limited",

@@ -36,6 +36,12 @@ RETRYABLE_STATUSES: frozenset[int] = frozenset({429, 502, 503, 504})
 # Default per-connector retry budget when a connector does not declare its own.
 DEFAULT_MAX_RETRIES = 3
 
+# Upper bound on a ``Retry-After`` delay accepted from an untrusted upstream.
+# A malicious/broken response with a huge (or future-dated) ``Retry-After``
+# would otherwise schedule an effectively-infinite retry sleep. Any larger
+# response is clamped to this value.
+MAX_RETRY_AFTER_SECONDS = 30.0
+
 # HTTP statuses that indicate the write was already processed or cannot be
 # retried blind: escalating (rather than retrying) prevents double-execution.
 _NON_RETRYABLE_WRITE_ESCALATION = frozenset({409, 412, 422})
@@ -131,12 +137,21 @@ def retry_after_seconds(response: httpx.Response) -> float | None:
     """Best-effort ``Retry-After`` delay, honoring either delta-seconds or HTTP-date.
 
     Prefers the numeric delta-seconds form (exact), then the HTTP-date form.
-    Returns ``None`` when the header is absent or not parseable.
+    Returns ``None`` when the header is absent, not parseable, or non-positive —
+    a zero/negative delta would schedule an immediate/no-op retry that is better
+    handled by the caller's blind backoff than by trusting the upstream. The
+    returned delay is clamped to :data:`MAX_RETRY_AFTER_SECONDS` so an untrusted
+    upstream cannot schedule an effectively-infinite retry sleep.
     """
     delta = parse_retry_after(response)
     if delta is not None:
-        return delta
-    return parse_retry_after_http_date(response)
+        if delta <= 0:
+            return None
+        return min(delta, MAX_RETRY_AFTER_SECONDS)
+    date_delay = parse_retry_after_http_date(response)
+    if date_delay is not None:
+        return min(date_delay, MAX_RETRY_AFTER_SECONDS)
+    return None
 
 
 # ── REST retry semantics: response-code x effect matrix ───────────────────────
@@ -230,6 +245,7 @@ def cancellation_is_unknown(phase: CancellationPhase) -> bool:
 def per_attempt_timeout_seconds(
     node_wait_for_seconds: float,
     *,
+    max_retries: int = 0,
     safety_margin_fraction: float = 0.2,
     min_margin_seconds: float = 0.5,
 ) -> float | None:
@@ -239,11 +255,24 @@ def per_attempt_timeout_seconds(
     ``asyncio.wait_for`` budget rather than overrun it: a single attempt may
     consume a full connection timeout, then the budget is already spent. This
     returns a per-attempt budget leaving a safety margin so the node's
-    ``wait_for`` never fires first. Returns ``None`` when the node budget is
-    too small to split safely (the caller should then use a single attempt).
+    ``wait_for`` never fires first.
+
+    When ``max_retries`` is nonzero, the budget is allocated across ALL attempts
+    (the original send plus each retry) so a later retry is not allowed to
+    blow the whole node budget mid-send: the allocation divides the
+    safely-usable window by ``max_retries + 1``, reserving headroom for the
+    backoff/sleep between attempts. A caller must pass the SAME ``max_retries``
+    it will actually use, otherwise a retry could fire ``wait_for`` mid-send and
+    yield a spurious UNKNOWN (FAR-410).
+
+    Returns ``None`` when the node budget is too small to split safely (the
+    caller should then use a single attempt). ``max_retries`` must be >= 0 or a
+    ``ValueError`` is raised.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be >= 0")
     headroom = max(node_wait_for_seconds * safety_margin_fraction, min_margin_seconds)
-    per_attempt = node_wait_for_seconds - headroom
+    per_attempt = (node_wait_for_seconds - headroom) / (max_retries + 1)
     if per_attempt <= 0 or per_attempt >= node_wait_for_seconds:
         return None
     return per_attempt

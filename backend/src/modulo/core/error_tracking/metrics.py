@@ -376,11 +376,11 @@ def record_connector_unknown_span(connector: str, node_id: str | None = None, de
 
     A connector write cancelled mid-send is a DISTINCT terminal state, never a
     generic failure. Sets the current span's status to ``ERROR`` with the
-    ``connector.unknown`` error-code attribute (and the ``error.type`` /
-    ``connector`` / ``node_id`` attributes) so it is observable and attributable
-    to the connector/node, then increments the UNKNOWN-rate counter. Both are
-    best-effort and swallow their own failures (tracing/metrics must never break
-    the retry path).
+    ``connector.side_effect_unknown`` error-code attribute (and the
+    ``error.type`` / ``connector`` / ``node_id`` attributes) so it is observable
+    and attributable to the connector/node, then increments the UNKNOWN-rate
+    counter. Both are best-effort and swallow their own failures (tracing/
+    metrics must never break the retry path).
     """
     try:
         from opentelemetry import trace as _otel_trace
@@ -388,14 +388,17 @@ def record_connector_unknown_span(connector: str, node_id: str | None = None, de
 
         span = _otel_trace.get_current_span()
         if span is not None and span.is_recording():
-            attrs: dict[str, str] = {"error.code": "connector.unknown", "error.type": "connector.unknown"}
+            attrs: dict[str, str] = {
+                "error.code": "connector.side_effect_unknown",
+                "error.type": "connector.side_effect_unknown",
+            }
             if connector:
                 attrs["connector"] = connector
             if node_id:
                 attrs["node_id"] = node_id
             if detail:
                 attrs["error.message"] = detail[:256]
-            span.set_status(Status(StatusCode.ERROR, "connector.unknown"))
+            span.set_status(Status(StatusCode.ERROR, "connector.side_effect_unknown"))
             span.set_attributes(attrs)
     except Exception:
         _log.warning("metrics.connector_unknown_span_failed", exc_info=True)

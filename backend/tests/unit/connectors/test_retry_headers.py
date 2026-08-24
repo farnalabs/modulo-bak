@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from modulo.connectors._retry_headers import (
+    MAX_RETRY_AFTER_SECONDS,
     RETRYABLE_STATUSES,
     CancellationPhase,
     RestRetryContext,
@@ -27,6 +28,7 @@ from modulo.connectors._retry_headers import (
     rest_retry_decision,
     retry_after_seconds,
 )
+from modulo.core.pipeline_engine.error_codes import known_error_codes, map_legacy_code
 
 RATE_LIMIT_HEADERS = (
     "X-RateLimit-Limit",
@@ -210,11 +212,33 @@ def test_parse_retry_after_http_date_missing_or_invalid() -> None:
 def test_retry_after_seconds_prefers_delta_then_http_date() -> None:
     response = httpx.Response(429, headers={"Retry-After": "7"})
     assert retry_after_seconds(response) == 7.0
-    fmt = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() + 90))
+    fmt = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() + 15))
     response = httpx.Response(429, headers={"Retry-After": fmt})
     delay = retry_after_seconds(response)
     assert delay is not None
-    assert 85 < delay <= 91
+    assert 10 < delay <= 16
+
+
+def test_retry_after_seconds_caps_unbounded_delta() -> None:
+    """An untrusted upstream must not schedule an effectively-infinite retry sleep."""
+    response = httpx.Response(429, headers={"Retry-After": "300"})
+    assert retry_after_seconds(response) == MAX_RETRY_AFTER_SECONDS
+    response = httpx.Response(429, headers={"Retry-After": "3600"})
+    assert retry_after_seconds(response) == MAX_RETRY_AFTER_SECONDS
+
+
+def test_retry_after_seconds_caps_future_http_date() -> None:
+    """A far-future HTTP-date is clamped too, not returned verbatim."""
+    fmt = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(time.time() + 86400))
+    response = httpx.Response(429, headers={"Retry-After": fmt})
+    assert retry_after_seconds(response) == MAX_RETRY_AFTER_SECONDS
+
+
+def test_retry_after_seconds_rejects_non_positive_delta() -> None:
+    """A zero/negative delta is not trusted for scheduling (mirror rate-limit reset)."""
+    for value in ("0", "-5"):
+        response = httpx.Response(429, headers={"Retry-After": value})
+        assert retry_after_seconds(response) is None
 
 
 # ── rest_retry_decision: response-code x effect matrix ───────────────────────
@@ -275,3 +299,48 @@ def test_per_attempt_timeout_is_strictly_below_node_budget() -> None:
 
 def test_per_attempt_timeout_tiny_budget_returns_none() -> None:
     assert per_attempt_timeout_seconds(0.2) is None
+
+
+def test_per_attempt_timeout_negative_max_retries_raises() -> None:
+    with pytest.raises(ValueError):
+        per_attempt_timeout_seconds(60.0, max_retries=-1)
+
+
+def test_per_attempt_timeout_with_retries_is_smaller_than_single() -> None:
+    single = per_attempt_timeout_seconds(60.0)
+    with_retries = per_attempt_timeout_seconds(60.0, max_retries=3)
+    assert single is not None and with_retries is not None
+    assert with_retries < single
+
+
+def test_per_attempt_timeout_retry_aware_allocates_within_budget() -> None:
+    """Retry-aware allocation keeps EVERY attempt (incl. later retries) within budget."""
+    node_budget = 60.0
+    max_retries = 3
+    per_attempt = per_attempt_timeout_seconds(node_budget, max_retries=max_retries)
+    assert per_attempt is not None
+    # The whole attempt sequence plus the safety margin must stay under the budget.
+    assert per_attempt * (max_retries + 1) < node_budget
+    assert per_attempt > 0
+    # The default sizing (max_retries=0) is the unsplit single-attempt budget.
+    single = per_attempt_timeout_seconds(node_budget)
+    assert single is not None
+    assert per_attempt * (max_retries + 1) <= single
+
+
+# ── connector.side_effect_unknown taxonomy: distinct code, not harness.unknown ──
+
+
+def test_connector_side_effect_unknown_spellings_map_to_distinct_code() -> None:
+    """All raw spellings of the connector write-UNKNOWN code resolve to the
+    DISTINCT connector.side_effect_unknown code, never collapsing to
+    harness.unknown (which would lose the critical terminal state)."""
+    assert map_legacy_code("ConnectorUnknownError") == "connector.side_effect_unknown"
+    assert map_legacy_code("connector_unknown") == "connector.side_effect_unknown"
+    assert map_legacy_code("connector.unknown") == "connector.side_effect_unknown"
+    assert map_legacy_code("connector.side_effect_unknown") == "connector.side_effect_unknown"
+    assert "connector.side_effect_unknown" in known_error_codes()
+    assert "ConnectorUnknownError" in known_error_codes()
+    assert "connector.unknown" in known_error_codes()
+    assert map_legacy_code("ConnectorUnknownError") != "harness.unknown"
+    assert map_legacy_code("connector_unknown") != "harness.unknown"
