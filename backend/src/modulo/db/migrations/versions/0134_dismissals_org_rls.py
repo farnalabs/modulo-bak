@@ -90,6 +90,14 @@ def _assert_owner_is_migrate(bind) -> None:
         )
 
 
+def _table_owner(bind, table: str) -> str | None:
+    """Return the current owner role of ``table`` (or None if not present)."""
+    return bind.execute(
+        sa.text("SELECT relowner::regrole::text FROM pg_class WHERE oid = to_regclass(:oid)"),
+        {"oid": f"public.{table}"},
+    ).scalar_one_or_none()
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     pg = _is_postgres(bind)
@@ -98,12 +106,22 @@ def upgrade() -> None:
         op.execute("SET search_path TO public")
         migrate_role = _role_exists(bind, _MIGRATE_ROLE)
         app_role = _role_exists(bind, _APP_ROLE)
+        # The SET ROLE ownership ceremony only applies where ``dismissals`` is
+        # already owned by ``modulo_migrate`` (prod databases whose earlier
+        # migrations ran under the migrate role). On a fresh database where the
+        # roles were bootstrapped BEFORE the migrations ran (integration
+        # conftest / break-glass gate), ``dismissals`` is owned by the migration
+        # caller; SET ROLE to the non-owner ``modulo_migrate`` would make the
+        # ALTER below fail with "must be owner of table dismissals".
+        migrate_owns_table = bool(migrate_role and _table_owner(bind, _TABLE) == _MIGRATE_ROLE)
         if migrate_role:
             op.execute(f"GRANT REFERENCES ON TABLE public.organisations TO {_MIGRATE_ROLE}")
+        if migrate_owns_table:
             op.execute(f"SET ROLE {_MIGRATE_ROLE}")
     else:
         migrate_role = False
         app_role = False
+        migrate_owns_table = False
 
     # Add the column nullable first so existing rows can be backfilled.
     op.add_column(
@@ -124,6 +142,8 @@ def upgrade() -> None:
     if pg:
         if migrate_role:
             op.execute("RESET ROLE")
+        # The ownership assertion is only meaningful where the ceremony ran.
+        if migrate_owns_table:
             _assert_owner_is_migrate(bind)
 
         # Backfill from the parent notification's organisation_id.
