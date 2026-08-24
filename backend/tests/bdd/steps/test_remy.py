@@ -73,6 +73,7 @@ def _make_mock_session(**overrides: Any) -> MagicMock:
     s.id = overrides.get("id", uuid.uuid4())
     s.organisation_id = overrides.get("organisation_id", ORG_ID)
     s.user_id = overrides.get("user_id", USER_ID)
+    s.account_id = overrides.get("account_id", overrides.get("user_id", USER_ID))
     s.name = overrides.get("name", "Test Session")
     s.provider = overrides.get("provider", "anthropic")
     s.model = overrides.get("model", "claude-sonnet-4-20250514")
@@ -87,6 +88,7 @@ def _make_mock_message(**overrides: Any) -> MagicMock:
     m = MagicMock()
     m.id = overrides.get("id", uuid.uuid4())
     m.organisation_id = overrides.get("organisation_id", ORG_ID)
+    m.account_id = overrides.get("account_id", USER_ID)
     m.session_id = overrides.get("session_id", uuid.uuid4())
     m.role = overrides.get("role", "user")
     m.content = overrides.get("content", "Hello")
@@ -103,6 +105,7 @@ def _make_mock_skill(**overrides: Any) -> MagicMock:
     s.id = overrides.get("id", uuid.uuid4())
     s.organisation_id = overrides.get("organisation_id")
     s.user_id = overrides.get("user_id")
+    s.account_id = overrides.get("account_id", overrides.get("user_id"))
     s.name = overrides.get("name", "test-skill")
     s.description = overrides.get("description")
     s.triggers = overrides.get("triggers")
@@ -271,6 +274,7 @@ def create_remy_session(provider: str, model: str, request, ctx) -> None:
         inst.id = mock_ses.id
         inst.organisation_id = ORG_ID
         inst.user_id = USER_ID
+        inst.account_id = USER_ID
         inst.name = None
         inst.provider = provider
         inst.model = model
@@ -1373,6 +1377,7 @@ def user_approves_action(request, ctx) -> None:
         mock_chat_session = MagicMock()
         mock_chat_session.id = ses.id
         mock_chat_session.user_id = USER_ID
+        mock_chat_session.account_id = USER_ID
         mock_session_inst.get = AsyncMock(return_value=mock_chat_session)
 
         client = _make_client(mock_session_inst)
