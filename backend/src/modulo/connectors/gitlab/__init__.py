@@ -14,6 +14,7 @@ from urllib.parse import quote
 import httpx
 
 from modulo.connectors._retry_headers import (
+    RETRYABLE_STATUSES,
     extract_rate_limit_metadata,
     format_rate_limit_detail,
     parse_rate_limit_reset,
@@ -50,8 +51,9 @@ _RATE_LIMIT_HEADERS = (
 # Preferred headers (epoch seconds) for the quota-reset retry delay, in order.
 _RATE_LIMIT_RESET_HEADERS = ("RateLimit-ResetTime", "RateLimit-Reset")
 
-# Retry/backoff configuration
-_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+# Retry/backoff configuration — FAR-410: single source of truth for the
+# retryable-status intersection (shared with GitHub/Jira/Slack/Linear).
+_RETRYABLE_STATUSES = RETRYABLE_STATUSES
 _MAX_RETRIES = 3
 _BASE_DELAY = 1.0
 _MAX_DELAY = 30.0

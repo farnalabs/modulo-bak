@@ -234,4 +234,15 @@ __all__ = [
     # --- Product analytics enforcement (FAR-361) ---
     "is_enforcement_active",
     "should_degrade_to_community",
+    # --- FAR-410 REST retry / idempotency / UNKNOWN infrastructure — public API
+    #     for the generic REST connector (FAR-401, separate ticket). Consumed
+    #     only by tests today; vulture sees no prod call site yet. Each is a
+    #     load-bearing contract the future connector composes with the executor
+    #     wait_for budget. (The runs-column idempotency persistence is deferred:
+    #     origin/main's migration chain is broken, so no runs migration ships.) ---
+    "rest_retry_decision",
+    "cancellation_is_unknown",
+    "per_attempt_timeout_seconds",
+    "record_connector_unknown_span",
+    "stable_idempotency_key",
 ]

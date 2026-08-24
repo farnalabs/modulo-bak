@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from modulo.connectors._retry_headers import (
+    RETRYABLE_STATUSES,
     extract_rate_limit_metadata,
     format_rate_limit_detail,
     parse_rate_limit_reset,
@@ -24,7 +25,7 @@ from modulo.connectors.base import (
     HealthResult,
 )
 
-_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_RETRYABLE_STATUSES = RETRYABLE_STATUSES
 _MAX_RETRIES = 3
 _BASE_DELAY = 1.0
 _MAX_DELAY = 30.0
