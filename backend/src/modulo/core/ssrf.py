@@ -606,13 +606,6 @@ class PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         # below makes that un-pin loud.
         backend = _PinnedAsyncNetworkBackend(pinned_hosts)
         self._pool._network_backend = backend
-        if self._pool._network_backend is not backend:
-            raise RuntimeError(
-                "SSRF: pinned network backend was not installed on the httpcore pool. The private "
-                "`_pool._network_backend` seam has likely changed; pin a compatible httpcore/httpx "
-                "range (see backend/pyproject.toml) or upgrade the pinned transport, or the "
-                "DNS-rebinding pin has silently dropped."
-            )
 
 
 async def pinned_async_transport(
@@ -651,7 +644,6 @@ async def pinned_async_client(
     verify: ssl.SSLContext | str | bool = True,
     http2: bool = False,
     trust_env: bool = False,
-    timeout: float | httpx.Timeout | None = None,  # noqa: ASYNC109
     follow_redirects: bool = False,
 ) -> httpx.AsyncClient:
     """Build a pinned-IP ``httpx.AsyncClient`` for ``url``.
@@ -678,6 +670,5 @@ async def pinned_async_client(
         verify=verify,
         http2=http2,
         trust_env=trust_env,
-        timeout=timeout,
         follow_redirects=follow_redirects,
     )
