@@ -328,7 +328,7 @@ async def test_validate_outbound_url_async_fails_closed_if_any_ip_blocked(
 # --- tenant-scoped egress allowlist ----------------------------------------
 
 
-async def test_tenant_scoped_allowlist_override_async(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_tenant_scoped_allowlist_override_async() -> None:
     with pytest.raises(ValueError, match="private/internal"):
         await ssrf.validate_outbound_url_async("http://10.1.2.3/")
     # Tenant-scoped override permits the range for this target.
@@ -346,7 +346,7 @@ def test_tenant_scoped_allowlist_layers_on_global(monkeypatch: pytest.MonkeyPatc
     assert ssrf.validate_outbound_url("http://192.168.1.1/") is None
 
 
-def test_tenant_allowlist_does_not_weaken_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_tenant_allowlist_does_not_weaken_loopback() -> None:
     # A tenant allowlist for another range must NOT silently permit loopback/metadata.
     ssrf.validate_outbound_url("http://10.1.2.3/", allow_networks=["10.0.0.0/8"])
     with pytest.raises(ValueError, match="private/internal"):
