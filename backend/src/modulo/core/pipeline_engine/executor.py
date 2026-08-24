@@ -273,8 +273,9 @@ def _retry_after_policy(
     ``_stream_graph``, which reaches this decision. The **executor-level
     zombie-watchdog stall** (``execute_run`` watchdog terminal-fails the run and
     cancels ``execute()``; the ``CancelledError`` is re-raised at the top of the
-    stream block before this decision runs) is NOT retried. See ``docs/prd.md``
-    §8.9.
+    stream block before this decision runs) is NOT retried. See
+    ``docs/adr/008-core-shared-manifest.md`` (product requirements retired from
+    docs/prd.md §8.9).
 
     An absent/malformed policy or a 0 budget yields None (no retry) — the
     current behaviour is unchanged for pipelines without a policy.
