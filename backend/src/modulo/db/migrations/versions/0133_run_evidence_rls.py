@@ -31,7 +31,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0133_run_evidence_rls"
-down_revision: str | None = "0131_eval_dataset_corpus"
+down_revision: str | None = "0132_agent_connector_report_soft_delete_audit"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -85,9 +85,8 @@ def upgrade() -> None:
     op.execute(sa.text('ALTER TABLE public."run_evidence" FORCE ROW LEVEL SECURITY'))
     op.execute(sa.text(f'CREATE POLICY rls_org_isolation ON public."run_evidence" USING ({_ORG_SCOPE})'))
 
-    # 5. Runtime role needs DML. Guard on the role existing: fresh dev/BDD
-    # databases are bootstrapped without ``modulo_app``, so skip the grant
-    # there (mirrors the guarding used by 0134_dismissals_org_rls).
+    # 5. Runtime role needs DML (guarded on the role existing — on fresh dev/BDD
+    # databases the app roles are bootstrapped after alembic runs).
     if _role_exists(bind, _APP_ROLE):
         op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
 

@@ -11,22 +11,20 @@ reader in one org could (in principle) observe dismissals belonging to another
 org. This migration closes that gap by giving ``dismissals`` the same
 org-isolation RLS every other org-scoped table has.
 
-ROLE WIRING (the 0066 ceremony, adapted for an EXISTING table): the migration
-connects via ``DATABASE_ADMIN_URL`` (env.py — the superuser/owner URL).
-``modulo_migrate`` is a NOLOGIN role (bootstrap_role.py), so it cannot be
-CONNECTED to. ``dismissals`` is an EXISTING table created by the migration caller
-(admin) in 0110, so ``modulo_migrate`` does NOT own it and therefore cannot
-``SET ROLE modulo_migrate`` + ``ALTER`` it (Postgres requires table ownership to
-ALTER). The column/index/FK are added as the caller, then ownership is
-transferred to ``modulo_migrate`` via ``ALTER TABLE dismissals OWNER TO
-modulo_migrate`` (the caller is superuser) so the 0066 owner-bypasses-RLS
-precondition still holds for this table. The post-add ownership assertion verifies
-the table's owner is ``modulo_migrate`` — the owner-bypasses-RLS precondition for
-``dismissals`` RLS confinement.
+ROLE WIRING (the 0066 ceremony, verbatim from 0115): the migration connects via
+``DATABASE_ADMIN_URL`` (env.py — the superuser/owner URL). ``modulo_migrate`` is
+a NOLOGIN role (bootstrap_role.py), so it cannot be CONNECTED to — the migration
+executes ``SET ROLE modulo_migrate`` BEFORE ``op.add_column`` + the FK constraint
+(the ``dismissals`` table is already owned by ``modulo_migrate`` from 0110, and
+the new column/FK must be created under that role so ownership stays consistent),
+then ``RESET ROLE`` AFTER (the RLS-enable + policy + grant steps run as the
+migration's caller). The post-add ownership assertion verifies the table's owner
+is still ``modulo_migrate`` — the owner-bypasses-RLS precondition for ``dismissals``
+RLS confinement.
 
 The ceremony is conditional on the roles existing (checked via ``pg_roles``):
 on a fresh DB where ``alembic upgrade heads`` runs BEFORE the app bootstraps
-roles (e.g. the BDD suite), the ownership transfer + assertion are
+roles (e.g. the BDD suite), the GRANTs / ``SET ROLE`` / owner assertion are
 skipped and the column is added by the migration caller. When the roles exist
 (production, where bootstrap runs before alembic), the full ``modulo_migrate``
 ownership ceremony runs as described above.
@@ -92,6 +90,14 @@ def _assert_owner_is_migrate(bind) -> None:
         )
 
 
+def _table_owner(bind, table: str) -> str | None:
+    """Return the current owner role of ``table`` (or None if not present)."""
+    return bind.execute(
+        sa.text("SELECT relowner::regrole::text FROM pg_class WHERE oid = to_regclass(:oid)"),
+        {"oid": f"public.{table}"},
+    ).scalar_one_or_none()
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     pg = _is_postgres(bind)
@@ -100,19 +106,24 @@ def upgrade() -> None:
         op.execute("SET search_path TO public")
         migrate_role = _role_exists(bind, _MIGRATE_ROLE)
         app_role = _role_exists(bind, _APP_ROLE)
+        # The SET ROLE ownership ceremony only applies where ``dismissals`` is
+        # already owned by ``modulo_migrate`` (prod databases whose earlier
+        # migrations ran under the migrate role). On a fresh database where the
+        # roles were bootstrapped BEFORE the migrations ran (integration
+        # conftest / break-glass gate), ``dismissals`` is owned by the migration
+        # caller; SET ROLE to the non-owner ``modulo_migrate`` would make the
+        # ALTER below fail with "must be owner of table dismissals".
+        migrate_owns_table = bool(migrate_role and _table_owner(bind, _TABLE) == _MIGRATE_ROLE)
+        if migrate_role:
+            op.execute(f"GRANT REFERENCES ON TABLE public.organisations TO {_MIGRATE_ROLE}")
+        if migrate_owns_table:
+            op.execute(f"SET ROLE {_MIGRATE_ROLE}")
     else:
         migrate_role = False
         app_role = False
+        migrate_owns_table = False
 
     # Add the column nullable first so existing rows can be backfilled.
-    #
-    # NOTE: unlike the 0115 ceremony, ``dismissals`` is an EXISTING table
-    # created by the migration caller (admin) in 0110, so ``modulo_migrate``
-    # does NOT own it and cannot ``SET ROLE modulo_migrate`` + ``ALTER`` it
-    # (Postgres requires table ownership to ALTER). The column/index/FK are
-    # therefore added as the caller, then ownership is transferred to
-    # ``modulo_migrate`` below so the 0066 owner-bypasses-RLS precondition
-    # still holds for this table.
     op.add_column(
         _TABLE,
         sa.Column("organisation_id", sa.Uuid(), nullable=True),
@@ -129,6 +140,12 @@ def upgrade() -> None:
     )
 
     if pg:
+        if migrate_role:
+            op.execute("RESET ROLE")
+        # The ownership assertion is only meaningful where the ceremony ran.
+        if migrate_owns_table:
+            _assert_owner_is_migrate(bind)
+
         # Backfill from the parent notification's organisation_id.
         op.execute(
             sa.text(
@@ -140,12 +157,6 @@ def upgrade() -> None:
         )
         # Make the column NOT NULL now that every row has an org.
         op.execute(sa.text("ALTER TABLE dismissals ALTER COLUMN organisation_id SET NOT NULL"))
-
-        if migrate_role:
-            # Transfer ownership to modulo_migrate (the caller is superuser) so
-            # the 0066 owner-bypasses-RLS precondition holds, then assert.
-            op.execute(f"ALTER TABLE public.{_TABLE} OWNER TO {_MIGRATE_ROLE}")
-            _assert_owner_is_migrate(bind)
 
         op.execute("ALTER TABLE dismissals ENABLE ROW LEVEL SECURITY")
         op.execute("ALTER TABLE dismissals FORCE ROW LEVEL SECURITY")
