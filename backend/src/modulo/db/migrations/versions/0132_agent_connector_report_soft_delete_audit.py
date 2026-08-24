@@ -23,7 +23,7 @@ bindings, history) keep resolving.
 from alembic import op
 
 revision: str = "0132_agent_connector_report_soft_delete_audit"
-down_revision: str | None = "0129_runs_json_to_jsonb"
+down_revision: str | None = "0131_eval_dataset_corpus"
 branch_labels: str | None = None
 depends_on: str | None = None
 
