@@ -13,8 +13,8 @@ Postgres (testcontainers) and verifies:
   * the downgrade drops the policy, the FK column, and the table cleanly, and a
     re-upgrade restores a clean (empty) head state.
 
-The test resets ``alembic_version`` to the revision *before* 0126, seeds data,
-and re-runs 0126 so the real backfill executes against live Postgres. It
+The test resets ``alembic_version`` to the revision *before* 0130, seeds data,
+and re-runs 0130 so the real backfill executes against live Postgres. It
 restores the head state in ``finally`` so the shared session schema is
 undisturbed for later tests.
 """
@@ -37,7 +37,11 @@ pytestmark = [pytest.mark.integration]
 BACKEND_ROOT = Path(__file__).parents[3]  # backend/
 
 MIGRATION_REV = "0130_eval_suite_entity"
-PREV_REV = "0125_soft_delete_lookup_indexes"
+# Reset only to the revision immediately before 0130. The 0126-0129 migrations on
+# origin/main are applied by the session's migrated_db_url fixture and are NOT all
+# idempotent (some DROP constraints without IF EXISTS), so re-running the whole
+# chain would fail. Resetting to 0129 re-runs only our idempotent 0130 migration.
+PREV_REV = "0129_runs_json_to_jsonb"
 
 # Mirror of the backfill DO block used by the migration, exposed so we can run
 # it a SECOND time and prove idempotency (no duplicate EvalSuite rows).
@@ -223,8 +227,9 @@ async def test_0126_eval_suite_backfill_rls_and_downgrade(migrated_db_url, monke
     org_b = uuid.uuid4()
 
     try:
-        # Reset to the revision before 0126, then seed data (so the backfill has
-        # something to migrate). The shared session schema is restored in finally.
+        # Reset to the revision before 0130 (only 0130 is re-run, which is
+        # idempotent), then seed data (so the backfill has something to migrate).
+        # The shared session schema is restored in finally.
         async with engine.begin() as conn:
             await conn.execute(
                 text("UPDATE alembic_version SET version_num = :rev"),
