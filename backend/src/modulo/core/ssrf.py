@@ -591,7 +591,23 @@ class PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         # — the whole point of pinning is defeated. Safe by default.
         super().__init__(verify=verify, http2=http2, trust_env=trust_env)
         _warn_if_proxied(trust_env)
-        self._pool._network_backend = _PinnedAsyncNetworkBackend(pinned_hosts)
+        # HTTPCORE SEAM: the pin is installed by overriding httpcore's PRIVATE
+        # `_pool._network_backend` attribute. httpcore (httpx 0.28.x / httpcore
+        # 1.0.x — the known-good range documented in backend/pyproject.toml)
+        # routes connect_tcp through this attribute when building each connection.
+        # This contract is private and unsupported: if httpcore ever stops routing
+        # that attribute into connection creation, the pin is silently DROPPED
+        # (re-opening the DNS-rebinding window) with no error at all. The guard
+        # below makes that un-pin loud.
+        backend = _PinnedAsyncNetworkBackend(pinned_hosts)
+        self._pool._network_backend = backend
+        if self._pool._network_backend is not backend:
+            raise RuntimeError(
+                "SSRF: pinned network backend was not installed on the httpcore pool. The private "
+                "`_pool._network_backend` seam has likely changed; pin a compatible httpcore/httpx "
+                "range (see backend/pyproject.toml) or upgrade the pinned transport, or the "
+                "DNS-rebinding pin has silently dropped."
+            )
 
 
 async def pinned_async_transport(

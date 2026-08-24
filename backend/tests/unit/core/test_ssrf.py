@@ -20,6 +20,7 @@ import ssl
 import threading
 import time
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -626,6 +627,52 @@ async def test_pin_registry_survives_request_and_reopen() -> None:
         # Re-opening on a fresh transport re-establishes the pin.
         transport2 = ssrf.PinnedAsyncHTTPTransport({"smoke.example": "127.0.0.1"})
         assert transport2._pool._network_backend._pinned_hosts == {"smoke.example": "127.0.0.1"}
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+async def test_pinned_async_client_full_composition(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """End-to-end composition: resolve -> pin-map -> transport -> real request.
+
+    ``pinned_async_client`` (the API FAR-408 will consume) is exercised through
+    the full wiring — ``pinned_async_client`` -> ``pinned_async_transport`` ->
+    ``PinnedAsyncHTTPTransport`` -> actual HTTP request — not just at the
+    transport level. The resolver is stubbed because loopback is now a
+    NON-NEGOTIABLE floor at the validation layer, so ``pinned_async_client``
+    cannot validate a host that maps to 127.0.0.1 on its own; stubbing
+    ``resolve_pinned_ip`` to return a loopback :class:`PinnedTarget` bypasses only
+    that DNS-validation gate (validation is covered by its own tests). The key
+    composition guarantee holds: the connection goes to the pinned 127.0.0.1 while
+    SNI + certificate verification use the original hostname, and the pin survives
+    the request without being silently reverted.
+    """
+    hostname = "compose-host.test"
+    cert_pem = tmp_path / "cert.pem"
+    key_pem = tmp_path / "key.pem"
+    _make_self_signed_cert(hostname, cert_pem, key_pem)
+    server, port = _start_tls_server(cert_pem, key_pem)
+    try:
+        verify_ctx = ssl.create_default_context(cafile=str(cert_pem))
+        pinned = ssrf.PinnedTarget(scheme="https", host=hostname, port=port, ip="127.0.0.1")
+        monkeypatch.setattr(ssrf, "resolve_pinned_ip", AsyncMock(return_value=pinned))
+        client = await ssrf.pinned_async_client(
+            f"https://{hostname}:{port}/",
+            verify=verify_ctx,
+        )
+        try:
+            transport = client._transport
+            backend = transport._pool._network_backend
+            assert isinstance(backend, ssrf._PinnedAsyncNetworkBackend)
+            assert backend._pinned_hosts == {hostname: "127.0.0.1"}
+            resp = await client.get(f"https://{hostname}:{port}/")
+            assert resp.status_code == 200
+            assert resp.text == "pinned-ok"
+            # The pin survives the request: backend is still the pinned backend.
+            assert transport._pool._network_backend is backend
+            assert backend._pinned_hosts == {hostname: "127.0.0.1"}
+        finally:
+            await client.aclose()
     finally:
         server.shutdown()
         server.server_close()
