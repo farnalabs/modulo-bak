@@ -11,20 +11,22 @@ reader in one org could (in principle) observe dismissals belonging to another
 org. This migration closes that gap by giving ``dismissals`` the same
 org-isolation RLS every other org-scoped table has.
 
-ROLE WIRING (the 0066 ceremony, verbatim from 0115): the migration connects via
+ROLE WIRING (the 0066 ceremony, adapted from 0115): the migration connects via
 ``DATABASE_ADMIN_URL`` (env.py — the superuser/owner URL). ``modulo_migrate`` is
-a NOLOGIN role (bootstrap_role.py), so it cannot be CONNECTED to — the migration
-executes ``SET ROLE modulo_migrate`` BEFORE ``op.add_column`` + the FK constraint
-(the ``dismissals`` table is already owned by ``modulo_migrate`` from 0110, and
-the new column/FK must be created under that role so ownership stays consistent),
-then ``RESET ROLE`` AFTER (the RLS-enable + policy + grant steps run as the
-migration's caller). The post-add ownership assertion verifies the table's owner
-is still ``modulo_migrate`` — the owner-bypasses-RLS precondition for ``dismissals``
-RLS confinement.
+a NOLOGIN role (bootstrap_role.py), so it cannot be CONNECTED to. Unlike 0115
+(which ``CREATE TABLE``s a brand-new table owned by ``modulo_migrate`` via
+``SET ROLE``), this migration ``ALTER``s the pre-existing ``dismissals`` table,
+which is owned by the migration caller (superuser). A non-owner role cannot
+``ALTER`` a table, so we do NOT ``SET ROLE modulo_migrate`` around the DDL.
+Instead the migration caller adds the column + FK, then explicitly
+``ALTER TABLE dismissals OWNER TO modulo_migrate`` so ownership stays consistent
+with the rest of the org-scoped schema. The post-add ownership assertion verifies
+the table's owner is ``modulo_migrate`` — the owner-bypasses-RLS precondition for
+``dismissals`` RLS confinement.
 
 The ceremony is conditional on the roles existing (checked via ``pg_roles``):
 on a fresh DB where ``alembic upgrade heads`` runs BEFORE the app bootstraps
-roles (e.g. the BDD suite), the GRANTs / ``SET ROLE`` / owner assertion are
+roles (e.g. the BDD suite), the GRANT / owner-reassign / owner assertion are
 skipped and the column is added by the migration caller. When the roles exist
 (production, where bootstrap runs before alembic), the full ``modulo_migrate``
 ownership ceremony runs as described above.
@@ -99,8 +101,12 @@ def upgrade() -> None:
         migrate_role = _role_exists(bind, _MIGRATE_ROLE)
         app_role = _role_exists(bind, _APP_ROLE)
         if migrate_role:
+            # The migration caller (superuser/owner) performs the DDL below. We
+            # deliberately do NOT ``SET ROLE modulo_migrate`` here: ``dismissals``
+            # is owned by the migration caller, and a non-owner role cannot
+            # ``ALTER`` it. After the column/FK are added we re-own the table to
+            # ``modulo_migrate`` (the RLS-confined owner) below.
             op.execute(f"GRANT REFERENCES ON TABLE public.organisations TO {_MIGRATE_ROLE}")
-            op.execute(f"SET ROLE {_MIGRATE_ROLE}")
     else:
         migrate_role = False
         app_role = False
@@ -122,8 +128,15 @@ def upgrade() -> None:
     )
 
     if pg:
+        # Re-own the table to modulo_migrate so the RLS-confined owner is
+        # consistent with the rest of the org-scoped schema. ``modulo_migrate``
+        # is NOLOGIN, so it never connects at runtime and the owner-bypasses-RLS
+        # precondition is satisfied (the runtime role ``modulo_app`` is not the
+        # owner). This replaces the original ``SET ROLE`` ceremony, which failed
+        # because ``modulo_migrate`` did not own the pre-existing ``dismissals``
+        # table and therefore could not ``ALTER`` it.
         if migrate_role:
-            op.execute("RESET ROLE")
+            op.execute(f"ALTER TABLE {_TABLE} OWNER TO {_MIGRATE_ROLE}")
             _assert_owner_is_migrate(bind)
 
         # Backfill from the parent notification's organisation_id.
