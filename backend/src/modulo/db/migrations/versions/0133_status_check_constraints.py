@@ -1,7 +1,7 @@
 """Add CHECK constraints on connector_instances.status / notification_delivery_log.status.
 
-Revision ID: 0129_status_check_constraints
-Revises: 0128_add_fk_lookup_indexes
+Revision ID: 0133_status_check_constraints
+Revises: 0129_runs_json_to_jsonb
 Create Date: 2026-08-23
 
 Both ``connector_instances.status`` and ``notification_delivery_log.status`` are
@@ -24,8 +24,8 @@ Postgres-only, matching the repo's existing CHECK-constraint migrations
 from alembic import op
 from sqlalchemy import text
 
-revision = "0129_status_check_constraints"
-down_revision = "0128_add_fk_lookup_indexes"
+revision = "0133_status_check_constraints"
+down_revision = "0129_runs_json_to_jsonb"
 branch_labels = None
 depends_on = None
 
