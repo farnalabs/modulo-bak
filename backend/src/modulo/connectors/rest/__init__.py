@@ -561,11 +561,18 @@ class RestConnector(ConnectorBase):
         await self._validate_target_url(url)
 
         # Write-path-style injection screening of everything that reaches the wire.
-        screened: list[str] = [url]
-        screened.extend(headers.values())
-        screened.extend(str(v) for v in params.values())
-        screened.extend(_collect_strings(body))
-        self._security_guard.filter_strings(screened, resource=resource)
+        # The prompt-injection TEXT classifier is a write-side concern (the hub
+        # guards write payloads with filter_payload_for_injection). On the READ
+        # surface it only adds false positives — a legitimate agent-supplied search
+        # term like ``q=import os`` would otherwise throw OutputRejectedError. The
+        # read surface relies on the real HTTP controls above (control-char
+        # rejection, protected-header set, SSRF/allowlist).
+        if surface == "write":
+            screened: list[str] = [url]
+            screened.extend(headers.values())
+            screened.extend(str(v) for v in params.values())
+            screened.extend(_collect_strings(body))
+            self._security_guard.filter_strings(screened, resource=resource)
 
         return RestRequest(
             method=spec["method"],

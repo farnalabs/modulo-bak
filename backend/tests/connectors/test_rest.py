@@ -302,6 +302,56 @@ def test_guard_rejects_non_http_scheme() -> None:
         asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 
+def test_query_benign_injection_phrase_not_rejected() -> None:
+    """A read/query whose term would trip the prompt-injection TEXT classifier must succeed.
+
+    The prompt-injection text classifier is scoped off the READ surface — a
+    legitimate agent-supplied search term like ``import os`` or ``eval(`` must not
+    throw out of the query path (it would previously raise OutputRejectedError).
+    The read surface is protected by the real HTTP controls (control-char
+    rejection, protected-header set, SSRF/allowlist) which the dedicated guard
+    tests above exercise.
+    """
+
+    class _RejectInjectionGuard(SecurityGuard):
+        def __init__(self) -> None:
+            super().__init__(validate_url=self._noop_validate, filter_strings=self._reject)
+
+        @staticmethod
+        async def _noop_validate(url: str) -> None:
+            return None
+
+        @staticmethod
+        def _reject(values: list[str], resource: str) -> None:
+            for value in values:
+                for trigger in ("import os", "eval(", "ignore previous instructions"):
+                    if trigger in value:
+                        raise ValueError(f"rejected injection term: {trigger}")
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"data": {"items": [{"id": 1}, {"id": 2}]}})
+
+    c = RestConnector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/search",
+            "params": {"q": "{{ q }}"},
+            "records_path": "data.items",
+        },
+        {"auth_mode": "bearer", "token": "t"},
+        transport=httpx.MockTransport(handler),
+        ssrf_validator=lambda url: None,
+        security_guard=_RejectInjectionGuard(),
+    )
+    result = asyncio_run(c.query(ConnectorQuery(resource="default", filters={"q": "import os"})))
+    assert captured["params"].get("q") == "import os"
+    assert len(result.records) == 2
+    assert [r["id"] for r in result.records] == [1, 2]
+
+
 # ── Write ──────────────────────────────────────────────────────────────────
 
 
