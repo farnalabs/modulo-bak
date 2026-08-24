@@ -1,7 +1,7 @@
 """Add CHECK constraints on connector_instances.status / notification_delivery_log.status.
 
 Revision ID: 0135_status_check_constraints
-Revises: 0131_eval_dataset_corpus
+Revises: 0134_dismissals_org_rls
 Create Date: 2026-08-23
 
 Both ``connector_instances.status`` and ``notification_delivery_log.status`` are
@@ -25,7 +25,7 @@ from alembic import op
 from sqlalchemy import text
 
 revision = "0135_status_check_constraints"
-down_revision = "0131_eval_dataset_corpus"
+down_revision = "0134_dismissals_org_rls"
 branch_labels = None
 depends_on = None
 
