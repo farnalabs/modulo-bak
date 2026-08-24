@@ -120,7 +120,7 @@ _SOURCE_ERROR_CLASSES: frozenset[str] = frozenset(
 #: the classifier never compares against raw status literals (the
 #: ``raw-status-complete`` semgrep rule routes status checks through the shared
 #: status sets until the FAR-146 success-predicate lands).
-_EXCLUDED_STATUSES: frozenset[str] = frozenset({"cancelled", "budget_exceeded"})
+_EXCLUDED_STATUSES: frozenset[str] = frozenset({"cancelled", "budget_exceeded", "router_no_match"})
 _COUNTABLE_NO_DELIVERY_STATUSES: frozenset[str] = frozenset({"failed", "eval_failed", "stalled"})
 #: The deliverable verdict bucket — the ONLY status that may produce
 #: ``delivered``. Named (not a raw ``status == "complete"`` literal) so the

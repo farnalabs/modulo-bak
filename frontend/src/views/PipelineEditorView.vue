@@ -311,6 +311,14 @@
                     <div class="text-xs font-medium text-primary">AGENT</div>
                     <div class="text-sm font-semibold">{{ nodeProps.data.label }}</div>
                   </div></template>
+          <template #node-router="nodeProps"><div class="rounded-lg border-2 border-indigo-500/60 bg-indigo-500/10 px-4 py-2 shadow-sm" v-tooltip.top="nodeProps.data.description">
+                    <div class="text-xs font-medium text-indigo-600 dark:text-indigo-300">ROUTER</div>
+                    <div class="text-sm font-semibold">{{ nodeProps.data.label || 'Router' }}</div>
+                  </div></template>
+          <template #node-hitl="nodeProps"><div class="rounded-lg border-2 border-rose-500/60 bg-rose-500/10 px-4 py-2 shadow-sm" v-tooltip.top="nodeProps.data.description">
+                    <div class="text-xs font-medium text-rose-600 dark:text-rose-300">HITL</div>
+                    <div class="text-sm font-semibold">{{ nodeProps.data.label || 'Human-in-the-loop' }}</div>
+                  </div></template>
           <template #edge-default="edgeProps">
             <div v-if="edgeProps.data?.hitl_gate_config" class="absolute -translate-y-4 translate-x-2">
               <span class="rounded bg-warning/20 px-1.5 py-0.5 text-[10px] font-medium text-warning">HITL</span>
@@ -342,9 +350,13 @@
               <span
                 :class="selectedNodeData.node_type === 'manual'
                   ? 'badge badge-status-warning'
-                  : 'badge badge-status-primary'"
+                  : selectedNodeData.node_type === 'router'
+                    ? 'badge bg-indigo-500/10 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300'
+                    : selectedNodeData.node_type === 'hitl'
+                      ? 'badge bg-rose-500/10 text-rose-600 dark:bg-rose-900 dark:text-rose-300'
+                      : 'badge badge-status-primary'"
               >
-                {{ selectedNodeData.node_type === 'manual' ? $t('views.PipelineEditorView.manual') : selectedNodeData.node_type === 'sandbox_agent' ? 'Sandbox Agent' : $t('views.PipelineEditorView.agent') }}
+                {{ selectedNodeData.node_type === 'manual' ? $t('views.PipelineEditorView.manual') : selectedNodeData.node_type === 'sandbox_agent' ? 'Sandbox Agent' : selectedNodeData.node_type === 'router' ? 'Router' : selectedNodeData.node_type === 'hitl' ? 'HITL' : $t('views.PipelineEditorView.agent') }}
               </span>
             </dd>
           </div>
@@ -1033,7 +1045,7 @@ const flowEdges = ref<any[]>([])
 const selectedNodeData = ref<any | null>(null)
 const selectedEdgeData = ref<any | null>(null)
 const showSaveAsDropdown = ref(false)
-const nodeTypes = { agent: 'agent', manual: 'manual' }
+const nodeTypes = { agent: 'agent', manual: 'manual', router: 'router', hitl: 'hitl' }
 const { fitView } = useVueFlow()
 
 const agents = ref<any[]>([])

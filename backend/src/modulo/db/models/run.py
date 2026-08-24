@@ -39,7 +39,15 @@ if TYPE_CHECKING:
 # across the codebase (crud/run, cron_helpers, analytics) import these instead
 # of re-declaring their own tuples.
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"complete", "failed", "cancelled", "eval_failed", "stalled", "budget_exceeded"}
+    {
+        "complete",
+        "failed",
+        "cancelled",
+        "eval_failed",
+        "stalled",
+        "budget_exceeded",
+        "router_no_match",
+    }
 )
 
 # Non-terminal (active) run statuses — a run that still holds a slot. A pending
@@ -94,7 +102,8 @@ class Run(OrgScoped):
         ),
         CheckConstraint(
             "status IN ('pending', 'running', 'awaiting_human', 'claimed', "
-            "'complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded')",
+            "'complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded', "
+            "'router_no_match')",
             name="ck_runs_status",
         ),
         UniqueConstraint("organisation_id", "run_number", name="uq_runs_org_run_number"),

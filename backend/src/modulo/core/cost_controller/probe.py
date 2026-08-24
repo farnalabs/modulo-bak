@@ -74,7 +74,15 @@ FLOOD_MIN_DISTINCT_RUNS = 5
 FLOOD_COOLDOWN_SECONDS = 15 * 60
 
 # The canonical terminal-status set (spec §4.2) — the probe sample predicate.
-PROBE_TERMINAL_STATUSES = ("complete", "failed", "cancelled", "eval_failed", "stalled", "budget_exceeded")
+PROBE_TERMINAL_STATUSES = (
+    "complete",
+    "failed",
+    "cancelled",
+    "eval_failed",
+    "stalled",
+    "budget_exceeded",
+    "router_no_match",
+)
 
 # Per-org statement/query timeout (one stalled org cannot block the cadence).
 _ORG_STATEMENT_TIMEOUT_MS = 5000
