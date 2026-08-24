@@ -39,6 +39,14 @@ _APP_ROLE = "modulo_app"
 _ORG_SCOPE = "organisation_id = nullif(current_setting('app.organisation_id', true), '')::uuid"
 
 
+def _role_exists(bind, role: str) -> bool:
+    """Return True when the Postgres role exists (fresh dev/BDD DBs have none)."""
+    return (
+        bind.execute(sa.text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}).scalar_one_or_none()
+        is not None
+    )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
@@ -77,8 +85,11 @@ def upgrade() -> None:
     op.execute(sa.text('ALTER TABLE public."run_evidence" FORCE ROW LEVEL SECURITY'))
     op.execute(sa.text(f'CREATE POLICY rls_org_isolation ON public."run_evidence" USING ({_ORG_SCOPE})'))
 
-    # 5. Runtime role needs DML.
-    op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
+    # 5. Runtime role needs DML. Guard on the role existing: fresh dev/BDD
+    # databases are bootstrapped without ``modulo_app``, so skip the grant
+    # there (mirrors the guarding used by 0134_dismissals_org_rls).
+    if _role_exists(bind, _APP_ROLE):
+        op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
 
 
 def downgrade() -> None:
