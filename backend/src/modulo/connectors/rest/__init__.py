@@ -435,13 +435,16 @@ class RestConnector(ConnectorBase):
             if not creds.get("api_key"):
                 raise ValueError("REST api_key auth requires creds['api_key']")
             auth["api_key"] = str(creds["api_key"])
-            auth["in"] = str(creds.get("in", "header")).lower()
+            auth_in = creds.get("in")
+            auth["in"] = str(auth_in if auth_in is not None else "header").lower()
             if auth["in"] not in {"header", "query"}:
                 raise ValueError(f"REST api_key auth 'in' must be 'header' or 'query' — got {auth['in']!r}")
             if auth["in"] == "header":
-                auth["header_name"] = str(creds.get("header_name", "X-API-Key"))
+                header_name = creds.get("header_name")
+                auth["header_name"] = str(header_name) if header_name is not None else "X-API-Key"
             else:
-                auth["query_param_name"] = str(creds.get("query_param_name", "api_key"))
+                query_param_name = creds.get("query_param_name")
+                auth["query_param_name"] = str(query_param_name) if query_param_name is not None else "api_key"
         return auth
 
     @property
