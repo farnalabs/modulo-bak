@@ -65,7 +65,7 @@ _MIGRATION_PATH = (
     / "db"
     / "migrations"
     / "versions"
-    / "0133_eval_suite_run.py"
+    / "0135_eval_suite_run.py"
 )
 
 
@@ -472,11 +472,11 @@ def test_migration_is_reversible_single_head() -> None:
     text_content = _MIGRATION_PATH.read_text(encoding="utf-8")
     assert 'op.drop_table("suite_runs")' in text_content
     assert 'drop_column("eval_results", "suite_run_id")' in text_content
-    assert 'down_revision: str | None = "0132_agent_connector_report_soft_delete_audit"' in text_content
+    assert 'down_revision: str | None = "0134_dismissals_org_rls"' in text_content
 
 
 def test_single_migration_head() -> None:
-    """Exactly one migration chains off 0131, and nothing chains off 0133."""
+    """Exactly one migration chains off each predecessor, and the head is 0135."""
     import glob
     import re
 
@@ -505,14 +505,20 @@ def test_single_migration_head() -> None:
     def _basename(path: str) -> str:
         return path.replace("\\", "/").rsplit("/", 1)[-1]
 
+    # The linear chain, integrated with main's run_evidence + dismissals RL
+    # migrations: 0131 -> 0132 -> 0133_run_evidence_rls -> 0134_dismissals_org_rls
+    # -> 0135_eval_suite_run (renumbered to resolve the 0133 collision).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
-    # The SuiteRun migration re-chains off main's 0132 → the head becomes 0133.
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
-    assert [_basename(p) for p in chaining_off_0132] == ["0133_eval_suite_run.py"]
-    # Nothing chains off 0133 → it is the single head.
-    chaining_off_0133 = [p for p in revisions if parents[p] == "0133_eval_suite_run"]
-    assert chaining_off_0133 == []
+    assert [_basename(p) for p in chaining_off_0132] == ["0133_run_evidence_rls.py"]
+    chaining_off_0133 = [p for p in revisions if parents[p] == "0133_run_evidence_rls"]
+    assert [_basename(p) for p in chaining_off_0133] == ["0134_dismissals_org_rls.py"]
+    chaining_off_0134 = [p for p in revisions if parents[p] == "0134_dismissals_org_rls"]
+    assert [_basename(p) for p in chaining_off_0134] == ["0135_eval_suite_run.py"]
+    # Nothing chains off 0135 -> it is the single head.
+    chaining_off_0135 = [p for p in revisions if parents[p] == "0135_eval_suite_run"]
+    assert chaining_off_0135 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

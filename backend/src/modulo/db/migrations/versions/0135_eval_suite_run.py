@@ -1,7 +1,7 @@
 """SuiteRun entity + eval_results attribution (FAR-376 Phase 3).
 
-Revision ID: 0133_eval_suite_run
-Revises: 0132_agent_connector_report_soft_delete_audit
+Revision ID: 0135_eval_suite_run
+Revises: 0134_dismissals_org_rls
 Create Date: 2026-08-24
 
 Phase 3 of the Generic Eval Product MVP: the run/comparison entity that closes
@@ -53,8 +53,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0133_eval_suite_run"
-down_revision: str | None = "0132_agent_connector_report_soft_delete_audit"
+revision: str = "0135_eval_suite_run"
+down_revision: str | None = "0134_dismissals_org_rls"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
