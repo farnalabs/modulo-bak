@@ -1,7 +1,7 @@
 """EvalDataset / EvalCase — repeatable eval input corpus (FAR-375 Phase 2).
 
-Revision ID: 0130_eval_dataset_corpus
-Revises: 0129_runs_json_to_jsonb
+Revision ID: 0131_eval_dataset_corpus
+Revises: 0130_eval_suite_entity
 Create Date: 2026-08-24
 
 Phase 2 of the Generic Eval Product MVP: a managed, versioned input corpus that
@@ -47,8 +47,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0130_eval_dataset_corpus"
-down_revision: str | None = "0129_runs_json_to_jsonb"
+revision: str = "0131_eval_dataset_corpus"
+down_revision: str | None = "0130_eval_suite_entity"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

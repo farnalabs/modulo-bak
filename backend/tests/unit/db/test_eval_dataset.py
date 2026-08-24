@@ -38,7 +38,7 @@ _MIGRATION_PATH = (
     / "db"
     / "migrations"
     / "versions"
-    / "0130_eval_dataset_corpus.py"
+    / "0131_eval_dataset_corpus.py"
 )
 
 
@@ -269,7 +269,7 @@ def test_migration_is_reversible() -> None:
     # downgrade must drop both tables (reversible, self-contained).
     assert 'op.drop_table("eval_cases")' in text_content
     assert 'op.drop_table("eval_datasets")' in text_content
-    assert 'down_revision: str | None = "0129_runs_json_to_jsonb"' in text_content
+    assert 'down_revision: str | None = "0130_eval_suite_entity"' in text_content
 
 
 def test_migration_standalone_no_eval_suite_dependency() -> None:
