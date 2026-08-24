@@ -1,7 +1,7 @@
 """Tenant-isolate run_evidence via organisation_id + RLS (FAR-?).
 
-Revision ID: 0127_run_evidence_rls
-Revises: 0126_human_set_eval_type
+Revision ID: 0131_run_evidence_rls
+Revises: 0129_runs_json_to_jsonb
 Create Date: 2026-08-23
 
 ``run_evidence`` was created in 0110 without tenant scoping (it carries no
@@ -30,8 +30,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0127_run_evidence_rls"
-down_revision: str | None = "0126_human_set_eval_type"
+revision: str = "0131_run_evidence_rls"
+down_revision: str | None = "0129_runs_json_to_jsonb"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
