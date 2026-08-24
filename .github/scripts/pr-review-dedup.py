@@ -94,10 +94,7 @@ def load(path):
 
 def main(argv):
     if len(argv) != 4:
-        print(
-            "usage: pr-review-dedup.py <reviews.json> <commits.json> <head_sha>",
-            file=sys.stderr,
-        )  # noqa: T201
+        sys.stderr.write("usage: pr-review-dedup.py <reviews.json> <commits.json> <head_sha>\n")
         return 2
     try:
         reviews = load(argv[1])

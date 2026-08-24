@@ -29,11 +29,16 @@ What this migration does:
 
 ROLE WIRING (the 0066 ceremony, verbatim from 0131): the migration connects via
 ``DATABASE_ADMIN_URL``. ``modulo_migrate`` is NOLOGIN so the migration executes
-``SET ROLE modulo_migrate`` BEFORE the ``create_table`` / ``ALTER`` and ``RESET
-ROLE`` AFTER (the RLS-enable + policy + grant steps run as the migration's
-caller). A post-create ownership assertion verifies ``suite_runs`` owner is
-``modulo_migrate``. The ceremony is conditional on the roles existing (fresh
-dev/BDD DBs have none).
+``SET ROLE modulo_migrate`` ONLY around the ``create_table("suite_runs")``, then
+``RESET ROLE`` IMMEDIATELY AFTER (the RLS-enable + policy + grant steps run as
+the migration's caller). CRITICAL: the ``eval_results`` ALTERs (``add_column``
+``suite_run_id``, the FK, the index, and ``ALTER COLUMN run_id DROP NOT NULL``)
+MUST run as the migration CALLER, NOT under ``SET ROLE modulo_migrate`` —
+``eval_results`` is OWNED BY ``modulo_app`` (migration 0003) and ``modulo_migrate``
+is not its owner, so running those as ``modulo_migrate`` fails the break-glass
+deploy gate with ``must be owner of table eval_results``. A post-create
+ownership assertion verifies ``suite_runs`` owner is ``modulo_migrate``. The
+ceremony is conditional on the roles existing (fresh dev/BDD DBs have none).
 
 Reversible: downgrade drops the ``suite_runs`` table, removes the
 ``eval_results.suite_run_id`` column + index + FK, restores ``run_id`` NOT NULL
@@ -147,9 +152,19 @@ def upgrade() -> None:
         ),
     )
 
+    if pg and migrate_role:
+        op.execute("RESET ROLE")
+        _assert_owner_is_migrate(bind, _TABLE)
+
     # eval_results attribution: back-link per-case outcomes to their SuiteRun.
     # ``run_id`` is relaxed to NULL so a SuiteRun outcome is attributed to a
     # ``suite_run`` rather than a pipeline ``Run``.
+    #
+    # CRITICAL: these MUST run as the migration CALLER (the DATABASE_ADMIN_URL
+    # role), NOT under SET ROLE modulo_migrate — eval_results is OWNED BY
+    # modulo_app (migration 0003) and modulo_migrate is not its owner, so running
+    # them as modulo_migrate fails the break-glass deploy gate with
+    # "must be owner of table eval_results".
     op.add_column("eval_results", sa.Column("suite_run_id", sa.Uuid(), nullable=True))
     op.create_foreign_key(
         "fk_eval_results_suite_run_id",
@@ -160,10 +175,6 @@ def upgrade() -> None:
         ondelete="CASCADE",
     )
     op.execute("ALTER TABLE eval_results ALTER COLUMN run_id DROP NOT NULL")
-
-    if pg and migrate_role:
-        op.execute("RESET ROLE")
-        _assert_owner_is_migrate(bind, _TABLE)
 
     op.create_index("ix_suite_runs_organisation_id", "suite_runs", ["organisation_id"])
     op.create_index("ix_suite_runs_suite_dataset", "suite_runs", ["suite_id", "dataset_id"])
