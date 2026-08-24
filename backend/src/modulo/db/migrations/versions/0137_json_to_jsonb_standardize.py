@@ -52,8 +52,8 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
     ("environment_profiles", "secret_refs_json"),
     ("error_events", "context_json"),
     ("error_forwarder_configs", "config_json"),
-    ("eval_datasets", "input_payload"),
-    ("eval_datasets", "expected_output"),
+    ("eval_cases", "input_payload"),
+    ("eval_cases", "expected_output"),
     ("eval_definitions", "config_json"),
     ("feedback_records", "rejected_output"),
     ("hitl_claims", "decision_payload"),
@@ -89,7 +89,7 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
     ("remy_skills", "triggers"),
     ("scheduled_reports", "config_json"),
     ("scheduled_reports", "recipient_config"),
-    ("schema_folders", "definition_json"),
+    ("schema_versions", "definition_json"),
     ("sso_providers", "group_mappings"),
     ("system_config", "value"),
     ("teams", "notification_endpoints"),
@@ -98,10 +98,10 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
     ("variant_groups", "variants"),
     ("saved_views", "filters"),
     ("saved_views", "columns"),
-    ("webhook_dedup_hashes", "raw_payload"),
+    ("webhook_payloads", "raw_payload"),
     ("workspace_leases", "resource_usage_json"),
     ("workspace_leases", "output_artifact_refs_json"),
-    ("tier_catalog", "depends_on"),
+    ("feature_flag_catalog", "depends_on"),
 )
 
 
