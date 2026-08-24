@@ -1,11 +1,9 @@
 """Auto-generate the product primer Markdown for Remy's system prompt.
 
 Reads:
-  - in-code _GLOSSARY_TERMS — key concepts and one-line definitions
-    (retired from docs/prd.md §5; canonical product structure in
-    frontend/src/manifest.yaml, see docs/adr/008-core-shared-manifest.md)
+  - docs/prd.md §5 (glossary, OPTIONAL/legacy) — if present, key concepts and one-line
+     definitions; otherwise the built-in glossary is used
   - frontend/src/manifest.yaml — sidebar groups, route names
-    (see docs/adr/008-core-shared-manifest.md)
   - Live DB counts — pipelines, connectors, model backends
   - Live user/org profile — display_name, role, org_name, plan_name
 
@@ -51,7 +49,7 @@ def _safe_output_path(path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 1.  Glossary — key concepts (retired from PRD §5; now in _GLOSSARY_TERMS)
+# 1. Glossary parsing - PRD §5 (optional; falls back to built-in glossary)
 # ---------------------------------------------------------------------------
 
 _GLOSSARY_TERMS: dict[str, str] = {
@@ -91,13 +89,35 @@ _KEY_CONCEPTS = [
 ]
 
 
-def _load_glossary() -> dict[str, str]:
-    """Return {term: definition} for key concepts.
+def _load_prd_glossary(prd_path: Path) -> dict[str, str]:
+    """Parse the §5 glossary table from an OPTIONAL prd.md at docs/prd.md (legacy).
 
-    The glossary was retired from docs/prd.md §5; it is now maintained inline
-    in ``_GLOSSARY_TERMS``.
+    If absent, returns the built-in glossary (_GLOSSARY_TERMS).
     """
-    return dict(_GLOSSARY_TERMS)
+    if not prd_path.exists():
+        return dict(_GLOSSARY_TERMS)
+
+    text = prd_path.read_text(encoding="utf-8")
+
+    # Find the ## 5. Core Concepts & Glossary section
+    m = re.search(r"## 5\. Core Concepts & Glossary\s*\n(.*?)(?=\n## \d)", text, re.DOTALL)
+    if not m:
+        return dict(_GLOSSARY_TERMS)
+
+    section = m.group(1)
+    terms: dict[str, str] = {}
+    for line in section.splitlines():
+        line = line.strip()
+        if not line.startswith("| **"):
+            continue
+        parts = [p.strip() for p in line.split("|") if p.strip()]
+        if len(parts) >= 2:
+            term = parts[0].removeprefix("**").removesuffix("**").strip()
+            definition = parts[1].strip()
+            if term and definition:
+                terms[term] = definition
+
+    return terms or dict(_GLOSSARY_TERMS)
 
 
 # ---------------------------------------------------------------------------
@@ -371,8 +391,15 @@ async def generate_primer(
     user_id: str | None = None,
 ) -> str:
     """Generate the complete product primer Markdown string."""
-    # Glossary (retired from docs/prd.md §5; now inline in _GLOSSARY_TERMS)
-    glossary = _load_glossary()
+    # Resolve project root
+    script_dir = Path(__file__).resolve().parent
+    backend_dir = script_dir.parent  # backend/
+    project_root = backend_dir.parent  # project root
+
+    # Glossary
+    # Optional legacy PRD glossary at docs/prd.md; falls back to built-in _GLOSSARY_TERMS if missing.
+    prd_path = project_root / "docs" / "prd.md"
+    glossary = _load_prd_glossary(prd_path)
 
     # Navigation
     nav = _load_navigation()
