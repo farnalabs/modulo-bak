@@ -13,9 +13,7 @@ tenant-isolation gap:
   * ENABLE + FORCE ROW LEVEL SECURITY so even the table owner is confined.
   * Add the canonical ``rls_org_isolation`` policy (org-scope USING on
     ``app.organisation_id``), mirroring every other tenant table.
-  * GRANT full DML to ``modulo_app`` (the runtime role) — guarded on the role
-    existing, since the BDD suite runs ``alembic upgrade heads`` before
-    ``bootstrap_role`` provisions the roles.
+  * GRANT full DML to ``modulo_app`` (the runtime role).
 
 ``run_evidence`` already exists, so this is an ALTER (not a ``modulo_migrate``
 ownership ceremony): FORCE RLS is what confines the app/owner role here, which
@@ -33,7 +31,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0133_run_evidence_rls"
-down_revision: str | None = "0131_eval_dataset_corpus"
+down_revision: str | None = "0132_agent_connector_report_soft_delete_audit"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -55,7 +53,6 @@ def upgrade() -> None:
         return
 
     op.execute("SET search_path TO public")
-    app_role = _role_exists(bind, _APP_ROLE)
 
     # 1. Add the column (nullable first so the backfill can run).
     op.execute(sa.text('ALTER TABLE public."run_evidence" ADD COLUMN IF NOT EXISTS organisation_id uuid'))
@@ -88,11 +85,9 @@ def upgrade() -> None:
     op.execute(sa.text('ALTER TABLE public."run_evidence" FORCE ROW LEVEL SECURITY'))
     op.execute(sa.text(f'CREATE POLICY rls_org_isolation ON public."run_evidence" USING ({_ORG_SCOPE})'))
 
-    # 5. Runtime role needs DML. Guarded on the role existing: on a fresh DB
-    # where ``alembic upgrade heads`` runs BEFORE ``bootstrap_role`` provisions
-    # the roles (e.g. the BDD suite), ``modulo_app`` does not exist yet and the
-    # later bootstrap run grants it DML on all schema tables anyway.
-    if app_role:
+    # 5. Runtime role needs DML (guarded on the role existing — on fresh dev/BDD
+    # databases the app roles are bootstrapped after alembic runs).
+    if _role_exists(bind, _APP_ROLE):
         op.execute(sa.text(f'GRANT SELECT, INSERT, UPDATE, DELETE ON public."run_evidence" TO {_APP_ROLE}'))
 
 
