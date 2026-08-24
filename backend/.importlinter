@@ -121,8 +121,7 @@ forbidden_modules =
 ignore_imports =
     # Shell resolves workspace sessions via the DB layer.
     modulo.connectors.shell -> modulo.db.session
-    # FAR-408 generic REST connector reuses core's SSRF guard and the write-path
-    # output-injection filter so the query path gets the same injection defence as
-    # the write path without duplicating/drifting the rules.
-    modulo.connectors.rest -> modulo.core.ssrf
-    modulo.connectors.rest -> modulo.core.pipeline_engine.output_filter
+    # The REST connector (FAR-408) binds its SSRF + output-injection port at the
+    # composition root (connector_hub) and never imports ``modulo.core`` directly;
+    # this contract enforces that the connector stays decoupled. Any attempt to
+    # pull ``modulo.core`` into ``modulo.connectors.rest`` must fail here.

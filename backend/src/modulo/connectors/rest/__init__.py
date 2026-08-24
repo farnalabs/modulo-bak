@@ -132,16 +132,14 @@ _MAX_RETRIES = 3
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 
-# ``.0`` (dot-number) segments are legacy ``_dot_get`` index syntax; JMESPath
-# wants ``[0]``. Coerce ``items.0`` -> ``items[0]`` so old configs keep working.
-_JMESPATH_INDEX = re.compile(r"\.(\d+)")
+# Legacy ``_dot_get`` index syntax (``items.0``) is NOT valid JMESPath; a
+# connector must declare ``items[0]`` instead. We reject dot-index paths with a
+# clear actionable error rather than silently rewriting them (a legit numeric
+# key such as ``data.2024`` must never be rewritten to ``data[2024]``).
+_MAX_RETRY_WAIT = 30.0
+_DOT_INDEX = re.compile(r"\.\d+(?![A-Za-z_])")
 
 SsrfValidator = Callable[[str], Awaitable[None] | None]
-
-
-def _coerce_jmespath(path: str) -> str:
-    """Translate legacy dot-index syntax (``items.0``) into JMESPath (``items[0]``)."""
-    return _JMESPATH_INDEX.sub(r"[\1]", path)
 
 
 def _collect_strings(value: Any) -> list[str]:
@@ -200,9 +198,10 @@ class SecurityGuard:
     Injected at the composition root (see ``connector_hub._build_connector``) so the
     connector does not reach into ``modulo.core`` directly. ``validate_url`` is
     awaited (or called) and raises on a disallowed target; ``filter_strings``
-    raises on a string that fails the injection filter. A convenience
-    :class:`_DefaultSecurityGuard` keeps direct construction (tests, ad-hoc use)
-    safety-preserving by wiring the lazy ``modulo.core`` implementations.
+    raises on a string that fails the injection filter. The composition root is the
+    single place that binds this port to the real ``modulo.core`` guards; the
+    constructor default (when no guard is injected) is an inert stub used only by
+    tests and ad-hoc direct construction.
     """
 
     def __init__(
@@ -223,29 +222,22 @@ class SecurityGuard:
         self._filter_strings(values, resource)
 
 
-class _DefaultSecurityGuard(SecurityGuard):
-    """Lazy ``modulo.core``-backed guard used when no guard is injected."""
+def _stub_security_guard() -> SecurityGuard:
+    """Inert guard used when no guard is injected (direct construction, tests).
 
-    def __init__(self) -> None:
-        super().__init__(validate_url=self._core_validate, filter_strings=self._core_filter)
+    The ``modulo.core`` SSRF + injection guards are bound by the composition root
+    (``connector_hub``) — never by the connector itself — so this stub performs no
+    enforcement. Directly-constructed connectors that need real guarding must
+    inject a real ``SecurityGuard``.
+    """
 
-    @staticmethod
-    async def _core_validate(url: str) -> None:
-        from modulo.core.ssrf import validate_outbound_url_async
+    async def validate_url(url: str) -> None:
+        return None
 
-        await validate_outbound_url_async(url)
+    def filter_strings(values: Sequence[str], resource: str) -> None:
+        return None
 
-    @staticmethod
-    def _core_filter(values: Sequence[str], resource: str) -> None:
-        from modulo.core.pipeline_engine.output_filter import (
-            OutputRejectedError,
-            filter_output_for_injection,
-        )
-
-        for value in values:
-            result = filter_output_for_injection(value)
-            if not result.passed:
-                raise OutputRejectedError(f"{result.reason} (REST resource: {resource!r})")
+    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
 
 
 @dataclass(frozen=True)
@@ -295,7 +287,7 @@ class RestConnector(ConnectorBase):
         self._transport = transport
         self._timeout = float(timeout or _DEFAULT_TIMEOUT)
         self._ssrf_validator = ssrf_validator
-        self._security_guard = security_guard or _DefaultSecurityGuard()
+        self._security_guard = security_guard or _stub_security_guard()
         self._base_url = str(self._config.get("base_url", "")).rstrip("/")
         if not self._base_url:
             raise ValueError("REST connector requires 'base_url' in config_json")
@@ -530,7 +522,10 @@ class RestConnector(ConnectorBase):
         (b) rendered headers may not override auth/transport headers;
         (c) the target URL must pass scheme/host allowlist + SSRF validation;
         (d) the rendered URL/params/headers/body are screened with the same
-        ``filter_output_for_injection`` the write path uses.
+        ``filter_output_for_injection`` the write path uses. Authentication
+        credentials (header mode via ``apply_auth``, query-mode ``api_key`` via
+        ``_request_kwargs``) are applied AFTER this screening so the secret is
+        never fed through the injection filter.
         """
         default_method = "GET" if surface == "read" else "POST"
         spec = self._operation_spec(resource, default_method=default_method)
@@ -553,16 +548,6 @@ class RestConnector(ConnectorBase):
             for key, value in rendered_params.items():
                 if value is not None:
                     params[str(key)] = value
-        # api_key-in-query creds are applied unconditionally AFTER the guard so a
-        # rendered/context param can never shadow the secret; a collision is a
-        # hard error rather than a silent override.
-        if self._auth["mode"] == "api_key" and self._auth["in"] == "query":
-            auth_param = self._auth["query_param_name"]
-            if auth_param in params:
-                raise ValueError(
-                    f"REST param name {auth_param!r} collides with the api_key credential query param name"
-                )
-            params[auth_param] = self._auth["api_key"]
 
         body: Any = None
         if spec["body"] is not None:
@@ -670,7 +655,21 @@ class RestConnector(ConnectorBase):
         headers = self.apply_auth(dict(request.headers))
         if request.idempotency_header:
             headers[request.idempotency_header] = str(uuid.uuid4())
-        kwargs: dict[str, Any] = {"headers": headers, "params": dict(request.params)}
+        params = dict(request.params)
+        # api_key-in-query creds are applied right before the wire (after the
+        # injection-guard screening in _build_request) so the secret is never
+        # screened. This is also the path health_check() routes through, so a
+        # query-mode api_key is sent on the health probe too. A rendered/context
+        # param of the same name is a collision — a hard error, never a silent
+        # override.
+        if self._auth["mode"] == "api_key" and self._auth["in"] == "query":
+            auth_param = self._auth["query_param_name"]
+            if auth_param in params:
+                raise ValueError(
+                    f"REST param name {auth_param!r} collides with the api_key credential query param name"
+                )
+            params[auth_param] = self._auth["api_key"]
+        kwargs: dict[str, Any] = {"headers": headers, "params": params}
         if request.body is not None:
             if isinstance(request.body, (dict, list)):
                 kwargs["json"] = request.body
@@ -733,7 +732,9 @@ class RestConnector(ConnectorBase):
     @staticmethod
     def _retry_delay(exc: RESTStatusError, attempt: int) -> float:
         if exc.retry_after is not None:
-            return max(0.0, exc.retry_after)
+            # Cap an untrusted Retry-After: a server can say 3600 and we must not
+            # sleep ~1h per retry. The cap bounds every retry hop (default 30s).
+            return min(max(0.0, exc.retry_after), _MAX_RETRY_WAIT)
         return RestConnector._backoff(attempt)
 
     def _status_detail(self, resp: httpx.Response, request: RestRequest, body_text: str) -> str:
@@ -769,7 +770,7 @@ class RestConnector(ConnectorBase):
         elif isinstance(parsed, dict):
             records_path = request.records_path
             if records_path:
-                source = jmespath.search(_coerce_jmespath(records_path), parsed)
+                source = self._search_jmespath(records_path, parsed)
                 if isinstance(source, list):
                     records = safe_records_list(source)
                 elif isinstance(source, dict):
@@ -812,10 +813,25 @@ class RestConnector(ConnectorBase):
         ]
 
     @staticmethod
+    def _search_jmespath(path: str, data: Any) -> Any:
+        """Run a validated JMESPath search, rejecting legacy dot-index syntax.
+
+        ``data.items.0`` is not expressible in JMESPath (identifiers cannot start
+        with a digit); a connector must declare ``data.items[0]``. Rather than
+        silently rewriting a ``.0`` segment, REJECT it with a clear actionable
+        error so a wrong path fails loud instead of returning wrong data.
+        """
+        if _DOT_INDEX.search(path):
+            raise ValueError(
+                f"REST JMESPath path {path!r} is invalid: use bracket index syntax like [0], not dot index like .0"
+            )
+        return jmespath.search(path, data)
+
+    @staticmethod
     def _extract_cursor(parsed: dict[str, Any], path: str | None) -> str | None:
         if not path:
             return None
-        value = jmespath.search(_coerce_jmespath(path), parsed)
+        value = RestConnector._search_jmespath(path, parsed)
         return str(value) if isinstance(value, str) and value else None
 
     def _write_result(self, resp: httpx.Response, body_text: str) -> dict[str, Any]:

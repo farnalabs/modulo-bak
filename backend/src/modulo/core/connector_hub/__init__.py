@@ -14,6 +14,7 @@ Sensitive data (credentials, API keys, user content) is never included in span a
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import uuid
@@ -136,7 +137,28 @@ class ConnectorHub:
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        await self._close_connectors()
         self.close()
+
+    async def _close_connectors(self) -> None:
+        """Close every held connector's async resources (e.g. pooled clients).
+
+        Consumers that serve streaming/connection-pooled connectors (REST's
+        ``httpx.AsyncClient``) need their async ``close()`` awaited at teardown or
+        keepalive sockets leak. Only connectors that expose a ``close()`` are
+        touched; a connector that does not is left to garbage collection. A
+        failing ``close()`` is logged and does not abort the teardown of the rest.
+        """
+        for connector in self._connectors.values():
+            close = getattr(connector, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("Failed to close connector", exc_info=True)
 
     def close(self) -> None:
         """Release every held connector and its decrypted credentials.
@@ -147,6 +169,10 @@ class ConnectorHub:
         is marked uninitialised; a subsequent ``initialise()`` rebuilds it
         for the next run. Safe to call multiple times and without an
         ``async with`` block.
+
+        Note: asynchronous connector resources (e.g. the REST connector's pooled
+        ``httpx.AsyncClient``) are closed by :meth:`_close_connectors`, which the
+        ``async with`` teardown path awaits before this synchronous pruning.
         """
         self._connectors.clear()
         self._acls.clear()

@@ -203,6 +203,46 @@ def test_auth_api_key_query() -> None:
     assert captured["params"] == {"api_key": "k456"}
 
 
+def test_api_key_query_secret_not_screened() -> None:
+    """A query-mode api_key with filter-triggering chars must never hit the injection filter.
+
+    The credential is injected into params AFTER the screening guard (the same
+    invariant as header mode, where apply_auth runs after the guard), so a legit
+    secret containing characters the output filter would reject still round-trips.
+    """
+    screened: list[str] = []
+
+    class _TrackingGuard(SecurityGuard):
+        def __init__(self) -> None:
+            super().__init__(validate_url=self._noop_validate, filter_strings=self._track_filter)
+
+        @staticmethod
+        async def _noop_validate(url: str) -> None:
+            return None
+
+        @staticmethod
+        def _track_filter(values: list[str], resource: str) -> None:
+            screened.extend(values)
+
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={})
+
+    secret = "k{{java}}ev"
+    c = RestConnector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "api_key", "api_key": secret, "in": "query", "query_param_name": "api_key"},
+        transport=httpx.MockTransport(handler),
+        ssrf_validator=lambda url: None,
+        security_guard=_TrackingGuard(),
+    )
+    asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert captured["params"] == {"api_key": secret}
+    assert secret not in screened
+
+
 def test_auth_basic() -> None:
     captured: dict[str, str] = {}
 
@@ -297,6 +337,24 @@ def test_health_check_ok() -> None:
     assert health.ok is True
 
 
+def test_health_check_api_key_in_query_sends_creds() -> None:
+    """health_check must send query-mode api_key creds (not a bare, unauthenticated probe)."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "api_key", "api_key": "the-secret", "in": "query", "query_param_name": "api_key"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    health = asyncio_run(c.health_check())
+    assert health.ok is True
+    assert captured["params"] == {"api_key": "the-secret"}
+
+
 # ── ConnectorHub multi-field creds round-trip ──────────────────────────────
 
 
@@ -335,6 +393,47 @@ def test_hub_ciphertext_round_trips_multi_field_json_dict() -> None:
     assert connector.connector_type is ConnectorType.REST
     assert connector._inner._auth["mode"] == "bearer"
     assert connector._inner._auth["token"] == "secret-token"
+
+
+def test_hub_teardown_closes_connector_client() -> None:
+    """ConnectorHub async teardown must close held connectors' pooled clients (FAR-408)."""
+    from cryptography.fernet import Fernet
+
+    from modulo.core.connector_hub import ConnectorHub
+    from modulo.core.secrets_backend import create_secrets_backend
+
+    key = Fernet.generate_key().decode()
+    creds = {"auth_mode": "bearer", "token": "secret-token"}
+    ciphertext = Fernet(key.encode()).encrypt(json.dumps(creds).encode())
+
+    class _CI:
+        def __init__(self) -> None:
+            self.id = uuid.uuid4()
+            self.connector_type_id = "rest"
+            self.config_json = {"base_url": "https://api.example.com", "path": "/items"}
+            self.credentials_ciphertext = ciphertext
+            self.visibility = "org"
+            self.allowed_operations = None
+
+    ci = _CI()
+    backend = create_secrets_backend(fernet_key=key, backend_name="fernet")
+    with (
+        patch.object(backend, "get_secret", side_effect=KeyError(str(ci.id))),
+        patch("modulo.settings.get_settings") as get_settings,
+    ):
+        get_settings.return_value.fernet_key = key
+
+        async def scenario() -> None:
+            hub = ConnectorHub(secrets_backend=backend)
+            await hub.initialise([ci])
+            connector = hub.get(ci.id)._inner
+            assert isinstance(connector, RestConnector)
+            client = connector._client()
+            assert client.is_closed is False
+            await hub.__aexit__(None, None, None)
+            assert client.is_closed is True
+
+        asyncio_run(scenario())
 
 
 def test_health_check_sends_credentials_and_validates() -> None:
@@ -492,6 +591,24 @@ def test_retry_delay_honours_retry_after() -> None:
     exc = RESTStatusError("boom", status_code=429, retry_after=2.5)
     assert RestConnector._retry_delay(exc, 0) == 2.5
     assert RestConnector._retry_delay(RESTStatusError("boom", status_code=429, retry_after=None), 1) >= 1.0
+
+
+def test_retry_delay_caps_huge_retry_after() -> None:
+    """An untrusted Retry-After header must be capped so a server cannot make us sleep ~1h."""
+    exc = RESTStatusError("boom", status_code=429, retry_after=3600)
+    assert RestConnector._retry_delay(exc, 0) == 30.0
+    assert RestConnector._retry_delay(exc, 3) == 30.0
+
+
+def test_dot_index_records_path_rejected() -> None:
+    """Legacy dot-index records_path must fail loud instead of being silently coerced."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "records_path": "data.items.0"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(lambda r: httpx.Response(200, json={"data": {"items": [{"id": 1}]}}))
+    with pytest.raises(ValueError, match=r"\[0\]"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 
 def test_response_size_cap_aborts() -> None:
