@@ -119,4 +119,10 @@ source_modules =
 forbidden_modules =
     modulo.core
 ignore_imports =
+    # Shell resolves workspace sessions via the DB layer.
     modulo.connectors.shell -> modulo.db.session
+    # FAR-408 generic REST connector reuses core's SSRF guard and the write-path
+    # output-injection filter so the query path gets the same injection defence as
+    # the write path without duplicating/drifting the rules.
+    modulo.connectors.rest -> modulo.core.ssrf
+    modulo.connectors.rest -> modulo.core.pipeline_engine.output_filter

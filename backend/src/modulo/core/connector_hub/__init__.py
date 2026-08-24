@@ -65,6 +65,7 @@ from modulo.connectors.onepassword import OnePasswordConnector
 from modulo.connectors.opsgenie import OpsgenieConnector
 from modulo.connectors.pagerduty import PagerDutyConnector
 from modulo.connectors.pypi import PyPIConnector
+from modulo.connectors.rest import RestConnector
 from modulo.connectors.sentry import SentryConnector
 from modulo.connectors.sharepoint import SharePointConnector
 from modulo.connectors.shell import ShellConnector
@@ -183,8 +184,19 @@ class ConnectorHub:
 
                                 _settings = get_settings()
                                 f = Fernet(_settings.fernet_key.encode())
-                                plaintext = f.decrypt(ciphertext)
-                                raw_str = json.dumps({"api_key": plaintext.decode()})
+                                plaintext = f.decrypt(ciphertext).decode("utf-8")
+                                # Multi-field creds round-trip: a JSON dict in the
+                                # ciphertext is used as-is (REST auth_mode/token/
+                                # api_key/...); a bare scalar falls back to the
+                                # legacy single api_key wrapper.
+                                try:
+                                    parsed_plain = json.loads(plaintext)
+                                except json.JSONDecodeError:
+                                    parsed_plain = None
+                                if isinstance(parsed_plain, dict):
+                                    raw_str = plaintext
+                                else:
+                                    raw_str = json.dumps({"api_key": plaintext})
                             except Exception:
                                 logger.warning(
                                     "Failed to decrypt credentials_ciphertext for connector %s", ci.id, exc_info=True
@@ -616,6 +628,12 @@ def _build_connector(
                 token=_get_cred(creds, "token", type_id),
                 base_url=config.get("base_url", _LOCALHOST_5678),
             )
+        case "rest":
+            # Generic REST connector: config_json + decrypted creds dict.
+            # Multi-field auth (auth_mode/token/api_key/username/password/...)
+            # arrives as a JSON dict via secrets_backend OR credentials_ciphertext
+            # — not the single api_key fallback (see initialise()).
+            return RestConnector(config=config, creds=creds)
         case "ticket-tracker":
             provider = config.get("provider", "github")
             if provider == "github":
