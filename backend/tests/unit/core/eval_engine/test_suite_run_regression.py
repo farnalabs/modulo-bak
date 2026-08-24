@@ -158,7 +158,7 @@ async def test_grouped_path_uses_suite_run_ids_and_computes_drop() -> None:
     assert "current_ids" in captured and "baseline_ids" in captured
     assert len(alerts) == 1
     assert alerts[0].drop_pct == pytest.approx(0.7)
-    assert alerts[0].affected_run_ids == [str(cur)]
+    assert alerts[0].affected_run_ids == [cur]
 
 
 async def test_grouped_path_relative_threshold_requires_both() -> None:
