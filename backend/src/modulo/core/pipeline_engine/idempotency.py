@@ -12,11 +12,11 @@ retry reuses the identical key.
 
 NOTE (persistence): the derived key is meant to be stored on the run record so
 an operator re-run can READ it back. The runs-column migration is DEFERRED —
-origin/main's migration chain is currently broken (``0136_rename_remy_*``
-references the absent ``0135_status_check_constraints``, and migrations
-0132-0134 are missing), so adding a new runs column migration here would
-compound that breakage rather than fix it. The derivation primitive is the
-delivered contract; the column lands once the chain is repaired.
+the migration chain was repaired (``0136_rename_remy_*`` now re-parents onto
+``0131_eval_dataset_corpus`` rather than the absent ``0135_status_check_constraints``,
+and migrations 0132-0134 were removed), so the deferred column migration can
+now land without compounding breakage. The derivation primitive is the
+delivered contract; the column lands once that migration is added.
 """
 
 from __future__ import annotations
