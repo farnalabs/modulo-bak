@@ -94,7 +94,8 @@ _TERMINAL_STATES: frozenset[str] = frozenset(
 
 def is_terminal(state: str | SuiteRunState) -> bool:
     """Return True when *state* is terminal (no further transition legal)."""
-    return state.value if isinstance(state, SuiteRunState) else state in _TERMINAL_STATES
+    value = state.value if isinstance(state, SuiteRunState) else state
+    return value in _TERMINAL_STATES
 
 
 def can_transition(current: str | SuiteRunState, target: str | SuiteRunState) -> bool:
@@ -201,9 +202,7 @@ class SuiteRun(OrgScoped):
     # Cost / excluded_case_count and any additional run telemetry.
     extra: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
-    eval_results: Mapped[list[EvalResult]] = relationship(  # type: ignore[type-arg]
-        back_populates="suite_run", lazy="selectin"
-    )
+    eval_results: Mapped[list[EvalResult]] = relationship(back_populates="suite_run", lazy="selectin")
 
     def __repr__(self) -> str:  # pragma: no cover - debug helper only
         return f"<SuiteRun id={self.id} suite={self.suite_id} state={self.state} version={self.version}>"
@@ -246,7 +245,7 @@ def transition_state(
         .values(**values)
         .returning(SuiteRun.version)
     )
-    new_version = session.execute(stmt).scalar_one_or_none()
+    new_version: int | None = session.execute(stmt).scalar_one_or_none()
     if new_version is None:
         raise OptimisticLockError(run.id, ver)
     run.state = new_state.value

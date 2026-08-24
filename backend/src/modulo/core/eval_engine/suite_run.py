@@ -159,7 +159,7 @@ async def acquire_org_advisory_lock(session: AsyncSession, run: SuiteRun) -> Any
     tiebreak already prevent disagreement). Returns the lock key, or ``None``
     when the backend cannot take the lock.
     """
-    bind = await session.get_bind()
+    bind = session.get_bind()
     if getattr(bind.dialect, "name", "") != "postgresql":
         return None
     lock_key = (run.organisation_id.int & 0x7FFFFFFF) ^ (run.suite_id.int & 0x7FFFFFFF)
@@ -185,7 +185,7 @@ def pass_rate_by_eval_type(rows: Sequence[tuple[str, bool]]) -> dict[str, dict[s
     """
     per_type: dict[str, dict[str, int]] = {}
     for eval_type, passed in rows:
-        bucket = per_type.setdefault(eval_type, {"passed": 0, "total": 0})  # type: ignore[typeddict-item]
+        bucket = per_type.setdefault(eval_type, {"passed": 0, "total": 0})
         bucket["total"] += 1
         if passed:
             bucket["passed"] += 1

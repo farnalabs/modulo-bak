@@ -316,7 +316,7 @@ async def _detect_regressions_grouped(
                 current_pass_rate=round(current_pass_rate, 4),
                 drop_pct=round(drop, 4),
                 trend="declining",
-                affected_run_ids=current_ids,
+                affected_run_ids=[UUID(x) for x in current_ids],
             ),
         )
 
