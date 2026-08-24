@@ -309,7 +309,8 @@ def test_per_attempt_timeout_negative_max_retries_raises() -> None:
 def test_per_attempt_timeout_with_retries_is_smaller_than_single() -> None:
     single = per_attempt_timeout_seconds(60.0)
     with_retries = per_attempt_timeout_seconds(60.0, max_retries=3)
-    assert single is not None and with_retries is not None
+    assert single is not None
+    assert with_retries is not None
     assert with_retries < single
 
 
