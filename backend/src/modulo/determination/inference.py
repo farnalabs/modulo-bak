@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from modulo.determination.scanner import ScanSample
+from modulo.determination.scanner import ScanSample, _repo_name
 
 _VALID_CONFIDENCES = frozenset({"high", "medium", "low"})
 
@@ -39,20 +39,6 @@ _CI_FILES = {
     ".circleci",
     "azure-pipelines",
 }
-
-
-def _repo_name(rec: dict[str, Any]) -> str:
-    """Extract a repo/project identifier from a record.
-
-    Handles GitHub (``name``/``full_name``) and GitLab
-    (``path_with_namespace``/``name``) formats without crashing on records that
-    lack an identifier, returning ``""``.
-    """
-    for key in ("name", "path_with_namespace", "full_name"):
-        value = rec.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
 
 
 def _age_days(value: Any) -> float | None:
