@@ -4397,7 +4397,7 @@ async def _sandbox_agent_impl(
                             ),
                             timeout=_SANDBOX_IO_TIMEOUT,
                         )
-                        sandbox_envs["MODULO_BRIDGE_ENDPOINT"] = f"http://localhost:{_bridge_port}"
+                        sandbox_envs["MODULO_BRIDGE_ENDPOINT"] = f"http://127.0.0.1:{_bridge_port}"
                         sandbox_envs["MODULO_BRIDGE_CONFIG"] = "/home/user/modulo_bridge_config.json"
                         _bridge_wrapped_command = (
                             f"python3 /home/user/modulo_bridge.py --wrap -- {rendered_agent_command}"

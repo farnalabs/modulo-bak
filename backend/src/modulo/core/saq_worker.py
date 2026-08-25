@@ -496,15 +496,18 @@ async def resume_run(
     run_id: str,
     org_id: str,
     resume_data: dict[str, Any] | None = None,
-    _claim_token: str | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """SAQ ``resume_run`` job — claim (awaiting_human/claimed or stale-running) + resume.
 
     The ``claim_token`` kwarg is the stale token stamped into this job's kwargs
     by a previous attempt (PR #1003). SAQ retries re-invoke this function with
-    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here —
-    the core claim (``claim_resume_run_async``) generates its own fresh token.
+    ``**job.kwargs``, so the kwarg must be accepted here — it is intentionally
+    IGNORED (the core claim ``claim_resume_run_async`` generates its own fresh
+    token). Popping it from ``kwargs`` keeps the SAQ re-invocation contract
+    intact while avoiding an unused-parameter lint.
     """
+    kwargs.pop("claim_token", None)
     from modulo.core.pipeline_execution import resume_run as resume_run_core
 
     aeng = _get_async_engine()

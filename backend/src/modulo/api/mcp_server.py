@@ -5121,7 +5121,9 @@ async def list_schemas(
 @_RETRY_DB
 async def infer_schema(
     input_sample: dict[str, Any],
+    pipeline_id: str | None = None,
 ) -> dict[str, Any]:
+    del pipeline_id  # retained for backward-compatible MCP input schema; unused by design
     try:
         if not await validate_current_auth():
             return _tool_auth_error(_MSG_TOKEN_REVOKED)
