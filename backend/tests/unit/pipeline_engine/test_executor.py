@@ -3,7 +3,7 @@
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Any, TypedDict
+from typing import Any, Self, TypedDict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,6 +13,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.pipeline_engine.executor import (
     PipelineExecutor,
     RunNotFoundError,
@@ -2928,3 +2929,64 @@ class TestTransientFailureDetail:
         assert code == "node_cancelled"
         assert "retry suppressed because a node in the graph is non-idempotent" in detail
         assert "idempotent=false" in detail
+
+
+def _make_connector_init_session(rows: list[Any]) -> AsyncMock:
+    """Session whose execute() yields non-empty ConnectorInstance rows for _init_connector_hub."""
+    result = MagicMock()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = rows
+    result.scalars.return_value = scalars_mock
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.return_value = result
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=None)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin = MagicMock(return_value=begin_cm)
+    return session
+
+
+class _FakeConnectorHub:
+    """Stand-in ConnectorHub whose initialise fails closed with a shared-budget error."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def initialise(self, _rows: list[Any]) -> None:
+        raise self._exc
+
+
+async def test_init_connector_hub_propagates_shared_budget_error():
+    """FAR-439: _init_connector_hub must FAIL CLOSED (re-raise) on SharedBudgetUnavailableError.
+
+    A configured-but-unconstructable shared Redis budget — or a settings-read failure on
+    the executor path — raises SharedBudgetUnavailableError from ``hub.initialise``.
+    Swallowing it and returning None would let the connector node vacuously "succeed"
+    with the ``no connector hub`` fallback, silently no-op'ing the remote integration and
+    finalising the run GREEN. The raise must propagate so the run fails loudly at startup.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([MagicMock()])
+    )
+    hub = _FakeConnectorHub(
+        SharedBudgetUnavailableError("shared rate-limit Redis client is configured but could not be constructed")
+    )
+
+    with (
+        patch("modulo.core.connector_hub.ConnectorHub", return_value=hub),
+        patch("modulo.core.runtime_provider.create_default_hub", return_value=MagicMock()),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="key")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        pytest.raises(SharedBudgetUnavailableError),
+    ):
+        await executor._init_connector_hub(org_id)

@@ -43,6 +43,7 @@ from opentelemetry.trace import set_span_in_context
 from sqlalchemy import Boolean, Uuid, bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.audit_logger import append_audit_event
 from modulo.core.connector_hub.locking import _uuid_to_lock_keys
 from modulo.core.cost_controller.finalize import derive_node_type_map, finalize_cost
@@ -1896,6 +1897,16 @@ class PipelineExecutor:
                     await hub.initialise(rows, allowed_connectors=allowed_connectors)
                     set_connector_hub(hub)
         except asyncio.CancelledError:
+            raise
+        except SharedBudgetUnavailableError:
+            # Configured-but-unconstructable shared Redis budget / settings-read
+            # failure on the executor path (FAR-439). Swallowing it and returning
+            # None would make the connector node vacuously "succeed" with the
+            # "no connector hub" fallback, silently no-op'ing the remote
+            # integration and finalising the run GREEN. Fail closed, loudly.
+            _log.exception("pipeline.connector_hub_init_failed_shared_budget")
+            if hub is not None:
+                await _teardown_hub(hub)
             raise
         except Exception:
             _log.exception("pipeline.connector_hub_init_failed")
