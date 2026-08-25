@@ -123,17 +123,16 @@
           <div class="flex-1">
             <h3 class="font-semibold">{{ $t('views.AdminHousekeepingView.checkpoint_retention') }}</h3>
             <p class="text-xs text-muted-foreground">
-              Purge LangGraph graph-state checkpoints for terminal runs older than N days. The run rows are kept
-              (outputs, telemetry, classification survive for audit + analytics).
+              {{ $t('views.AdminHousekeepingView.checkpoint_retention_description') }}
             </p>
           </div>
           <span class="text-sm text-muted-foreground">
-            {{ checkpointCandidateCount }} run{{ checkpointCandidateCount === 1 ? '' : 's' }} reclaimable
+            {{ $t('views.AdminHousekeepingView.checkpoint_reclaimable', { count: checkpointCandidateCount }) }}
           </span>
         </div>
         <div class="flex flex-wrap items-center gap-3 px-4 py-3">
           <label class="flex items-center gap-2 text-sm">
-            Purge terminal runs older than
+            {{ $t('views.AdminHousekeepingView.checkpoint_purge_older_than') }}
             <input
               v-model.number="ckptMaxAge"
               type="number"
@@ -141,24 +140,25 @@
               class="w-20 rounded border bg-transparent px-2 py-1 text-sm text-right"
               data-testid="hk-ckpt-max-age"
             />
-            day{{ ckptMaxAge === 1 ? '' : 's' }}
+            {{ $t('views.AdminHousekeepingView.checkpoint_day', { count: ckptMaxAge }) }}
           </label>
           <Button v-if="!ckptConfirming" severity="danger" :disabled="ckptPurgeLoading || ckptMaxAge < 1" data-testid="hk-ckpt-purge" @click="ckptConfirming = true">
-            Purge Checkpoints
+            {{ $t('views.AdminHousekeepingView.checkpoint_purge_button') }}
           </Button>
           <template v-else>
-            <span class="text-sm text-muted-foreground">Confirm purge of checkpoints older than {{ ckptMaxAge }} day{{ ckptMaxAge === 1 ? '' : 's' }}?</span>
+            <span class="text-sm text-muted-foreground">{{ $t('views.AdminHousekeepingView.checkpoint_confirm_prompt', { count: ckptMaxAge }) }}</span>
             <Button severity="danger" :disabled="ckptPurgeLoading" data-testid="hk-ckpt-purge-confirm" @click="doCheckpointPurge">
-              {{ ckptPurgeLoading ? 'Purging…' : 'Confirm Purge' }}
+              {{ ckptPurgeLoading ? $t('views.AdminHousekeepingView.checkpoint_purging') : $t('views.AdminHousekeepingView.checkpoint_confirm_purge') }}
             </Button>
             <Button severity="secondary" outlined :disabled="ckptPurgeLoading" data-testid="hk-ckpt-purge-cancel" @click="ckptConfirming = false">
-              Cancel
+              {{ $t('views.AdminHousekeepingView.cancel') }}
             </Button>
           </template>
           <span v-if="ckptResult" class="text-sm text-muted-foreground" data-testid="hk-ckpt-result">
-            Purged {{ ckptResult.checkpoints_purged }} checkpoint row{{ ckptResult.checkpoints_purged === 1 ? '' : 's' }}
-            from {{ ckptResult.threads_purged }} run{{ ckptResult.threads_purged === 1 ? '' : 's' }} ·
-            freed {{ formatBytes(ckptResult.bytes_freed) }}
+            {{ $t('views.AdminHousekeepingView.checkpoint_purged_prefix') }}
+            {{ $t('views.AdminHousekeepingView.checkpoint_purged_rows', { count: ckptResult.checkpoints_purged }) }}
+            {{ $t('views.AdminHousekeepingView.checkpoint_purged_from', { count: ckptResult.threads_purged }) }}
+            {{ $t('views.AdminHousekeepingView.checkpoint_freed', { bytes: formatBytes(ckptResult.bytes_freed) }) }}
           </span>
           <span v-if="ckptError" class="text-sm text-destructive" data-testid="hk-ckpt-error">{{ ckptError }}</span>
         </div>

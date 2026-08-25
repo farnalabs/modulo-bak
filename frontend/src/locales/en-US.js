@@ -2428,7 +2428,19 @@ export default {
       "scan_error": "Failed to scan for housekeeping candidates",
       "cleanup_error": "Cleanup failed",
       "confirm_cleanup": "Confirm Cleanup",
-      "checkpoint_retention": "Checkpoint Retention"
+      "checkpoint_retention": "Checkpoint Retention",
+      "checkpoint_retention_description": "Purge LangGraph graph-state checkpoints for terminal runs older than N days. The run rows are kept (outputs, telemetry, classification survive for audit + analytics).",
+      "checkpoint_reclaimable": "{count} run reclaimable | {count} runs reclaimable",
+      "checkpoint_purge_older_than": "Purge terminal runs older than",
+      "checkpoint_day": "day | days",
+      "checkpoint_purge_button": "Purge Checkpoints",
+      "checkpoint_confirm_prompt": "Confirm purge of checkpoints older than {count} day | Confirm purge of checkpoints older than {count} days",
+      "checkpoint_purging": "Purging…",
+      "checkpoint_confirm_purge": "Confirm Purge",
+      "checkpoint_purged_prefix": "Purged",
+      "checkpoint_purged_rows": "{count} checkpoint row | {count} checkpoint rows",
+      "checkpoint_purged_from": "from {count} run | from {count} runs",
+      "checkpoint_freed": "· freed {bytes}"
     },
     "LifecycleMapList": {
       "create_lifecycle_map": "Create Lifecycle Map",
