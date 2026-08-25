@@ -173,7 +173,7 @@ class DockerRuntimeProvider(RuntimeProvider):
 
     async def _collect_exec_output(self, exec_instance: Any) -> tuple[bytes, bytes, int]:
         """Stream stdout/stderr from an exec instance and return decoded output."""
-        stream: Any = await exec_instance.start(detach=False)  # type: ignore[misc]
+        stream: Any = await exec_instance.start(detach=False)
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
         while True:
