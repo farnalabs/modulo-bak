@@ -1,6 +1,6 @@
 """PipelineSnapshot live-edit history + release channels (FAR-402 P6).
 
-Revision ID: 0141_pipeline_snapshot_versioning_far420
+Revision ID: 0142_pipeline_snapshot_versioning_far420
 Revises: 0140_eval_regression_alert
 Create Date: 2026-08-25
 
@@ -39,8 +39,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0141_pipeline_snapshot_versioning_far420"
-down_revision: str | None = "0140_eval_regression_alert"
+revision: str = "0142_pipeline_snapshot_versioning_far420"
+down_revision: str | None = "0141_pipeline_edge_ports"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
