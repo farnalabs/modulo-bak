@@ -3001,11 +3001,16 @@ features:
 
             # Happy Path
             - "[ ] A REST connector instance is creatable with a declarative endpoint (base_url + path + method) and an auth credential profile (bearer / api_key / basic)"
-            - "[ ] query() is the read surface and write() is the write surface; a mutating verb (PUT/DELETE/PATCH) maps to the write surface"
+            - "[ ] query() is the read surface and write() is the write surface; a mutating verb (PUT/DELETE/PATCH) is intended to be declared on the write surface — the connector does not infer semantics, the author declares the method, and the query/write surface fixes the ACL gate"
             - "[ ] A JSON response with a configured records_path JMESPath expression yields a list of dicts that feeds the downstream JMESPath consumer; a top-level JSON array and a whole-object single-record fallback also stay list-of-dicts"
             - "[ ] When no records_path is configured, raw / passthrough content-types yield a single uniform {body, content_type, status_code, headers} record, so the result always stays a list-of-dicts (UNTESTED for XML)"
             - "[ ] Templated fields (headers, params, body, path) render from runtime variables via the sandboxed Jinja environment"
             - "[ ] Pagination is response-driven: the response's next_cursor (via next_cursor_path JMESPath) is surfaced on the result, while a caller-supplied start cursor is rejected with an actionable error (UNTESTED for the end-to-end paging loop)"
+
+            # Config Validation
+            - "[ ] Config validation rejects an unsupported HTTP method against the allowlist (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS) with an actionable ValueError"
+            - "[ ] JMESPath paths using legacy dot-index syntax (data.items.0) are rejected with an actionable ValueError directing to bracket notation (data.items[0]); a numeric key like data.2024 is never silently rewritten"
+            - "[ ] verify_tls is configurable (default true) and controls the httpx TLS certificate verify on the connector client"
 
             # Auth & Credentials
             - "[ ] Credentials are stored encrypted as a multi-field JSON dict (auth_mode bearer / api_key / basic) and round-trip through the secrets backend; the credential never reaches LangGraph state, logs, or error detail, and error detail redacts secret values"
@@ -3031,7 +3036,7 @@ features:
 
             # Retry / Idempotency / Concurrency
             - "[ ] Idempotent verbs (GET/HEAD) retry on 429/5xx and transient transport failures with exponential backoff + jitter, honouring a Retry-After capped at 30s; mutating verbs retry only when the operation declares an idempotency_header, and never retry otherwise (UNTESTED for idempotency key replay)"
-            - "[ ] Fan-out emits items SEQUENTIALLY (one request per item, no concurrent or bounded-concurrency fork in v1); each item consumes a token from a per-destination TokenBucket keyed by host"
+            - "[ ] Fan-out emits items SEQUENTIALLY (one request per item, no concurrent or bounded-concurrency fork in v1); each item consumes a token from a per-destination TokenBucket — one bucket per connector instance, keyed by the connector's base_url"
             - "[ ] The connector shares a single lazily-created, connection-pooled httpx.AsyncClient (max_connections / max_keepalive_connections) closed via close(), and is not Redis-backed"
             - "[ ] The fan-out budget (max_cardinality x per_item_timeout x (max_retries + 1)) is reconciled against the node's timeout_seconds budget by the graph validator at save/run time (UNTESTED — validator-only, not a runtime assertion)"
             - "[ ] A per-request timeout (default 30s, override via timeout_seconds) applies to both the read and write surfaces; the fan-out path uses its own per_item_timeout (default = connector timeout) (UNTESTED for the write-timeout surfacing a RESTConnectError)"
@@ -3041,7 +3046,7 @@ features:
         deferrals:
             - Per-tenant weighted concurrency semaphore / bounded-concurrency fan-out fork — fan-out emits sequentially in v1 (no concurrent fork); throughput relies on pipeline-level concurrency limits and the connector's single connection-pooled client
             - Redis-backed per-destination rate limiting — the token bucket is per-process (each uvicorn / SAQ worker owns its buckets), NOT shared across workers (future work)
-            - Per-connector metrics / OTel instrumentation (call counts, latency, per-item outcomes) — not wired in v1; connector observability is limited to the result metadata (status_code/url/method/retry_after)
+            - "Per-connector call-count / latency METRICS (per-item fan-out outcome spans, per-destination counters) — not emitted in v1. Per-operation OTel trace spans ARE wired (from _TracedConnector: connector.<type>.query/write/health_check emitting connector.type/operation/resource/limit/result_total/error_type + duration); only per-item outcome spans and call-count-per-destination metrics are deferred"
             - DISTINCT classification layer (request-to-response ingestion classification runs as one opaque hop; a separate deduplicate/classify layer is deferred to FAR-404)
 
     feat-costs:
