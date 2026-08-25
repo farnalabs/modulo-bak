@@ -1639,9 +1639,23 @@ def make_node_fn(
         if not model_backend_id_str:
             return {"artifacts": [{"node_id": node_id, "status": "executed"}]}
 
+        # FAR-418: context_scope — the agent's run_context VIEW (the keys fed to
+        # the prompt template) is allowlist-gated to the node's need-to-know set.
+        # The machinery reads (run_overrides, autonomy) still use the full
+        # run_context so internal control keys are never starved.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+        # FAR-418 (MAJOR-3 fix): the need-to-know boundary must also bind the
+        # ``state.run_context`` view. ``state`` otherwise carries the full,
+        # unscoped run_context, so a template could read gated keys via
+        # ``{{ state.run_context.<key> }}`` and defeat the boundary. Pass a
+        # shallow copy with the scoped run_context in place — the live state dict
+        # is never mutated.
+        scoped_state = dict(state)
+        scoped_state["run_context"] = scoped_run_context
         rendered_prompt, routing_mode = _render_agent_prompt(
-            state=state,
-            run_context=run_context,
+            state=scoped_state,
+            run_context=scoped_run_context,
             raw_input=raw_input,
             prompt_template=prompt_template,
             node_def=node_def,
@@ -4249,6 +4263,18 @@ async def _sandbox_agent_impl(
                 org_id=org_id,
             ),
         )
+
+        # FAR-418: expose the node's capability_scope.allowed_tools to the sandbox
+        # agent runtime (FAR-402 P4 / FAR-418) so the agent's MCP client can
+        # forward it as the ``X-Modulo-Allowed-Tools`` header. The MCP server's
+        # McpAuthMiddleware lifts that header into the request-scoped allow-list
+        # consumed by check_tool_scope, enforcing node-level tool scoping in the
+        # production run path. Absent/empty (the UNRESTRICTED default) sets nothing,
+        # preserving pre-scope behaviour.
+        _node_scope = node_def.get("capability_scope") or {}
+        _allowed_tools = _node_scope.get("allowed_tools")
+        if _allowed_tools:
+            env_vars_extra["MODULO_ALLOWED_TOOLS"] = ",".join(str(t) for t in _allowed_tools)
 
         # FAR-212 PR B: apply the enforced sandbox policy AFTER the Modulo-owned
         # context files / prompt / input are written but BEFORE the agent/script

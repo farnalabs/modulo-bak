@@ -187,20 +187,35 @@ def _is_connector_object(value: Any) -> bool:
 def assert_no_secret_objects(value: Any, *, node_id: str) -> None:
     """Secret-hygiene guard: connector/secret OBJECTS are never valid port payloads.
 
-    Only opaque connector IDs may appear in state/ports. Recursively rejects any
+    Only opaque connector IDs may appear in state/ports. Iteratively rejects any
     connector/secret object (see :func:`_is_connector_object`) with a typed
     ``ScopeViolationError``; plain-serializable data always passes. Raises on the
     first offending nested value.
+
+    The traversal is iterative with a depth bound and a cycle guard (via object
+    id) so a cyclic or pathologically deep payload raises a typed
+    ``ScopeViolationError`` rather than an uncaught ``RecursionError``.
     """
-    if _is_connector_object(value):
-        raise ScopeViolationError(
-            node_id=node_id,
-            target=type(value).__name__,
-            kind="secret",
-        )
-    if isinstance(value, dict):
-        for nested in value.values():
-            assert_no_secret_objects(nested, node_id=node_id)
-    elif isinstance(value, (list, tuple)):
-        for nested in value:
-            assert_no_secret_objects(nested, node_id=node_id)
+    max_scope_depth = 64
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    seen: set[int] = set()
+    while stack:
+        current, depth = stack.pop()
+        if _is_connector_object(current):
+            raise ScopeViolationError(
+                node_id=node_id,
+                target=type(current).__name__,
+                kind="secret",
+            )
+        if depth >= max_scope_depth:
+            continue
+        if isinstance(current, dict):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            for nested in current.values():
+                stack.append((nested, depth + 1))
+        elif isinstance(current, (list, tuple)):
+            for nested in current:
+                stack.append((nested, depth + 1))
