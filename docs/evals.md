@@ -333,10 +333,15 @@ A finished eval must **never** re-trigger another eval. Two mechanisms:
 1. **Write surface** — a SuiteRun execution writes ONLY to `suite_runs` and
    `eval_results`. It never creates a `Run`, never writes a `TriggerEvent`, and
    never writes a `WebhookPayload`/dedup row (the fire path skips TriggerEvent
-   logging too), so nothing enters the trigger-watch/dedup event set.
-2. **Watch-set filter** — `exclude_eval_families` drops the eval/feedback event
-   families (`eval_regression`, `eval_blocked`, `suite_run`, `eval_result`,
-   `feedback`) from the watch set before it decides what re-fires a trigger.
+   logging too), so nothing enters the trigger-watch/dedup event set. This is the
+   enforcement: there is no watchable event produced by a finished eval.
+2. **Watch-set filter** — `exclude_eval_families` (and `is_eval_trigger`) are
+   exposed *helpers* for the forward event-watch wiring; they drop the
+   eval/feedback event families (`eval_regression`, `eval_blocked`,
+   `suite_run`, `eval_result`, `feedback`) from a watch set before it decides
+   what re-fires a trigger. The current cron dispatch routes on
+   `run_kind == 'suite_run'` directly; the loop guard holds today via the write
+   surface rather than this filter.
 
 ### Separate spend pool
 

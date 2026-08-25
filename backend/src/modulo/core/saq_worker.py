@@ -56,6 +56,7 @@ import time
 import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, cast
 
 from redis import asyncio as aioredis
@@ -720,15 +721,29 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
             if run is None:
                 _log.warning("SAQ execute_suite_run: suite_run %s not found", rid)
                 return {"status": "missing"}
+            # modulo_app is BYPASSRLS, so ``session.get`` is NOT org-scoped — the
+            # explicit predicate is the isolation control. Verify the loaded run
+            # belongs to the job's org before executing it (defense-in-depth):
+            # a cross-org suite_run_id must never be executed.
+            if run.organisation_id != oid:
+                _log.warning("SAQ execute_suite_run: suite_run %s belongs to a different org", rid)
+                return {"status": "missing"}
             extra = run.extra or {}
-            stats = await _run_exec(
-                session,
-                run,
-                entity_thresholds=extra.get("entity_thresholds"),
-                suite_ceiling=extra.get("suite_ceiling"),
-                scenario_inputs=extra.get("scenario_inputs"),
-                eval_definition_version=int(extra.get("eval_definition_version", 1)),
-            )
+            run_kwargs: dict[str, Any] = {
+                "entity_thresholds": extra.get("entity_thresholds"),
+                "suite_ceiling": extra.get("suite_ceiling"),
+                "scenario_inputs": extra.get("scenario_inputs"),
+                "eval_definition_version": int(extra.get("eval_definition_version", 1)),
+            }
+            # ``cost_per_llm_case`` is JSON-decoded from ``extra`` (may be a
+            # str/int/float). Coerce to ``Decimal`` (the ledger arithmetic needs
+            # it); when absent, leave it to the runner's default rather than
+            # passing ``None`` (which would override the default AND feed ``None``
+            # into the ledger).
+            cost_per = extra.get("cost_per_llm_case")
+            if cost_per is not None:
+                run_kwargs["cost_per_llm_case"] = Decimal(str(cost_per))
+            stats = await _run_exec(session, run, **run_kwargs)
             run.extra = {**extra, "execution": stats}
             await session.flush()
         _log.info(

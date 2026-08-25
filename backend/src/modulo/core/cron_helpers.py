@@ -2054,6 +2054,10 @@ async def fire_suite_run_trigger(
         # Stamp the config-derived execution context + the owning trigger id
         # onto the run so the SAQ job can run it and a finished eval never
         # touches the production pool.
+        # ``str(None)`` would render as the literal 'None' and crash ``Decimal``,
+        # so a config key explicitly set to ``null`` falls back to the default.
+        cost_raw = config.get("cost_per_llm_case")
+        cost_per_case = Decimal("0.001") if cost_raw is None else Decimal(str(cost_raw))
         run.extra = {
             "trigger_id": str(trigger_id),
             "dataset_id": str(dataset_id),
@@ -2062,7 +2066,7 @@ async def fire_suite_run_trigger(
             "entity_thresholds": config.get("entity_thresholds") or {},
             "suite_ceiling": config.get("suite_ceiling"),
             "eval_definition_version": int(config.get("eval_definition_version", 1)),
-            "cost_per_llm_case": Decimal(str(config.get("cost_per_llm_case", "0.001"))),
+            "cost_per_llm_case": cost_per_case,
         }
         await session.flush()
         await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))

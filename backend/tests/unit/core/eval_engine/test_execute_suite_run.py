@@ -158,6 +158,12 @@ async def test_execute_suite_run_completes_and_persists_results(session) -> None
     assert stats["failed_cases"] == 1
     assert stats["excluded_case_count"] == 0
 
+    # The runner feeds the SEPARATE suite-run daily spend pool by mirroring the
+    # row-locked ``claimed_cost`` ledger into ``total_cost_usd``. A deterministic
+    # suite claims nothing, so it must be 0 (not NULL) — proving the column the
+    # ``suite_run_daily_spend_used`` pool sums is actually written.
+    assert run.total_cost_usd == Decimal(0)
+
     rows = list(
         (
             await session.execute(__import__("sqlalchemy").select(EvalResult).where(EvalResult.suite_run_id == run.id))

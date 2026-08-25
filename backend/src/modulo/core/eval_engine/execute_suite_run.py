@@ -27,12 +27,14 @@ Load-bearing guards:
 * **Org isolation** — every query injects an unconditional
   ``organisation_id = :org`` predicate (the BYPASSRLS -> explicit predicate is
   the isolation control); RLS is never relied on alone.
-* **Loop guard** — a SuiteRun completion writes ONLY to ``suite_runs`` and
-  ``eval_results``. It never creates a ``Run``, never writes a ``TriggerEvent``
-  and never writes a ``WebhookPayload``/dedup row, so a finished eval can NEVER
-  re-trigger another eval through the trigger-watch/dedup event set. The
-  ``fire_suite_run`` dispatch path additionally filters the watch set via
-  ``exclude_eval_families`` so eval/feedback event families never re-fire.
+* **Loop guard** — the enforcement is the WRITE SURFACE: a SuiteRun completion
+  writes ONLY to ``suite_runs`` and ``eval_results``. It never creates a ``Run``,
+  never writes a ``TriggerEvent`` and never writes a
+  ``WebhookPayload``/dedup row, so a finished eval can NEVER re-trigger another
+  eval through the trigger-watch/dedup event set. ``exclude_eval_families`` and
+  ``is_eval_trigger`` are exposed helpers for the (forward) event-watch wiring —
+  the cron dispatch routes on ``run_kind == 'suite_run'`` directly, and the
+  suite-run execution path writes no watchable event.
 * **Separate spend pool** — the ``suite_run`` trigger uses its OWN
   ``daily_spend_limit`` (summed over ``suite_runs``, never over ``runs``) and a
   separate per-suite cumulative ceiling via the row-locked
@@ -129,7 +131,11 @@ async def _suite_run_transition(session: AsyncSession, run: SuiteRun, target: Su
         values["completed_at"] = datetime.now(UTC)
     stmt = (
         update(SuiteRun)
-        .where(SuiteRun.id == run.id, SuiteRun.version == ver)
+        .where(
+            SuiteRun.id == run.id,
+            SuiteRun.organisation_id == run.organisation_id,
+            SuiteRun.version == ver,
+        )
         .values(**values)
         .returning(SuiteRun.version)
     )
@@ -146,9 +152,10 @@ def is_eval_trigger(trigger: Any) -> bool:
     """Return True when *trigger* fires a SuiteRun instead of a pipeline Run.
 
     Uses the ``run_kind`` discriminator (``'suite_run'``) OR a bound
-    ``eval_suite_id``. This is what the cron/ongoing dispatch path and the
-    loop-guard rely on to treat an eval trigger as out-of-scope for the
-    production watch set.
+    ``eval_suite_id``. This is the discriminator the cron/ongoing dispatch path
+    SHOULD route on; the current cron routing uses the ``run_kind`` attribute
+    directly, and a future event-watch loop-guard can use this to treat an eval
+    trigger as out-of-scope for the production watch set.
     """
     run_kind = getattr(trigger, "run_kind", "run")
     return run_kind == "suite_run" or getattr(trigger, "eval_suite_id", None) is not None
@@ -158,9 +165,12 @@ def exclude_eval_families(event_families: Sequence[str] | None) -> set[str]:
     """Drop eval/feedback event families from a watch set (loop guard).
 
     Returns a new set without any family in :data:`EVAL_WATCH_EVENT_FAMILIES`.
-    The production trigger-watch set is filtered through this before deciding
-    what re-fires a trigger, so a ``SuiteRun``/``EvalResult`` write can never be
-    observed as a re-fire trigger.
+    A caller that selects the production trigger-watch set SHOULD filter it
+    through this before deciding what re-fires a trigger, so a
+    ``SuiteRun``/``EvalResult`` write can never be observed as a re-fire trigger.
+    It is exposed for the forward event-watch wiring; the suite-run execution
+    path itself writes no watchable event, so the loop guard currently holds via
+    the write surface alone.
     """
     return {e for e in (event_families or []) if e} - EVAL_WATCH_EVENT_FAMILIES
 
@@ -457,7 +467,12 @@ async def execute_suite_run(
             for result in results:
                 session.add(result)
 
-            case_passed = errored == 0 and len(results) == len(suite_defs) and all(r.passed for r in results)
+            # ``all(passed_flags)`` is only reached when ``passed_flags`` is
+            # non-empty (guarded by ``bool``) — a case that resolved to zero
+            # results is never a silent pass. The flags are collected first so
+            # the ``all`` is evaluated on a concrete list, never an empty one.
+            passed_flags = [r.passed for r in results]
+            case_passed = errored == 0 and len(results) == len(suite_defs) and bool(passed_flags) and all(passed_flags)
             if errored:
                 excluded += 1
             elif case_passed:
@@ -469,6 +484,13 @@ async def execute_suite_run(
         run.passed_cases = passed
         run.failed_cases = failed
         run.excluded_case_count = excluded
+        # Feed the SEPARATE suite-run daily spend pool. ``suite_run_daily_spend_used``
+        # sums ``total_cost_usd`` over the org's ``suite_runs`` (never the production
+        # ``runs`` pool); ``claimed_cost`` is the row-locked per-suite ledger the
+        # runner already incremented per judge call. Mirroring it here is what makes
+        # the daily limit enforceable — without it the pool always reads 0 and the
+        # ``fire_suite_run_trigger`` daily guard is vacuous.
+        run.total_cost_usd = run.claimed_cost or Decimal(0)
 
         # ``partial`` means SOME CASES ERRORED (excluded). A run that executed
         # every case — even one where evals failed — is ``completed``; failed
