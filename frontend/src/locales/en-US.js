@@ -2427,7 +2427,8 @@ export default {
       "cancel": "Cancel",
       "scan_error": "Failed to scan for housekeeping candidates",
       "cleanup_error": "Cleanup failed",
-      "confirm_cleanup": "Confirm Cleanup"
+      "confirm_cleanup": "Confirm Cleanup",
+      "checkpoint_retention": "Checkpoint Retention"
     },
     "LifecycleMapList": {
       "create_lifecycle_map": "Create Lifecycle Map",
