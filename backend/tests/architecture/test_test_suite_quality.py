@@ -5153,8 +5153,7 @@ def _environ_mutation_violations(tree: ast.AST) -> list[tuple[int, str]]:
         found.append(
             (
                 node.lineno,
-                f"{ast.unparse(node)} in {fn.name} mutates the process environment "
-                f"without monkeypatch ({kind})",
+                f"{ast.unparse(node)} in {fn.name} mutates the process environment without monkeypatch ({kind})",
             )
         )
 
