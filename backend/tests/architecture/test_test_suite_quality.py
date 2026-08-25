@@ -334,6 +334,7 @@ of a bare "assert not violations", mirroring the sibling architecture tests.
 """
 
 import ast
+import functools
 import operator
 import re
 from fractions import Fraction
@@ -357,13 +358,16 @@ def _decorator_name(dec: ast.AST) -> str | None:
     return None
 
 
+@functools.lru_cache(maxsize=1)
 def _iter_test_modules():
-    for path in sorted(TESTS.rglob("*.py")):
-        if any(part in EXCLUDED_PACKAGES for part in path.parts):
-            continue
-        yield path
+    return tuple(
+        path
+        for path in sorted(TESTS.rglob("*.py"))
+        if not any(part in EXCLUDED_PACKAGES for part in path.parts)
+    )
 
 
+@functools.lru_cache(maxsize=None)
 def _parse(path: Path):
     try:
         return ast.parse(path.read_text(encoding="utf-8"))
