@@ -12,8 +12,10 @@ import pytest
 
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery, ConnectorType
 from modulo.connectors.rest import (
+    RESTCardinalityExceededError,
     RESTConnectError,
     RestConnector,
+    RESTFanOutFailureError,
     RESTResponseTooLargeError,
     RESTStatusError,
     SecurityGuard,
@@ -685,6 +687,215 @@ def test_transport_errors_are_typed() -> None:
     c._transport = httpx.MockTransport(handler)
     with pytest.raises(RESTConnectError, match="transport error"):
         asyncio_run(c.query(ConnectorQuery(resource="default")))
+
+
+# ── Fan-out / iterator (FAR-411) ───────────────────────────────────────────
+
+
+def test_write_fanout_sequentially_emits_each_item() -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}", "idx": "{{ item_index }}"},
+            "fan_out": {"enabled": True, "items_path": "items"},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(
+        c.write(ConnectorPayload(resource="default", data={"items": [{"name": "Ada"}, {"name": "Grace"}]}))
+    )
+
+    assert result["fanout"] is True
+    assert result["total"] == 2
+    assert result["success_count"] == 2
+    assert result["failure_count"] == 0
+    assert result["cardinality_over_cap"] is False
+    assert len(captured) == 2
+    assert captured[0] == {"name": "Ada", "idx": "0"}
+    assert captured[1] == {"name": "Grace", "idx": "1"}
+    assert [o["status"] for o in result["outcomes"]] == ["success", "success"]
+    assert result["outcomes"][0]["item"] == {"name": "Ada"}
+
+
+def test_write_fanout_sized_cardinality_exceeded_fails_closed() -> None:
+    requests: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"n": "{{ n }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "max_cardinality": 2},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(RESTCardinalityExceededError, match="exceeding max_cardinality") as exc:
+        asyncio_run(c.write(ConnectorPayload(resource="default", data={"items": [{"n": 1}, {"n": 2}, {"n": 3}]})))
+    # Fail-closed: zero partial emit — nothing hit the wire.
+    assert len(requests) == 0
+    assert exc.value.source_cardinality == 3
+    assert exc.value.fanout_capacity == 2
+    assert exc.value.lazy is False
+    assert exc.value.cardinality_over_cap is True
+
+
+def test_write_fanout_lazy_generator_cardinality_exceeded_fails_closed() -> None:
+    requests: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"n": "{{ n }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "max_cardinality": 3},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+
+    def gen() -> Any:
+        for i in range(10):
+            yield {"n": i}
+
+    with pytest.raises(RESTCardinalityExceededError, match="lazy source") as exc:
+        asyncio_run(c.write(ConnectorPayload(resource="default", data={"items": gen()})))
+    assert len(requests) == 0
+    assert exc.value.lazy is True
+    assert exc.value.source_cardinality is None
+    assert exc.value.cardinality_over_cap is True
+
+
+def test_write_fanout_empty_iterator_vacuous_success() -> None:
+    requests: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"n": "{{ n }}"},
+            "fan_out": {"enabled": True, "items_path": "items"},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(c.write(ConnectorPayload(resource="default", data={"items": []})))
+    assert result["fanout"] is True
+    assert result["total"] == 0
+    assert result["success_count"] == 0
+    assert result["failure_count"] == 0
+    assert result["outcomes"] == []
+    assert len(requests) == 0
+
+
+def test_write_fanout_items_path_unresolved_is_vacuous_success() -> None:
+    requests: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(1)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"n": "{{ n }}"},
+            "fan_out": {"enabled": True, "items_path": "items"},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(c.write(ConnectorPayload(resource="default", data={"other": 1})))
+    assert result["total"] == 0
+    assert len(requests) == 0
+
+
+def test_write_fanout_per_item_failure_fails_node_with_outcomes() -> None:
+    calls: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        if body.get("name") == "fail":
+            return httpx.Response(500, text="boom")
+        return httpx.Response(200, json={"ok": True})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items"},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(RESTFanOutFailureError, match="fan-out failed at item 1") as exc:
+        asyncio_run(
+            c.write(
+                ConnectorPayload(
+                    resource="default",
+                    data={"items": [{"name": "ok"}, {"name": "fail"}, {"name": "never"}]},
+                )
+            )
+        )
+    # Sequential abort: the 3rd item was never attempted.
+    assert len(calls) == 2
+    assert exc.value.failed_index == 1
+    assert exc.value.failed_item == {"name": "fail"}
+    assert exc.value.success_count == 1
+    assert exc.value.failure_count == 1
+    assert exc.value.outcomes[0]["status"] == "success"
+    assert exc.value.outcomes[1]["status"] == "failure"
+    assert "boom" in exc.value.failed_error or "500" in exc.value.failed_error
+
+
+def test_write_fanout_applies_per_destination_rate_limit() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items"},
+            "rate_limit": {"requests_per_second": 1000.0, "burst": 10},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    result = asyncio_run(
+        c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(5)]}))
+    )
+    assert result["total"] == 5
+    assert result["success_count"] == 5
+    assert len(calls) == 5
+    # One bucket per destination (host), lazily created on first send.
+    assert len(c._rate_buckets) == 1
 
 
 def asyncio_run(coro: Any) -> Any:

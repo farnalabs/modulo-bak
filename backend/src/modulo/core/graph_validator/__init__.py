@@ -103,6 +103,20 @@ def _is_valid_retry_budget(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _RETRY_POLICY_MAX_RETRIES
 
 
+def _as_positive_number(value: Any) -> float | None:
+    """Coerce *value* to a positive float, or None when it is not one.
+
+    Used by the node send-budget reconcile (FAR-410/FAR-411) on advisory keys
+    like ``fanout_cardinality`` / ``per_item_budget`` / ``node_wait_for`` — a
+    malformed value is treated as absent (skipped) rather than a hard error.
+    """
+    try:
+        number = float(value)
+    except (ValueError, TypeError):
+        return None
+    return number if number > 0 else None
+
+
 def _check_list_type_mismatch(path: str, out_type: object, in_type: list[object]) -> list[str]:
     """Input is a nullable type list: output must be a subset of the input types."""
     if isinstance(out_type, list):
@@ -1092,6 +1106,7 @@ class GraphValidator:
         self._check_edges(graph_json, result)
         self._check_sandbox_agent_config(graph_json, result)
         self._check_node_idempotent(graph_json, result)
+        self._check_node_send_budget(graph_json, result)
         self._check_parallel_run_context_writes(graph_json, result)
         self._check_schema_compatibility(graph_json, result)
         await self._check_connector_bindings(connector_bindings or [], session, result)
@@ -1178,6 +1193,7 @@ class GraphValidator:
 
         # Node idempotency flag check (FAR-295).
         self._check_node_idempotent(snapshot.graph_json, result)
+        self._check_node_send_budget(snapshot.graph_json, result)
 
         # Edge validation.
         self._check_edges(snapshot.graph_json, result)
@@ -2383,6 +2399,66 @@ class GraphValidator:
                     "NODE_IDEMPOTENT_INVALID",
                     f"Node '{nid}': idempotent must be a boolean (true = safe to re-run, "
                     f"false = never auto-retry), got {node.get('idempotent')!r}",
+                    node_id=nid,
+                )
+
+    # ------------------------------------------------------------------
+    # Node send budget reconcile (FAR-410 / FAR-411)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_node_send_budget(graph_json: dict[str, Any], result: ValidationResult) -> None:
+        """Warn when a fan-out node's send budget exceeds its wait_for budget.
+
+        A connector node may fan out over ``fanout_cardinality`` items and run
+        each with a ``per_item_budget`` — but all of that must fit inside the
+        node's total ``wait_for`` budget (``node_wait_for``, else
+        ``timeout_seconds``). The per-item worst case carries a retry multiplier:
+        each item may be retried ``fanout_max_retries`` times (default 2 → 3
+        attempts), so the worst case is ``fanout_cardinality x per_item_budget x
+        (fanout_max_retries + 1)``.
+
+        When the sends cannot sequentially fit in the budget — after accounting
+        for retries — retries collide with the node deadline and every attempt
+        gets cancelled mid-send (UNKNOWN outcomes). This is a save-time warning,
+        not a hard error: nodes without these config keys (every existing graph)
+        are unaffected, and it is advisory rather than a blocker so an operator
+        can still save while they reconcile.
+
+        The default ``fanout_max_retries`` of 2 (3 attempts) matches the REST
+        connector's ``fan_out.max_retries`` default, so the connector and the
+        validator reconcile the same retry semantics.
+        """
+        for node in graph_json.get("nodes", []) or []:
+            if not isinstance(node, dict):
+                continue
+            fanout = node.get("fanout_cardinality")
+            per_item = node.get("per_item_budget")
+            if fanout is None and per_item is None:
+                continue
+            nid = _string_or_default(node.get("id"))
+            fanout_val = _as_positive_number(fanout)
+            per_item_val = _as_positive_number(per_item)
+            if fanout_val is None or per_item_val is None:
+                continue
+            attempts_raw = node.get("fanout_max_retries")
+            if isinstance(attempts_raw, int) and not isinstance(attempts_raw, bool) and attempts_raw >= 0:
+                attempts = attempts_raw + 1
+            else:
+                attempts = 3
+            wait_for = _as_positive_number(node.get("node_wait_for"))
+            if wait_for is None:
+                wait_for = _as_positive_number(node.get("timeout_seconds"))
+            if wait_for is None:
+                continue
+            total = fanout_val * per_item_val * attempts
+            if total > wait_for:
+                result.warning(
+                    "NODE_SEND_BUDGET_OVERSUBSCRIBED",
+                    f"Node '{nid}': fanout_cardinality={fanout_val} x per_item_budget={per_item_val} "
+                    f"x attempts={attempts} ({total:.1f}s) exceeds node wait_for budget {wait_for:.1f}s — "
+                    "retries will be cancelled mid-send, producing UNKNOWN outcomes. Raise node_wait_for, "
+                    "lower per_item_budget, or reduce fanout_max_retries.",
                     node_id=nid,
                 )
 

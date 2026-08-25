@@ -1401,3 +1401,75 @@ async def test_sandbox_wallclock_budget_non_int_is_error():
     result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
     assert not result.is_valid
     assert any(i.code == "SANDBOX_WALLCLOCK_BUDGET_INVALID" for i in result.issues)
+
+
+# ---------------------------------------------------------------------------
+# Node send-budget reconcile (FAR-410 / FAR-411)
+# ---------------------------------------------------------------------------
+
+
+async def test_node_send_budget_oversubscribed_warns_with_retry_multiplier():
+    """fanout_cardinality x per_item_budget x (fanout_max_retries+1) must fit wait_for."""
+    graph = {
+        "nodes": [
+            {
+                "id": "fanout-node",
+                "fanout_cardinality": 100,
+                "per_item_budget": 5,
+                "timeout_seconds": 30,
+            }
+        ],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    assert result.is_valid  # a warning is not a blocker
+    oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
+    assert len(oversub) == 1
+    # 100 * 5 * 3 (default 2 retries + 1) = 1500s > 30s budget.
+    assert oversub[0].node_id == "fanout-node"
+
+
+async def test_node_send_budget_within_budget_no_warning():
+    graph = {
+        "nodes": [
+            {
+                "id": "fanout-node",
+                "fanout_cardinality": 2,
+                "per_item_budget": 1,
+                "timeout_seconds": 30,
+            }
+        ],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_retries_zero_uses_single_attempt():
+    """fanout_max_retries=0 collapses the multiplier to a single attempt per item."""
+    graph = {
+        "nodes": [
+            {
+                "id": "fanout-node",
+                "fanout_cardinality": 100,
+                "per_item_budget": 5,
+                "fanout_max_retries": 0,
+                "timeout_seconds": 30,
+            }
+        ],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    # 100 * 5 * 1 = 500s > 30s — still over budget, but the multiplier is 1.
+    oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
+    assert len(oversub) == 1
+    assert "attempts=1" in oversub[0].message
+
+
+async def test_node_send_budget_absent_keys_no_warning():
+    """Nodes without fan-out config keys are untouched."""
+    graph = {"nodes": [{"id": "plain-node"}], "edges": []}
+    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
