@@ -6,7 +6,7 @@ Router compile-time default-rule enforcement, HITL-node compile-equivalence
 with the legacy edge-gate, and ``loop`` edge authorability.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -228,3 +228,191 @@ def test_router_node_compiles():
     assert "R" in nodes
     assert "A" in nodes
     assert "B" in nodes
+
+
+# ---------------------------------------------------------------------------
+# Executor terminalization: RouterNoMatchError -> router_no_match (FAR-415)
+# ---------------------------------------------------------------------------
+
+import uuid  # noqa: E402
+from contextlib import asynccontextmanager  # noqa: E402
+from typing import Any  # noqa: E402
+
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
+
+from modulo.core.pipeline_engine.executor import PipelineExecutor  # noqa: E402
+
+
+def _make_run(*, claim_token: str | None = "tok-claim-abc") -> MagicMock:
+    run = MagicMock()
+    run.id = uuid.uuid4()
+    run.pipeline_id = uuid.uuid4()
+    run.snapshot_id = uuid.uuid4()
+    run.langgraph_thread_id = str(uuid.uuid4())
+    run.status = "pending"
+    run.claim_count = 0
+    run.node_attempt_count = 0
+    run.claim_token = claim_token
+    return run
+
+
+def _make_snapshot() -> MagicMock:
+    snap = MagicMock()
+    router_config = {"rules": [{"guard": "state.x == `1`", "target": "A"}]}
+    snap.graph_json = {"nodes": [{"id": "R", "node_type": "router", "router_config": router_config}], "edges": []}
+    snap.run_context_defaults = {}
+    return snap
+
+
+def _make_session(snapshot: MagicMock, statements: list[str] | None = None) -> AsyncMock:
+    pipeline = MagicMock()
+    pipeline.max_concurrent_runs = 5
+    pipeline.lock_wait_timeout_seconds = 30
+    pipeline.max_duration_seconds = 3600
+    pipeline.max_steps = 100
+    pipeline.token_budget = None
+
+    pipeline_result = MagicMock()
+    pipeline_result.scalar_one.return_value = pipeline
+    snapshot_result = MagicMock()
+    snapshot_result.scalar_one.return_value = snapshot
+    eval_result = MagicMock()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = []
+    eval_result.scalars.return_value = scalars_mock
+    count_result = MagicMock()
+    count_result.scalar.return_value = 0
+
+    execute_results = iter([pipeline_result, snapshot_result, eval_result, count_result])
+    recorded = statements if statements is not None else []
+
+    async def _execute(*_args: Any, **_kwargs: Any) -> Any:
+        recorded.append(str(_args[0]) if _args else "")
+        try:
+            return next(execute_results)
+        except StopIteration:
+            return count_result
+
+    session = AsyncMock(spec=AsyncSession)
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=None)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin = MagicMock(return_value=begin_cm)
+    session.add = MagicMock()
+    session.execute = _execute
+    return session
+
+
+def _make_session_factory(session: AsyncMock) -> MagicMock:
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    return MagicMock(side_effect=lambda: _ctx())
+
+
+def _mock_compiled_raising(exc: Exception) -> MagicMock:
+    async def _astream(state: Any, config: Any, *, version: str = "v1") -> Any:
+        raise exc
+        yield  # pragma: no cover
+
+    c = MagicMock()
+    c.astream_events = _astream
+    return c
+
+
+def _mock_registry() -> MagicMock:
+    broker = MagicMock()
+    broker.publish = MagicMock()
+    broker.is_closed = False
+    registry = MagicMock()
+    registry.get_or_create.return_value = broker
+    registry.close = MagicMock()
+    return registry
+
+
+def _mock_graph_validator() -> MagicMock:
+    validation = MagicMock()
+    validation.is_valid = True
+    mock_cls = MagicMock()
+    mock_cls.return_value.validate_for_run = AsyncMock(return_value=validation)
+    return mock_cls
+
+
+async def _bypass_capacity(mock_self, **kwargs):
+    run = MagicMock()
+    run.status = "running"
+    return run
+
+
+async def test_execute_router_no_match_terminalizes_as_router_no_match():
+    """Prove-the-fix (FAR-415): a Router node raising RouterNoMatchError must be
+    caught by the executor's dedicated except and terminalize the run with the
+    ``router_no_match`` status (error_code ``router.no_match``) — NOT bubble up
+    as an unclassified ``failed``. This is the wiring that the unit-only
+    ``test_router_no_match_raises`` test never exercised."""
+    run = _make_run()
+    snapshot = _make_snapshot()
+    session = _make_session(snapshot)
+    factory = _make_session_factory(session)
+    compiled = _mock_compiled_raising(RouterNoMatchError(node_id="R"))
+    registry = _mock_registry()
+    settings = MagicMock(saq_run_retries=5)
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
+        patch("modulo.core.pipeline_engine.executor.get_run", return_value=run),
+        patch("modulo.core.pipeline_engine.executor.update_run_status", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.set_rls_org"),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context"),
+        patch("modulo.core.pipeline_engine.executor.get_or_compile", return_value=compiled),
+        patch("modulo.core.pipeline_engine.executor.get_registry", return_value=registry),
+        patch("modulo.core.pipeline_engine.executor.GraphValidator", new=_mock_graph_validator()),
+        patch.object(PipelineExecutor, "_check_capacity", _bypass_capacity),
+        patch("modulo.settings.get_settings", return_value=settings),
+    ):
+        executor = PipelineExecutor(MagicMock())
+        # Must NOT raise — the exception is terminalized, not propagated.
+        await executor.execute(run_id=run.id, org_id=uuid.uuid4(), input_payload={}, claim_token="tok-claim-abc")
+
+    # The terminal status write carries the dedicated router_no_match status.
+    mock_finalize.assert_awaited_once()
+    call_kwargs = mock_finalize.await_args.kwargs
+    assert call_kwargs["status"] == "router_no_match"
+    assert call_kwargs["error_code"] == "router.no_match"
+    assert call_kwargs["is_terminal"] is True
+    # Cleanup ran so the broker is released.
+    registry.close.assert_called_once_with(run.id)
+
+
+async def test_execute_router_no_match_not_classed_as_failed():
+    """Guard against a regression where a generic ``except Exception`` would
+    shadow the RouterNoMatchError handler and re-terminalize the run as
+    ``failed``. The run must end under ``router_no_match``, never ``failed``."""
+    run = _make_run()
+    snapshot = _make_snapshot()
+    session = _make_session(snapshot)
+    factory = _make_session_factory(session)
+    compiled = _mock_compiled_raising(RouterNoMatchError(node_id="R"))
+    registry = _mock_registry()
+    settings = MagicMock(saq_run_retries=5)
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
+        patch("modulo.core.pipeline_engine.executor.get_run", return_value=run),
+        patch("modulo.core.pipeline_engine.executor.update_run_status", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.set_rls_org"),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context"),
+        patch("modulo.core.pipeline_engine.executor.get_or_compile", return_value=compiled),
+        patch("modulo.core.pipeline_engine.executor.get_registry", return_value=registry),
+        patch("modulo.core.pipeline_engine.executor.GraphValidator", new=_mock_graph_validator()),
+        patch.object(PipelineExecutor, "_check_capacity", _bypass_capacity),
+        patch("modulo.settings.get_settings", return_value=settings),
+    ):
+        executor = PipelineExecutor(MagicMock())
+        await executor.execute(run_id=run.id, org_id=uuid.uuid4(), input_payload={}, claim_token="tok-claim-abc")
+
+    assert mock_finalize.await_args.kwargs["status"] != "failed"
+    assert mock_finalize.await_args.kwargs["status"] == "router_no_match"

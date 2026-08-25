@@ -1,7 +1,7 @@
 """runs — add ``router_no_match`` to the ``ck_runs_status`` CHECK constraint.
 
 Revision ID: 0139_add_router_no_match_status
-Revises: 0141_pipeline_edge_ports
+Revises: 0143_rest_connector_profile
 Create Date: 2026-08-24
 
 FAR-402 P1 (FAR-415) introduces the ``router_no_match`` terminal run status

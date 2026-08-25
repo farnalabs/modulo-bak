@@ -30,6 +30,7 @@ Decision table (spec, keyed on status — never prose):
 |-----------------|------------------------------------------------|
 | cancelled       | ``excluded`` (operator/HITL-cancelled — never countable, even with an unparseable reason) |
 | budget_exceeded | ``excluded`` (and breaks the FAR-190 walk)      |
+| router_no_match | ``excluded`` (FAR-415 — its own reason, never budget_exceeded) |
 | failed / eval_failed / stalled | ``no_delivery`` (COUNTABLE — infra/sandbox crash elevated to failed counts, PO) |
 | complete        | ``delivered`` iff >= 1 valid ``pr_url`` OR any marker carries ``delivery_done`` (FAR-228 |
 |                 | email sentinel); else COUNTABLE ``no_delivery`` (empty-backlog, PO) |
@@ -84,6 +85,7 @@ REASON_PARSE_ERROR = "parse_error"
 REASON_NO_DELIVERY = "no_delivery"
 REASON_CANCELLED = "operator_or_hitl_cancelled"
 REASON_BUDGET_EXCEEDED = "budget_exceeded"
+REASON_ROUTER_NO_MATCH = "router_no_match"
 REASON_DELIVERED = "pr_delivered"
 REASON_DELIVERED_EMAIL = "email_delivered"
 REASON_UNCLASSIFIED = "classifier_error"
@@ -396,11 +398,18 @@ def classify_run(
     computed_at = datetime.now(UTC)
     declared_success_nodes = len(_declared_success_nodes(outputs_json, telemetry_json))
 
-    # operator/HITL-cancelled + budget_exceeded -> EXCLUDED. A cancelled run is
-    # never countable, even with an unparseable reason; budget_exceeded is
-    # excluded and breaks the FAR-190 walk.
+    # operator/HITL-cancelled + budget_exceeded + router_no_match -> EXCLUDED. A
+    # cancelled run is never countable, even with an unparseable reason;
+    # budget_exceeded is excluded and breaks the FAR-190 walk. Each excluded
+    # status keeps its own reason so analytics/reporting never mislabels a
+    # router_no_match run as a budget attribution (FAR-415).
     if status in _EXCLUDED_STATUSES:
-        reason = REASON_CANCELLED if status == "cancelled" else REASON_BUDGET_EXCEEDED
+        if status == "cancelled":
+            reason = REASON_CANCELLED
+        elif status == "router_no_match":
+            reason = REASON_ROUTER_NO_MATCH
+        else:
+            reason = REASON_BUDGET_EXCEEDED
         return ClassificationResult(
             RunClassificationValue.excluded,
             reason,
