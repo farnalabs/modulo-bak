@@ -488,6 +488,50 @@ def _seed_state(
     }
 
 
+def _run_connector_fetch_scope(
+    graph_json: dict[str, Any] | None,
+    agent_connector_grants: dict[str, set[str]] | None = None,
+) -> list[str] | None:
+    """Compute the run-level ``allowed_connectors`` fetch scope (FAR-435).
+
+    The scope passed to ``ConnectorHub.initialise`` is the UNION of:
+
+    * (a) every node's ``capability_scope.allowed_connectors`` — the node-level
+      narrowing (connector instance-ids and/or connector types) that FAR-418
+      adds per node; and
+    * (b) every referenced Agent's ``connector_type_refs`` grants — so agent
+      nodes (which have NO static connector binding and tool-call the hub at
+      runtime) are still able to reach their granted connectors.
+
+    The union is a SUPERSET: it is as broad as any single node's scope, so a
+    per-node narrow-gate can never be silently defeated by an over-tight run
+    scope. ``agent_connector_grants`` maps ``agent_id`` (string) → the set of
+    granted connector-type strings (see ``agent_granted_connector_types``).
+
+    Returns a list suitable for ``initialise``'s ``allowed_connectors``, or
+    ``None`` when the union is EMPTY — the unrestricted/legacy default (no
+    narrowing, the pre-scope behaviour).
+    """
+    scope: set[str] = set()
+    if isinstance(graph_json, dict):
+        for node in graph_json.get("nodes", []) or []:
+            if not isinstance(node, dict):
+                continue
+            cap_scope = node.get("capability_scope") or {}
+            if isinstance(cap_scope, dict):
+                allowed = cap_scope.get("allowed_connectors")
+                if isinstance(allowed, (list, tuple, set)):
+                    scope.update(str(entry) for entry in allowed if entry)
+            agent_id = node.get("agent_id")
+            if agent_id is not None and agent_connector_grants:
+                grants = agent_connector_grants.get(str(agent_id))
+                if grants:
+                    scope.update(grants)
+    if not scope:
+        return None
+    return sorted(scope)
+
+
 def _map_lg_event(
     lg_event: dict[str, Any],
     node_ids: set[str],
@@ -1301,6 +1345,11 @@ class PipelineExecutor:
         # write out from under a successor. Seeded into LangGraph state as
         # ``_claim_lease`` for the sandbox dispatch marker.
         self._claim_token: str | None = None
+        # FAR-435: the run-level connector fetch scope (``allowed_connectors``),
+        # computed once at run start from the graph (node capability_scope union
+        # Agent connector_type_refs grants) and reused by the compensation hub
+        # so both run paths apply the same deny-by-default fetch gate.
+        self._run_connector_scope: list[str] | None = None
         # Cancellation-intent signals wired by run_executor_with_watchdog so the
         # NodeCancelledError retry handler can tell a watchdog stall / supersession
         # from a genuine transient node cancellation and skip the pending-reset.
@@ -1777,11 +1826,23 @@ class PipelineExecutor:
             hub = None
         return hub
 
-    async def _init_connector_hub(self, org_id: uuid.UUID) -> Any | None:
+    async def _init_connector_hub(
+        self,
+        org_id: uuid.UUID,
+        *,
+        graph_json: dict[str, Any] | None = None,
+    ) -> Any | None:
         """Load active ConnectorInstance rows for the org and initialise ConnectorHub.
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
+
+        When *graph_json* is provided (the run-start path), the hub applies a
+        run-level fetch scope: the union of every node's
+        ``capability_scope.allowed_connectors`` and the referenced Agents'
+        ``connector_type_refs`` grants (FAR-435). The scope is cached on the
+        executor and reused by the compensation path (which has no graph) so
+        both apply the same deny-by-default fetch gate.
         """
         hub: Any | None = None
         try:
@@ -1790,7 +1851,42 @@ class PipelineExecutor:
                 await set_rls_execution_context(session)
                 from sqlalchemy import select
 
+                from modulo.core.capability_scope import agent_granted_connector_types
+                from modulo.db.models.agent import Agent
                 from modulo.db.models.connector_instance import ConnectorInstance
+
+                allowed_connectors: list[str] | None = None
+                if graph_json is not None:
+                    agent_ids: list[uuid.UUID] = []
+                    for node in graph_json.get("nodes", []) or []:
+                        if not isinstance(node, dict):
+                            continue
+                        agent_id = node.get("agent_id")
+                        if agent_id:
+                            try:
+                                agent_ids.append(uuid.UUID(str(agent_id)))
+                            except (TypeError, ValueError):
+                                continue
+                    grants: dict[str, set[str]] = {}
+                    if agent_ids:
+                        agent_rows = (
+                            (
+                                await session.execute(
+                                    select(Agent).where(
+                                        Agent.id.in_(agent_ids),
+                                        Agent.organisation_id == org_id,
+                                    )
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                        for agent in agent_rows:
+                            grants[str(agent.id)] = agent_granted_connector_types(agent.connector_type_refs)
+                    allowed_connectors = _run_connector_fetch_scope(graph_json, grants)
+                    self._run_connector_scope = allowed_connectors
+                else:
+                    allowed_connectors = self._run_connector_scope
 
                 rows = (
                     (
@@ -1822,7 +1918,7 @@ class PipelineExecutor:
                         runtime_provider=runtime_hub,
                     )
                     await hub.__aenter__()
-                    await hub.initialise(rows)
+                    await hub.initialise(rows, allowed_connectors=allowed_connectors)
                     set_connector_hub(hub)
         except asyncio.CancelledError:
             raise
@@ -3059,7 +3155,9 @@ class PipelineExecutor:
         # Load model backends for this run's org — provides LLM access to agent nodes.
         model_backend_hub = await self._init_model_backend_hub(org_id)
         # Load connector hub for this run's org — provides connector access to connector nodes.
-        connector_hub = await self._init_connector_hub(org_id)
+        # FAR-435: the hub is initialised with a run-level fetch scope (deny-by-default)
+        # derived from the graph's node capability_scope union Agent connector_type_refs grants.
+        connector_hub = await self._init_connector_hub(org_id, graph_json=graph_json)
 
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
