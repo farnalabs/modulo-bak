@@ -1,210 +1,442 @@
 <template>
-  <div data-theme="agent" class="page-wide">
-    <PageHeader :title="$t('views.AdminRunRetentionView.run_retention')" :subtitle="$t('views.AdminRunRetentionView.configure_run_retention_policies_and_manual_purge')" />
+  <FeatureGate feature-name="admin_run_retention" required-tier="team" show-disabled>
+    <div class="page-wide">
+      <PageHeader
+        title="Run Retention"
+        subtitle="Export old runs to a file, then clear them down across checkpoints"
+      >
+        <template #right>
+          <Button
+            severity="secondary"
+            outlined
+            data-testid="admin-run-retention-refresh"
+            :disabled="loading"
+            @click="loadCandidates"
+          >
+            {{ loading ? 'Loading…' : 'Refresh' }}
+          </Button>
+          <Button
+            data-testid="admin-run-retention-export"
+            :disabled="exporting || candidates.length === 0"
+            @click="exportFile"
+          >
+            {{ exporting ? 'Exporting…' : 'Export to file' }}
+          </Button>
+          <Button
+            severity="danger"
+            data-testid="admin-run-retention-purge"
+            :disabled="purging || terminalCandidates.length === 0"
+            @click="openPurgeConfirm"
+          >
+            {{ purging ? 'Purging…' : 'Purge' }}
+          </Button>
+        </template>
+      </PageHeader>
 
-    <FeatureGate feature-name="admin_run_retention" required-tier="team" show-disabled>
+      <div
+        v-if="exportError || purgeError"
+        class="mb-4 rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+        data-testid="admin-run-retention-error"
+      >
+        {{ exportError || purgeError }}
+      </div>
+      <div
+        v-if="exportSuccess"
+        class="mb-4 rounded-lg border border-success/50 bg-success/10 p-3 text-sm text-success"
+        data-testid="admin-run-retention-export-result"
+      >
+        {{ exportSuccess }}
+      </div>
+      <div
+        v-if="purgeResult"
+        class="mb-4 rounded-lg border border-success/50 bg-success/10 p-3 text-sm text-success"
+        data-testid="admin-run-retention-purge-result"
+      >
+        Purged {{ purgeResult.purged_runs }} run(s) and {{ purgeResult.purged_checkpoints }}
+        checkpoint(s), freeing {{ formatBytes(purgeResult.freed_estimated_bytes) }}.
+      </div>
 
-      <LoadingSpinner v-if="loading" />
-
-      <ErrorAlert v-else-if="loadError" :message="loadError" :on-retry="loadData" />
-
-      <template v-else>
-        <Card>
-          <template #title>{{ $t('views.AdminRunRetentionView.current_retention_period') }}</template>
-<template #subtitle>{{ $t('views.AdminRunRetentionView.runs_older_than_this_many_days_are_automatically_cleaned_up') }}</template>
-
-          <template #content>
-            <div class="flex items-end gap-3">
-              <div class="flex-1">
-                <span class="mb-1.5 block text-xs font-medium text-muted-foreground">{{ $t('views.AdminRunRetentionView.retention_period_days') }}</span>
-                <InputText aria-label="Form control"
-                  :model-value="retentionDays == null ? '' : String(retentionDays)"
-                  @update:model-value="(v: any) => retentionDays = v === '' ? null : Number(v)"
-                  type="number"
-                  min="7"
-                  max="365"
-                  data-testid="admin-run-retention-days"
-                />
-              </div>
-              <Button :disabled="savingRetention" data-testid="admin-run-retention-save" @click="saveRetention">
-                {{ savingRetention ? 'Saving...' : 'Save' }}
-              </Button>
+      <Card>
+        <template #title>Filters</template>
+        <template #subtitle>Narrow the candidate runs by date, pipeline, or status.</template>
+        <template #content>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-from">From</label>
+              <input
+                id="rr-date-from"
+                v-model="dateFrom"
+                type="datetime-local"
+                class="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                data-testid="admin-run-retention-date-from"
+              />
             </div>
-            <p v-if="retentionSaveError" class="mt-2 text-xs text-destructive">{{ retentionSaveError }}</p>
-            <p v-if="retentionSaveSuccess" class="mt-2 text-xs text-success">{{ $t('views.AdminRunRetentionView.retention_period_updated') }}</p>
-          </template>
-        </Card>
-
-        <Card>
-          <template #title>{{ $t('views.AdminRunRetentionView.manual_purge') }}</template>
-<template #subtitle>{{ $t('views.AdminRunRetentionView.immediately_delete_runs_older_than_a_specified_number_of_days') }}</template>
-
-          <template #content>
-            <div class="flex items-end gap-3">
-              <div class="flex-1">
-                <span class="mb-1.5 block text-xs font-medium text-muted-foreground">{{ $t('views.AdminRunRetentionView.purge_runs_older_than_days') }}</span>
-                <InputText aria-label="Form control"
-                  :model-value="purgeAge == null ? '' : String(purgeAge)"
-                  @update:model-value="(v: any) => purgeAge = v === '' ? null : Number(v)"
-                  type="number"
-                  min="1"
-                  max="365"
-                  data-testid="admin-run-retention-purge-age"
-                />
-              </div>
-              <Button :disabled="purging" severity="danger" data-testid="admin-run-retention-purge-now" @click="executePurge">
-                {{ purging ? 'Purging...' : 'Purge Now' }}
-              </Button>
+            <div>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-to">To</label>
+              <input
+                id="rr-date-to"
+                v-model="dateTo"
+                type="datetime-local"
+                class="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                data-testid="admin-run-retention-date-to"
+              />
             </div>
-            <p v-if="purgeError" class="mt-2 text-xs text-destructive">{{ purgeError }}</p>
-            <p v-if="purgeResult" class="mt-2 text-xs text-success">{{ purgeResult }}</p>
-          </template>
-        </Card>
-
-        <Card>
-          <template #title>{{ $t('views.AdminRunRetentionView.storage_info') }}</template>
-<template #subtitle>{{ $t('views.AdminRunRetentionView.current_run_storage_statistics') }}</template>
-
-          <template #content>
-            <LoadingSpinner v-if="storageLoading" />
-            <div v-else-if="storageError" class="text-sm text-destructive">{{ storageError }}</div>
-            <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-3">
-              <div class="rounded-lg border bg-muted p-4 text-center">
-                <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-runs">{{ storageInfo.total_runs ?? 0 }}</p>
-                <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.total_runs') }}</p>
-              </div>
-              <div class="rounded-lg border bg-muted p-4 text-center">
-                <p class="text-2xl font-semibold capitalize">{{ storageInfo.status_breakdown ? Object.keys(storageInfo.status_breakdown).length : 0 }}</p>
-                <p class="text-xs text-muted-foreground capitalize">{{ $t('views.AdminRunRetentionView.status_categories') }}</p>
-              </div>
-              <div class="rounded-lg border bg-muted p-4 text-center">
-                <p class="text-2xl font-semibold" data-testid="admin-run-retention-estimated-saved">{{ storageInfo.estimated_saved_bytes ? formatBytes(storageInfo.estimated_saved_bytes) : '0 B' }}</p>
-                <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_storage_saved') }}</p>
-              </div>
+            <div>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-pipeline">Pipeline</label>
+              <Select
+                id="rr-pipeline"
+                v-model="selectedPipelineId"
+                :options="pipelineOptions"
+                option-label="label"
+                option-value="value"
+                placeholder="All pipelines"
+                class="w-full"
+                data-testid="admin-run-retention-pipeline"
+              />
             </div>
-            <div v-if="storageInfo.status_breakdown && Object.keys(storageInfo.status_breakdown).length > 0" class="mt-4">
-              <h4 class="mb-2 text-sm font-medium text-muted-foreground">{{ $t('views.AdminRunRetentionView.runs_by_status') }}</h4>
-              <div class="space-y-1">
-                <div v-for="(count, status) in storageInfo.status_breakdown" :key="status" class="flex items-center justify-between rounded border px-3 py-2 text-sm">
-                  <span class="capitalize">{{ status }}</span>
-                  <span class="font-medium">{{ count }}</span>
-                </div>
-              </div>
+            <div>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-status">Status</label>
+              <Select
+                id="rr-status"
+                v-model="selectedStatus"
+                :options="statusOptions"
+                option-label="label"
+                option-value="value"
+                placeholder="All statuses"
+                class="w-full"
+                data-testid="admin-run-retention-status"
+              />
             </div>
-          </template>
-        </Card>
-      </template>
-    </FeatureGate>
-  </div>
+          </div>
+          <div class="mt-3 flex items-center gap-2">
+            <Button data-testid="admin-run-retention-apply" @click="loadCandidates">
+              Apply filters
+            </Button>
+            <button
+              type="button"
+              class="rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium hover:bg-accent"
+              data-testid="admin-run-retention-reset"
+              @click="resetFilters"
+            >
+              Reset
+            </button>
+          </div>
+        </template>
+      </Card>
+
+      <Card>
+        <template #title>Summary</template>
+        <template #subtitle>Checkpoint data dominates the estimated reclaimable size.</template>
+        <template #content>
+          <div v-if="loading" class="flex justify-center py-6">
+            <LoadingSpinner />
+          </div>
+          <div v-else-if="error" class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive" data-testid="admin-run-retention-error-msg">
+            {{ error }}
+          </div>
+          <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div class="rounded-lg border bg-muted p-4 text-center">
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-runs">{{ totalCount }}</p>
+              <p class="text-xs text-muted-foreground">Matching runs</p>
+            </div>
+            <div class="rounded-lg border bg-muted p-4 text-center">
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(totalEstimatedBytes) }}</p>
+              <p class="text-xs text-muted-foreground">Estimated reclaimable</p>
+            </div>
+            <div class="rounded-lg border bg-muted p-4 text-center">
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-terminal-runs">{{ terminalCandidates.length }}</p>
+              <p class="text-xs text-muted-foreground">Terminal (purge-able)</p>
+            </div>
+          </div>
+        </template>
+      </Card>
+
+      <div class="mb-4 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm" data-testid="admin-run-retention-warning">
+        Only terminal runs (complete, failed, cancelled, eval-failed, stalled) are ever purged.
+        In-flight runs (pending, running, awaiting human, claimed) are never deleted — they are
+        listed as candidates but are skipped by the purge.
+      </div>
+
+      <Card>
+        <template #title>Candidates</template>
+        <template #subtitle>Up to 500 matching runs with an estimated per-run size.</template>
+        <template #content>
+          <div v-if="loading" class="flex justify-center py-6">
+            <LoadingSpinner />
+          </div>
+          <div v-else-if="error" class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
+            {{ error }}
+          </div>
+          <div v-else-if="candidates.length === 0" class="py-6 text-center text-sm text-muted-foreground" data-testid="admin-run-retention-empty">
+            No runs match the current filters.
+          </div>
+          <div v-else class="max-h-96 overflow-auto rounded-lg border" data-testid="admin-run-retention-candidates-table">
+            <table class="w-full">
+              <thead>
+                <tr>
+                  <th class="table-header">Status</th>
+                  <th class="table-header">Created</th>
+                  <th class="table-header">Pipeline</th>
+                  <th class="table-header">Estimated size</th>
+                  <th class="table-header">Run id</th>
+                </tr>
+              </thead>
+              <tbody class="divide-y">
+                <tr v-for="run in candidates" :key="run.id">
+                  <td class="table-cell">
+                    <span :class="statusBadge(run.status.toLowerCase())" class="rounded px-2 py-0.5 text-xs font-medium capitalize">{{ run.status }}</span>
+                  </td>
+                  <td class="table-cell whitespace-nowrap text-xs text-muted-foreground">{{ formatDate(run.created_at) }}</td>
+                  <td class="table-cell text-xs">{{ pipelineName(run.pipeline_id) }}</td>
+                  <td class="table-cell whitespace-nowrap text-xs">{{ formatBytes(run.estimated_bytes) }}</td>
+                  <td class="table-cell whitespace-nowrap font-mono text-xs text-muted-foreground">{{ shortId(run.id) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+      </Card>
+
+      <Dialog
+        :visible="showPurgeConfirm"
+        :modal="true"
+        :dismissable-mask="true"
+        data-testid="admin-run-retention-confirm-dialog"
+        @update:visible="showPurgeConfirm = $event"
+      >
+        <template #header>
+          <div>
+            <div class="text-lg font-semibold">Confirm clear-down</div>
+            <div class="mt-0.5 text-sm text-muted-foreground">
+              This permanently deletes data and cannot be undone.
+            </div>
+          </div>
+        </template>
+        <div class="space-y-3 text-sm">
+          <p>
+            {{ terminalCandidates.length }} terminal run(s) matching the current filters will be
+            purged, along with their checkpoints and related per-run rows. In-flight runs are
+            never touched.
+          </p>
+          <p class="text-muted-foreground">Estimated reclaimable: {{ formatBytes(totalEstimatedBytes) }}.</p>
+        </div>
+        <template #footer>
+          <div class="flex justify-end gap-2">
+            <Button severity="secondary" outlined data-testid="admin-run-retention-purge-cancel" @click="showPurgeConfirm = false">
+              Cancel
+            </Button>
+            <Button severity="danger" :disabled="purging" data-testid="admin-run-retention-purge-confirm" @click="executePurge">
+              {{ purging ? 'Purging…' : 'Purge selected' }}
+            </Button>
+          </div>
+        </template>
+      </Dialog>
+    </div>
+  </FeatureGate>
 </template>
 
 <script setup lang="ts">
-import PageHeader from '../components/shared/PageHeader.vue'
 import { ref, computed } from 'vue'
-import { api } from '../lib/api/client'
-import { useDataFetch } from '../composables/useDataFetch'
-import { formatApiError } from '../lib/api/formatError'
-import { usePlanStore } from '../stores/planStore'
-import FeatureGate from '../components/FeatureGate.vue'
+import PageHeader from '../components/shared/PageHeader.vue'
 import LoadingSpinner from '../components/shared/LoadingSpinner.vue'
-import ErrorAlert from '../components/shared/ErrorAlert.vue'
+import FeatureGate from '../components/FeatureGate.vue'
 import Card from 'primevue/card'
-import InputText from 'primevue/inputtext'
+import Select from 'primevue/select'
 import Button from 'primevue/button'
+import Dialog from 'primevue/dialog'
+import { api, getAuthHeaders } from '../lib/api/client'
+import { formatApiError } from '../lib/api/formatError'
+import type { components } from '../lib/api/schema'
 
-const planStore = usePlanStore()
+type CandidatesResponse = components['schemas']['CandidatesResponse']
+type RetentionCandidate = components['schemas']['RetentionCandidate']
+type PurgeResponse = components['schemas']['PurgeResponse']
+type PipelineResponse = components['schemas']['PipelineResponse']
 
-interface RetentionConfig {
-  retention_days: number
-}
+const TERMINAL_STATUSES = ['complete', 'failed', 'cancelled', 'eval_failed', 'stalled']
 
-interface StorageInfo {
-  total_runs: number
-  status_breakdown: Record<string, number>
-  estimated_saved_bytes: number
-}
+const AVAILABLE_STATUSES = [
+  'pending',
+  'running',
+  'awaiting_human',
+  'claimed',
+  'complete',
+  'failed',
+  'cancelled',
+  'eval_failed',
+  'stalled',
+]
 
-interface PurgeResult {
-  deleted_count: number
-}
+const dateFrom = ref('')
+const dateTo = ref('')
+const selectedPipelineId = ref<string | null>(null)
+const selectedStatus = ref<string | null>(null)
 
-const { data: retentionData, loading, error: loadError, load: loadData } = useDataFetch(
-  () => (api as any).GET('/api/v1/admin/runs/retention') as Promise<{ data?: RetentionConfig; error?: { detail?: string } }>,
-)
+const candidates = ref<RetentionCandidate[]>([])
+const totalCount = ref(0)
+const totalEstimatedBytes = ref(0)
+const pipelines = ref<PipelineResponse[]>([])
+const loading = ref(false)
+const error = ref<string | null>(null)
 
-const retentionDays = computed(() => retentionData.value?.retention_days ?? null)
-const savingRetention = ref(false)
-const retentionSaveError = ref<string | null>(null)
-const retentionSaveSuccess = ref(false)
+const exporting = ref(false)
+const exportError = ref<string | null>(null)
+const exportSuccess = ref<string | null>(null)
 
-const { data: storageResp, loading: storageLoading, error: storageError, load: loadStorageInfo } = useDataFetch(
-  () => (api as any).GET('/api/v1/admin/runs/storage') as Promise<{ data?: StorageInfo; error?: { detail?: string } }>,
-  { initialValue: { total_runs: 0, status_breakdown: {}, estimated_saved_bytes: 0 } as StorageInfo }
-)
-
-const storageInfo = computed(() => storageResp.value ?? { total_runs: 0, status_breakdown: {}, estimated_saved_bytes: 0 } as StorageInfo)
-
-const purgeAge = ref<number | null>(null)
 const purging = ref(false)
 const purgeError = ref<string | null>(null)
-const purgeResult = ref<string | null>(null)
+const purgeResult = ref<PurgeResponse | null>(null)
+const showPurgeConfirm = ref(false)
 
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  const val = bytes / Math.pow(1024, i)
-  return `${val.toFixed(1)} ${units[i]}`
+const pipelineOptions = computed(() => pipelines.value.map(p => ({ value: p.id, label: p.name })))
+const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({ value: s, label: s.replace(/_/g, ' ') })))
+
+const terminalCandidates = computed(() => candidates.value.filter(c => TERMINAL_STATUSES.includes(c.status.toLowerCase())))
+
+function toIso(value: string): string | null {
+  if (!value) return null
+  const d = new Date(value)
+  return isNaN(d.getTime()) ? null : d.toISOString()
 }
 
-async function saveRetention() {
-  savingRetention.value = true
-  retentionSaveError.value = null
-  retentionSaveSuccess.value = false
-  try {
-    const { error: err } = await (api as any).PUT('/api/v1/admin/runs/retention', {
-      body: { retention_days: retentionDays.value },
-    })
-    if (err) {
-      retentionSaveError.value = `Failed to save: ${formatApiError(err)}`
-    } else {
-      retentionSaveSuccess.value = true
-    }
-  } catch (e: unknown) {
-    retentionSaveError.value = `Failed to save: ${formatApiError(e)}`
-  } finally {
-    savingRetention.value = false
+function buildQuery(): Record<string, unknown> {
+  const q: Record<string, unknown> = { limit: 500 }
+  const df = toIso(dateFrom.value)
+  const dt = toIso(dateTo.value)
+  if (df) q.date_from = df
+  if (dt) q.date_to = dt
+  if (selectedPipelineId.value) q.pipeline_id = selectedPipelineId.value
+  if (selectedStatus.value) q.status = selectedStatus.value
+  return q
+}
+
+function buildBody(): Record<string, unknown> {
+  return {
+    date_from: toIso(dateFrom.value),
+    date_to: toIso(dateTo.value),
+    pipeline_id: selectedPipelineId.value,
+    status: selectedStatus.value,
   }
+}
+
+function resetFilters() {
+  dateFrom.value = ''
+  dateTo.value = ''
+  selectedPipelineId.value = null
+  selectedStatus.value = null
+  loadCandidates()
+}
+
+async function loadPipelines() {
+  const res = await api.GET('/api/v1/pipelines', {})
+  if (!res.error && res.data) {
+    pipelines.value = res.data.items
+  }
+}
+
+async function loadCandidates() {
+  loading.value = true
+  error.value = null
+  try {
+    const res = await api.GET('/api/v1/admin/run-retention/candidates', {
+      params: { query: buildQuery() as any },
+    })
+    if (res.error) throw new Error(formatApiError(res.error))
+    const data: CandidatesResponse | undefined = res.data as CandidatesResponse | undefined
+    candidates.value = data?.runs ?? []
+    totalCount.value = data?.total_count ?? 0
+    totalEstimatedBytes.value = data?.total_estimated_bytes ?? 0
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : 'Failed to load candidates'
+  } finally {
+    loading.value = false
+  }
+}
+
+function openPurgeConfirm() {
+  purgeError.value = null
+  showPurgeConfirm.value = true
 }
 
 async function executePurge() {
-  if (!purgeAge.value || purgeAge.value < 1) {
-    purgeError.value = 'Please enter a valid number of days.'
-    return
-  }
-  if (!window.confirm(`This will permanently delete all runs older than ${purgeAge.value} days. Continue?`)) {
-    return
-  }
   purging.value = true
   purgeError.value = null
-  purgeResult.value = null
   try {
-    const { data, error: err } = await (api as any).POST('/api/v1/admin/runs/purge', {
-      body: { older_than_days: purgeAge.value },
+    const res = await api.POST('/api/v1/admin/run-retention/purge', {
+      body: { ...buildBody(), confirm: true } as any,
     })
-    if (err) {
-      purgeError.value = `Purge failed: ${formatApiError(err)}`
-    } else if (data) {
-      const resp = data as PurgeResult
-      purgeResult.value = `Purge completed. ${resp.deleted_count} run(s) deleted.`
-      loadStorageInfo()
-    }
+    if (res.error) throw new Error(formatApiError(res.error))
+    purgeResult.value = res.data as PurgeResponse
+    showPurgeConfirm.value = false
+    await loadCandidates()
   } catch (e: unknown) {
-    purgeError.value = `Purge failed: ${formatApiError(e)}`
+    purgeError.value = e instanceof Error ? e.message : 'Purge failed'
+    showPurgeConfirm.value = false
   } finally {
     purging.value = false
   }
 }
 
-planStore.fetchPlan()
+async function exportFile() {
+  exporting.value = true
+  exportError.value = null
+  exportSuccess.value = null
+  try {
+    const res = await fetch('/api/v1/admin/run-retention/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify(buildBody()),
+    })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(formatApiError(detail) || `Export failed: ${res.status}`)
+    }
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'run-retention-export.ndjson'
+    a.click()
+    URL.revokeObjectURL(url)
+    exportSuccess.value = 'Export downloaded.'
+  } catch (e: unknown) {
+    exportError.value = e instanceof Error ? e.message : 'Export failed'
+  } finally {
+    exporting.value = false
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  const val = bytes / Math.pow(1024, i)
+  return `${val.toFixed(1)} ${units[i]}`
+}
+
+function formatDate(iso: string | null): string {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+}
+
+function shortId(id: string): string {
+  return id.length > 8 ? `${id.slice(0, 8)}…` : id
+}
+
+function pipelineName(id: string): string {
+  const p = pipelines.value.find(p => p.id === id)
+  return p ? p.name : shortId(id)
+}
+
+function statusBadge(status: string): string {
+  if (status === 'complete') return 'bg-success/15 text-success'
+  if (status === 'failed') return 'bg-destructive/15 text-destructive'
+  if (status === 'cancelled' || status === 'stalled') return 'bg-muted text-muted-foreground'
+  return 'bg-secondary text-secondary-foreground'
+}
+
+loadPipelines()
+loadCandidates()
 </script>

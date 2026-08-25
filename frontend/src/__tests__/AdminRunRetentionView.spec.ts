@@ -1,173 +1,142 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { createPinia, setActivePinia } from 'pinia'
-import { nextTick } from 'vue'
-import { usePlanStore } from '../stores/planStore'
+import type { Mock } from 'vitest'
 
 vi.mock('../lib/api/client', () => ({
   api: {
-    GET: vi.fn().mockImplementation((path: string) => {
-      if (path === '/api/v1/admin/runs/retention') {
-        return Promise.resolve({ data: { retention_days: 90 }, error: null })
-      }
-      if (path === '/api/v1/admin/runs/storage') {
-        return Promise.resolve({
-          data: {
-            total_runs: 150,
-            status_breakdown: { completed: 100, failed: 30, running: 20 },
-            estimated_saved_bytes: 524288000,
-          },
-          error: null,
-        })
-      }
-      if (path === '/api/v1/admin/feature-flags') {
-        return Promise.resolve({
-          data: {
-            license: { tier: 'team', has_license_key: true, is_valid: true },
-            flags: [{ name: 'admin_run_retention', description: '', tier: 'team', currently_active: true, depends_on: null }],
-            would_activate: [],
-          },
-          error: null,
-        })
-      }
-      return Promise.resolve({ data: null, error: null })
-    }),
-    PUT: vi.fn().mockResolvedValue({ data: null, error: null }),
-    POST: vi.fn().mockResolvedValue({ data: { deleted_count: 42 }, error: null }),
+    GET: vi.fn(),
+    POST: vi.fn(),
   },
   getAccessToken: vi.fn().mockReturnValue('mock-token'),
+  getAuthHeaders: vi.fn().mockReturnValue({}),
 }))
 
 import AdminRunRetentionView from '../views/AdminRunRetentionView.vue'
+import { api } from '../lib/api/client'
+
+const mockPipelines = {
+  items: [
+    { id: 'pipeline-1', name: 'Alpha Pipeline' },
+    { id: 'pipeline-2', name: 'Beta Pipeline' },
+  ],
+  total: 2,
+  page: 1,
+  page_size: 100,
+  has_more: false,
+}
+
+const mockCandidates = {
+  runs: [
+    { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeffffffff', created_at: '2026-08-01T00:00:00Z', status: 'complete', pipeline_id: 'pipeline-1', thread_id: 'thread-1', estimated_bytes: 26214400 },
+    { id: '11111111-2222-3333-4444-555566667777', created_at: '2026-08-02T00:00:00Z', status: 'failed', pipeline_id: 'pipeline-1', thread_id: 'thread-2', estimated_bytes: 26214400 },
+    { id: '99999999-8888-7777-6666-555544443333', created_at: '2026-08-03T00:00:00Z', status: 'running', pipeline_id: 'pipeline-2', thread_id: 'thread-3', estimated_bytes: 10485760 },
+  ],
+  total_count: 3,
+  total_estimated_bytes: 62914560,
+}
+
+function setupDefaultMock() {
+  ;(api.GET as Mock).mockImplementation(async (url: string) => {
+    if (url === '/api/v1/pipelines') {
+      return { data: mockPipelines, error: undefined }
+    }
+    if (url === '/api/v1/admin/run-retention/candidates') {
+      return { data: mockCandidates, error: undefined }
+    }
+    return { data: null, error: undefined }
+  })
+  ;(api.POST as Mock).mockResolvedValue({
+    data: { purged_runs: 2, purged_checkpoints: 6, freed_estimated_bytes: 52428800 },
+    error: undefined,
+  })
+}
+
+async function mountView() {
+  const pinia = createPinia()
+  setActivePinia(pinia)
+  const wrapper = mount(AdminRunRetentionView, {
+    global: {
+      plugins: [pinia],
+      stubs: { FeatureGate: { template: '<div><slot /></div>' } },
+    },
+  })
+  for (let i = 0; i < 10; i++) {
+    await flushPromises()
+  }
+  return wrapper
+}
 
 describe('AdminRunRetentionView', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.clearAllMocks()
+    setupDefaultMock()
   })
 
   it('renders without crashing', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
-
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
+    const wrapper = await mountView()
     expect(wrapper.exists()).toBe(true)
     expect(wrapper.text()).toContain('Run Retention')
   })
 
-  it('displays the current retention period from API', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
-
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
-    const input = wrapper.find('[data-testid="admin-run-retention-days"]') as any
-    expect(input.element.value).toBe('90')
+  it('shows candidate summary from the API', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('[data-testid="admin-run-retention-total-runs"]').text()).toBe('3')
+    expect(wrapper.find('[data-testid="admin-run-retention-total-bytes"]').text()).toBe('60.0 MB')
+    expect(wrapper.find('[data-testid="admin-run-retention-terminal-runs"]').text()).toBe('2')
   })
 
-  it('shows storage info with total runs count', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
-
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
-    const totalRuns = wrapper.find('[data-testid="admin-run-retention-total-runs"]')
-    expect(totalRuns.text()).toBe('150')
+  it('lists candidates with pipeline names resolved', async () => {
+    const wrapper = await mountView()
+    expect(wrapper.find('[data-testid="admin-run-retention-candidates-table"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('Alpha Pipeline')
   })
 
-  it('renders manual purge section with age input and button', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
-
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
-    const ageInput = wrapper.find('[data-testid="admin-run-retention-purge-age"]')
-    expect(ageInput.exists()).toBe(true)
-
-    const purgeButton = wrapper.find('[data-testid="admin-run-retention-purge-now"]')
-    expect(purgeButton.exists()).toBe(true)
-    expect(purgeButton.text()).toContain('Purge Now')
+  it('shows a warning that in-flight runs are never purged', async () => {
+    const wrapper = await mountView()
+    const warning = wrapper.find('[data-testid="admin-run-retention-warning"]')
+    expect(warning.exists()).toBe(true)
+    expect(warning.text().toLowerCase()).toContain('never')
   })
 
-  it('shows error when purge age is empty', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
+  it('calls purge endpoint with confirm:true after confirming the dialog', async () => {
+    const wrapper = await mountView()
+    await wrapper.find('[data-testid="admin-run-retention-purge"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
 
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
+    const confirmBtn = document.body.querySelector('[data-testid="admin-run-retention-purge-confirm"]') as HTMLElement
+    expect(confirmBtn).not.toBeNull()
+    confirmBtn.click()
+    await flushPromises()
+    await flushPromises()
 
-    await nextTick()
-    await nextTick()
-    await nextTick()
+    const postMock = api.POST as Mock
+    const purgeCall = postMock.mock.calls.find((c: unknown[]) => c[0] === '/api/v1/admin/run-retention/purge')
+    expect(purgeCall).toBeDefined()
+    const body = (purgeCall![1] as { body: { confirm: boolean } }).body
+    expect(body.confirm).toBe(true)
 
-    const purgeButton = wrapper.find('[data-testid="admin-run-retention-purge-now"]')
-    await purgeButton.trigger('click')
-    await nextTick()
-
-    expect(wrapper.text()).toContain('Please enter a valid number of days.')
+    const result = wrapper.find('[data-testid="admin-run-retention-purge-result"]')
+    expect(result.text()).toContain('Purged 2 run(s)')
   })
 
-  it('calls save retention API on save button click', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
+  it('disables the purge button when no terminal candidates match', async () => {
+    const runningOnly = {
+      runs: [
+        { id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeffffffff', created_at: '2026-08-01T00:00:00Z', status: 'running', pipeline_id: 'pipeline-1', thread_id: 'thread-1', estimated_bytes: 26214400 },
+      ],
+      total_count: 1,
+      total_estimated_bytes: 26214400,
+    }
+    ;(api.GET as Mock).mockImplementation(async (url: string) => {
+      if (url === '/api/v1/pipelines') return { data: mockPipelines, error: undefined }
+      if (url === '/api/v1/admin/run-retention/candidates') return { data: runningOnly, error: undefined }
+      return { data: null, error: undefined }
     })
 
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
-    const saveButton = wrapper.find('[data-testid="admin-run-retention-save"]')
-    await saveButton.trigger('click')
-    await nextTick()
-
-    const { api } = await import('../lib/api/client')
-    expect(api.PUT).toHaveBeenCalledWith('/api/v1/admin/runs/retention', {
-      body: { retention_days: 90 },
-    })
-  })
-
-  it('shows estimated storage saved in human-readable format', async () => {
-    const store = usePlanStore()
-    store.$patch({ features: { admin_run_retention: true } })
-
-    const wrapper = mount(AdminRunRetentionView, {
-      global: { plugins: [createPinia()] },
-    })
-
-    await nextTick()
-    await nextTick()
-    await nextTick()
-
-    const estimatedSaved = wrapper.find('[data-testid="admin-run-retention-estimated-saved"]')
-    expect(estimatedSaved.text()).toBe('500.0 MB')
+    const wrapper = await mountView()
+    expect(wrapper.find('[data-testid="admin-run-retention-purge"]').attributes('disabled')).toBeDefined()
   })
 })
