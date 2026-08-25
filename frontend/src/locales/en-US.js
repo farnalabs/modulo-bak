@@ -1379,6 +1379,11 @@ export default {
       "org_lifetime_ceiling_usd": "Org lifetime ceiling (USD)",
       "org_lifetime_ceiling_help": "Maximum lifetime spend for the organisation. 0 blocks all runs. Empty = no limit.",
       "remaining_budget": "Remaining budget",
+      "per_run_ceiling_aria": "Per-run ceiling",
+      "org_lifetime_ceiling_aria": "Org lifetime ceiling",
+      "no_limit": "No limit",
+      "saving": "Saving...",
+      "save": "Save",
       "ceiling_updated": "Ceilings updated."
     },
     "CostComponentsView": {

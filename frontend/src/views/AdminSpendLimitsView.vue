@@ -49,13 +49,13 @@
                     <div class="flex-1">
                       <span class="mb-1.5 block text-xs font-medium text-muted-foreground">{{ $t('views.AdminSpendLimitsView.per_run_ceiling_usd') }}</span>
                       <InputText
-                        aria-label="Per-run ceiling"
+                        :aria-label="$t('views.AdminSpendLimitsView.per_run_ceiling_aria')"
                         :model-value="ceilingMaxRun == null ? '' : String(ceilingMaxRun)"
                         @update:model-value="(v: any) => ceilingMaxRun = v === '' ? null : Number(v)"
                         type="number"
                         min="0"
                         step="0.01"
-                        placeholder="No limit"
+                        :placeholder="$t('views.AdminSpendLimitsView.no_limit')"
                         data-testid="admin-spend-limits-max-run-cost"
                       />
                       <p class="mt-1 text-xs text-muted-foreground">{{ $t('views.AdminSpendLimitsView.per_run_ceiling_help') }}</p>
@@ -66,13 +66,13 @@
                     <div class="flex-1">
                       <span class="mb-1.5 block text-xs font-medium text-muted-foreground">{{ $t('views.AdminSpendLimitsView.org_lifetime_ceiling_usd') }}</span>
                       <InputText
-                        aria-label="Org lifetime ceiling"
+                        :aria-label="$t('views.AdminSpendLimitsView.org_lifetime_ceiling_aria')"
                         :model-value="ceilingSpend == null ? '' : String(ceilingSpend)"
                         @update:model-value="(v: any) => ceilingSpend = v === '' ? null : Number(v)"
                         type="number"
                         min="0"
                         step="0.01"
-                        placeholder="No limit"
+                        :placeholder="$t('views.AdminSpendLimitsView.no_limit')"
                         data-testid="admin-spend-limits-spend-ceiling"
                       />
                       <p class="mt-1 text-xs text-muted-foreground">{{ $t('views.AdminSpendLimitsView.org_lifetime_ceiling_help') }}</p>
@@ -88,7 +88,7 @@
 
                   <div class="flex items-center gap-3">
                     <Button :disabled="savingCeiling" data-testid="admin-spend-limits-ceiling-save" @click="saveCeiling">
-                      {{ savingCeiling ? 'Saving...' : 'Save' }}
+                      {{ savingCeiling ? $t('views.AdminSpendLimitsView.saving') : $t('views.AdminSpendLimitsView.save') }}
                     </Button>
                     <p v-if="ceilingSaveError" class="text-xs text-destructive">{{ ceilingSaveError }}</p>
                     <p v-if="ceilingSaveSuccess" class="text-xs text-success">{{ $t('views.AdminSpendLimitsView.ceiling_updated') }}</p>
@@ -193,6 +193,7 @@ import Button from 'primevue/button'
 import PageTabs from "../components/PageTabs.vue"
 import { formatMoney } from '../lib/money'
 import { useOrgCurrency } from '../composables/useOrgCurrency'
+import type { components } from '../lib/api/schema'
 
 const planStore = usePlanStore()
 const { currencyCode, loadCurrency } = useOrgCurrency()
@@ -296,25 +297,18 @@ const savingCeiling = ref(false)
 const ceilingSaveError = ref<string | null>(null)
 const ceilingSaveSuccess = ref(false)
 
-interface SpendCeilingData {
-  max_run_cost: number | null
-  spend_ceiling: number | null
-  org_cumulative_spend_usd: number
-  remaining_budget_usd: number | null
-}
-
 async function loadCeiling() {
   ceilingLoading.value = true
   ceilingLoadError.value = null
   try {
-    const { data, error: err } = await (api as any).GET('/api/v1/admin/costs/ceiling')
+    const { data, error: err } = await api.GET('/api/v1/admin/costs/ceiling')
     if (err) {
       ceilingLoadError.value = `Failed to load: ${formatApiError(err)}`
     } else if (data) {
-      const resp = data as SpendCeilingData
-      ceilingMaxRun.value = resp.max_run_cost
-      ceilingSpend.value = resp.spend_ceiling
-      ceilingRemaining.value = resp.remaining_budget_usd
+      const resp: components['schemas']['SpendCeilingResponse'] = data
+      ceilingMaxRun.value = resp.max_run_cost ?? null
+      ceilingSpend.value = resp.spend_ceiling ?? null
+      ceilingRemaining.value = resp.remaining_budget_usd ?? null
     }
   } catch (e: unknown) {
     ceilingLoadError.value = `Failed to load: ${formatApiError(e)}`
@@ -328,7 +322,7 @@ async function saveCeiling() {
   ceilingSaveError.value = null
   ceilingSaveSuccess.value = false
   try {
-    const { error: err } = await (api as any).PUT('/api/v1/admin/costs/ceiling', {
+    const { error: err } = await api.PUT('/api/v1/admin/costs/ceiling', {
       body: { max_run_cost: ceilingMaxRun.value, spend_ceiling: ceilingSpend.value },
     })
     if (err) {
