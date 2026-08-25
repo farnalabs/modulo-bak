@@ -19,7 +19,7 @@ import asyncio
 import threading
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, cast
 
 import jmespath
@@ -107,7 +107,7 @@ def _make_gate_id(source: str, target: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_router_pass_fn(node_id: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def _make_router_pass_fn(node_id: str) -> Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]:
     """A pass-through node function for Router nodes.
 
     A Router node makes no tool/agent call — it exists solely to host the

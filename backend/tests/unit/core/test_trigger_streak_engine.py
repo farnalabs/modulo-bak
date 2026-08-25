@@ -264,8 +264,11 @@ class TestDeactivateSQL:
         drained (never counted, never breaking the walk; never cancelled). The
         status set is derived from TERMINAL_STATUSES (single source of truth)."""
         sql = ts._NO_DELIVERY_DEACTIVATE_SQL
-        assert "r.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
-        assert "r3.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
+        terminal_statuses = (
+            "'budget_exceeded','cancelled','complete','eval_failed','failed','router_no_match','stalled'"
+        )
+        assert f"r.status IN ({terminal_statuses})" in sql
+        assert f"r3.status IN ({terminal_statuses})" in sql
         assert "pending" not in sql
 
     def test_guarded_atomic_update(self) -> None:
@@ -302,7 +305,7 @@ class TestMigrationBackfillGrace:
         assert 'ADD COLUMN IF NOT EXISTS "streak_epoch" timestamp with time zone DEFAULT CURRENT_TIMESTAMP' in source
         assert "ix_runs_unclassified_terminal" in source
         heads = ScriptDirectory(str(versions_dir.parent)).get_heads()
-        assert heads == ["0136_rename_remy_user_id_to_account_id"], f"expected a single head, got {heads}"
+        assert heads == ["0137_add_router_no_match_status"], f"expected a single head, got {heads}"
 
 
 # ---------------------------------------------------------------------------

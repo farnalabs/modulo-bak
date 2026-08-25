@@ -8368,7 +8368,7 @@ export interface components {
          * AnalyticsStatus
          * @enum {string}
          */
-         AnalyticsStatus: "pending" | "running" | "awaiting_human" | "claimed" | "complete" | "failed" | "cancelled" | "eval_failed" | "stalled" | "budget_exceeded" | "router_no_match";
+        AnalyticsStatus: "pending" | "running" | "awaiting_human" | "claimed" | "complete" | "failed" | "cancelled" | "eval_failed" | "stalled";
         /**
          * AnalyticsTriggerType
          * @enum {string}
@@ -12590,7 +12590,7 @@ export interface components {
              * @default agent
              * @enum {string}
              */
-            node_type: "agent" | "manual" | "composite" | "sandbox_agent";
+            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "router" | "hitl";
             /** Agent Id */
             agent_id?: string | null;
             position: components["schemas"]["GraphPosition"];
@@ -12714,6 +12714,20 @@ export interface components {
              * @description Filesystem detector: globs of sandbox paths whose change counts as activity.
              */
             watch_globs?: string[];
+            /**
+             * Router Config
+             * @description Router node config: {mode, rules:[{guard (JMESPath), target|target_port}|{default, target}]}. Required for node_type='router'.
+             */
+            router_config?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Hitl Config
+             * @description HITL node config (mode, form_schema_ref, reject_target, claim_team_id, claim_expiry_min, human_only, eval_before_interrupt, required_team_id, overdue_threshold_minutes, eval_condition, condition). Compiles to the existing synthetic-gate path. Required for node_type='hitl'.
+             */
+            hitl_config?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** PipelineGraphResponse */
         PipelineGraphResponse: {

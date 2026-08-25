@@ -1620,7 +1620,7 @@ def make_router_node_fn(
     # Store (guard_expr, target) tuples. The guards are evaluated through the
     # shared JMESPath evaluator so Router and the conditional-edge compile path
     # share ONE truthiness rule.
-    rule_targets: list[tuple[str | None, str]] = []
+    rule_targets: list[tuple[str | None, str | None]] = []
     default_target: str | None = None
     for rule in rules:
         target = rule.get("target") or rule.get("target_port")
@@ -1631,14 +1631,16 @@ def make_router_node_fn(
 
     def _router(state: dict[str, Any]) -> str:
         for guard, target in rule_targets:
-            if evaluate_jmespath_condition(state, guard):
+            if target is not None and evaluate_jmespath_condition(state, guard):
                 return target
         if classifier_mode:
             label = state.get("_llm_next_node")
             if label is not None:
                 for rule in rules:
                     if rule.get("label") == label:
-                        return rule.get("target") or rule.get("target_port")
+                        matched: str | None = rule.get("target") or rule.get("target_port")
+                        if matched is not None:
+                            return matched
         if default_target:
             return default_target
         raise RouterNoMatchError(node_id=node_id)
