@@ -312,6 +312,51 @@ regression that silently weakens the suite:
   literal that *contains* ``ANY`` (``[a, ANY]``) makes ``in`` always PASS and
   ``not in`` always FAIL, because the element match short-circuits on
   ``x == ANY``
+- a freshly-constructed Mock nested *inside* a container literal in an
+  ``assert`` — ``assert result == {'status': MagicMock()}``,
+  ``assert result != [AsyncMock()]``, ``assert {'k': Mock()} in x``. A fresh
+  Mock compares by identity (``__eq__`` defaults to ``is``), so ``==`` against
+  a container it can never equal ALWAYS FAILS and ``!=`` ALWAYS PASSES, and
+  ``assert [Mock()]`` / ``assert (Mock(),)`` (a non-empty container is always
+  truthy) ALWAYS PASS — every one decided at source time, never by the code
+  under test. This is the nested-or-direct-container twin of the Mock-
+  constructor lens, which owns only the *direct* positions (the assert's test
+  expression, a ``not``-wrap, or a single comparison operand): a fresh
+  constructor buried in a list/dict/tuple/set literal is a different AST shape
+  that the direct lens provably misses. The configure-then-assert fix is the
+  same — configure the double (``return_value``/``side_effect``) and verify
+  through ``assert_called*``/attribute checks instead of comparing to a
+  constructor call
+- a direct mutation of the process environment made without the ``monkeypatch``
+  fixture in scope — subscript set/delete on the ``os.environ`` mapping
+  (``os.environ[key] = ...`` / ``del os.environ[key]`` and the
+  ``from os import environ`` twin), the mutating ``environ`` methods
+  (``pop``/``update``/``setdefault``/``clear`` and their ``__*__`` / pydantic
+  twins), and ``os.putenv()``/``os.unsetenv()``. A test that mutates
+  ``os.environ`` and never restores it leaks state into every test that runs
+  afterwards, so the suite becomes order-dependent: a test can pass alone and
+  silently corrupt a sibling (or be corrupted by one) in the full run.
+  ``monkeypatch.setenv()``/``monkeypatch.delenv()`` restore the value at
+  teardown automatically and are the pytest-blessed form — a function that
+  requests ``monkeypatch`` is left alone even when it mutates ``os.environ``
+  directly. Reads (``os.getenv``, ``os.environ.get``, subscript loads) and the
+  module-level ``os.environ.setdefault(...)`` bootstrap (the   ``conftest.py``
+  pattern that pins ``DATABASE_URL`` once at import time, which is idempotent
+  configuration rather than between-test leakage) are deliberately left alone
+- a direct mutation of the process *working directory* made without the
+  ``monkeypatch`` fixture in scope — ``os.chdir(...)`` (either spelling),
+  ``os.fchdir(...)``, and ``Path.chdir()``. A test that changes the current
+  working directory and never restores it leaks that directory into every test
+  that runs afterwards, so the suite becomes order-dependent: a test that (say)
+  resolves a config template relative to ``os.getcwd()``, or writes a file into
+  ``Path.cwd()``, behaves one way alone in CI and another way after a sibling
+  that ``os.chdir``'d (or that itself depends on the pristine repo-root CWD).
+  ``monkeypatch.chdir(tmp_path)`` restores the original directory at teardown
+  automatically and is the pytest-blessed form — a function that requests
+  ``monkeypatch`` is trusted even when it ``os.chdir``'s directly. Reads of the
+  working directory (``os.getcwd()``, ``Path.cwd()``) are left alone, as are
+  directory *creation* calls (``os.makedirs``/``os.mkdir``/``Path.mkdir``)
+  that never change the process CWD
 
 Every lens is written so it reports actionable file:line violations instead
 of a bare "assert not violations", mirroring the sibling architecture tests.
@@ -4271,6 +4316,122 @@ def test_mock_constructor_lens_flags_dead_asserts():
         assert not _mock_constructor_assert_violations(tree), f"lens should NOT flag:\n{source}"
 
 
+def _mock_constructor_container_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``assert`` whose test
+    expression nests a freshly-constructed Mock *inside* a container literal
+    (``[Mock()]``, ``{'k': MagicMock()}``, ``(AsyncMock(),)``, ``{Mock()}``).
+
+    A fresh Mock is only meaningful as an obligation for ``assert_called_with``
+    to match; inside a container it is compared by identity (``__eq__``
+    defaults to ``is``), so ``assert result == {'s': MagicMock()}`` ALWAYS
+    FAILS and ``assert result != [...]`` ALWAYS PASSES no matter what
+    ``result`` evaluates to, while ``assert [Mock()]`` (a non-empty container
+    is always truthy) ALWAYS PASSES. The outcome is fixed at source time in
+    every case. Only the *container-nesting* position is flagged here —
+    a fresh constructor that is the assert's test expression, a ``not``-wrap,
+    or the direct operand of a single-operator comparison belongs to the
+    Mock-constructor lens, so the two never double-report the same line. No
+    name resolution is involved, so a mock bound to a name elsewhere is never
+    implicated and the lens has no false positives from mocking assignments or
+    ``patch`` bindings."""
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        # Hunt for a fresh-mock constructor nested anywhere inside a container
+        # literal that itself sits inside the assert's test expression.
+        for container in ast.walk(node.test):
+            if not isinstance(container, (ast.List, ast.Dict, ast.Tuple, ast.Set)):
+                continue
+            elements = (
+                list(container.elts)
+                if isinstance(container, (ast.List, ast.Tuple, ast.Set))
+                else (list(container.keys) + list(container.values))
+            )
+            if any(_is_mock_constructor_call(el) for el in elements):
+                found.append(
+                    (
+                        node.lineno,
+                        f"assert {ast.unparse(node.test)} — a fresh Mock nested inside a "
+                        "container literal is compared by identity, so the outcome is fixed "
+                        "at source time",
+                    )
+                )
+                break
+    return found
+
+
+def test_no_mock_constructor_in_container_asserts():
+    """An ``assert`` that nests a freshly-constructed Mock *inside* a container
+    literal is dead code with a fixed outcome, like the direct Mock-constructor
+    lens. A fresh Mock compares by identity (``__eq__`` defaults to ``is``), so
+    ``assert result == {'s': MagicMock()}`` always fails and
+    ``assert result != [AsyncMock()]`` always passes regardless of what
+    ``result`` evaluates to, and ``assert [Mock()]`` always passes because a
+    non-empty container is truthy. The nested-container spelling is a distinct
+    AST shape from the direct positions the Mock-constructor lens owns, so it
+    needs its own detector. The double should be configured
+    (``return_value``/``side_effect``) and asserted through ``assert_called*``
+    /attribute checks, never compared to through a container wrapper."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _mock_constructor_container_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} assertion(s) against a newly-constructed Mock nested in a container.\n"
+        "A fresh Mock compares by identity and a non-empty container is always truthy, so the\n"
+        "outcome is decided at source time, never by the code under test. Configure the double\n"
+        "(return_value/side_effect) and assert through assert_called* instead.\n" + "\n".join(violations)
+    )
+
+
+def test_mock_constructor_container_lens_flags_nested_constructors():
+    """Synthetic positive/negative control for the container-nested Mock lens: it
+    must flag an ``assert`` that nests a fresh Mock constructor inside a
+    list/dict/tuple/set literal in any operand position (equality with the
+    container, membership against it, bare truthiness) and ignore the direct
+    constructor positions owned by the Mock-constructor lens (bare, ``not``-wrapped,
+    single-comparison operand), already-bound mock names, mocks passed as call
+    arguments, and containers built from non-mock values (including ``ANY``)."""
+    positive_sources = [
+        "def test_foo():\n    assert result == [MagicMock()]\n",
+        "def test_foo():\n    assert result != [AsyncMock()]\n",
+        "def test_foo():\n    assert result == {'status': MagicMock()}\n",
+        "def test_foo():\n    assert result in (Mock(), 'x')\n",
+        "def test_foo():\n    assert result not in {MagicMock()}\n",
+        "def test_foo():\n    assert [Mock()]\n",
+        "def test_foo():\n    assert (AsyncMock(),)\n",
+        "def test_foo():\n    assert {'k': mocker.MagicMock()} == result\n",
+        "def test_foo():\n    assert result == [mock.Mock()]\n",
+        "def test_foo():\n    assert result == {'a': 1, 'b': unittest.mock.AsyncMock()}\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _mock_constructor_container_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert Mock()\n",
+        "def test_foo():\n    assert result == Mock()\n",
+        "def test_foo():\n    assert not MagicMock()\n",
+        "def test_foo():\n    assert result is not None\n",
+        "def test_foo():\n    mock = MagicMock()\n    assert result == [mock]\n",
+        "def test_foo():\n    assert result == [m]\n",
+        "def test_foo():\n    assert result == [1, 2]\n",
+        "def test_foo():\n    assert result == {'k': 'v'}\n",
+        "def test_foo():\n    assert result == [ANY]\n",
+        "def test_foo():\n    mock.assert_called_with([1, MagicMock(return_value=2)])\n",
+        "def test_foo():\n    assert result == []\n",
+        "def test_foo():\n    assert result == {}\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _mock_constructor_container_violations(tree), f"lens should NOT flag:\n{source}"
+
+
 _MOCK_ASSERT_METHOD_NAMES = frozenset(
     {
         "assert_called",
@@ -4931,3 +5092,300 @@ def test_any_equality_lens_flags_fixed_outcomes():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _any_equality_tautologies(tree), f"lens should NOT flag:\n{source}"
+
+
+_MUTATING_ENVIRON_METHODS = frozenset({"pop", "update", "setdefault", "clear", "__setitem__", "__delitem__"})
+# Method names on ``os.environ`` that mutate the mapping in place. The
+# ``__setitem__``/``__delitem__`` twins cover the pydantic-spelled
+# ``os.environ["K"] = ...`` / ``del os.environ["K"]`` subscripts written as
+# method calls.
+
+
+def _is_environ_reference(node: ast.AST) -> bool:
+    """Return True for either spelling of the process-environment mapping:
+    the attribute path ``os.environ`` (``import os``) and the bare ``environ``
+    name (``from os import environ``)."""
+    if isinstance(node, ast.Attribute):
+        return node.attr == "environ"
+    return isinstance(node, ast.Name) and node.id == "environ"
+
+
+def _environ_mutation_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every direct ``os.environ``
+    mutation made without the ``monkeypatch`` fixture in scope.
+
+    A test that mutates the process environment and never restores it leaks
+    state into every test that runs afterwards, so the suite becomes
+    order-dependent: a test can pass alone and silently corrupt a sibling (or
+    be corrupted by one) in the full run. ``monkeypatch.setenv()`` /
+    ``monkeypatch.delenv()`` restore the value at teardown automatically and
+    are the pytest-blessed form — a function that requests ``monkeypatch`` is
+    left alone even when it mutates ``os.environ`` directly. The recognised
+    mutation spellings are the subscript store/delete on either environ
+    spelling (``os.environ[key] = ...`` / ``del os.environ[key]``), the
+    mutating ``environ`` methods (``pop``/``update``/``setdefault``/``clear``
+    and their ``__*__`` twins), and the ``os.putenv()`` / ``os.unsetenv()``
+    builtins. Reads (``os.getenv``, ``os.environ.get``, subscript loads) are
+    left alone, and each function scope decides its own guard — a nested
+    helper without ``monkeypatch`` stays flagged even inside a guarded test.
+    Only mutations *inside a function body* are flagged: a module-level
+    ``os.environ.setdefault(...)`` bootstrap (the ``conftest.py`` pattern that
+    pins ``DATABASE_URL``/``FERNET_KEY`` once at import time) is idempotent
+    environment configuration, not between-test leakage, and is deliberately
+    left alone.
+    """
+    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    found: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def _record(node: ast.AST, fn: ast.AST, kind: str) -> None:
+        key = (node.lineno, ast.unparse(node))
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(
+            (
+                node.lineno,
+                f"{ast.unparse(node)} in {fn.name} mutates the process environment without monkeypatch ({kind})",
+            )
+        )
+
+    for fn in functions:
+        guarded = any(arg.arg == "monkeypatch" for arg in fn.args.args)
+        pending = list(fn.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not guarded:
+                if isinstance(node, ast.Subscript) and _is_environ_reference(node.value):
+                    if isinstance(node.ctx, (ast.Store, ast.Del)):
+                        _record(node, fn, "subscript set/del")
+                elif isinstance(node, ast.Call):
+                    func = node.func
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and _is_environ_reference(func.value)
+                        and func.attr in _MUTATING_ENVIRON_METHODS
+                    ):
+                        _record(node, fn, f"environ.{func.attr}()")
+                    elif (
+                        isinstance(func, ast.Attribute)
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "os"
+                        and func.attr in ("putenv", "unsetenv")
+                    ):
+                        _record(node, fn, f"os.{func.attr}()")
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def test_no_environ_mutation_without_monkeypatch():
+    """A test that mutates ``os.environ`` and never restores it leaks process
+    state into every later test in the same run, so the suite becomes
+    order-dependent: a test can pass on its own (or in the first hop of a
+    --randomly shuffle) and silently corrupt the sibling that runs after it,
+    and the failure surfaces at the wrong test far from the offending
+    mutation. ``monkeypatch.setenv()``/``monkeypatch.delenv()`` restore the
+    original value at teardown automatically and are the pytest-blessed form,
+    so a function that requests ``monkeypatch`` is trusted even when it writes
+    ``os.environ`` directly. This guards the subscript set/delete spellings,
+    the mutating ``environ`` methods, and ``os.putenv``/``os.unsetenv``.
+    Reads (``os.getenv``, ``os.environ.get``, subscript loads) and the
+    module-level ``conftest.py`` bootstrap are deliberately left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _environ_mutation_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} process-environment mutation(s) made without monkeypatch.\n"
+        "A direct os.environ mutation never restores the prior value, so it leaks state into\n"
+        "every later test in the run — the suite becomes order-dependent and fails at the wrong\n"
+        "test. Use monkeypatch.setenv()/monkeypatch.delenv(), which restore at teardown.\n" + "\n".join(violations)
+    )
+
+
+def test_environ_mutation_lens_flags_unguarded_mutations():
+    """Synthetic positive/negative control for the environ-mutation lens: it
+    must flag every direct mutation spelling (subscript store/delete on either
+    ``os.environ`` spelling, the ``environ`` mutating methods, and
+    ``os.putenv``/``os.unsetenv``) when the enclosing function does not request
+    ``monkeypatch``, and ignore reads, module-level bootstraps, mutations
+    inside a ``monkeypatch``-guarded function, nested helpers that *are*
+    guarded, and unrelated mutations."""
+    positive_sources = [
+        "def test_foo():\n    os.environ['K'] = 'v'\n",
+        "def test_foo():\n    del os.environ['K']\n",
+        "def test_foo():\n    environ['K'] = 'v'\n",
+        "def test_foo():\n    os.environ.pop('K')\n",
+        "def test_foo():\n    os.environ.update({'K': 'v'})\n",
+        "def test_foo():\n    os.environ.setdefault('K', 'v')\n",
+        "def test_foo():\n    os.environ.clear()\n",
+        "def test_foo():\n    os.putenv('K', 'v')\n",
+        "def test_foo():\n    os.unsetenv('K')\n",
+        "def test_foo():\n    def inner():\n        os.environ['K'] = 'v'\n",
+        "def test_foo():\n    os.environ['K'] = os.environ.get('OLD', '')\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _environ_mutation_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    m = monkeypatch\n    m.setenv('K', 'v')\n",
+        "def test_foo(monkeypatch):\n    os.environ['K'] = 'v'\n",
+        "def test_foo(monkeypatch):\n    os.environ.pop('K', None)\n",
+        "def test_foo(monkeypatch):\n    os.putenv('K', 'v')\n",
+        "def test_foo():\n    v = os.environ.get('K')\n",
+        "def test_foo():\n    v = os.getenv('K')\n",
+        "def test_foo():\n    v = os.environ['K']\n",
+        "def test_foo():\n    x = config['K'] = 'v'\n",
+        "def test_foo():\n    d = {}\n    d['K'] = 'v'\n",
+        "def test_foo():\n    os.makedirs('/tmp/x')\n",
+        "os.environ.setdefault('DATABASE_URL', 'sqlite://')\n",
+        "import os\nos.environ.setdefault('FERNET_KEY', 'x')\n",
+        "def test_foo(monkeypatch):\n    def inner(monkeypatch):\n        os.environ['K'] = 'v'\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _environ_mutation_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _chdir_reference(node: ast.AST) -> bool:
+    """Return True for the ``os.chdir`` spelling — ``import os`` + the
+    attribute path ``os.chdir(...)`` (and the ``os.fchdir`` twin)."""
+    if not isinstance(node, (ast.Attribute,)) or not isinstance(node.value, ast.Name):
+        return False
+    return node.value.id == "os" and node.attr in ("chdir", "fchdir")
+
+
+def _cwd_mutation_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every direct working-directory
+    mutation made without the ``monkeypatch`` fixture in scope.
+
+    A test that changes the process working directory and never restores it
+    leaks that directory into every test that runs afterwards, so the suite
+    becomes order-dependent: a sibling that (say) resolves a config template
+    relative to ``os.getcwd()``, or writes into ``Path.cwd()``, behaves
+    differently after the offender runs. ``monkeypatch.chdir(tmp_path)``
+    restores the original directory at teardown automatically and is the
+    pytest-blessed form — a function that requests ``monkeypatch`` is left
+    alone even when it changes the directory directly. The recognised
+    mutation spellings are ``os.chdir(path)``/``os.fchdir(fd)`` (the
+    ``import os`` attribute form), the bare ``chdir(path)`` name (the
+    ``from os import chdir`` twin), and the ``Path.chdir()`` method. Reads of
+    the working directory (``os.getcwd()``, ``Path.cwd()``) and directory
+    *creation* calls (``os.makedirs``/``os.mkdir``/``Path.mkdir``) never
+    change the process CWD and are deliberately left alone. Only mutations
+    *inside a function body* are flagged: a module-level ``os.chdir(...)``
+    bootstrap that pins the process CWD once at import time is idempotent
+    setup, not between-test leakage.
+    """
+    functions = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    found: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+
+    def _record(node: ast.AST, fn: ast.AST, kind: str) -> None:
+        key = (node.lineno, ast.unparse(node))
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(
+            (
+                node.lineno,
+                f"{ast.unparse(node)} in {fn.name} changes the working directory without monkeypatch ({kind})",
+            )
+        )
+
+    for fn in functions:
+        guarded = any(arg.arg == "monkeypatch" for arg in fn.args.args)
+        pending = list(fn.body)
+        while pending:
+            node = pending.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not guarded and isinstance(node, ast.Call):
+                func = node.func
+                if _chdir_reference(func):
+                    _record(node, fn, f"os.{func.attr}()")
+                elif isinstance(func, ast.Name) and func.id == "chdir":
+                    _record(node, fn, "bare chdir()")
+                elif isinstance(func, ast.Attribute) and func.attr == "chdir":
+                    receiver = func.value
+                    if not (isinstance(receiver, ast.Name) and receiver.id == "monkeypatch"):
+                        _record(node, fn, "Path.chdir()")
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def test_no_cwd_mutation_without_monkeypatch():
+    """A test that changes the process working directory and never restores it
+    leaks that directory into every later test in the same run, so the suite
+    becomes order-dependent: a test can pass on its own and silently corrupt a
+    sibling that (say) resolves config relative to ``os.getcwd()`` or writes
+    into ``Path.cwd()``. ``monkeypatch.chdir(tmp_path)`` restores the original
+    directory at teardown automatically and is the pytest-blessed form, so a
+    function that requests ``monkeypatch`` is trusted even when it changes the
+    directory directly. This guards the ``os.chdir``/``os.fchdir`` attribute
+    spellings, the bare ``chdir(...)`` name, and ``Path.chdir()``. Reads of
+    the working directory (``os.getcwd()``/``Path.cwd()``) and directory
+    *creation* calls (``os.makedirs``/``os.mkdir``) are deliberately left
+    alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _cwd_mutation_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} working-directory mutation(s) made without monkeypatch.\n"
+        "A direct os.chdir never restores the prior directory, so it leaks state into every\n"
+        "later test in the run — the suite becomes order-dependent and fails at the wrong\n"
+        "test. Use monkeypatch.chdir(tmp_path), which restores at teardown.\n" + "\n".join(violations)
+    )
+
+
+def test_cwd_mutation_lens_flags_unguarded_mutations():
+    """Synthetic positive/negative control for the cwd-mutation lens: it must
+    flag every direct spelling (``os.chdir``/``os.fchdir``, the bare
+    ``chdir(...)`` name, and ``Path.chdir()``) when the enclosing function does
+    not request ``monkeypatch``, and ignore reads of the working directory,
+    directory *creation* calls, ``monkeypatch.chdir`` (the blessed form),
+    mutations inside a ``monkeypatch``-guarded function, nested helpers that
+    *are* guarded, and unrelated calls."""
+    positive_sources = [
+        "def test_foo():\n    os.chdir(tmp_path)\n",
+        "def test_foo():\n    import os\n    os.chdir('/tmp/x')\n",
+        "def test_foo():\n    os.fchdir(fd)\n",
+        "def test_foo():\n    chdir(tmp_path)\n",
+        "def test_foo():\n    from os import chdir\n    chdir('/tmp/x')\n",
+        "def test_foo():\n    Path.cwd().chdir()\n",
+        "def test_foo():\n    from pathlib import Path\n    Path('/tmp/x').chdir()\n",
+        "def test_foo():\n    def inner():\n        os.chdir(tmp_path)\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _cwd_mutation_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo(monkeypatch):\n    os.chdir(tmp_path)\n",
+        "def test_foo():\n    monkeypatch.chdir(tmp_path)\n",
+        "def test_foo():\n    cwd = os.getcwd()\n",
+        "def test_foo():\n    cwd = Path.cwd()\n",
+        "def test_foo():\n    os.makedirs('/tmp/x')\n",
+        "def test_foo():\n    os.mkdir('/tmp/x')\n",
+        "def test_foo():\n    Path('/tmp/x').mkdir()\n",
+        "def test_foo():\n    p = Path('/tmp/x')\n    p.chdir = fake\n",
+        "def test_foo():\n    os.path.join('a', 'b')\n",
+        "def test_foo():\n    chdir_service.run()\n",
+        "def test_foo(monkeypatch):\n    def inner(monkeypatch):\n        os.chdir(tmp_path)\n",
+        "def test_foo():\n    fd = os.open('/tmp/x', os.O_RDONLY)\n    os.close(fd)\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _cwd_mutation_violations(tree), f"lens should NOT flag:\n{source}"
