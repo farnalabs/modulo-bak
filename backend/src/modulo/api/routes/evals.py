@@ -79,6 +79,10 @@ class EvalDefinitionResponse(BaseModel):
     failure_behaviour: str
     pass_threshold: float | None = None
     suite_id: str | None = None
+    # Eval-definition version (FAR-382): additive/optional, defaults to 1 so
+    # existing clients that don't read it keep working unchanged.
+    version: int = 1
+    pre_version_raw: dict[str, Any] | None = None
     created_by: uuid.UUID = Field(validation_alias="account_id")
 
 
@@ -99,7 +103,22 @@ def _eval_def_to_dict(eval_def: EvalDefinition) -> dict[str, Any]:
         "pass_threshold": eval_def.pass_threshold,
         "suite_id": eval_def.suite_id,
         "account_id": str(eval_def.account_id),
+        "version": getattr(eval_def, "version", 1),
+        "pre_version_raw": getattr(eval_def, "pre_version_raw", None),
     }
+
+
+def _stamp_eval_definition_version(eval_def: EvalDefinition) -> None:
+    """Bump the eval-definition version and snapshot the pre-edit config.
+
+    FAR-382: an edit to an eval definition is a version-scoped event. The prior
+    config is captured into ``pre_version_raw`` before mutation so a reversal is
+    reconstructable, then ``version`` is incremented. A v1->v2 rubric change is
+    therefore explicit — an ``EvalResult`` stamped with v1 never looks like a
+    regression against a v2-scoped result.
+    """
+    eval_def.pre_version_raw = {"config_json": eval_def.config_json}
+    eval_def.version = (eval_def.version or 1) + 1
 
 
 def _validate_guardrail_request(
@@ -239,6 +258,7 @@ async def create_eval_definition(
                 pass_threshold=req.pass_threshold,
                 suite_id=req.suite_id,
                 account_id=principal.account_id,
+                version=1,
             )
             session.add(eval_def)
             await session.flush()
@@ -557,6 +577,10 @@ async def update_eval_definition(
                 failure_behaviour=new_behaviour,
                 config_json=new_config,
             )
+            # FAR-382 versioning: snapshot the raw pre-edit config so a reversal
+            # is reconstructable, then bump the version — a rubric/config change
+            # is an explicitly version-scoped event, never a silent regression.
+            _stamp_eval_definition_version(eval_def)
             for key, value in updates.items():
                 setattr(eval_def, key, value)
             await session.flush()
@@ -1170,6 +1194,7 @@ async def create_eval_from_run(
                 config_json=config_json,
                 failure_behaviour="warn",
                 account_id=principal.account_id,
+                version=1,
             )
             session.add(eval_def)
             await session.flush()

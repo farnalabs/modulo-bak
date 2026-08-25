@@ -187,6 +187,30 @@ These are captured **at creation and never live-looked-up**. The immutable
 `baseline_tuple` is the comparison key: `(suite_id, dataset_id, dataset_version,
 eval_definition_ids, definition_checksum, model_backend_id, scenario_signature)`.
 
+### Version scoping — FAR-382
+
+Each `EvalDefinition` and `EvalSuite` carries an integer `version` (default `1`,
+non-null from cutover). Every definition create stamps `version=1`; every edit
+snapshots the pre-edit config into `pre_version_raw` (JSON) and bumps `version`
+by one, so a rubric change (e.g. a v1 -> v2 edit to an eval's `config_json`) is
+an **explicitly version-scoped event** rather than a silent mutation.
+
+* **`EvalResult.eval_definition_version`** — a snapshot of the eval-definition
+  `version` that scored the result, captured at write time. A version bump after
+  a result was scored never retroactively changes what that result represents.
+* **NULL-version lookup (latest-at-time)** — a result recorded before
+  versioning was cut over carries `eval_definition_version = NULL`. When a query
+  needs an eval definition but no version is pinned, it resolves to the
+  definition's **current (latest)** `version` (see
+  `resolve_eval_definition_version`); a pinned version is returned unchanged.
+* Complement, not replacement: `definition_checksum` remains the config
+  fingerprint that produces a new `baseline_tuple` on a config change, while
+  `version` is the human-explicit signal of that change. The two together ensure
+  a rubric change is never mistaken for a regression.
+
+`CalibrationLabel` / calibration-vs-human-labels is deliberately **out of scope**
+for this versioning work.
+
 ### State machine
 
 ```

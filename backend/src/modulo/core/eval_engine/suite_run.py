@@ -29,6 +29,7 @@ from typing import Any
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
 from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
 from modulo.db.models.notification_endpoint import NotificationEndpoint
@@ -55,6 +56,41 @@ class BaselineAmbiguityError(RuntimeError):
 
 class SpendLimitExceededError(SuiteRunError):
     """Raised when a spend ceiling (daily or per-suite) would be exceeded."""
+
+
+# --------------------------------------------------------------------------- #
+# Eval-definition versioning (FAR-382)                                        #
+# --------------------------------------------------------------------------- #
+async def resolve_eval_definition_version(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    eval_id: uuid.UUID,
+    pinned_version: int | None = None,
+) -> int:
+    """Resolve which eval-definition version a lookup should target.
+
+    FAR-382: a version can be pinned on an ``EvalResult`` (its
+    ``eval_definition_version`` snapshot) or passed by a caller. When a version
+    IS pinned, it is returned unchanged. When NO version is pinned (the
+    NULL-version lookup for legacy rows), the definition's CURRENT (latest)
+    ``version`` is resolved from the DB — a legacy result is treated as having
+    been scored under the definition's latest version, never as a mystery.
+
+    Raises ``SuiteRunError`` when the definition does not exist (or belongs to a
+    different org), so versioning never silently resolves against a foreign row.
+    """
+    if pinned_version is not None:
+        return pinned_version
+    result = await session.execute(
+        select(EvalDefinition).where(
+            EvalDefinition.id == eval_id,
+            EvalDefinition.organisation_id == org_id,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise SuiteRunError(f"eval definition {eval_id} not found while resolving version for org {org_id}")
+    return row.version
 
 
 def build_baseline_tuple(
@@ -414,6 +450,7 @@ __all__ = [
     "pass_rate_by_eval_type",
     "record_completion",
     "resolve_baseline_run",
+    "resolve_eval_definition_version",
     "run_suite_comparison",
     "should_notify_regression",
     "suite_cumulative_exceeded",

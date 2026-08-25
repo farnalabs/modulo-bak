@@ -1,6 +1,7 @@
 import uuid
+from typing import Any
 
-from sqlalchemy import JSON, CheckConstraint, ForeignKey, String, UniqueConstraint, Uuid
+from sqlalchemy import JSON, CheckConstraint, ForeignKey, Integer, String, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from modulo.db.models.base import OrgScoped
@@ -62,3 +63,10 @@ class EvalSuite(OrgScoped):
     # Original free-text suite tag (FAR-374 backfill). NULL for suites created
     # through the new UI.
     legacy_suite_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Eval-suite versioning (FAR-382): mirrors EvalDefinition.version — an
+    # integer starting at 1, bumped on edit so a suite-level change is an
+    # explicitly version-scoped event. ``pre_version_raw`` snapshots the suite
+    # definition as it existed before the current version was stamped (nullable
+    # for suites that have never been edited since versioning).
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1", default=1)
+    pre_version_raw: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
