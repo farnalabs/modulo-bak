@@ -55,6 +55,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.core.eval_engine import EvalDefinition, EvalEngine, EvalType
@@ -516,39 +517,106 @@ async def execute_suite_run(
     except SuiteRunExecutionError as exc:
         await _fail_run(session, run, str(exc))
         raise
+    except SQLAlchemyError as exc:
+        # Raw DB errors (IntegrityError/ProgrammingError/...) previously escaped
+        # this handler UNCAUGHT — the run was never terminalised and the error
+        # surfaced only via the after_process sink. Map them to a stable status
+        # code and route them through ``_fail_run`` so they also terminalise the
+        # run, then re-raise a typed orchestration error (the caller — the SAQ
+        # job — persists the failure in its OWN committed transaction).
+        detail = f"{_sql_error_status(exc)}: {exc}"
+        await _fail_run(session, run, detail)
+        raise SuiteRunExecutionError(detail) from exc
 
 
 async def _fail_run(session: AsyncSession, run: SuiteRun, detail: str) -> None:
-    """Terminalise the run as ``failed`` + populate the monitored failure sink."""
+    """Terminalise the run as ``failed`` + populate the monitored failure sink.
+
+    Handles BOTH the caller-owned-transaction case (a run already ``running``
+    when orchestration failed) AND the SAQ-after-rollback case (the run is
+    re-read fresh and is ``pending`` again because the rolled-back transaction
+    discarded the ``pending -> running`` transition). ``pending`` only allows
+    the edge ``{running, cancelled}``, so a ``pending`` run is promoted to
+    ``running`` first — otherwise the ``failed`` edge would be illegal and the
+    run would stay stranded ``pending``. This is the transaction-boundary fix
+    (FAR-377): a persistent failure must land ``failed`` in a transaction that
+    survives the caller's rollback.
+
+    The Error-Ingestion sink is best-effort AND isolated in a savepoint, so a
+    broken sink (transient DB error, missing table) rolls back only the sink and
+    can never roll back the terminal ``failed`` transition below it.
+    """
     run.error_detail = detail[:2000]
     try:
+        if run.state == SuiteRunState.PENDING.value:
+            # A fresh re-read after a rolled-back transaction is PENDING again;
+            # promote to RUNNING so the FAILED edge below is a legal transition.
+            await _suite_run_transition(session, run, SuiteRunState.RUNNING)
+            await session.flush()
         await _suite_run_transition(session, run, SuiteRunState.FAILED)
         await session.flush()
     except Exception:
         _log.exception("suite_run fail transition failed run=%s", run.id)
 
     # Monitored sink: escalate to the Error Dashboard (best-effort — the run is
-    # already transitioning; a sink failure must not fail the run write).
+    # already transitioning; a sink failure must not fail the run write). The
+    # savepoint isolates the sink so a failure here can never roll back the
+    # terminal transition in the same transaction.
     try:
         from modulo.core.error_tracking import ErrorIngestionService
 
-        await ErrorIngestionService().ingest(
-            session,
-            run.organisation_id,
-            {
-                "level": "error",
-                "message": f"SuiteRun {run.id} failed: {run.error_detail or detail}",
-                "source": "suite_run",
-                "context_json": {
-                    "suite_id": str(run.suite_id),
-                    "dataset_id": str(run.dataset_id),
-                    "suite_run_id": str(run.id),
+        async with session.begin_nested():
+            await ErrorIngestionService().ingest(
+                session,
+                run.organisation_id,
+                {
+                    "level": "error",
+                    "message": f"SuiteRun {run.id} failed: {run.error_detail or detail}",
+                    "source": "suite_run",
+                    "context_json": {
+                        "suite_id": str(run.suite_id),
+                        "dataset_id": str(run.dataset_id),
+                        "suite_run_id": str(run.id),
+                    },
                 },
-            },
-        )
+            )
         await session.flush()
     except Exception:
         _log.exception("suite_run failure sink ingest failed run=%s", run.id)
+
+
+def _sql_error_status(exc: Exception) -> int:
+    """Map a raw DB/exception to a stable status code (codebase convention).
+
+    ``IntegrityError``->409, ``ProgrammingError``->501, other ``SQLAlchemyError``
+    (e.g. ``OperationalError``)->503, and any other ``Exception``->500. Used to
+    label a SuiteRun orchestration failure (stored in ``error_detail``) so the
+    Error Dashboard / after_process sink shows a consistent code.
+    """
+    from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
+
+    if isinstance(exc, IntegrityError):
+        return 409
+    if isinstance(exc, ProgrammingError):
+        return 501
+    if isinstance(exc, OperationalError):
+        return 503
+    if isinstance(exc, SQLAlchemyError):
+        return 503
+    return 500
+
+
+def _failure_detail(exc: Exception) -> str:
+    """Derive the ``error_detail`` message for a SuiteRun orchestration failure.
+
+    A typed ``SuiteRunExecutionError`` carries its own message; any other
+    exception (a raw DB error, a job-level failure) is surfaced with a mapped
+    status code, satisfying the "always terminalise with a labelled error"
+    contract.
+    """
+    if isinstance(exc, SuiteRunExecutionError):
+        return str(exc)
+    return f"{_sql_error_status(exc)}: {exc}"
 
 
 async def build_suite_run(

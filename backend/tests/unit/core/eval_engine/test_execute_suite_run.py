@@ -471,3 +471,160 @@ async def test_suite_run_execution_jobs_are_registered_on_runs_worker() -> None:
     names = {n for n, _ in _runs_functions()}
     assert "modulo.core.saq_worker.execute_suite_run" in names
     assert "modulo.core.saq_worker.fire_suite_run_trigger" in names
+
+
+# --------------------------------------------------------------------------- #
+# Transaction-boundary failure persistence (FAR-377 Critical)                 #
+# --------------------------------------------------------------------------- #
+async def test_saq_job_persists_orchestration_failure_across_rollback(monkeypatch) -> None:
+    """Prove-the-fix (Critical): an orchestration failure in the SAQ job must
+    leave the SuiteRun ``failed`` -- NEVER stranded ``pending``.
+
+    The runner (`execute_suite_run`) transitions the run to ``failed`` + writes
+    ``error_detail`` + ingests the Error-Ingestion event, but it runs INSIDE the
+    job's ``async with factory() as session, session.begin():`` block. When the
+    runner re-raises, that context manager ROLLS BACK the transaction, silently
+    discarding the ``failed`` transition + ``error_detail`` + event — the run
+    reverts to ``pending`` and is stranded forever (never terminal, never
+    surfaced). The job must re-persist the failure in its OWN committed
+    transaction (``_persist_suite_run_execution_failure``) so it survives.
+
+    Without the fix the final re-read (re-loading fresh) is ``pending``; with it,
+    the run is ``failed`` with ``error_detail`` populated.
+    """
+    from datetime import UTC, datetime
+
+    import modulo.core.saq_worker as sw
+
+    org = await _org()
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=_tables())
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as s, s.begin():
+        suite, dataset, _, backend = await seed_suite(s, org)
+        # Seed the run DIRECTLY (not via build_suite_run — it refuses a suite
+        # with no active definitions): the job loads it and the runner must fail
+        # on the empty definition set.
+        run = SuiteRun(
+            organisation_id=org,
+            suite_id=suite.id,
+            dataset_id=dataset.id,
+            dataset_version=1,
+            definition_checksum="a" * 64,
+            model_backend_id=backend.id,
+            baseline_tuple={},
+            scenario_signature=None,
+            state=SuiteRunState.PENDING.value,
+            version=0,
+            total_cases=0,
+            passed_cases=0,
+            failed_cases=0,
+            excluded_case_count=0,
+            claimed_cost=Decimal(0),
+            created_at=datetime.now(UTC),
+        )
+        s.add(run)
+        await s.flush()
+        # Remove every definition so the runner raises "no active definitions".
+        for d in (await s.execute(__import__("sqlalchemy").select(EvalDefinition))).scalars():
+            await s.delete(d)
+        await s.flush()
+        rid, oid = str(run.id), str(org)
+
+    class _FakeIngestionService:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        async def ingest(self, *a: Any, **k: Any) -> None:
+            return None
+
+    monkeypatch.setattr("modulo.core.error_tracking.ErrorIngestionService", _FakeIngestionService)
+    monkeypatch.setattr(sw, "_make_session_factory", lambda: factory)
+
+    with pytest.raises(SuiteRunExecutionError, match="no active eval definitions"):
+        await sw.execute_suite_run({}, suite_run_id=rid, org_id=oid)
+
+    async with factory() as s:
+        fresh = await s.get(SuiteRun, uuid.UUID(rid))
+        assert fresh is not None
+        assert fresh.state == SuiteRunState.FAILED.value
+        assert "no active eval definitions" in (fresh.error_detail or "")
+
+    await engine.dispose()
+
+
+async def test_saq_job_persists_raw_db_error_as_failed(monkeypatch) -> None:
+    """Prove-the-fix: a RAW ``SQLAlchemyError`` (not ``SuiteRunExecutionError``)
+    thrown inside the runner also terminalises the SuiteRun to ``failed``.
+
+    Previously a raw DB error (IntegrityError/ProgrammingError/...) escaped the
+    runner UNCAUGHT — the run was never terminalised and the error surfaced only
+    via the after_process sink. The runner now maps it to a status code
+    (ProgrammingError -> 501), routes it through ``_fail_run``, and re-raises a
+    typed error; the SAQ job persists the failure in its OWN committed
+    transaction. The     final re-read must be ``failed`` with the mapped code in
+    ``error_detail``.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy.exc import ProgrammingError
+
+    import modulo.core.saq_worker as sw
+
+    org = await _org()
+    engine = create_async_engine("sqlite+aiosqlite://")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=_tables())
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as s, s.begin():
+        suite, dataset, _, backend = await seed_suite(s, org)
+        run = SuiteRun(
+            organisation_id=org,
+            suite_id=suite.id,
+            dataset_id=dataset.id,
+            dataset_version=1,
+            definition_checksum="a" * 64,
+            model_backend_id=backend.id,
+            baseline_tuple={},
+            scenario_signature=None,
+            state=SuiteRunState.PENDING.value,
+            version=0,
+            total_cases=0,
+            passed_cases=0,
+            failed_cases=0,
+            excluded_case_count=0,
+            claimed_cost=Decimal(0),
+            created_at=datetime.now(UTC),
+        )
+        s.add(run)
+        await s.flush()
+        rid, oid = str(run.id), str(org)
+
+    async def _raise_programming_error(*a: Any, **k: Any) -> None:
+        raise ProgrammingError("SELECT ...", {}, Exception("boom"))
+
+    monkeypatch.setattr("modulo.core.eval_engine.execute_suite_run.load_suite_definitions", _raise_programming_error)
+
+    class _FakeIngestionService:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            pass
+
+        async def ingest(self, *a: Any, **k: Any) -> None:
+            return None
+
+    monkeypatch.setattr("modulo.core.error_tracking.ErrorIngestionService", _FakeIngestionService)
+    monkeypatch.setattr(sw, "_make_session_factory", lambda: factory)
+
+    with pytest.raises(SuiteRunExecutionError, match="501"):
+        await sw.execute_suite_run({}, suite_run_id=rid, org_id=oid)
+
+    async with factory() as s:
+        fresh = await s.get(SuiteRun, uuid.UUID(rid))
+        assert fresh is not None
+        assert fresh.state == SuiteRunState.FAILED.value
+        assert "501" in (fresh.error_detail or "")
+
+    await engine.dispose()

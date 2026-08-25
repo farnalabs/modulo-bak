@@ -1426,6 +1426,91 @@ class TestSuiteRunDispatchRouting:
         assert "snapshot_id" in kwargs
         assert "cron_expression" in kwargs
 
+    @pytest.mark.asyncio
+    async def test_suite_run_polling_row_enqueues_fire_suite_run_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``run_kind == 'suite_run'`` POLLING row routes to the SuiteRun fire
+        job (mirroring the cron scan) — never ``fire_polling_trigger`` (which
+        runs a connector poll query + ``create_run`` and would write a pipeline
+        ``Run``). The write-surface loop guard depends on this discriminator.
+        """
+        _patch_env(monkeypatch)
+        q = MagicMock()
+        now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+        org_id = ORG
+        suite_row = SimpleNamespace(
+            id=TRIGGER_POLL,
+            pipeline_id=uuid.uuid4(),
+            config_json={"poll_query": "select 1"},
+            run_kind="suite_run",
+        )
+        summary: dict[str, int] = {"polling_enqueued": 0, "enqueue_failures": 0}
+
+        with patch.object(ch, "_enqueue_fire_job_async", new_callable=AsyncMock, return_value="job-1") as enqueue:
+            ok = await ch._enqueue_polling_fire(
+                q, now, org_id, suite_row, suite_row.config_json, connector_instance_id=None, summary=summary
+            )
+
+        assert ok is True
+        assert summary["polling_enqueued"] == 1
+        args = enqueue.await_args.args
+        kwargs = enqueue.await_args.kwargs
+        assert args[1] == "modulo.core.saq_worker.fire_suite_run_trigger"
+        assert args[2].startswith(f"suite_fire:{TRIGGER_POLL}:")
+        # The suite-run path passes no connector/poll args.
+        assert "connector_instance_id" not in kwargs
+        assert "poll_query" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_suite_run_ongoing_row_enqueues_fire_suite_run_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``run_kind == 'suite_run'`` ONGOING row routes to the SuiteRun fire
+        job — never ``fire_ongoing_trigger`` (which tops up + dispatches pipeline
+        ``Run`` s via ``create_run``). It must not pass a snapshot id; the suite
+        run resolves its own dataset/backend from the trigger config.
+        """
+        _patch_env(monkeypatch)
+        session = MagicMock()
+        q = MagicMock()
+        now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+        org_id = ORG
+        suite_row = SimpleNamespace(
+            id=TRIGGER_A,
+            pipeline_id=uuid.uuid4(),
+            config_json={"scan_interval_seconds": 60},
+            run_kind="suite_run",
+        )
+        summary: dict[str, int] = {
+            "ongoing_due": 0,
+            "ongoing_enqueued": 0,
+            "ongoing_enqueue_failures": 0,
+            "enqueue_failures": 0,
+        }
+
+        with (
+            patch.object(ch, "_advance_ongoing_next_fire", new_callable=AsyncMock, return_value=True),
+            patch.object(ch, "_enqueue_fire_job_async", new_callable=AsyncMock, return_value="job-1") as enqueue,
+        ):
+            returned = await ch._process_one_ongoing_row(
+                session,
+                q,
+                now,
+                org_id,
+                org_paused=False,
+                row=suite_row,
+                ongoing_latest_snapshots={},
+                summary=summary,
+                ongoing_enqueued=0,
+            )
+
+        assert returned == 1
+        assert summary["ongoing_enqueued"] == 1
+        args = enqueue.await_args.args
+        kwargs = enqueue.await_args.kwargs
+        assert args[1] == "modulo.core.saq_worker.fire_suite_run_trigger"
+        assert args[2].startswith(f"suite_fire:{TRIGGER_A}:")
+        # The suite-run path never passes a snapshot id (the suite run resolves
+        # its own dataset/backend from the trigger config).
+        assert "latest_snapshot_id" not in kwargs
+
 
 # ---------------------------------------------------------------------------
 # Fire logic skips (mirrors the relocated CronFireTask semantics)

@@ -703,9 +703,13 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
     (carrying the immutable baseline tuple + any config-derived ceiling from
     ``extra``), executes it end-to-end (pending -> terminal) via the
     ``execute_suite_run`` runner, and returns the terminal stats. On an
-    orchestration failure the runner already transitioned the run to ``failed``;
-    the job re-raises so the SAQ ``after_process`` hook sinks it to the Error
-    Dashboard (the monitored failure sink).
+    orchestration failure (typed OR raw DB error) the runner transitions the run
+    to ``failed``, but that write happens INSIDE ``session.begin()`` and is
+    ROLLED BACK when the runner re-raises — so the failure is re-persisted in its
+    OWN committed transaction (``_persist_suite_run_execution_failure``) before the
+    job re-raises for the SAQ ``after_process`` hook (the monitored failure sink).
+    A persistent failure therefore leaves the run ``failed`` with
+    ``error_detail`` populated, never stranded ``pending``.
     """
     from modulo.core.eval_engine.execute_suite_run import execute_suite_run as _run_exec
     from modulo.db.models.eval_suite_run import SuiteRun
@@ -753,9 +757,57 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
         return stats
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
         _log.exception("SAQ execute_suite_run failed for suite_run %s", rid)
+        # Transaction-boundary fix (FAR-377): ``execute_suite_run`` (the runner)
+        # transitions the run to ``failed`` + populates ``error_detail`` + ingests
+        # the Error-Ingestion event, but it runs INSIDE ``session.begin()`` above.
+        # When the runner re-raises (an orchestration failure — typed OR a raw DB
+        # error), the async context manager ROLLS BACK that transaction, discarding
+        # the ``failed`` transition + ``error_detail`` + event. The run would be
+        # stranded ``pending`` forever — never terminal, never surfaced. Persist
+        # the failure in a FRESH session/transaction here so it survives the
+        # rollback, then re-raise for the after_process sink.
+        await _persist_suite_run_execution_failure(factory, rid, oid, exc)
         raise
+
+
+async def _persist_suite_run_execution_failure(
+    factory: Any, suite_run_id: uuid.UUID, org_id: uuid.UUID, exc: Exception
+) -> None:
+    """Persist a SuiteRun orchestration failure in its OWN committed transaction.
+
+    Called from ``execute_suite_run``'s outer handler AFTER the runner's execution
+    transaction rolled back. Re-loads the freshly-persisted run (now ``pending``
+    again — the rolled-back transaction also discarded the ``pending -> running``
+    transition) and terminalises it to ``failed`` with ``error_detail`` + the
+    Error-Ingestion event, then commits. ``_fail_run`` promotes a ``pending`` run
+    to ``running`` first so the ``failed`` edge is legal, and isolates the ingest
+    sink in a savepoint so it can never roll back the terminal transition.
+
+    Best-effort: if this itself fails (e.g. the DB is down), it is logged and the
+    caller still re-raises so SAQ's after_process sink sees the original error.
+    """
+    from modulo.core.eval_engine.execute_suite_run import _fail_run, _failure_detail
+    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.rls import set_rls_org as _set_rls
+
+    detail = _failure_detail(exc)
+    try:
+        async with factory() as session, session.begin():
+            await _set_rls(session, org_id)
+            run = await session.get(SuiteRun, suite_run_id)
+            if run is None or run.organisation_id != org_id:
+                _log.warning(
+                    "SAQ execute_suite_run: cannot persist failure, suite_run %s missing or cross-org",
+                    suite_run_id,
+                )
+                return
+            await _fail_run(session, run, detail)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("SAQ execute_suite_run: failed to persist suite_run failure %s", suite_run_id)
 
 
 # ---------------------------------------------------------------------------

@@ -2653,6 +2653,7 @@ def _new_fire_due_summary() -> dict[str, Any]:
         "polling_skipped_paused": 0,
         "report_due": 0,
         "report_enqueued": 0,
+        "report_skipped_suite_run": 0,
         "ongoing_due": 0,
         "ongoing_enqueued": 0,
         "ongoing_skipped_paused": 0,
@@ -2786,6 +2787,7 @@ async def _process_due_polling_scan(
                     Trigger.pipeline_id,
                     Trigger.config_json,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "polling",
                     Trigger.active.is_(True),
@@ -2850,6 +2852,7 @@ async def _process_due_ongoing_scan(
                     Trigger.pipeline_id,
                     Trigger.config_json,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "ongoing",
                     Trigger.active.is_(True),
@@ -3101,7 +3104,15 @@ async def _enqueue_polling_fire(
     No advance rollback for polling — a consumed epoch self-heals on the next
     tick — the caller ingests the error event. Extracted unchanged from
     ``_process_due_polling_rows`` (complexity bound).
+
+    FAR-377: a ``run_kind == 'suite_run'`` polling row routes to the SuiteRun
+    fire job (mirroring the cron scan) — it builds a SuiteRun, never a pipeline
+    ``Run``. The write-surface loop guard depends on this discriminator.
     """
+    if getattr(row, "run_kind", "run") == "suite_run":
+        # The suite run resolves its own dataset/backend from the trigger config;
+        # no connector instance, poll query or condition is needed.
+        return await _enqueue_suite_run_fire(q, now, org_id, row, summary, "polling_enqueued")
     try:
         job_id = await _enqueue_fire_job_async(
             q,
@@ -3122,6 +3133,42 @@ async def _enqueue_polling_fire(
         return False
     if job_id is not None:
         summary["polling_enqueued"] += 1
+    return True
+
+
+async def _enqueue_suite_run_fire(
+    q: RedisQueue,
+    now: datetime,
+    org_id: uuid.UUID,
+    row: Any,
+    summary: dict[str, Any],
+    counter_key: str,
+) -> bool:
+    """Enqueue the ``fire_suite_run_trigger`` job for a ``run_kind='suite_run'`` row.
+
+    Shared by the coupling that routes a suite_run row surfaced by the ongoing or
+    polling dispatch scans (FAR-377). Mirrors the cron scan: builds a SuiteRun,
+    never a pipeline ``Run``, and passes NO snapshot/connector args (the suite run
+    resolves its own dataset/backend from the trigger config). Returns ``False``
+    only when the enqueue raised (the caller then ingests the error event).
+    """
+    try:
+        job_id = await _enqueue_fire_job_async(
+            q,
+            "modulo.core.saq_worker.fire_suite_run_trigger",
+            f"suite_fire:{row.id}:{int(now.timestamp())}",
+            trigger_id=str(row.id),
+            org_id=str(org_id),
+            pipeline_id=str(row.pipeline_id),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        summary["enqueue_failures"] += 1
+        _log.exception("fire_due_triggers: suite_run fire enqueue failed %s", row.id)
+        return False
+    if job_id is not None:
+        summary[counter_key] += 1
     return True
 
 
@@ -3149,9 +3196,12 @@ async def _process_one_due_polling_row(
             row.id,
         )
         interval = 60
-    if connector_instance_id is None:
+    is_suite_run = getattr(row, "run_kind", "run") == "suite_run"
+    if connector_instance_id is None and not is_suite_run:
         # Missing connector instance — log poll_error and advance
-        # (mirrors the legacy beat _fetch_due_triggers behaviour).
+        # (mirrors the legacy beat _fetch_due_triggers behaviour). A suite_run
+        # polling row is exempt: it resolves its own dataset/backend from the
+        # trigger config and needs no connector instance.
         await _polling_missing_connector(session, org_id, row, interval, summary)
         return
 
@@ -3238,6 +3288,13 @@ async def _process_due_report_rows(
 ) -> None:
     """Advance + enqueue the due scheduled-report rows (one epoch each, atomic)."""
     for row in report_rows:
+        # FAR-377: never mis-dispatch a ``run_kind == 'suite_run'`` row through the
+        # report path (which drives ``fire_report_trigger``, a scheduled report
+        # delivery — not a pipeline Run). A suite_run scheduled report should not
+        # exist, but the guard keeps a mis-typed row from firing a report.
+        if getattr(row, "run_kind", "run") == "suite_run":
+            summary["report_skipped_suite_run"] += 1
+            continue
         summary["report_due"] += 1
         try:
             if not await _advance_report_next_send(session, row.id, row.cron_expression):
@@ -3303,6 +3360,11 @@ async def _process_one_ongoing_row(
         # Per-tick enqueue cap — defer to the next tick. The
         # advance already happened (no double-fire).
         return 0
+    if getattr(row, "run_kind", "run") == "suite_run":
+        # FAR-377: a suite_run ongoing row routes to the SuiteRun fire job
+        # (mirroring the cron scan) — it builds a SuiteRun, never a pipeline
+        # ``Run``. The suite run resolves its own dataset/backend; no snapshot id.
+        return 1 if await _enqueue_suite_run_fire(q, now, org_id, row, summary, "ongoing_enqueued") else 0
     snapshot_id = _resolve_snapshot_id(row, ongoing_latest_snapshots)
     try:
         job_id = await _enqueue_fire_job_async(
