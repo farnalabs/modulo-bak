@@ -187,6 +187,8 @@ class GraphEdgeData:
     condition_expression: str | None
     hitl_gate_config: dict[str, Any] | None
     hitl_gate_config_present: bool
+    source_port: str = "out"
+    target_port: str = "in"
 
 
 def _edge_to_data(edge: PipelineGraphEdge) -> GraphEdgeData:
@@ -199,6 +201,8 @@ def _edge_to_data(edge: PipelineGraphEdge) -> GraphEdgeData:
         condition_expression=edge.condition_expression,
         hitl_gate_config=(edge.hitl_gate_config.model_dump(mode="json") if edge.hitl_gate_config is not None else None),
         hitl_gate_config_present="hitl_gate_config" in edge.model_fields_set,
+        source_port=edge.source_port,
+        target_port=edge.target_port,
     )
 
 
@@ -211,6 +215,8 @@ def _edge_data_to_dict(edge: GraphEdgeData) -> dict[str, Any]:
         "condition_expression": edge.condition_expression,
         "hitl_gate_config": edge.hitl_gate_config,
         "hitl_gate_config_present": edge.hitl_gate_config_present,
+        "source_port": edge.source_port,
+        "target_port": edge.target_port,
     }
 
 
@@ -222,6 +228,8 @@ def _edge_data_to_validator(edge: GraphEdgeData) -> dict[str, Any]:
         "type": edge.edge_type,
         "condition_expression": edge.condition_expression,
         "hitl_gate_config": edge.hitl_gate_config,
+        "source_port": edge.source_port,
+        "target_port": edge.target_port,
     }
 
 
@@ -478,9 +486,9 @@ class PipelineResponse(BaseModel):
     node_timeout_seconds: int
     run_context_defaults: dict[str, Any]
     default_autonomy_level: str | None = None
-    # TODO: Make this non-optional (int = 3600) once migration
-    # 0029_fix_pipeline_max_duration_non_null has run on all production DBs and there's no risk
-    # of NULL values from rollbacks or pre-migration data.
+    # Intentionally nullable: legacy rows and rollbacks of pre-migration data
+    # can still expose a NULL value until the max_duration pipeline migration
+    # has run on all production DBs.
     max_duration_seconds: int | None = None
     stale_run_timeout_minutes: int = 30
     rate_limit_config: dict[str, Any] | None = None
@@ -650,6 +658,21 @@ class PipelineGraphNode(BaseModel):
     watch_globs: list[str] = Field(
         default_factory=list,
         description="Filesystem detector: globs of sandbox paths whose change counts as activity.",
+    )
+    # FAR-416 (FAR-402 F1): ports are ADDITIVE metadata over the flat
+    # run_context/artifact dict. A port name maps 1:1 to the flat-state key the
+    # node already uses (identity mapping). When absent, the lazy backfill
+    # synthesizes a single {port:"out"} output and {port:"in"} input. Declaring
+    # ports enables compile-time fan-in safety + typed port validation.
+    inputs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Input ports. Each entry: {port: str, schema_ref?: str}. "
+        "None => backfilled with a single default 'in' port at compile time.",
+    )
+    outputs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Output ports. Each entry: {port: str, schema_ref?: str}. "
+        "None => backfilled with a single default 'out' port at compile time.",
     )
 
     @model_validator(mode="after")
@@ -828,6 +851,16 @@ class PipelineGraphEdge(BaseModel):
         max_length=500,
         description="JMESPath expression for conditional edge routing. "
         "Evaluated against pipeline state; if truthy, routes to target.",
+    )
+    # FAR-416 (FAR-402 F1): port addressing. Defaults mirror the flat-state keys
+    # used before ports existed, so legacy edges route identically.
+    source_port: str = Field(
+        default="out",
+        description="Output port on the source node this edge originates from.",
+    )
+    target_port: str = Field(
+        default="in",
+        description="Input port on the target node this edge delivers into.",
     )
 
     model_config = {"from_attributes": True}
@@ -2595,6 +2628,8 @@ def _edge_to_dict(e: Any) -> dict[str, Any]:
         "condition_expression": getattr(e, "condition_expression", None),
         "hitl_gate_config": dict(e.hitl_gate_config) if isinstance(e.hitl_gate_config, dict) else e.hitl_gate_config,
         "hitl_gate_config_present": True,
+        "source_port": getattr(e, "source_port", "out"),
+        "target_port": getattr(e, "target_port", "in"),
     }
 
 

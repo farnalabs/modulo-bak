@@ -1158,7 +1158,25 @@ async def create_run(
     # no-raw-persist). Observe-mode guardrails stamp observed=True so the
     # guardrail_summary observed bucket is counted exactly once.
     if guardrail_results:
+        from modulo.db.models.eval_definition import EvalDefinition as _EvalDefinitionModel
         from modulo.db.models.eval_result import EvalResult as EvalResultModel
+
+        # FAR-382: stamp the definition version snapshot so a later rubric bump
+        # never makes this guardrail outcome look like a regression. The engine
+        # DTO carries no version, so resolve it from the (org-scoped) definition
+        # rows in one batched query rather than N+1.
+        guardrail_eval_ids = {gr.eval_id for gr in guardrail_results}
+        version_by_eval_id: dict[uuid.UUID, int] = {}
+        if guardrail_eval_ids:
+            def_rows = (
+                await session.execute(
+                    select(_EvalDefinitionModel.id, _EvalDefinitionModel.version).where(
+                        _EvalDefinitionModel.id.in_(guardrail_eval_ids),
+                        _EvalDefinitionModel.organisation_id == org_id,
+                    )
+                )
+            ).all()
+            version_by_eval_id = {row.id: row.version for row in def_rows}
 
         for gr in guardrail_results:
             session.add(
@@ -1167,6 +1185,7 @@ async def create_run(
                     run_id=run_id,
                     node_id=None,
                     eval_id=gr.eval_id,
+                    eval_definition_version=version_by_eval_id.get(gr.eval_id),
                     passed=gr.passed,
                     score=gr.score,
                     detail=(gr.detail or "")[:2000],
@@ -1575,13 +1594,13 @@ _UPDATE_STATUS_FENCED_SQL = text(
     "total_tokens = COALESCE(:total_tokens, total_tokens), "
     "total_cost_usd = COALESCE(:total_cost_usd, total_cost_usd), "
     "cost_breakdown = CASE WHEN :cost_breakdown_sentinel THEN cost_breakdown "
-    "  ELSE CAST(:cost_breakdown AS json) END, "
-    "node_token_usage = CASE WHEN CAST(:node_token_usage AS json) IS NOT NULL "
-    "  THEN CAST(:node_token_usage AS json) ELSE node_token_usage END, "
-    "outputs_json = CASE WHEN CAST(:outputs_json AS json) IS NOT NULL "
-    "  THEN CAST(:outputs_json AS json) ELSE outputs_json END, "
-    "node_telemetry_json = CASE WHEN CAST(:node_telemetry_json AS json) IS NOT NULL "
-    "  THEN CAST(:node_telemetry_json AS json) ELSE node_telemetry_json END "
+    "  ELSE CAST(:cost_breakdown AS jsonb) END, "
+    "node_token_usage = CASE WHEN CAST(:node_token_usage AS jsonb) IS NOT NULL "
+    "  THEN CAST(:node_token_usage AS jsonb) ELSE node_token_usage END, "
+    "outputs_json = CASE WHEN CAST(:outputs_json AS jsonb) IS NOT NULL "
+    "  THEN CAST(:outputs_json AS jsonb) ELSE outputs_json END, "
+    "node_telemetry_json = CASE WHEN CAST(:node_telemetry_json AS jsonb) IS NOT NULL "
+    "  THEN CAST(:node_telemetry_json AS jsonb) ELSE node_telemetry_json END "
     "WHERE id=:rid "
     "AND (CAST(:tok AS text) IS NULL OR claim_token = CAST(:tok AS text)) "
     "AND (CAST(:from_status AS text) IS NULL OR status = CAST(:from_status AS text)) "
