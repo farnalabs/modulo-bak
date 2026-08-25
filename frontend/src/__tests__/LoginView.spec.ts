@@ -54,7 +54,7 @@ describe('LoginView', () => {
     const wrapper = mount(LoginView)
     await flushPromises()
 
-    expect(wrapper.get('[data-testid="login-sso-section"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(true)
     expect(wrapper.get('[data-testid="login-sso-oidc-google"]').attributes('href')).toBe(
       '/api/v1/auth/oidc/google/login',
     )
@@ -89,6 +89,6 @@ describe('LoginView', () => {
     await flushPromises()
 
     expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(false)
-    expect(wrapper.get('[data-testid="login-submit"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="login-submit"]').exists()).toBe(true)
   })
 })
