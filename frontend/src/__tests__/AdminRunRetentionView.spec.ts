@@ -109,8 +109,7 @@ describe('AdminRunRetentionView', () => {
     const confirmBtn = document.body.querySelector('[data-testid="admin-run-retention-purge-confirm"]') as HTMLElement
     expect(confirmBtn).not.toBeNull()
     confirmBtn.click()
-    await flushPromises()
-    await flushPromises()
+    for (let i = 0; i < 5; i++) await flushPromises()
 
     const postMock = api.POST as Mock
     const purgeCall = postMock.mock.calls.find((c: unknown[]) => c[0] === '/api/v1/admin/run-retention/purge')
@@ -120,6 +119,24 @@ describe('AdminRunRetentionView', () => {
 
     const result = wrapper.find('[data-testid="admin-run-retention-purge-result"]')
     expect(result.text()).toContain('Purged 2 run(s)')
+  })
+
+  it('clears the stale purge-result banner when candidates are reloaded', async () => {
+    const wrapper = await mountView()
+    await wrapper.find('[data-testid="admin-run-retention-purge"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    const confirmBtn = document.body.querySelector('[data-testid="admin-run-retention-purge-confirm"]') as HTMLElement
+    confirmBtn.click()
+    for (let i = 0; i < 5; i++) await flushPromises()
+
+    expect(wrapper.find('[data-testid="admin-run-retention-purge-result"]').exists()).toBe(true)
+
+    await wrapper.find('[data-testid="admin-run-retention-refresh"]').trigger('click')
+    for (let i = 0; i < 5; i++) await flushPromises()
+
+    expect(wrapper.find('[data-testid="admin-run-retention-purge-result"]').exists()).toBe(false)
   })
 
   it('disables the purge button when no terminal candidates match', async () => {
@@ -201,8 +218,7 @@ describe('AdminRunRetentionView', () => {
     const confirmBtn = document.body.querySelector('[data-testid="admin-run-retention-purge-confirm"]') as HTMLElement
     expect(confirmBtn).not.toBeNull()
     confirmBtn.click()
-    await flushPromises()
-    await flushPromises()
+    for (let i = 0; i < 5; i++) await flushPromises()
 
     const postMock = api.POST as Mock
     const purgeCall = postMock.mock.calls.find((c: unknown[]) => c[0] === '/api/v1/admin/run-retention/purge')

@@ -350,6 +350,8 @@ async function loadPipelines() {
 async function loadCandidates() {
   loading.value = true
   error.value = null
+  purgeResult.value = null
+  purgeError.value = null
   try {
     const res = await api.GET('/api/v1/admin/run-retention/candidates', {
       params: { query: buildQuery() as any },
@@ -386,9 +388,9 @@ async function executePurge() {
       body: { ...buildBody(), confirm: true } as any,
     })
     if (res.error) throw new Error(formatApiError(res.error))
-    purgeResult.value = res.data as PurgeResponse
     showPurgeConfirm.value = false
     await loadCandidates()
+    purgeResult.value = res.data as PurgeResponse
   } catch (e: unknown) {
     purgeError.value = e instanceof Error ? e.message : t('views.AdminRunRetentionView.purge_failed')
     showPurgeConfirm.value = false
