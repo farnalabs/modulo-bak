@@ -40,6 +40,7 @@
                   <td class="table-cell">
                     <div>
                       <button
+                        type="button"
                         class="font-medium text-left hover:text-primary transition-colors"
                         @click="toggleExpand(plugin.PLUGIN_ID)"
                       >
@@ -77,6 +78,7 @@
                       <label for="adminpluginsview-field-1"
                         class="relative inline-flex cursor-pointer items-center"
                         :title="activeStates[plugin.PLUGIN_ID] !== false ? 'Disable plugin' : 'Enable plugin'"
+                        :aria-label="activeStates[plugin.PLUGIN_ID] !== false ? 'Disable plugin' : 'Enable plugin'"
                       >
                         <input id="adminpluginsview-field-1"
                           type="checkbox"
@@ -89,6 +91,7 @@
                         />
                       </label>
                       <button
+                        type="button"
                         class="rounded p-1 text-muted-foreground hover:bg-accent"
                         data-testid="admin-plugins-expand"
                         :aria-label="$t('views.AdminPluginsView.expand_plugin_details')"
@@ -212,7 +215,7 @@ function toggleExpand(id: string) {
 }
 
 async function togglePlugin(id: string) {
-  const newState = activeStates[id] !== false ? false : true
+  const newState = activeStates[id] === false
   activeStates[id] = newState
   try {
     const { error: err } = await (api as any).PUT(`/api/v1/plugins/${id}/toggle`, {
