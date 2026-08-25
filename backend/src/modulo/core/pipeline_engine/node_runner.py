@@ -3837,6 +3837,17 @@ async def _sandbox_agent_impl(
     run_context: dict[str, Any] = state.get("run_context") or {}
     raw_input: Any = run_context.get("input", {})
 
+    # FAR-418 (MAJOR-3 fix, sandbox_agent path): the sandbox agent's render view
+    # must be bound by context_scope too — otherwise a gated run_context key leaks
+    # into the rendered prompt (written to /home/user/prompt.md) and agent_command
+    # via ``{{ run_context.<key> }}`` / ``{{ state.run_context.<key> }}``. Mirror
+    # the make_node_fn scoped_state/scoped_run_context boundary. ``raw_input`` stays
+    # sourced from the full run_context so input routing is unaffected.
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+    scoped_state = dict(state)
+    scoped_state["run_context"] = scoped_run_context
+
     run_id: str = str(state.get("_run_id", ""))
     pipeline_id: str = str(state.get("_pipeline_id", ""))
     org_id: str = str(state.get("_org_id", ""))
@@ -3851,8 +3862,8 @@ async def _sandbox_agent_impl(
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
         template_vars: dict[str, Any] = {
-            "state": state,
-            "run_context": run_context,
+            "state": scoped_state,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         resolved = node_def.get("_resolved_parameters")
