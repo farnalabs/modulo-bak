@@ -2983,6 +2983,14 @@ export default {
       "failed_to_dismiss_notification": "Failed to dismiss notification",
       "notifications": "Notifications"
     },
+    "PipelineSnapshotTimeline": {
+      "version_timeline": "Version timeline",
+      "no_snapshots_yet": "No snapshots yet.",
+      "compare_to": "Compare to:",
+      "impacted_nodes": "Impacted nodes:",
+      "breaking_changes": "Breaking changes",
+      "no_breaking_port_changes": "No breaking port changes."
+    },
     "SidebarLink": {
       "preview": "Preview",
       "dev_preview": "Dev Preview",

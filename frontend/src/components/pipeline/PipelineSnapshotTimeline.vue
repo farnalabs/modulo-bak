@@ -1,7 +1,7 @@
 <template>
   <div class="fixed right-4 top-16 z-40 w-96 max-w-[calc(100vw-2rem)] rounded-lg border bg-card p-4 shadow-lg">
     <div class="mb-3 flex items-center justify-between">
-      <h3 class="text-sm font-semibold">Version timeline</h3>
+      <h3 class="text-sm font-semibold">{{ $t('components.PipelineSnapshotTimeline.version_timeline') }}</h3>
       <button
         type="button"
         class="rounded p-1 hover:bg-accent"
@@ -15,7 +15,7 @@
     <LoadingSpinner v-if="loading" />
 
     <template v-else>
-      <p v-if="snapshots.length === 0" class="text-sm text-muted-foreground">No snapshots yet.</p>
+      <p v-if="snapshots.length === 0" class="text-sm text-muted-foreground">{{ $t('components.PipelineSnapshotTimeline.no_snapshots_yet') }}</p>
 
       <div v-else class="mb-3 max-h-56 space-y-1 overflow-y-auto">
         <div
@@ -48,7 +48,7 @@
         </div>
       </div>
 
-      <span class="mb-1 block text-[10px] text-muted-foreground">Compare to:</span>
+      <span class="mb-1 block text-[10px] text-muted-foreground">{{ $t('components.PipelineSnapshotTimeline.compare_to') }}</span>
       <div class="mb-3 flex items-center gap-2">
         <Select
           data-testid="snapshot-timeline-compare"
@@ -70,12 +70,12 @@
 
       <div v-if="diffResult" class="space-y-2" data-testid="snapshot-timeline-diff-result">
         <div class="text-xs">
-          <span class="font-medium">Impacted nodes:</span>
+          <span class="font-medium">{{ $t('components.PipelineSnapshotTimeline.impacted_nodes') }}</span>
           <span class="text-muted-foreground">{{ impactedLabel }}</span>
         </div>
 
         <div v-if="diffResult.semantic?.breaking_changes?.length" class="space-y-1">
-          <div class="text-xs font-medium text-destructive">Breaking changes</div>
+          <div class="text-xs font-medium text-destructive">{{ $t('components.PipelineSnapshotTimeline.breaking_changes') }}</div>
           <div
             v-for="(b, i) in diffResult.semantic.breaking_changes"
             :key="i"
@@ -87,7 +87,7 @@
             — {{ b.reason }}
           </div>
         </div>
-        <p v-else class="text-[11px] text-muted-foreground">No breaking port changes.</p>
+        <p v-else class="text-[11px] text-muted-foreground">{{ $t('components.PipelineSnapshotTimeline.no_breaking_port_changes') }}</p>
       </div>
 
       <div class="mt-3 flex justify-end border-t pt-2">

@@ -149,6 +149,10 @@ def test_rollback_succeeds_when_enabled(team_client: TestClient) -> None:
     new_snapshot.notes = None
     new_snapshot.created_at = None
     new_snapshot.account_id = _USER_ID
+    new_snapshot.version_kind = "run"
+    new_snapshot.created_kind = "run"
+    new_snapshot.draft = False
+    new_snapshot.channel = "none"
     with (
         patch("modulo.api.routes.pipelines.set_rls_org"),
         patch("modulo.api.routes.pipelines.set_rls_user_context"),
@@ -174,6 +178,10 @@ def test_snapshot_list_is_community_tier(community_client: TestClient) -> None:
     snapshot.notes = None
     snapshot.created_at = None
     snapshot.account_id = _USER_ID
+    snapshot.version_kind = "run"
+    snapshot.created_kind = "run"
+    snapshot.draft = False
+    snapshot.channel = "none"
 
     with (
         patch("modulo.api.routes.pipelines.set_rls_org"),

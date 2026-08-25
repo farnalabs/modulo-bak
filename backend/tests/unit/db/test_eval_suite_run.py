@@ -522,9 +522,10 @@ def test_single_migration_head() -> None:
     assert [_basename(p) for p in chaining_off_0135] == ["0136_rename_remy_user_id_to_account_id.py"]
     chaining_off_0136 = [p for p in revisions if parents[p] == "0136_rename_remy_user_id_to_account_id"]
     assert [_basename(p) for p in chaining_off_0136] == ["0137_eval_suite_run.py"]
-    # Nothing chains off 0137 -> it is the single head.
+    # 0138_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0137 ->
+    # it is now the single head.
     chaining_off_0137 = [p for p in revisions if parents[p] == "0137_eval_suite_run"]
-    assert chaining_off_0137 == []
+    assert [_basename(p) for p in chaining_off_0137] == ["0138_pipeline_snapshot_versioning_far420.py"]
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
