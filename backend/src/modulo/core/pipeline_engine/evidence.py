@@ -53,7 +53,6 @@ _log = logging.getLogger(__name__)
 #: Bounded async probe budget — code-constant, ≤3s per probe (§15.13).
 EVIDENCE_PROBE_TIMEOUT_SECONDS: float = 3.0
 
-
 #: Run statuses eligible for the reconciliation sweep. Only genuinely
 #: terminalized ``complete`` runs (not all terminal statuses) are no-op
 #: eligible — a failed/cancelled run is already a declared failure (§13.3).

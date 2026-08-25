@@ -17,7 +17,7 @@ from modulo.connectors.base import (
     HealthResult,
 )
 
-# Repeated REST path and cast type alias (S1192).
+# Repeated REST path (S1192).
 _WORKFLOWS_PATH = "/rest/workflows"
 
 

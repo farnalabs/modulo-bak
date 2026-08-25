@@ -20,7 +20,6 @@ from modulo.connectors.base import (
 
 _BUILDKITE_API = "https://api.buildkite.com/v2"
 
-
 _STATUS_MAP: dict[str, CIRunStatus] = {
     "scheduled": CIRunStatus.QUEUED,
     "running": CIRunStatus.IN_PROGRESS,

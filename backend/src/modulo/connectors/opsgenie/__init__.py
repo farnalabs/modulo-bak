@@ -19,7 +19,7 @@ from modulo.connectors.base import (
 
 _BASE = "https://api.opsgenie.com/v2"
 
-# Repeated REST path and cast type alias (S1192).
+# Repeated REST path (S1192).
 _ALERTS_PATH = "/alerts"
 
 
