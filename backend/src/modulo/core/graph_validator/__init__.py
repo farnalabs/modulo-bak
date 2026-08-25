@@ -2468,76 +2468,93 @@ class GraphValidator:
         found: dict[uuid.UUID, ConnectorInstance] = {r.id: r for r in rows}
 
         for binding in connector_bindings:
-            node_id: str | None = str(binding.get("node_id")) if binding.get("node_id") else None
-            if node_id is None:
-                continue
-            node = node_map.get(node_id)
-            if not isinstance(node, dict):
-                continue
-            cid_obj = try_parse_uuid(binding.get("connector_instance_id"))
-            if cid_obj is None:
-                continue
-            instance = found.get(cid_obj)
-            if instance is None:
-                continue
+            self._reconcile_binding_send_budget(binding, node_map, found, result)
 
-            fanout = (instance.config_json or {}).get("fan_out")
-            if not isinstance(fanout, dict):
-                continue
-            # The connector only fans out when ``_fanout_enabled AND
-            # _fanout_items_path`` are both truthy (rest/__init__.py write()).
-            # ``_fanout_enabled = bool(enabled or items_path)`` and
-            # ``_fanout_items_path = items_path``, so the effective activation
-            # predicate reduces to ``bool(items_path)`` — ``enabled`` alone is
-            # NOT sufficient. A ``fan_out`` dict with ``enabled`` but NO
-            # ``items_path`` (``{}`` or ``{"enabled": true}``) runs as a SINGLE
-            # call, so it must not be reconciled against a fan-out send budget.
-            # Gate on the SAME effective predicate (``items_path`` truthy) so an
-            # inert fan-out is skipped rather than spuriously warned about.
-            if not fanout.get("items_path"):
-                continue
-            # The connector DEFAULTS both keys when absent (max_cardinality ->
-            # 1000, per_item_timeout -> its ``_DEFAULT_TIMEOUT``, which is ALWAYS
-            # 30.0s in production — the connector never reads a top-level
-            # ``timeout`` config key, and the composition root constructs it with
-            # no ``timeout`` arg). Substitute those defaults, imported from the
-            # connector module as the single source of truth, so a minimal
-            # fan_out config still gets reconciled; an explicitly-malformed value
-            # (present but not a positive number) is still skipped via
-            # _as_positive_number.
-            from modulo.connectors.rest import _DEFAULT_MAX_FANOUT_CARDINALITY, _DEFAULT_TIMEOUT
+    def _reconcile_binding_send_budget(
+        self,
+        binding: dict[str, Any],
+        node_map: dict[str, Any],
+        found: dict[uuid.UUID, ConnectorInstance],
+        result: ValidationResult,
+    ) -> None:
+        """Emit NODE_SEND_BUDGET_OVERSUBSCRIBED for a single fan-out binding.
 
-            if "max_cardinality" in fanout:
-                max_cardinality = _as_positive_number(fanout.get("max_cardinality"))
-                if max_cardinality is None:
-                    continue
-            else:
-                max_cardinality = float(_DEFAULT_MAX_FANOUT_CARDINALITY)
-            if "per_item_timeout" in fanout:
-                per_item_timeout = _as_positive_number(fanout.get("per_item_timeout"))
-                if per_item_timeout is None:
-                    continue
-            else:
-                per_item_timeout = _DEFAULT_TIMEOUT
-            max_retries_raw = fanout.get("max_retries")
-            if isinstance(max_retries_raw, int) and not isinstance(max_retries_raw, bool) and max_retries_raw >= 0:
-                attempts = max_retries_raw + 1
-            else:
-                attempts = 3
-            wait_for = _as_positive_number(node.get("timeout_seconds"))
-            if wait_for is None:
-                continue
-            total = max_cardinality * per_item_timeout * attempts
-            if total > wait_for:
-                result.warning(
-                    "NODE_SEND_BUDGET_OVERSUBSCRIBED",
-                    f"Node '{node_id}': fan_out max_cardinality={max_cardinality} "
-                    f"x per_item_timeout={per_item_timeout} x attempts={attempts} "
-                    f"({total:.1f}s) exceeds node timeout_seconds budget {wait_for:.1f}s — "
-                    "retries will be cancelled mid-send, producing UNKNOWN outcomes. Raise "
-                    "timeout_seconds, lower per_item_timeout, or reduce fan_out.max_retries.",
-                    node_id=node_id,
-                )
+        Mirrors :meth:`_check_node_send_budget`: a binding only counts when its
+        node resolves, its connector instance is found, and the instance's
+        ``fan_out`` config is genuinely fan-out-active (``items_path`` truthy).
+        """
+        node_id = str(binding.get("node_id")) if binding.get("node_id") else None
+        if node_id is None:
+            return
+        node = node_map.get(node_id)
+        if not isinstance(node, dict):
+            return
+        cid_obj = try_parse_uuid(binding.get("connector_instance_id"))
+        if cid_obj is None:
+            return
+        instance = found.get(cid_obj)
+        if instance is None:
+            return
+        fanout = (instance.config_json or {}).get("fan_out")
+        if not isinstance(fanout, dict):
+            return
+        # The connector only fans out when ``items_path`` is truthy (rest/__init__.py
+        # write()): ``_fanout_enabled = bool(enabled or items_path)`` and
+        # ``_fanout_items_path = items_path``, so the effective predicate reduces to
+        # ``bool(items_path)`` — ``enabled`` alone is NOT sufficient. An inert
+        # fan_out (``{}`` / ``{"enabled": true}``) runs as a single call and must
+        # not be reconciled against a fan-out send budget.
+        if not fanout.get("items_path"):
+            return
+        params = self._resolve_fanout_budget(fanout)
+        if params is None:
+            return
+        max_cardinality, per_item_timeout, attempts = params
+        wait_for = _as_positive_number(node.get("timeout_seconds"))
+        if wait_for is None:
+            return
+        total = max_cardinality * per_item_timeout * attempts
+        if total > wait_for:
+            result.warning(
+                "NODE_SEND_BUDGET_OVERSUBSCRIBED",
+                f"Node '{node_id}': fan_out max_cardinality={max_cardinality} "
+                f"x per_item_timeout={per_item_timeout} x attempts={attempts} "
+                f"({total:.1f}s) exceeds node timeout_seconds budget {wait_for:.1f}s — "
+                "retries will be cancelled mid-send, producing UNKNOWN outcomes. Raise "
+                "timeout_seconds, lower per_item_timeout, or reduce fan_out.max_retries.",
+                node_id=node_id,
+            )
+
+    def _resolve_fanout_budget(self, fanout: dict[str, Any]) -> tuple[float, float, int] | None:
+        """Resolve ``(max_cardinality, per_item_timeout, attempts)`` from fan_out.
+
+        Returns ``None`` when a present numeric value is malformed, so the caller
+        skips the advisory rather than emitting a spurious warning. Missing keys
+        fall back to the connector's production defaults (imported from the
+        connector module as the single source of truth).
+        """
+        if "max_cardinality" in fanout:
+            max_cardinality = _as_positive_number(fanout.get("max_cardinality"))
+            if max_cardinality is None:
+                return None
+        else:
+            from modulo.connectors.rest import _DEFAULT_MAX_FANOUT_CARDINALITY
+
+            max_cardinality = float(_DEFAULT_MAX_FANOUT_CARDINALITY)
+        if "per_item_timeout" in fanout:
+            per_item_timeout = _as_positive_number(fanout.get("per_item_timeout"))
+            if per_item_timeout is None:
+                return None
+        else:
+            from modulo.connectors.rest import _DEFAULT_TIMEOUT
+
+            per_item_timeout = _DEFAULT_TIMEOUT
+        max_retries_raw = fanout.get("max_retries")
+        if isinstance(max_retries_raw, int) and not isinstance(max_retries_raw, bool) and max_retries_raw >= 0:
+            attempts = max_retries_raw + 1
+        else:
+            attempts = 3
+        return (max_cardinality, per_item_timeout, attempts)
 
     # ------------------------------------------------------------------
     # Pipeline retry_policy

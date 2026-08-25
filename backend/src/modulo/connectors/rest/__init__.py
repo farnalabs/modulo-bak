@@ -727,7 +727,7 @@ class RestConnector(ConnectorBase):
                 outcome["result"] = self._result_summary(result)
                 success_count += 1
                 outcomes.append(outcome)
-            except asyncio.CancelledError as exc:  # NOSONAR: subclass, cancellation preserved (FAR-411)
+            except asyncio.CancelledError as exc:  # NOSONAR
                 raise RESTFanOutCancelledError(
                     f"REST fan-out cancelled at item {index} of {len(resolved)} "
                     f"after {success_count} successful item(s)",
@@ -1068,7 +1068,6 @@ class RestConnector(ConnectorBase):
         """
         retries = _MAX_RETRIES - 1 if max_retries is None else max_retries
         retries = max(0, min(retries, _MAX_SANE_RETRIES))
-        attempts = retries + 1
         # Rate-limit wait deadline: bound the token-bucket refill by the per-request
         # timeout so a saturated destination never spins past the per-item budget.
         rate_wait_timeout = request_timeout if request_timeout is not None else self._timeout
@@ -1076,16 +1075,30 @@ class RestConnector(ConnectorBase):
         if not self._is_retryable(request):
             await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
+        return await self._send_retryable(client, request, kwargs, rate_wait_timeout, request_timeout, retries + 1)
+
+    async def _send_retryable(
+        self,
+        client: httpx.AsyncClient,
+        request: RestRequest,
+        kwargs: dict[str, Any],
+        rate_wait_timeout: float | None,
+        request_timeout: float | None,
+        attempts: int,
+    ) -> tuple[httpx.Response, str]:
+        """Retry loop for idempotent verbs — see :meth:`_send` for the contract.
+
+        A token is acquired before every wire attempt so each retry is metered,
+        and a bounded backoff is applied between attempts.
+        """
         last_delay = 0.0
         for attempt in range(attempts):
-            if attempt:
-                await asyncio.sleep(last_delay)
-            # Acquire a token before EACH wire attempt so every retry is metered.
+            await asyncio.sleep(last_delay)
             await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             try:
                 return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:
-                if exc.status_code not in _RETRYABLE_STATUS or attempt == attempts - 1:
+                if not self._is_status_retryable(exc, attempt, attempts):
                     raise
                 last_delay = self._retry_delay(exc, attempt)
             except RESTConnectError:
@@ -1093,6 +1106,10 @@ class RestConnector(ConnectorBase):
                     raise
                 last_delay = self._backoff(attempt)
         raise AssertionError("unreachable")  # pragma: no cover
+
+    def _is_status_retryable(self, exc: RESTStatusError, attempt: int, attempts: int) -> bool:
+        """Whether a ``RESTStatusError`` should trigger another attempt."""
+        return attempt != attempts - 1 and exc.status_code in _RETRYABLE_STATUS
 
     def _request_kwargs(self, request: RestRequest) -> dict[str, Any]:
         """Build the httpx kwargs, injecting auth headers + idempotency key once."""
