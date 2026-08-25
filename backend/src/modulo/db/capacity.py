@@ -141,7 +141,7 @@ def capacity_hard_stop(settings: Settings, status: dict[str, Any]) -> bool:
         return False
     if settings.db_capacity_bypass:
         return False
-    percent = status.get("capacity_percent")
+    percent: float | None = status.get("capacity_percent")
     if percent is None:
         return False
     return percent >= settings.db_capacity_hard_stop_pct
