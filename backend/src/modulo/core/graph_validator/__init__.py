@@ -1127,7 +1127,6 @@ class GraphValidator:
         self._check_ports(graph_json, result)
         self._check_sandbox_agent_config(graph_json, result)
         self._check_node_idempotent(graph_json, result)
-
         await self._check_node_send_budget_bindings(graph_json, connector_bindings or [], session, result)
         self._check_parallel_run_context_writes(graph_json, result)
         self._check_schema_compatibility(graph_json, result)

@@ -56,7 +56,6 @@ _RATE_LIMIT_HEADERS = (
 # Preferred headers (epoch seconds) for the quota-reset retry delay, in order.
 _RATE_LIMIT_RESET_HEADERS = ("RateLimit-ResetTime", "RateLimit-Reset")
 
-
 # Retry/backoff configuration (canonical values live in _retry_headers)
 _RETRYABLE_STATUSES = RETRYABLE_STATUSES
 _MAX_RETRIES = MAX_RETRIES

@@ -83,7 +83,6 @@ _COMMIT_ACTIONS = frozenset({"create", "update", "delete", "move"})
 # Review events accepted by the PR review resource (write("pr_review"))
 _REVIEW_EVENTS = frozenset({"APPROVE", "REQUEST_CHANGES", "COMMENT"})
 
-
 # Retry/backoff configuration (canonical values live in _retry_headers)
 _RETRYABLE_STATUSES = RETRYABLE_STATUSES
 _MAX_RETRIES = MAX_RETRIES
