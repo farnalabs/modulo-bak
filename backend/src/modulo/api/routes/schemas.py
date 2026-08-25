@@ -841,7 +841,7 @@ async def _infer_definition(
     mbs: Any,
     records: list[dict[str, Any]],
     connector_type: str,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], uuid.UUID]:
     """Run LLM schema inference and return ``(definition_json, backend_id)``."""
     secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
     async with ModelBackendHub() as mh:
@@ -1006,7 +1006,7 @@ async def _generate_schema(
     settings: Settings,
     mbs: Any,
     req: SchemaGenerateRequest,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], uuid.UUID]:
     """Run LLM schema generation and return ``(definition_json, backend_id)``."""
     secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
     async with ModelBackendHub() as mh:
