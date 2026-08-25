@@ -566,8 +566,10 @@ def test_single_migration_head() -> None:
     # -> 0142_merge_heads_add_fk_indexes (main's FK-index merge head).
     # -> 0143_rest_connector_profile (FAR-412 REST connector profile, renumbered
     #    from 0142 to avoid colliding with main's 0142_merge_heads_add_fk_indexes).
-    # -> 0144_json_to_jsonb_standardize (this branch's json->jsonb cleanup,
-    #    renumbered from 0142 to avoid colliding with main's 0142_* migrations).
+    # -> 0144_broaden_notification_status_in_app (main: allow 'in_app' status on
+    #    notification_delivery_log) -> 0145_json_to_jsonb_standardize (this
+    #    branch's json->jsonb cleanup, renumbered from 0144 to avoid colliding
+    #    with main's 0144_broaden_notification_status_in_app).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -594,12 +596,15 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0142 except 0143 (the FAR-412 REST connector profile, renumbered).
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
     assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
-    # Nothing chains off 0143 except 0144 (this branch's json->jsonb cleanup).
+    # 0144_broaden_notification_status_in_app (main) chains off 0143; this
+    # branch's 0145_json_to_jsonb_standardize chains off it and is the head.
     chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
-    assert [_basename(p) for p in chaining_off_0143] == ["0144_json_to_jsonb_standardize.py"]
-    # Nothing chains off 0144 -> it is the single head.
-    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_json_to_jsonb_standardize"]
-    assert chaining_off_0144 == []
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_broaden_notification_status_in_app.py"]
+    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_broaden_notification_status_in_app"]
+    assert [_basename(p) for p in chaining_off_0144] == ["0145_json_to_jsonb_standardize.py"]
+    # Nothing chains off 0145 -> it is the single head.
+    chaining_off_0145 = [p for p in revisions if parents[p] == "0145_json_to_jsonb_standardize"]
+    assert chaining_off_0145 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
