@@ -18,6 +18,7 @@ import uuid
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -33,6 +34,7 @@ from modulo.core.eval_engine.execute_suite_run import (
     execute_suite_run,
     is_eval_trigger,
     suite_run_daily_spend_exceeded,
+    suite_run_daily_spend_used,
 )
 from modulo.db.models import Base
 from modulo.db.models.eval_dataset import EvalCase, EvalDataset
@@ -41,6 +43,8 @@ from modulo.db.models.eval_result import EvalResult
 from modulo.db.models.eval_suite import EvalSuite
 from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
 from modulo.db.models.model_backend import ModelBackend
+from modulo.db.models.run import Run
+from modulo.db.models.trigger_event import TriggerEvent
 
 
 def _tables() -> list[Any]:
@@ -52,6 +56,8 @@ def _tables() -> list[Any]:
         SuiteRun.__table__,
         EvalResult.__table__,
         ModelBackend.__table__,
+        Run.__table__,
+        TriggerEvent.__table__,
     ]
 
 
@@ -204,6 +210,44 @@ async def test_failure_sink_transitions_run_to_failed(session) -> None:
     assert "llm_judge" in (run.error_detail or "")
 
 
+async def test_failure_sink_ingests_error_event(session, monkeypatch) -> None:
+    """The monitored failure sink escalates to the Error Dashboard.
+
+    Prove-the-fix: without ``_fail_run``'s ``ErrorIngestionService().ingest``
+    call the error event is never surfaced — the run would be failed with
+    ``error_detail`` set but no monitored event, so the Error Dashboard and the
+    missed-run watchers would see nothing.
+    """
+    org = await _org()
+    suite, dataset, _, backend = await seed_suite(session, org)
+    await seed_cases(session, org, dataset, [{"category": "billing"}])
+
+    ingest = AsyncMock()
+
+    class _FakeIngestionService:
+        def __init__(self, *a: Any, **k: Any) -> None:
+            self.ingest = ingest
+
+    monkeypatch.setattr("modulo.core.error_tracking.ErrorIngestionService", _FakeIngestionService)
+
+    run = await build_suite_run(
+        session, org_id=org, suite_id=suite.id, dataset_id=dataset.id, model_backend_id=backend.id
+    )
+    # No definitions -> orchestration error -> failure sink.
+    for d in (await session.execute(__import__("sqlalchemy").select(EvalDefinition))).scalars():
+        await session.delete(d)
+
+    with pytest.raises(SuiteRunExecutionError):
+        await execute_suite_run(session, run)
+    assert run.state == SuiteRunState.FAILED.value
+    ingest.assert_awaited_once()
+    payload = ingest.await_args.args[2]
+    assert payload["level"] == "error"
+    assert payload["source"] == "suite_run"
+    assert str(run.id) in payload["message"]
+    assert payload["context_json"]["suite_run_id"] == str(run.id)
+
+
 async def test_execute_suite_run_rejects_no_definitions(session) -> None:
     org = await _org()
     suite, dataset, _, backend = await seed_suite(session, org)
@@ -255,11 +299,11 @@ def test_exclude_eval_families_drops_eval_events() -> None:
 async def test_suite_run_completion_writes_only_eval_results(session) -> None:
     """A SuiteRun execution persists EvalResult rows and nothing else.
 
-    Only the eval tables are created here — there is no ``runs`` or
-    ``trigger_events`` table. If the runner attempted to write a ``Run`` or a
-    ``TriggerEvent``, the flush would fail and the test would error. Reaching
-    ``completed`` therefore proves the loop-guard: a finished eval writes ONLY
-    into the eval surface, never into the webhook/trigger-watch source.
+    The ``runs`` and ``trigger_events`` surfaces are created alongside the eval
+    tables here, so a loop-guard regression that wrote a ``Run`` or a
+    ``TriggerEvent`` would be observable. Reaching ``completed`` with zero rows
+    in BOTH proves the loop-guard: a finished eval writes ONLY into the eval
+    surface, never into the webhook/trigger-watch source.
     """
     org = await _org()
     suite, dataset, _, backend = await seed_suite(session, org)
@@ -274,6 +318,49 @@ async def test_suite_run_completion_writes_only_eval_results(session) -> None:
     await session.flush()
     assert stats["state"] == SuiteRunState.COMPLETED.value
 
+    # Loop guard: a finished eval writes NO pipeline Run and NO TriggerEvent.
+    runs = list((await session.execute(__import__("sqlalchemy").select(Run))).scalars())
+    assert runs == []
+    events = list((await session.execute(__import__("sqlalchemy").select(TriggerEvent))).scalars())
+    assert events == []
+    # But the per-case EvalResults ARE persisted.
+    results = list((await session.execute(__import__("sqlalchemy").select(EvalResult))).scalars())
+    assert len(results) == 1
+    assert results[0].suite_run_id == run.id
+
+
+# --------------------------------------------------------------------------- #
+# Runner from ``pending`` (the SAQ execute_suite_run path)                    #
+# --------------------------------------------------------------------------- #
+async def test_execute_suite_run_from_pending_self_transitions_to_running(session) -> None:
+    """The runner handles a run still in ``pending`` — the SAQ job path.
+
+    ``fire_suite_run_trigger`` (cron_helpers) builds a ``pending`` SuiteRun and
+    the SAQ ``execute_suite_run`` job hands it straight to this runner WITHOUT a
+    prior ``pending -> running`` transition. The runner's own contract is
+    "(pending -> terminal)", so it must self-transition a ``pending`` run to
+    ``running`` before evaluation.
+
+    Prove-the-fix: without this self-transition the runner calls
+    ``_suite_run_transition(session, run, COMPLETED)`` while the run is still
+    ``pending`` — an ILLEGAL edge (``pending`` only allows ``{running,
+    cancelled}``) that raises ``IllegalStateTransitionError`` and leaves the run
+    stuck ``pending`` forever, never surfaced as failed.
+    """
+    org = await _org()
+    suite, dataset, _, backend = await seed_suite(session, org)
+    await seed_cases(session, org, dataset, [{"category": "billing"}])
+    # build_suite_run leaves the run PENDING — exactly the fire_path state.
+    run = await build_suite_run(
+        session, org_id=org, suite_id=suite.id, dataset_id=dataset.id, model_backend_id=backend.id
+    )
+    assert run.state == SuiteRunState.PENDING.value
+    # NO manual _suite_run_transition to RUNNING here — the runner must do it.
+    stats = await execute_suite_run(session, run, eval_definition_version=1)
+    await session.flush()
+    assert stats["state"] == SuiteRunState.COMPLETED.value
+    assert run.state == SuiteRunState.COMPLETED.value
+
 
 # --------------------------------------------------------------------------- #
 # Separate spend pool                                                         #
@@ -284,6 +371,44 @@ def test_suite_run_spend_is_independent_of_production_pool() -> None:
     assert suite_run_daily_spend_exceeded(Decimal("10.0"), Decimal("10.0")) is True
     assert suite_run_daily_spend_exceeded(Decimal("9.99"), Decimal("10.0")) is False
     assert suite_run_daily_spend_exceeded(Decimal(5), None) is False
+
+
+async def test_suite_run_daily_spend_used_ignores_production_runs(session) -> None:
+    """The suite-run spend pool SUMs ``suite_runs`` cost — never ``runs``.
+
+    Prove-the-fix: if ``suite_run_daily_spend_used`` queried the production
+    ``runs`` table (the pool production triggers enforce over), a run costing
+    $100 would be counted against the suite-run limit. Here a production Run
+    costs $100 and a SuiteRun costs $2; the suite-run today-pool must be $2.
+    """
+    org = await _org()
+    prod_run = Run(
+        organisation_id=org,
+        pipeline_id=uuid.uuid4(),
+        snapshot_id=uuid.uuid4(),
+        trigger_type="cron",
+        run_number=1,
+        input_hash="h" * 64,
+        langgraph_thread_id=str(uuid.uuid4()),
+        total_cost_usd=Decimal("100.00"),
+    )
+    suite_run = SuiteRun(
+        organisation_id=org,
+        suite_id=uuid.uuid4(),
+        dataset_id=uuid.uuid4(),
+        definition_checksum="a" * 64,
+        model_backend_id=uuid.uuid4(),
+        state=SuiteRunState.COMPLETED.value,
+        total_cost_usd=Decimal("2.00"),
+    )
+    session.add_all([prod_run, suite_run])
+    await session.flush()
+
+    used = await suite_run_daily_spend_used(session, org)
+    assert used == Decimal("2.00")
+    # A second org never sees the first's suite-run spend (org isolation).
+    other = await suite_run_daily_spend_used(session, uuid.uuid4())
+    assert other == Decimal(0)
 
 
 # --------------------------------------------------------------------------- #

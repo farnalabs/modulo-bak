@@ -406,6 +406,17 @@ async def execute_suite_run(
         elif raw is not None:
             suite_ceiling = Decimal(str(raw))
     try:
+        # The SAQ ``execute_suite_run`` job hands a run straight from
+        # ``build_suite_run`` (via ``fire_suite_run_trigger``) — a ``pending``
+        # run that has NOT been moved to ``running`` by a separate step. Self-
+        # transition it so the terminal transition below (``running ->
+        # completed/partial/failed``) is a legal edge. Without this the runner
+        # would try ``pending -> completed`` (illegal) and strand the run in
+        # ``pending`` forever — never terminal, never surfaced.
+        if run.state == SuiteRunState.PENDING.value:
+            await _suite_run_transition(session, run, SuiteRunState.RUNNING)
+            await session.flush()
+
         definitions = await load_suite_definitions(session, run.organisation_id, run.suite_id)
         if not definitions:
             raise SuiteRunExecutionError(f"suite {run.suite_id} has no active eval definitions")

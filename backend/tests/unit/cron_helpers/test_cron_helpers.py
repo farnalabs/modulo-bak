@@ -1324,6 +1324,110 @@ class TestEnqueueFireJob:
 
 
 # ---------------------------------------------------------------------------
+# FAR-377 run-kind routing (cron due-row dispatch)
+# ---------------------------------------------------------------------------
+
+
+class TestSuiteRunDispatchRouting:
+    @pytest.mark.asyncio
+    async def test_suite_run_row_enqueues_fire_suite_run_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``run_kind == 'suite_run'`` cron row routes to the SuiteRun fire job.
+
+        Prove-the-fix: without the FAR-377 discriminator the due-row enqueue
+        would always call ``fire_cron_trigger`` (building a pipeline ``Run``).
+        The discriminator must route a ``suite_run`` row to
+        ``fire_suite_run_trigger`` and NOT pass a ``snapshot_id`` (the suite run
+        resolves its own dataset/backend from the trigger config).
+        """
+        _patch_env(monkeypatch)
+        q = MagicMock()
+        redis_client = AsyncMock()
+        now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+        org_id = ORG
+        suite_row = SimpleNamespace(
+            id=TRIGGER_A,
+            pipeline_id=uuid.uuid4(),
+            config_json={"eval_suite_id": str(uuid.uuid4())},
+            cron_expression="0 0 * * *",
+            cron_timezone=None,
+            next_fire_at=now - timedelta(hours=1),
+            run_kind="suite_run",
+        )
+        advanced_this_tick: set[uuid.UUID] = set()
+        summary: dict[str, int] = {"cron_enqueued": 0}
+
+        with (
+            patch.object(ch, "_enqueue_fire_job_async", new_callable=AsyncMock, return_value="job-1") as enqueue,
+            patch.object(ch, "_mark_catchup_fired", new_callable=AsyncMock),
+        ):
+            ok = await ch._enqueue_cron_fire(
+                q,
+                redis_client,
+                now,
+                org_id,
+                suite_row,
+                snapshot_id=str(uuid.uuid4()),
+                advanced_this_tick=advanced_this_tick,
+                summary=summary,
+            )
+
+        assert ok is True
+        assert summary["cron_enqueued"] == 1
+        assert TRIGGER_A in advanced_this_tick
+        enqueue.assert_awaited_once()
+        args = enqueue.await_args.args
+        kwargs = enqueue.await_args.kwargs
+        assert args[1] == "modulo.core.saq_worker.fire_suite_run_trigger"
+        assert args[2].startswith(f"suite_fire:{TRIGGER_A}:")
+        # The suite-run path never passes a snapshot_id / cron_expression.
+        assert "snapshot_id" not in kwargs
+        assert "cron_expression" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_run_row_enqueues_fire_cron_trigger(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A plain ``run_kind == 'run'`` row keeps routing to ``fire_cron_trigger``
+        with its snapshot — the discriminator is opt-in, never a regression."""
+        _patch_env(monkeypatch)
+        q = MagicMock()
+        redis_client = AsyncMock()
+        now = datetime(2026, 8, 25, 12, 0, tzinfo=UTC)
+        org_id = ORG
+        run_row = SimpleNamespace(
+            id=TRIGGER_A,
+            pipeline_id=uuid.uuid4(),
+            config_json={"snapshot_id": str(uuid.uuid4())},
+            cron_expression="0 0 * * *",
+            cron_timezone=None,
+            next_fire_at=now - timedelta(hours=1),
+            run_kind="run",
+        )
+        advanced_this_tick: set[uuid.UUID] = set()
+        summary: dict[str, int] = {"cron_enqueued": 0}
+
+        with (
+            patch.object(ch, "_enqueue_fire_job_async", new_callable=AsyncMock, return_value="job-1") as enqueue,
+            patch.object(ch, "_mark_catchup_fired", new_callable=AsyncMock),
+        ):
+            ok = await ch._enqueue_cron_fire(
+                q,
+                redis_client,
+                now,
+                org_id,
+                run_row,
+                snapshot_id=str(uuid.uuid4()),
+                advanced_this_tick=advanced_this_tick,
+                summary=summary,
+            )
+
+        assert ok is True
+        args = enqueue.await_args.args
+        kwargs = enqueue.await_args.kwargs
+        assert args[1] == "modulo.core.saq_worker.fire_cron_trigger"
+        assert "snapshot_id" in kwargs
+        assert "cron_expression" in kwargs
+
+
+# ---------------------------------------------------------------------------
 # Fire logic skips (mirrors the relocated CronFireTask semantics)
 # ---------------------------------------------------------------------------
 
