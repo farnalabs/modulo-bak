@@ -210,6 +210,7 @@ modulo/
 │   └── workflows/                # CI/CD pipeline definitions
 ├── docs/
 │   ├── adr/                      # Architecture decision records
+│   ├── product-map/              # Feature graph entries (see product-map/README.md)
 │   ├── security/                 # Security documentation
 │   └── deployment/               # Deployment guides
       (product map: frontend/src/manifest.yaml — feature registry + per-route refs, ADR 008)
@@ -452,7 +453,10 @@ exist in the devtools tooling repo.
 2. Run the test suites and lint checks relevant to your change (see
    [Testing](#testing) and [Coding Standards](#coding-standards))
 3. Verify coverage thresholds are met
-4. Update the product map entry for any feature changes (see the product map)
+4. Update the product map entry for any feature changes (see the product map — the
+   feature graph lives in `docs/product-map/`, keyed by the `features:` registry and
+   route `product_map` refs in `frontend/src/manifest.yaml`; see
+   `docs/product-map/README.md`)
 5. Update the product map (frontend/src/manifest.yaml) and relevant docs if your change introduces new behaviour
 
 ### Review requirements
