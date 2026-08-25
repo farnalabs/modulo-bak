@@ -2,8 +2,8 @@
   <FeatureGate feature-name="admin_run_retention" required-tier="team" show-disabled>
     <div class="page-wide">
       <PageHeader
-        title="Run Retention"
-        subtitle="Export old runs to a file, then clear them down across checkpoints"
+        :title="$t('views.AdminRunRetentionView.run_retention')"
+        :subtitle="$t('views.AdminRunRetentionView.page_subtitle')"
       >
         <template #right>
           <Button
@@ -13,14 +13,14 @@
             :disabled="loading"
             @click="loadCandidates"
           >
-            {{ loading ? 'Loading…' : 'Refresh' }}
+            {{ loading ? $t('views.AdminRunRetentionView.refreshing') : $t('views.AdminRunRetentionView.refresh') }}
           </Button>
           <Button
             data-testid="admin-run-retention-export"
             :disabled="exporting || candidates.length === 0"
             @click="exportFile"
           >
-            {{ exporting ? 'Exporting…' : 'Export to file' }}
+            {{ exporting ? $t('views.AdminRunRetentionView.exporting') : $t('views.AdminRunRetentionView.export_to_file') }}
           </Button>
           <Button
             severity="danger"
@@ -28,7 +28,7 @@
             :disabled="purging || terminalCandidates.length === 0"
             @click="openPurgeConfirm"
           >
-            {{ purging ? 'Purging…' : 'Purge' }}
+            {{ purging ? $t('views.AdminRunRetentionView.purging') : $t('views.AdminRunRetentionView.purge') }}
           </Button>
         </template>
       </PageHeader>
@@ -52,8 +52,7 @@
         class="mb-4 rounded-lg border border-success/50 bg-success/10 p-3 text-sm text-success"
         data-testid="admin-run-retention-purge-result"
       >
-        Purged {{ purgeResult.purged_runs }} run(s) and {{ purgeResult.purged_checkpoints }}
-        checkpoint(s), freeing {{ formatBytes(purgeResult.freed_estimated_bytes) }}.
+        {{ $t('views.AdminRunRetentionView.purge_result', { runs: purgeResult.purged_runs, checkpoints: purgeResult.purged_checkpoints, bytes: formatBytes(purgeResult.freed_estimated_bytes) }) }}
       </div>
 
       <Card>
@@ -72,7 +71,7 @@
               />
             </div>
             <div>
-              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-to">To</label>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-to">{{ $t('views.AdminRunRetentionView.to_label') }}</label>
               <input
                 id="rr-date-to"
                 v-model="dateTo"
@@ -89,7 +88,7 @@
                 :options="pipelineOptions"
                 option-label="label"
                 option-value="value"
-                placeholder="All pipelines"
+                :placeholder="$t('views.AdminRunRetentionView.all_pipelines')"
                 class="w-full"
                 data-testid="admin-run-retention-pipeline"
               />
@@ -102,7 +101,7 @@
                 :options="statusOptions"
                 option-label="label"
                 option-value="value"
-                placeholder="All statuses"
+                :placeholder="$t('views.AdminRunRetentionView.all_statuses')"
                 class="w-full"
                 data-testid="admin-run-retention-status"
               />
@@ -110,7 +109,7 @@
           </div>
           <div class="mt-3 flex items-center gap-2">
             <Button data-testid="admin-run-retention-apply" @click="loadCandidates">
-              Apply filters
+              {{ $t('views.AdminRunRetentionView.apply_filters') }}
             </Button>
             <button
               type="button"
@@ -118,7 +117,7 @@
               data-testid="admin-run-retention-reset"
               @click="resetFilters"
             >
-              Reset
+              {{ $t('views.AdminRunRetentionView.reset') }}
             </button>
           </div>
         </template>
@@ -152,14 +151,12 @@
       </Card>
 
       <div class="mb-4 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm" data-testid="admin-run-retention-warning">
-        Only terminal runs (complete, failed, cancelled, eval-failed, stalled) are ever purged.
-        In-flight runs (pending, running, awaiting human, claimed) are never deleted — they are
-        listed as candidates but are skipped by the purge.
+        {{ $t('views.AdminRunRetentionView.warning_terminal_only') }}
       </div>
 
       <Card>
         <template #title>{{ $t('views.AdminRunRetentionView.candidates_title') }}</template>
-        <template #subtitle>Up to 500 matching runs with an estimated per-run size.</template>
+        <template #subtitle>{{ $t('views.AdminRunRetentionView.candidates_subtitle') }}</template>
         <template #content>
           <div v-if="loading" class="flex justify-center py-6">
             <LoadingSpinner />
@@ -167,9 +164,9 @@
           <div v-else-if="error" class="rounded-lg border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive">
             {{ error }}
           </div>
-          <div v-else-if="candidates.length === 0" class="py-6 text-center text-sm text-muted-foreground" data-testid="admin-run-retention-empty">
-            No runs match the current filters.
-          </div>
+            <div v-else-if="candidates.length === 0" class="py-6 text-center text-sm text-muted-foreground" data-testid="admin-run-retention-empty">
+              {{ $t('views.AdminRunRetentionView.no_runs_match') }}
+            </div>
           <div v-else class="max-h-96 overflow-auto rounded-lg border" data-testid="admin-run-retention-candidates-table">
             <table class="w-full">
               <thead>
@@ -186,7 +183,7 @@
                   <td class="table-cell">
                     <span :class="statusBadge(run.status.toLowerCase())" class="rounded px-2 py-0.5 text-xs font-medium capitalize">{{ run.status }}</span>
                   </td>
-                  <td class="table-cell whitespace-nowrap text-xs text-muted-foreground">{{ formatDate(run.created_at) }}</td>
+                  <td class="table-cell whitespace-nowrap text-xs text-muted-foreground">{{ formatDateShort(run.created_at) }}</td>
                   <td class="table-cell text-xs">{{ pipelineName(run.pipeline_id) }}</td>
                   <td class="table-cell whitespace-nowrap text-xs">{{ formatBytes(run.estimated_bytes) }}</td>
                   <td class="table-cell whitespace-nowrap font-mono text-xs text-muted-foreground">{{ shortId(run.id) }}</td>
@@ -208,7 +205,7 @@
           <div>
             <div class="text-lg font-semibold">{{ $t('views.AdminRunRetentionView.confirm_clear_down') }}</div>
             <div class="mt-0.5 text-sm text-muted-foreground">
-              This permanently deletes data and cannot be undone.
+              {{ $t('views.AdminRunRetentionView.confirm_warning') }}
             </div>
           </div>
         </template>
@@ -218,15 +215,15 @@
             purged, along with their checkpoints and related per-run rows. In-flight runs are
             never touched.
           </p>
-          <p class="text-muted-foreground">Estimated reclaimable: {{ formatBytes(totalEstimatedBytes) }}.</p>
+          <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(totalEstimatedBytes) }}.</p>
         </div>
         <template #footer>
           <div class="flex justify-end gap-2">
             <Button severity="secondary" outlined data-testid="admin-run-retention-purge-cancel" @click="showPurgeConfirm = false">
-              Cancel
+              {{ $t('views.AdminRunRetentionView.cancel') }}
             </Button>
             <Button severity="danger" :disabled="purging" data-testid="admin-run-retention-purge-confirm" @click="executePurge">
-              {{ purging ? 'Purging…' : 'Purge selected' }}
+              {{ purging ? $t('views.AdminRunRetentionView.purging') : $t('views.AdminRunRetentionView.purge_selected') }}
             </Button>
           </div>
         </template>
@@ -237,6 +234,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import PageHeader from '../components/shared/PageHeader.vue'
 import LoadingSpinner from '../components/shared/LoadingSpinner.vue'
 import FeatureGate from '../components/FeatureGate.vue'
@@ -246,26 +244,19 @@ import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import { api, getAuthHeaders } from '../lib/api/client'
 import { formatApiError } from '../lib/api/formatError'
+import { isTerminalStatus } from '../constants/runStatuses'
+import { RUN_STATUS } from '../constants/filters'
+import { formatDateShort } from '../lib/formatDate'
 import type { components } from '../lib/api/schema'
+
+const { t } = useI18n()
 
 type CandidatesResponse = components['schemas']['CandidatesResponse']
 type RetentionCandidate = components['schemas']['RetentionCandidate']
 type PurgeResponse = components['schemas']['PurgeResponse']
 type PipelineResponse = components['schemas']['PipelineResponse']
 
-const TERMINAL_STATUSES = ['complete', 'failed', 'cancelled', 'eval_failed', 'stalled']
-
-const AVAILABLE_STATUSES = [
-  'pending',
-  'running',
-  'awaiting_human',
-  'claimed',
-  'complete',
-  'failed',
-  'cancelled',
-  'eval_failed',
-  'stalled',
-]
+const AVAILABLE_STATUSES = Object.values(RUN_STATUS)
 
 const dateFrom = ref('')
 const dateTo = ref('')
@@ -291,7 +282,7 @@ const showPurgeConfirm = ref(false)
 const pipelineOptions = computed(() => pipelines.value.map(p => ({ value: p.id, label: p.name })))
 const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({ value: s, label: s.replace(/_/g, ' ') })))
 
-const terminalCandidates = computed(() => candidates.value.filter(c => TERMINAL_STATUSES.includes(c.status.toLowerCase())))
+const terminalCandidates = computed(() => candidates.value.filter(c => isTerminalStatus(c.status.toLowerCase())))
 
 function toIso(value: string): string | null {
   if (!value) return null
@@ -347,7 +338,7 @@ async function loadCandidates() {
     totalCount.value = data?.total_count ?? 0
     totalEstimatedBytes.value = data?.total_estimated_bytes ?? 0
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : 'Failed to load candidates'
+    error.value = e instanceof Error ? e.message : t('views.AdminRunRetentionView.failed_to_load_candidates')
   } finally {
     loading.value = false
   }
@@ -370,7 +361,7 @@ async function executePurge() {
     showPurgeConfirm.value = false
     await loadCandidates()
   } catch (e: unknown) {
-    purgeError.value = e instanceof Error ? e.message : 'Purge failed'
+    purgeError.value = e instanceof Error ? e.message : t('views.AdminRunRetentionView.purge_failed')
     showPurgeConfirm.value = false
   } finally {
     purging.value = false
@@ -398,9 +389,9 @@ async function exportFile() {
     a.download = 'run-retention-export.ndjson'
     a.click()
     URL.revokeObjectURL(url)
-    exportSuccess.value = 'Export downloaded.'
+    exportSuccess.value = t('views.AdminRunRetentionView.export_downloaded')
   } catch (e: unknown) {
-    exportError.value = e instanceof Error ? e.message : 'Export failed'
+    exportError.value = e instanceof Error ? e.message : t('views.AdminRunRetentionView.export_failed')
   } finally {
     exporting.value = false
   }
@@ -412,13 +403,6 @@ function formatBytes(bytes: number): string {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
   const val = bytes / Math.pow(1024, i)
   return `${val.toFixed(1)} ${units[i]}`
-}
-
-function formatDate(iso: string | null): string {
-  if (!iso) return '—'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
 function shortId(id: string): string {

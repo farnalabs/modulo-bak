@@ -139,4 +139,82 @@ describe('AdminRunRetentionView', () => {
     const wrapper = await mountView()
     expect(wrapper.find('[data-testid="admin-run-retention-purge"]').attributes('disabled')).toBeDefined()
   })
+
+  it('exports the filtered set via a streaming download', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      blob: async () => new Blob(['{}']),
+      json: async () => ({}),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    if (typeof URL.createObjectURL !== 'function') {
+      // jsdom does not implement object URLs; provide a spyable stub.
+      ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = vi.fn()
+    }
+    if (typeof URL.revokeObjectURL !== 'function') {
+      ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = vi.fn()
+    }
+    const createObjectURLSpy = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock')
+    const revokeObjectURLSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+
+    const wrapper = await mountView()
+    await wrapper.find('[data-testid="admin-run-retention-export"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [url, opts] = fetchMock.mock.calls[0] as [string, { method: string; headers: Record<string, string>; body: string }]
+    expect(url).toBe('/api/v1/admin/run-retention/export')
+    expect(opts.method).toBe('POST')
+    expect(opts.headers).toMatchObject({ 'Content-Type': 'application/json' })
+    expect(JSON.parse(opts.body)).toEqual({
+      date_from: null,
+      date_to: null,
+      pipeline_id: null,
+      status: null,
+    })
+    expect(createObjectURLSpy).toHaveBeenCalled()
+    expect(clickSpy).toHaveBeenCalled()
+    expect(wrapper.find('[data-testid="admin-run-retention-export-result"]').exists()).toBe(true)
+
+    vi.unstubAllGlobals()
+    createObjectURLSpy.mockRestore()
+    revokeObjectURLSpy.mockRestore()
+    clickSpy.mockRestore()
+  })
+
+  it('surfaces an export error when the export endpoint fails', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: 'Internal Server Error',
+      blob: async () => new Blob([]),
+      json: async () => ({ detail: 'export boom' }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    if (typeof URL.createObjectURL !== 'function') {
+      ;(URL as unknown as { createObjectURL: unknown }).createObjectURL = vi.fn()
+    }
+    if (typeof URL.revokeObjectURL !== 'function') {
+      ;(URL as unknown as { revokeObjectURL: unknown }).revokeObjectURL = vi.fn()
+    }
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+
+    const wrapper = await mountView()
+    await wrapper.find('[data-testid="admin-run-retention-export"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    const error = wrapper.find('[data-testid="admin-run-retention-error"]')
+    expect(error.exists()).toBe(true)
+    expect(error.text()).toContain('export boom')
+
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
 })
