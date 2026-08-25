@@ -173,6 +173,40 @@ def filter_run_context_scope(run_context: dict[str, Any], context_scope: list[st
     return {k: v for k, v in run_context.items() if k in allowed or k in _CONTEXT_ALWAYS_KEPT}
 
 
+def compute_run_fetch_scope(graph_json: dict[str, Any] | None) -> list[str] | None:
+    """Derive the ConnectorHub *fetch-time* scope for an entire run.
+
+    The hub decrypts credentials once per run, so the fetch set is run-wide: it
+    is the union of every node's ``allowed_connectors``. A single run can only be
+    as restrictive as its most permissive node, so we stay conservative:
+
+    * If EVERY node declares a non-empty ``capability_scope.allowed_connectors``
+      (connector-scoped), return the union of all of them. The hub then decrypts
+      ONLY those connectors — credentials outside the scope are genuinely never
+      decrypted (deny-by-default). A node can still only *use* the connectors in
+      its own scope via the ``is_connector_allowed`` gate.
+    * If ANY node is connector-unrestricted (no ``capability_scope``, or a scope
+      with an empty/absent ``allowed_connectors``), return ``None``. The hub
+      fetches every active org connector, preserving the pre-scope behaviour
+      exactly so an unrestricted node never loses access.
+
+    This makes the documented "never decrypts excluded credentials" guarantee
+    real in the production run path instead of dead code.
+    """
+    nodes = (graph_json or {}).get("nodes", [])
+    if not nodes:
+        return None
+    fetch: set[str] = set()
+    for node in nodes:
+        scope = (node or {}).get("capability_scope") or {}
+        allowed = scope.get("allowed_connectors")
+        if not allowed:
+            # A connector-unrestricted node needs every connector the hub has.
+            return None
+        fetch.update(allowed)
+    return list(fetch)
+
+
 def _is_connector_object(value: Any) -> bool:
     """Duck-typed connector/secret-object identity check (no heavy import).
 

@@ -28,6 +28,7 @@ from modulo.core.capability_scope import (
     ScopeViolationError,
     agent_granted_connector_types,
     assert_no_secret_objects,
+    compute_run_fetch_scope,
     filter_run_context_scope,
     is_connector_allowed,
     validate_allowed_connectors_subset,
@@ -451,6 +452,70 @@ async def test_make_connector_fn_no_scope_uses_any_fetched():
         assert hub.resolved == [inst]
     finally:
         set_connector_hub(None)
+
+
+# ---------------------------------------------------------------------------
+# Run-level fetch-time scope (compute_run_fetch_scope)
+# ---------------------------------------------------------------------------
+
+
+def test_fully_scoped_graph_returns_union():
+    """When every node is connector-scoped, the run fetch set is the union."""
+    gh = str(uuid.uuid4())
+    sl = str(uuid.uuid4())
+    graph = {
+        "nodes": [
+            {"capability_scope": {"allowed_connectors": ["github", gh]}},
+            {"capability_scope": {"allowed_connectors": ["slack", sl]}},
+        ]
+    }
+    scope = compute_run_fetch_scope(graph)
+    assert set(scope) == {"github", "slack", gh, sl}
+
+
+def test_any_unrestricted_node_falls_back_to_none():
+    """An unrestricted node (no capability_scope) forces the run to fetch all."""
+    gh = str(uuid.uuid4())
+    graph = {
+        "nodes": [
+            {"capability_scope": {"allowed_connectors": ["github", gh]}},
+            {"node_type": "transform"},  # no capability_scope → unrestricted
+        ]
+    }
+    assert compute_run_fetch_scope(graph) is None
+
+
+def test_scoped_node_with_empty_allowed_connectors_falls_back_to_none():
+    """A node scoped on tools/context but unrestricted on connectors → fetch all."""
+    graph = {
+        "nodes": [
+            {
+                "capability_scope": {
+                    "allowed_connectors": [],
+                    "allowed_tools": ["search"],
+                }
+            },
+        ]
+    }
+    assert compute_run_fetch_scope(graph) is None
+
+
+def test_empty_graph_returns_none():
+    assert compute_run_fetch_scope({"nodes": []}) is None
+    assert compute_run_fetch_scope(None) is None
+
+
+def test_mixed_union_dedupes_across_nodes():
+    shared = str(uuid.uuid4())
+    graph = {
+        "nodes": [
+            {"capability_scope": {"allowed_connectors": [shared, "github"]}},
+            {"capability_scope": {"allowed_connectors": [shared, "slack"]}},
+        ]
+    }
+    scope = compute_run_fetch_scope(graph)
+    assert scope.count(shared) == 1
+    assert set(scope) == {shared, "github", "slack"}
 
 
 # ---------------------------------------------------------------------------

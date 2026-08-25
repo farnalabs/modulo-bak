@@ -549,7 +549,8 @@
                     <button
                       type="button"
                       class="text-muted-foreground hover:text-foreground"
-                      :aria-label="`Remove ${t}`"
+                      :aria-label="$t('views.PipelineEditorView.capability_scope_remove_tool', { name: t })"
+                      :data-testid="`pipeline-editor-scope-tool-remove-${t}`"
                       @click="removeCapabilityEntry('allowed_tools', t)"
                     >&times;</button>
                   </span>
@@ -558,6 +559,7 @@
                   <input
                     v-model="capabilityToolInput"
                     :placeholder="$t('views.PipelineEditorView.capability_scope_tool_placeholder')"
+                    :aria-label="$t('views.PipelineEditorView.capability_scope_allowed_tools')"
                     class="w-full rounded border border-input bg-background px-2 py-1 text-xs"
                     @keydown.enter.prevent="addCapabilityEntry('allowed_tools')"
                     data-testid="pipeline-editor-scope-tool-input"
@@ -579,7 +581,8 @@
                     <button
                       type="button"
                       class="text-muted-foreground hover:text-foreground"
-                      :aria-label="`Remove ${k}`"
+                      :aria-label="$t('views.PipelineEditorView.capability_scope_remove_context', { name: k })"
+                      :data-testid="`pipeline-editor-scope-context-remove-${k}`"
                       @click="removeCapabilityEntry('context_scope', k)"
                     >&times;</button>
                   </span>
@@ -588,6 +591,7 @@
                   <input
                     v-model="capabilityContextInput"
                     :placeholder="$t('views.PipelineEditorView.capability_scope_context_placeholder')"
+                    :aria-label="$t('views.PipelineEditorView.capability_scope_context_scope')"
                     class="w-full rounded border border-input bg-background px-2 py-1 text-xs"
                     @keydown.enter.prevent="addCapabilityEntry('context_scope')"
                     data-testid="pipeline-editor-scope-context-input"

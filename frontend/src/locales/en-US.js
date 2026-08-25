@@ -879,7 +879,9 @@ export default {
       "capability_scope_add": "Add",
       "capability_scope_reset": "Reset to unrestricted",
       "capability_scope_widen_warning": "Some selected connectors are not granted to the node's Agent and may be rejected: ",
-      "capability_scope_scoped_badge": "Scoped"
+      "capability_scope_scoped_badge": "Scoped",
+      "capability_scope_remove_tool": "Remove {name}",
+      "capability_scope_remove_context": "Remove {name}"
     },
     "AdminPluginsView": {
       "manage_installed_modulo_plugins_and_extensions": "Manage installed Modulo plugins and extensions",
