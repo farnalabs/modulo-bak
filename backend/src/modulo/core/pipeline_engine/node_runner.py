@@ -67,6 +67,8 @@ from jinja2.sandbox import SandboxedEnvironment
 from langchain_core.messages import HumanMessage
 from langgraph.types import interrupt
 
+from modulo.core.secret_patterns import AWS_ACCESS_KEY_PATTERN, GITHUB_PAT_PATTERN
+
 if TYPE_CHECKING:
     from e2b import AsyncSandbox
 
@@ -752,7 +754,16 @@ _PR_URL_PATTERN = _re.compile(r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_
 # any ``http(s)://...@host`` URL; ``_TOKEN_VALUE_PATTERN`` defensively masks
 # bare token values that follow known credential labels.
 _TOKENIZED_GIT_URL_PATTERN = _re.compile(r"(https?://)[^@\s/]+@")
-_TOKEN_VALUE_PATTERN = _re.compile(r"(x-access-token:|gh[pous]_|github_pat_|Bearer\s+|token=)[^\s\"'<>]+")
+# Label-based masking (covers short tokens including github_pat_ <50 chars)
+# plus the canonical bare-value patterns for fine-grained GitHub PATs and AWS
+# access keys, shared from the sensitive_mask canonical list.
+_TOKEN_VALUE_PATTERN = _re.compile(
+    r"(x-access-token:|gh[pous]_|github_pat_|Bearer\s+|token=)[^\s\"'<>]+"
+    + r"|"
+    + GITHUB_PAT_PATTERN.pattern
+    + r"|"
+    + AWS_ACCESS_KEY_PATTERN.pattern
+)
 
 
 def _extract_pr_url(raw_text: str) -> str:
@@ -1567,7 +1578,7 @@ def make_node_fn(
     role: str | None = None,
     timeout: float | None = None,
     max_input_length: int | None = None,
-    token_budget: int | None = None,
+    token_budget: int | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); budget enforced at executor level
 ) -> Any:
     """Return a decorated async node function for use in a StateGraph.
 
@@ -2247,7 +2258,7 @@ def make_hitl_gate_fn(
 def make_manual_node_fn(
     node_def: dict[str, Any],
     *,
-    timeout: float | None = None,
+    timeout: float | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); manual nodes never time out
 ) -> Any:
     """Return a node function for a manual-input node.
 
@@ -3050,7 +3061,6 @@ class _SandboxWatchdog:
         sandbox_mode: str,
         stdout_percentage_delta: float | None,
         stream_broker: RunEventBroker | None,
-        stream_enabled: bool,
         drained_chunks: list[str],
         wallclock_budget_seconds: int | None,
         start_time: float,
@@ -3067,7 +3077,7 @@ class _SandboxWatchdog:
         self._sandbox_mode = sandbox_mode
         self._stdout_ratio = stdout_percentage_delta
         self._stream_broker = stream_broker
-        self._stream_enabled = stream_enabled
+        self._stream_enabled = isinstance(stream_broker, RunEventBroker)
         self._drained_chunks = drained_chunks
         self._activity: dict[str, Any] = {"last": time.monotonic()}
         self._stdout_prev: str | None = None
@@ -3783,7 +3793,7 @@ def _script_enforcement_requires_remote(
     )
 
 
-async def _sandbox_agent_impl(
+async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegates to extracted helpers (FAR-310)
     state: dict[str, Any],
     *,
     config: _SandboxNodeConfig,
@@ -4349,7 +4359,6 @@ async def _sandbox_agent_impl(
                     _stream_broker = get_registry().get(uuid.UUID(run_id))
                 except (TypeError, ValueError):
                     _stream_broker = None
-            _stream_enabled = isinstance(_stream_broker, RunEventBroker)
 
             watchdog = _SandboxWatchdog(
                 sandbox=sandbox,
@@ -4362,7 +4371,6 @@ async def _sandbox_agent_impl(
                 sandbox_mode=sandbox_mode,
                 stdout_percentage_delta=stdout_percentage_delta,
                 stream_broker=_stream_broker,
-                stream_enabled=_stream_enabled,
                 drained_chunks=_drained_chunks,
                 wallclock_budget_seconds=wallclock_budget_seconds,
                 start_time=start_time,
