@@ -189,6 +189,7 @@ async def _process_trigger(
     snapshot_id, snapshot_skip = await _resolve_snapshot_id(session, trigger, org_id)
     if snapshot_skip is not None:
         return [snapshot_skip]
+    assert snapshot_id is not None
 
     # Create child run within a SAVEPOINT so a failed insert only rolls back
     # the child-run, leaving the caller's transaction usable. A pause gate
@@ -224,6 +225,7 @@ async def _process_trigger(
 
     if create_skip is not None:
         return [create_skip]
+    assert child_run is not None
 
     # Log TriggerEvent.
     await _log_signal_event(
