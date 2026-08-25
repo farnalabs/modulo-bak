@@ -121,7 +121,7 @@
       >
         <div class="flex items-center gap-3 border-b px-4 py-3">
           <div class="flex-1">
-            <h3 class="font-semibold">Checkpoint Retention</h3>
+            <h3 class="font-semibold">{{ $t('views.AdminHousekeepingView.checkpoint_retention') }}</h3>
             <p class="text-xs text-muted-foreground">
               Purge LangGraph graph-state checkpoints for terminal runs older than N days. The run rows are kept
               (outputs, telemetry, classification survive for audit + analytics).
