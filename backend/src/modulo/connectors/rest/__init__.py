@@ -727,7 +727,7 @@ class RestConnector(ConnectorBase):
                 outcome["result"] = self._result_summary(result)
                 success_count += 1
                 outcomes.append(outcome)
-            except asyncio.CancelledError as exc:
+            except asyncio.CancelledError as exc:  # NOSONAR: subclass, cancellation preserved (FAR-411)
                 raise RESTFanOutCancelledError(
                     f"REST fan-out cancelled at item {index} of {len(resolved)} "
                     f"after {success_count} successful item(s)",
