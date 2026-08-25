@@ -30,7 +30,7 @@ import random
 import socket
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -97,6 +97,7 @@ from modulo.core.pipeline_engine.node_runner import (
     set_conformance_ctx,
 )
 from modulo.core.pipeline_engine.output_filter import OutputRejectedError
+from modulo.core.pipeline_engine.port_resolver import compute_port_topology_hash
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
 from modulo.core.trigger_engine.agent_signal import fire_agent_signal
 from modulo.db.crud.pipeline import get_pipeline
@@ -1818,18 +1819,21 @@ class PipelineExecutor:
             hub = None
         return hub
 
-    async def _init_connector_hub(self, org_id: uuid.UUID, graph_json: dict[str, Any] | None = None) -> Any | None:
+    async def _init_connector_hub(
+        self,
+        org_id: uuid.UUID,
+        allowed_connectors: Sequence[str] | None = None,
+    ) -> Any | None:
         """Load active ConnectorInstance rows for the org and initialise ConnectorHub.
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
 
-        FAR-418 (MAJOR-2 fix): when *graph_json* is supplied the per-run union of
-        every node's ``capability_scope.allowed_connectors`` is passed to
-        ``ConnectorHub.initialise`` so the hub decrypts ONLY the in-scope
-        connectors (deny-by-default) instead of every active org connector. If any
-        node is UNRESTRICTED (absent/empty scope) the hub stays unrestricted and
-        fetches everything, preserving the pre-scope behaviour.
+        *allowed_connectors* (FAR-418) wires fetch-time capability scoping into the
+        production run path: when every node in the run is connector-scoped the hub
+        decrypts ONLY those connectors, so out-of-scope credentials are never
+        disclosed. Pass ``None`` (the default) to fetch every active org connector,
+        preserving the pre-scope behaviour (used for compensation and unscoped runs).
         """
         hub: Any | None = None
         try:
@@ -1870,12 +1874,7 @@ class PipelineExecutor:
                         runtime_provider=runtime_hub,
                     )
                     await hub.__aenter__()
-                    # FAR-418 (MAJOR-2 fix): wire fetch-time scoping into the run
-                    # path. Compute the per-run union of every node's
-                    # allowed_connectors; an unrestricted node forces the hub to
-                    # stay unrestricted (fetch everything).
-                    fetch_scope = _compute_connector_fetch_scope(graph_json)
-                    await hub.initialise(rows, allowed_connectors=fetch_scope)
+                    await hub.initialise(rows, allowed_connectors=allowed_connectors)
                     set_connector_hub(hub)
         except asyncio.CancelledError:
             raise
@@ -2308,6 +2307,7 @@ class PipelineExecutor:
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
             ),
             pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+            graph_struct_hash=compute_port_topology_hash(graph_json),
         )
 
         config = {"configurable": {"thread_id": thread_id}}
@@ -3112,7 +3112,15 @@ class PipelineExecutor:
         # Load model backends for this run's org — provides LLM access to agent nodes.
         model_backend_hub = await self._init_model_backend_hub(org_id)
         # Load connector hub for this run's org — provides connector access to connector nodes.
-        connector_hub = await self._init_connector_hub(org_id, graph_json=graph_json)
+        # FAR-418: wire fetch-time capability scoping — when every graph node is
+        # connector-scoped the hub decrypts ONLY the union of their allowed
+        # connectors, so out-of-scope credentials are never disclosed.
+        from modulo.core.capability_scope import compute_run_fetch_scope
+
+        connector_hub = await self._init_connector_hub(
+            org_id,
+            allowed_connectors=compute_run_fetch_scope(graph_json),
+        )
 
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
@@ -3161,6 +3169,7 @@ class PipelineExecutor:
                 pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
             ),
             pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
+            graph_struct_hash=compute_port_topology_hash(graph_json),
         )
 
         initial_state = _seed_state(snapshot, input_payload, variant_config_snapshot)
@@ -4317,28 +4326,3 @@ class PipelineExecutor:
             if run_root_token is not None:
                 context_api.detach(run_root_token)
             self._otel_bridge.end_run_root()
-
-
-def _compute_connector_fetch_scope(graph_json: dict[str, Any] | None) -> list[str] | None:
-    """Compute the connector fetch scope for a run from its graph (FAR-418).
-
-    Returns the per-run union of every node's ``capability_scope.allowed_connectors``
-    so ``ConnectorHub.initialise`` decrypts only those connectors. Returns ``None``
-    (unrestricted — fetch every active connector) when *graph_json* is absent, the
-    graph has no nodes, or ANY node declares an UNRESTRICTED scope (absent/empty
-    ``allowed_connectors``), since an unrestricted node must be able to use any
-    connector the hub fetched.
-    """
-    if not graph_json:
-        return None
-    nodes = graph_json.get("nodes") or []
-    fetch_scope: set[str] = set()
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        scope = node.get("capability_scope") or {}
-        allowed = scope.get("allowed_connectors")
-        if not allowed:  # UNRESTRICTED node -> must fetch everything
-            return None
-        fetch_scope.update(allowed)
-    return list(fetch_scope) if fetch_scope else None

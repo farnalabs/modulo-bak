@@ -30,6 +30,7 @@ heavy graph machinery.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import Any
@@ -173,6 +174,40 @@ def filter_run_context_scope(run_context: dict[str, Any], context_scope: list[st
     return {k: v for k, v in run_context.items() if k in allowed or k in _CONTEXT_ALWAYS_KEPT}
 
 
+def compute_run_fetch_scope(graph_json: dict[str, Any] | None) -> list[str] | None:
+    """Derive the ConnectorHub *fetch-time* scope for an entire run.
+
+    The hub decrypts credentials once per run, so the fetch set is run-wide: it
+    is the union of every node's ``allowed_connectors``. A single run can only be
+    as restrictive as its most permissive node, so we stay conservative:
+
+    * If EVERY node declares a non-empty ``capability_scope.allowed_connectors``
+      (connector-scoped), return the union of all of them. The hub then decrypts
+      ONLY those connectors — credentials outside the scope are genuinely never
+      decrypted (deny-by-default). A node can still only *use* the connectors in
+      its own scope via the ``is_connector_allowed`` gate.
+    * If ANY node is connector-unrestricted (no ``capability_scope``, or a scope
+      with an empty/absent ``allowed_connectors``), return ``None``. The hub
+      fetches every active org connector, preserving the pre-scope behaviour
+      exactly so an unrestricted node never loses access.
+
+    This makes the documented "never decrypts excluded credentials" guarantee
+    real in the production run path instead of dead code.
+    """
+    nodes = (graph_json or {}).get("nodes", [])
+    if not nodes:
+        return None
+    fetch: set[str] = set()
+    for node in nodes:
+        scope = (node or {}).get("capability_scope") or {}
+        allowed = scope.get("allowed_connectors")
+        if not allowed:
+            # A connector-unrestricted node needs every connector the hub has.
+            return None
+        fetch.update(allowed)
+    return list(fetch)
+
+
 def _is_connector_object(value: Any) -> bool:
     """Duck-typed connector/secret-object identity check (no heavy import).
 
@@ -184,38 +219,44 @@ def _is_connector_object(value: Any) -> bool:
     return hasattr(value, "connector_type") and callable(getattr(value, "query", None))
 
 
-def assert_no_secret_objects(value: Any, *, node_id: str) -> None:
+def assert_no_secret_objects(value: Any, *, node_id: str, _seen: set[int] | None = None) -> None:
     """Secret-hygiene guard: connector/secret OBJECTS are never valid port payloads.
 
-    Only opaque connector IDs may appear in state/ports. Iteratively rejects any
+    Only opaque connector IDs may appear in state/ports. Recursively rejects any
     connector/secret object (see :func:`_is_connector_object`) with a typed
     ``ScopeViolationError``; plain-serializable data always passes. Raises on the
     first offending nested value.
 
-    The traversal is iterative with a depth bound and a cycle guard (via object
-    id) so a cyclic or pathologically deep payload raises a typed
-    ``ScopeViolationError`` rather than an uncaught ``RecursionError``.
+    The production query path returns a ``ConnectorResult`` *dataclass* whose
+    ``records`` carry the real payload — a shape that is neither ``dict`` nor
+    ``list``/``tuple``, so the guard must descend into dataclass fields (and, as
+    a backstop, arbitrary object ``__dict__``) or a smuggled connector/secret
+    object riding inside ``ConnectorResult.records`` would slip past the guard.
+    A ``_seen`` id-set prevents infinite recursion on cyclic payloads.
     """
-    max_scope_depth = 64
-    stack: list[tuple[Any, int]] = [(value, 0)]
-    seen: set[int] = set()
-    while stack:
-        current, depth = stack.pop()
-        if _is_connector_object(current):
-            raise ScopeViolationError(
-                node_id=node_id,
-                target=type(current).__name__,
-                kind="secret",
-            )
-        if depth >= max_scope_depth:
-            continue
-        if isinstance(current, dict):
-            obj_id = id(current)
-            if obj_id in seen:
-                continue
-            seen.add(obj_id)
-            for nested in current.values():
-                stack.append((nested, depth + 1))
-        elif isinstance(current, (list, tuple)):
-            for nested in current:
-                stack.append((nested, depth + 1))
+    if _seen is None:
+        _seen = set()
+    obj_id = id(value)
+    if obj_id in _seen:
+        return
+    _seen.add(obj_id)
+    if _is_connector_object(value):
+        raise ScopeViolationError(
+            node_id=node_id,
+            target=type(value).__name__,
+            kind="secret",
+        )
+    if isinstance(value, dict):
+        for nested in value.values():
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            assert_no_secret_objects(getattr(value, field.name), node_id=node_id, _seen=_seen)
+    elif hasattr(value, "__dict__") and not isinstance(value, (str, bytes, bytearray, int, float, bool)):
+        # Backstop for non-dataclass objects (agents may wrap payloads in plain
+        # classes). Skip primitives and types; descend into attributes.
+        for nested in vars(value).values():
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
