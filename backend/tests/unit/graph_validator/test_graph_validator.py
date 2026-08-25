@@ -1533,3 +1533,84 @@ async def test_node_send_budget_uses_timeout_seconds_not_flat_keys():
     )
     assert result.is_valid
     assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_minimal_fanout_defaults_warn():
+    """A minimal fan_out config (enabled + items_path only) is reconciled with
+    the connector's EFFECTIVE defaults (max_cardinality=1000,
+    per_item_timeout=default timeout 30s), which oversubscribes a realistic node.
+
+    Previously this config was silently skipped because both keys were absent,
+    even though the connector genuinely attempts up to 1000 x 30 x 3 = 90000s
+    against a 60-300s node timeout.
+    """
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"enabled": True, "items_path": "data.items"}},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 60}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid  # a warning is not a blocker
+    oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
+    assert len(oversub) == 1
+    assert oversub[0].node_id == "fanout-node"
+    # 1000 * 30 * 3 (default attempts) = 90000s > 60s budget.
+    assert "max_cardinality=1000.0" in oversub[0].message
+    assert "per_item_timeout=30.0" in oversub[0].message
+
+
+async def test_node_send_budget_minimal_fanout_uses_connector_timeout():
+    """A fan_out config that omits per_item_timeout but sets max_cardinality
+    substitutes the connector's EFFECTIVE timeout (top-level ``timeout`` config)
+    rather than skipping the reconcile."""
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"max_cardinality": 100}, "timeout": 50},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 300}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid
+    oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
+    assert len(oversub) == 1
+    # 100 * 50 (top-level timeout, not the 30s default) * 3 = 15000s > 300s.
+    assert "per_item_timeout=50.0" in oversub[0].message
+
+
+async def test_node_send_budget_explicit_malformed_value_skipped():
+    """An explicitly-present but malformed fan_out value is still skipped
+    (the _as_positive_number guard), not defaulted."""
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"max_cardinality": "many", "per_item_timeout": 5}},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
