@@ -65,7 +65,6 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
     ("model_backends", "default_params"),
     ("model_backends", "fallback_backend_ids"),
     ("notification_endpoints", "events"),
-    ("oauth_authorization_codes", "scopes"),
     ("organisations", "settings_json"),
     ("organisations", "otel_config_json"),
     ("organisations", "export_bundle_json"),
