@@ -919,8 +919,8 @@ async def replace_pipeline_graph(
             target_node_id=uuid.UUID(str(edge["target_node_id"])),
             edge_type=edge["edge_type"],
             hitl_gate_config=_preserve_omitted_gate_config(edge, old_by_key),
-            source_port=edge.get("source_port", "out"),
-            target_port=edge.get("target_port", "in"),
+            source_port=edge.get("source_port") or "out",
+            target_port=edge.get("target_port") or "in",
         )
         for edge in edges
     ]

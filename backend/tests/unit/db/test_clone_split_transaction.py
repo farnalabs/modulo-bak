@@ -294,6 +294,47 @@ async def test_clone_emits_one_batched_gate_audit_event(monkeypatch: pytest.Monk
     assert len(edge_ids) == 2, f"expected 2 cloned gated edges, got {len(edge_ids)}"
 
 
+async def test_clone_preserves_non_default_edge_ports(monkeypatch: pytest.MonkeyPatch) -> None:
+    audit = AsyncMock()
+    monkeypatch.setattr("modulo.db.crud.pipeline.append_audit_event", audit)
+    source = _make_source()
+    custom_edge = _Row(
+        id=uuid.uuid4(),
+        source_node_id=uuid.UUID(_NODE_A),
+        target_node_id=uuid.UUID(_NODE_B),
+        edge_type="normal",
+        hitl_gate_config=None,
+        source_port="custom_out",
+        target_port="custom_in",
+    )
+    read_session = _make_read_session(
+        events=[],
+        on_held=None,
+        source=source,
+        edges=[custom_edge],
+        snapshots=[],
+        pins_by_snap={},
+    )
+    factory = _read_factory(read_session)
+    main_session = _make_main_session()
+
+    await clone_pipeline(
+        main_session,
+        org_id=uuid.uuid4(),
+        pipeline_id=source.id,
+        account_id=uuid.uuid4(),
+        _read_session_factory=factory,
+    )
+
+    added_edges = [c.args[0] for c in main_session.add.call_args_list if type(c.args[0]).__name__ == "PipelineEdge"]
+    assert added_edges, "expected the cloned PipelineEdge to be added on the main session"
+    cloned_edge = added_edges[0]
+    # The clone must copy the source edge's real (non-default) ports, not fall
+    # back to the legacy "out"/"in" defaults.
+    assert cloned_edge.source_port == "custom_out"
+    assert cloned_edge.target_port == "custom_in"
+
+
 async def test_clone_no_gate_edges_emits_no_gate_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     source = _make_source()
     edges = [
