@@ -69,7 +69,7 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           format: 'table'
-          skip-dirs: '.venv,node_modules,.git,.cache,dist,build'
+          skip-dirs: '**/.venv,**/node_modules,**/.git,**/.agents,**/.pytest_cache,**/dist,**/build'
 
   backend-test:
     name: Test (Backend)
