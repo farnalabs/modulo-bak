@@ -76,6 +76,16 @@ def upgrade() -> None:
             """
         )
     )
+    # Idempotent: the policy may already exist when this migration is re-run
+    # against a database whose template already carries the migrated schema
+    # (e.g. the per-test private DB created in test_migration_0126_eval_suite).
+    op.execute(
+        sa.text(
+            """
+            DROP POLICY IF EXISTS rls_org_isolation ON "metrics_staging"
+            """
+        )
+    )
     op.execute(
         sa.text(
             """
