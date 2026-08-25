@@ -361,13 +361,11 @@ def _decorator_name(dec: ast.AST) -> str | None:
 @functools.lru_cache(maxsize=1)
 def _iter_test_modules():
     return tuple(
-        path
-        for path in sorted(TESTS.rglob("*.py"))
-        if not any(part in EXCLUDED_PACKAGES for part in path.parts)
+        path for path in sorted(TESTS.rglob("*.py")) if not any(part in EXCLUDED_PACKAGES for part in path.parts)
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _parse(path: Path):
     try:
         return ast.parse(path.read_text(encoding="utf-8"))
