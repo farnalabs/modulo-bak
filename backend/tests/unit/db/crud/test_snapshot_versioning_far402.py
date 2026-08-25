@@ -360,9 +360,9 @@ class TestDiffSnapshotsSemantic:
         session = _diff_session(snap_a, snap_b)
         result = await diff_snapshots(session, sid_a, sid_b)
         assert result is not None
-        assert result["semantic"]["port_changes"] == []
-        assert result["semantic"]["impacted_nodes"] == []
-        assert result["semantic"]["breaking_changes"] == []
+        assert not result["semantic"]["port_changes"]
+        assert not result["semantic"]["impacted_nodes"]
+        assert not result["semantic"]["breaking_changes"]
 
     async def test_diff_report_node_modification_with_ports(self):
         sid_a = uuid.uuid4()
