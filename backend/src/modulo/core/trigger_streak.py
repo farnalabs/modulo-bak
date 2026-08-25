@@ -1273,7 +1273,7 @@ async def _streak_mass_cascade_alerted_this_window(
 async def _maybe_alert_mass_cascade(
     factory: async_sessionmaker[AsyncSession],
     org_id: uuid.UUID,
-    redis_client: AsyncRedis | None = None,
+    _redis_client: AsyncRedis | None = None,
 ) -> bool:
     """Mass-cascade guard (FAR-190 item 9): when an org has deactivated >= 5
     triggers within 24h (an infra-outage signature), raise a critical alert —

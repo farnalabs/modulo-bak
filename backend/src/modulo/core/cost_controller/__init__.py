@@ -245,7 +245,7 @@ async def _sum_created_at_day(
     *,
     org_id: uuid.UUID,
     day_start: datetime,
-    run_id: uuid.UUID | None,
+    _run_id: uuid.UUID | None,
     team_id: uuid.UUID | None = None,
 ) -> Decimal:
     """SUM the day's ledger spend (``org_daily_run_counts.total_spend_usd``).

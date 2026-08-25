@@ -1453,7 +1453,7 @@ def make_node_fn(
     role: str | None = None,
     timeout: float | None = None,
     max_input_length: int | None = None,
-    token_budget: int | None = None,
+    _token_budget: int | None = None,
 ) -> Any:
     """Return a decorated async node function for use in a StateGraph.
 
@@ -1651,7 +1651,7 @@ def _build_llm_judge_callable(
         text = response.content if hasattr(response, "content") else str(response)
         try:
             parsed = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             parsed = {"passed": False, "score": 0.0, "detail": text}
         detail = parsed.get("detail", "")
         return {
@@ -2036,7 +2036,7 @@ def _hitl_gate_autonomy_result(
 def make_hitl_gate_fn(
     hitl_gate_config: dict[str, Any],
     *,
-    timeout: float | None = None,
+    _timeout: float | None = None,
     eval_definitions: Sequence[EvalDefinition] | None = None,
     session_factory: Callable[..., Any] | None = None,
     org_id: uuid.UUID | None = None,
@@ -2164,7 +2164,7 @@ def make_hitl_gate_fn(
 def make_manual_node_fn(
     node_def: dict[str, Any],
     *,
-    timeout: float | None = None,
+    _timeout: float | None = None,
 ) -> Any:
     """Return a node function for a manual-input node.
 
@@ -2654,7 +2654,7 @@ async def _sandbox_store_dispatch_marker_sandbox(
     claim_lease: str | None,
     org_id: str,
     run_id: str,
-    node_id: str,
+    _node_id: str,
     attempt_key: str | None,
 ) -> None:
     """Persist the real sandbox id onto the runs row after a successful create."""
@@ -2695,7 +2695,7 @@ async def _sandbox_store_script_lease(
     claim_lease: str | None,
     org_id: str,
     run_id: str,
-    node_id: str,
+    _node_id: str,
     attempt_key: str | None,
 ) -> None:
     """FAR-296 Phase 2 fencing lease: record the script-mode execution claim.
@@ -2838,7 +2838,7 @@ async def _sandbox_clear_dispatch_marker(
     claim_lease: str | None,
     org_id: str,
     run_id: str,
-    node_id: str,
+    _node_id: str,
 ) -> None:
     """Fenced marker clear — only when the claim token still matches.
 
@@ -4037,13 +4037,10 @@ async def _sandbox_agent_impl(
                         "backoff_seconds": _backoff,
                     },
                 )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.sleep(_backoff),
-                        timeout=min(sandbox_timeout, 120),
-                    )
-                except asyncio.CancelledError:
-                    raise
+                await asyncio.wait_for(
+                    asyncio.sleep(_backoff),
+                    timeout=min(sandbox_timeout, 120),
+                )
         if sandbox is None:
             raise RuntimeError("Sandbox was not created before use")
         _sandbox_id = getattr(sandbox, "sandbox_id", None) or None
@@ -4285,7 +4282,7 @@ async def _sandbox_agent_impl(
                             ),
                             timeout=_SANDBOX_IO_TIMEOUT,
                         )
-                        sandbox_envs["MODULO_BRIDGE_ENDPOINT"] = f"http://127.0.0.1:{_bridge_port}"
+                        sandbox_envs["MODULO_BRIDGE_ENDPOINT"] = f"http://localhost:{_bridge_port}"
                         sandbox_envs["MODULO_BRIDGE_CONFIG"] = "/home/user/modulo_bridge_config.json"
                         _bridge_wrapped_command = (
                             f"python3 /home/user/modulo_bridge.py --wrap -- {rendered_agent_command}"

@@ -82,7 +82,7 @@ class LocalRuntimeProvider(RuntimeProvider):
                     cwd=workspace_dir,
                     cmd_timeout=spec.timeout_seconds,
                 )
-        except (asyncio.CancelledError, Exception):
+        except Exception:
             await asyncio.to_thread(shutil.rmtree, workspace_dir, ignore_errors=True)
             raise
 

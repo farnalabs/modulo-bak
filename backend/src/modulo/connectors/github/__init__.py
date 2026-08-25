@@ -284,7 +284,7 @@ def _decode_read_content(info: Any) -> None:
         return
     try:
         info["content"] = base64.b64decode(info["content"]).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
+    except ValueError:
         return
 
 
@@ -855,8 +855,8 @@ class GitHubConnector(ConnectorBase):
         self,
         operation: CompensationOperation,
         *,
-        context: CompensationContext,
-        error: str,
+        _context: CompensationContext,
+        _error: str,
     ) -> CompensationResult:
         """Compensate a performed GitHub write (FAR-213): close a PR the run opened.
 
@@ -1125,7 +1125,7 @@ class GitHubConnector(ConnectorBase):
         links = _parse_link_header(r)
         return self._result(items, r, total=_search_total(body), next_cursor=links.get("next"))
 
-    async def _query_rate_limit(self, q: ConnectorQuery) -> ConnectorResult:
+    async def _query_rate_limit(self, _q: ConnectorQuery) -> ConnectorResult:
         r = await self._call_api("GET", "/rate_limit")
         body = await self._parse_json_object(r)
         resources = cast("dict[str, Any]", body.get("resources", {}))

@@ -32,7 +32,7 @@ __all__ = [
 
 
 async def _duplicate_exists(
-    session: AsyncSession, org_id: uuid.UUID, *, name: str, report_key: str | None, kind: str
+    session: AsyncSession, org_id: uuid.UUID, *, name: str, report_key: str | None, _kind: str
 ) -> bool:
     """Org-scoped duplicate pre-check (409). Explicit parens pin the precedence."""
     row = await session.execute(

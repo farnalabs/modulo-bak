@@ -595,7 +595,7 @@ class LoopInterceptCallbackServer:
         config: LoopInterceptConfig,
         *,
         audit_sink: Callable[[Sequence[LoopInterceptAuditRecord]], Awaitable[None]] | None = None,
-        host: str = "127.0.0.1",
+        host: str = "localhost",
         port: int = 0,
     ) -> None:
         self._engine = engine

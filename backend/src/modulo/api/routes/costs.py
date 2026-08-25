@@ -644,7 +644,7 @@ async def reset_circuit_breaker(
 async def export_costs(
     period: str = Query("this_month", pattern=r"^(this_month|last_month|7d|30d|90d)$"),
     group_by: str = Query("team", pattern=r"^(team|pipeline|model)$"),
-    format: str = Query("csv", pattern=r"^(csv)$"),
+    _format: str = Query("csv", pattern=r"^(csv)$"),
     _: object = require_feature("admin_cost_breakdown"),
     current_user: TenantPrincipal = require_permission(_CODE_COST_MANAGE),
     session: AsyncSession = Depends(get_db_session),

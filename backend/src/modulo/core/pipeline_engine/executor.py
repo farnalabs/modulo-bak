@@ -1606,7 +1606,7 @@ class PipelineExecutor:
         *,
         max_concurrent: int,
         active_count: int,
-        pipeline_capacity_ok: bool,
+        _pipeline_capacity_ok: bool,
         org_sandbox_cap: int | None,
         org_count: int,
         org_capacity_ok: bool,
@@ -1668,7 +1668,7 @@ class PipelineExecutor:
     def _build_eval_defs_by_node(
         eval_rows: list[EvalDefinition],
         org_id: uuid.UUID,
-        pipeline_id: uuid.UUID,
+        _pipeline_id: uuid.UUID,
     ) -> dict[str, list[EvalDefDTO]]:
         """Convert eval definition ORM rows to a dict keyed by node id."""
         eval_defs_by_node: dict[str, list[EvalDefDTO]] = {}

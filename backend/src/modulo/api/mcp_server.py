@@ -962,7 +962,7 @@ async def _authenticate_oauth_jwt(
 
 
 async def _verify_oauth_token_family(
-    token: str,
+    _token: str,
     claims: Any,
 ) -> Response | None:
     """Return an error response if the OAuth token family is blacklisted.
@@ -5121,7 +5121,7 @@ async def list_schemas(
 @_RETRY_DB
 async def infer_schema(
     input_sample: dict[str, Any],
-    pipeline_id: str | None = None,
+    _pipeline_id: str | None = None,
 ) -> dict[str, Any]:
     try:
         if not await validate_current_auth():
@@ -5936,7 +5936,7 @@ async def resource_library_detail(primitive_type: str, slug: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _mcp_healthz(request: Request) -> JSONResponse:
+def _mcp_healthz(_request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
 

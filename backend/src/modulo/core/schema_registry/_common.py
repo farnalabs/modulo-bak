@@ -50,7 +50,7 @@ async def invoke_and_parse(
             async with asyncio.timeout(timeout):
                 response = await backend.invoke(messages)
         except TimeoutError:
-            _log.error("Schema %s timed out after %ss (attempt %d/%d)", context, timeout, attempt, _max_retries)
+            _log.exception("Schema %s timed out after %ss (attempt %d/%d)", context, timeout, attempt, _max_retries)
             if attempt == _max_retries:
                 raise error_cls(f"LLM call timed out after {timeout}s") from None
             continue
@@ -66,7 +66,7 @@ async def invoke_and_parse(
         try:
             content = response.content
         except AttributeError:
-            _log.error(
+            _log.exception(
                 "Backend returned response without .content attribute for schema %s (response type: %s)",
                 context,
                 type(response).__name__,
@@ -79,7 +79,7 @@ async def invoke_and_parse(
 
         try:
             return parse_schema_from_response(content)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except ValueError as exc:
             _log.exception("Failed to parse %s schema from LLM response", context)
             raise error_cls(f"Failed to parse {context} schema from LLM response") from exc
 

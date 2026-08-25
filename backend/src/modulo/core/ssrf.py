@@ -120,7 +120,7 @@ def _check_resolved(decoded: str, ip_strings: list[str]) -> None:
 def _resolve_all_sync(host: str) -> list[str]:
     try:
         addrinfos = socket.getaddrinfo(host, 0, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except (OSError, socket.gaierror):
+    except OSError:
         # Fail-closed on DNS resolution failure
         raise ValueError(f"DNS resolution failed for {host}. Cannot verify the target is not internal.") from None
     result: list[str] = []
@@ -136,7 +136,7 @@ async def _resolve_all_async(host: str) -> list[str]:
     loop = asyncio.get_running_loop()
     try:
         addrinfos = await loop.getaddrinfo(host, 0, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-    except (OSError, socket.gaierror):
+    except OSError:
         raise ValueError(f"DNS resolution failed for {host}. Cannot verify the target is not internal.") from None
     result: list[str] = []
     for _fam, _typ, _proto, _canon, sockaddr in addrinfos:

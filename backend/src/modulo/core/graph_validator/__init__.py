@@ -470,7 +470,7 @@ def _check_sandbox_command(node: dict[str, Any], nid: str, result: ValidationRes
     try:
         _validate_sandbox_mode_config(node)
     except ValueError as exc:
-        result.error("SANDBOX_MISSING_COMMAND", str(exc), node_id=nid)
+        result.exception("SANDBOX_MISSING_COMMAND", str(exc), node_id=nid)
 
 
 def _check_sandbox_jinja(node: dict[str, Any], nid: str, result: ValidationResult) -> None:
@@ -721,7 +721,7 @@ def _check_sandbox_egress(node: dict[str, Any], nid: str, result: ValidationResu
     try:
         _validate_sandbox_egress_allowlist_config(egress_policy, node.get("egress_allowlist"), nid)
     except ValueError as exc:
-        result.error(
+        result.exception(
             "SANDBOX_EGRESS_ALLOWLIST_INVALID",
             f"Sandbox agent node '{nid}' egress allowlist is invalid: {exc}",
             node_id=nid,
@@ -786,7 +786,7 @@ def _check_sandbox_read_only(node: dict[str, Any], nid: str, result: ValidationR
     try:
         _validate_sandbox_read_only_config(node)
     except ValueError as exc:
-        result.error("SANDBOX_READ_ONLY_INVALID", str(exc), node_id=nid)
+        result.exception("SANDBOX_READ_ONLY_INVALID", str(exc), node_id=nid)
 
 
 def _check_sandbox_git_credentials(node: dict[str, Any], nid: str, result: ValidationResult) -> None:
@@ -806,7 +806,7 @@ def _check_sandbox_git_credentials(node: dict[str, Any], nid: str, result: Valid
     try:
         _validate_sandbox_git_credentials_config(node)
     except ValueError as exc:
-        result.error("SANDBOX_GIT_CREDENTIALS_INVALID", str(exc), node_id=nid)
+        result.exception("SANDBOX_GIT_CREDENTIALS_INVALID", str(exc), node_id=nid)
 
 
 def _check_sandbox_policy_fields_only_on_sandbox_nodes(graph_json: dict[str, Any], result: ValidationResult) -> None:
@@ -854,7 +854,7 @@ def _check_sandbox_wallclock_budget(node: dict[str, Any], nid: str, result: Vali
             nid,
         )
     except ValueError as exc:
-        result.error(
+        result.exception(
             "SANDBOX_WALLCLOCK_BUDGET_INVALID",
             f"Sandbox agent node '{nid}' wallclock_budget_seconds is invalid: {exc}",
             node_id=nid,
@@ -883,7 +883,7 @@ def _check_sandbox_loop_intercept(node: dict[str, Any], nid: str, result: Valida
         from modulo.core.guardrails.loop_intercept import validate_loop_intercept_config_errors
     except Exception:
         # Lazy import failure must not crash validation — surface as an error.
-        result.error(
+        result.exception(
             "SANDBOX_LOOP_INTERCEPT_MALFORMED",
             f"Sandbox agent node '{nid}' loop_intercept could not be validated",
             node_id=nid,
@@ -968,7 +968,7 @@ def _check_loop_expression(edge: dict[str, Any], source: str, result: Validation
         try:
             jmespath.compile(expr.strip())
         except jmespath.exceptions.JMESPathError as exc:
-            result.error(
+            result.exception(
                 "LOOP_INVALID_EXPRESSION",
                 f"Loop edge from '{source}': invalid JMESPath expression: {exc}",
                 node_id=source,
@@ -992,7 +992,7 @@ def _edge_source(edge: dict[str, Any]) -> str:
 
 
 def _check_llm_routing_labels(
-    node: dict[str, Any],
+    _node: dict[str, Any],
     edges: list[dict[str, Any]],
     nid: str,
     result: ValidationResult,
@@ -1396,7 +1396,7 @@ class GraphValidator:
         try:
             jmespath.compile(expr.strip())
         except jmespath.exceptions.JMESPathError as exc:
-            result.error(
+            result.exception(
                 "CONDITION_INVALID_EXPRESSION",
                 f"Edge from '{src}': invalid JMESPath expression: {exc}",
                 node_id=src,
@@ -2288,7 +2288,7 @@ class GraphValidator:
             try:
                 re.compile(pattern)
             except re.error as exc:
-                result.error(
+                result.exception(
                     "COMPOSITE_VALIDATION_REGEX_INVALID",
                     f"Node '{node_id}', eval '{eval_name}': regex pattern '{pattern}' failed to compile: {exc}",
                     node_id=node_id,

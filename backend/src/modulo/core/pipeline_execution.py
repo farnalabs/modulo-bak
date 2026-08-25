@@ -167,8 +167,8 @@ _CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_claim_update(
     *,
-    stale_seconds: int,
-    claim_cap: int | None = None,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a pipeline run.
@@ -434,7 +434,7 @@ async def heartbeat_loop(
             consecutive_failures += 1
             _log.warning("Heartbeat failed for run %s (%d consecutive)", run_id, consecutive_failures)
             if consecutive_failures >= 3:
-                _log.error(
+                _log.exception(
                     "Heartbeat lost for run %s after %d consecutive failures — failing closed",
                     run_id,
                     consecutive_failures,
@@ -690,7 +690,7 @@ async def node_deadline_watchdog(
     aeng: AsyncEngine,
     run_id: str,
     org_id: str,
-    node_timeouts: dict[str, int],
+    _node_timeouts: dict[str, int],
     *,
     exec_task: asyncio.Task[Any],
     stall_requested: asyncio.Event | None = None,
@@ -1074,7 +1074,7 @@ async def run_executor_with_watchdog(
         if stall_requested.is_set():
             _log.warning("run_executor_with_watchdog: execution cancelled by node/executor watchdog for run %s", rid)
         elif health_failed.is_set():
-            _log.error(
+            _log.exception(
                 "run_executor_with_watchdog: heartbeat lost for run %s — killing sandbox and failing run",
                 rid,
             )
@@ -1447,8 +1447,8 @@ _RESUME_CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_resume_claim_update(
     *,
-    stale_seconds: int,
-    claim_cap: int | None = None,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a resumed HITL run.

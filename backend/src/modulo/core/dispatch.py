@@ -76,7 +76,7 @@ def _new_claim_token() -> str:
     return uuid.uuid4().hex
 
 
-async def _capacity_deferred(session: AsyncSession, run_id: uuid.UUID, org_id: uuid.UUID) -> bool:
+async def _capacity_deferred(session: AsyncSession, run_id: uuid.UUID, _org_id: uuid.UUID) -> bool:
     """True when the run's pipeline is at ``max_concurrent_runs`` (plan F3b)."""
     from modulo.db.crud.run import count_active_runs_for_pipeline, get_run
     from modulo.db.models.pipeline import Pipeline
