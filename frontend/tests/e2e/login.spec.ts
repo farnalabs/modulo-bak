@@ -32,7 +32,7 @@ test.describe('Login Flow', () => {
     await expect(page.getByText(/Invalid credentials|Incorrect email or password/)).toBeVisible({ timeout: 15000 })
   })
 
-  test('surfaces configured SSO providers as login buttons', async ({ page }) => {
+  test('surfaces configured SSO providers as login buttons', { tag: '@regression' }, async ({ page }) => {
     await page.route('**/api/v1/auth/sso/providers', (route) => {
       void route.fulfill({
         status: 200,
@@ -51,7 +51,7 @@ test.describe('Login Flow', () => {
     await expect(page.getByTestId('login-sso-saml')).toHaveAttribute('href', '/api/v1/auth/saml/login')
   })
 
-  test('keeps password login when no SSO providers are configured', async ({ page }) => {
+  test('keeps password login when no SSO providers are configured', { tag: '@regression' }, async ({ page }) => {
     await page.route('**/api/v1/auth/sso/providers', (route) => {
       void route.fulfill({
         status: 402,
