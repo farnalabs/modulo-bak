@@ -2124,7 +2124,7 @@ async def get_snapshot_detail_endpoint(
 @router.patch("/{pipeline_id}/snapshots/{snapshot_id}")
 @handle_db_errors("pipelines.tag_snapshot")
 async def tag_snapshot_endpoint(
-    _pipeline_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
     req: SnapshotTagUpdate,
     session: AsyncSession = Depends(get_db_session),
@@ -2234,7 +2234,7 @@ async def delete_snapshot_endpoint(
 )
 @handle_db_errors("pipelines.diff_snapshots")
 async def diff_snapshot_endpoint(
-    _pipeline_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
     req: SnapshotDiffQuery,
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),

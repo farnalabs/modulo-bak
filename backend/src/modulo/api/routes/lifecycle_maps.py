@@ -991,7 +991,7 @@ async def save_lifecycle_map_version_endpoint(
 @handle_db_errors(_CODE_LIFECYCLE_MAPS_UPDATE_VERSION)
 async def update_lifecycle_map_version_endpoint(
     lifecycle_map_id: uuid.UUID,
-    _version_id: uuid.UUID,
+    version_id: uuid.UUID,
     req: VersionSaveRequest,
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal = require_permission(_CODE_LIFECYCLE_MAP_UPDATE),
@@ -1105,7 +1105,7 @@ async def get_lifecycle_map_version_endpoint(
 @handle_db_errors(_CODE_LIFECYCLE_MAPS_GRADUATE_STAGE)
 async def graduate_lifecycle_map_stage_endpoint(
     lifecycle_map_id: uuid.UUID,
-    _version_id: uuid.UUID,
+    version_id: uuid.UUID,
     stage_id: str,
     req: GraduateStageRequest,
     session: AsyncSession = Depends(get_db_session),

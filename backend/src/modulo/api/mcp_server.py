@@ -5121,7 +5121,6 @@ async def list_schemas(
 @_RETRY_DB
 async def infer_schema(
     input_sample: dict[str, Any],
-    _pipeline_id: str | None = None,
 ) -> dict[str, Any]:
     try:
         if not await validate_current_auth():
