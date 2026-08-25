@@ -127,7 +127,7 @@ async def _suite_run_transition(session: AsyncSession, run: SuiteRun, target: Su
     if not can_transition(run.state, new_state):
         raise IllegalStateTransitionError(run.state, new_state.value)
     ver = run.version
-    values = {"state": new_state.value, "version": SuiteRun.version + 1}
+    values: dict[str, Any] = {"state": new_state.value, "version": SuiteRun.version + 1}
     if new_state in (SuiteRunState.COMPLETED, SuiteRunState.PARTIAL, SuiteRunState.FAILED, SuiteRunState.CANCELLED):
         values["completed_at"] = datetime.now(UTC)
     stmt = (

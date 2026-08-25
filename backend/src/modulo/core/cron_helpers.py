@@ -3096,7 +3096,7 @@ async def _enqueue_polling_fire(
     org_id: uuid.UUID,
     row: Any,
     config: dict[str, Any],
-    connector_instance_id: uuid.UUID,
+    connector_instance_id: uuid.UUID | None,
     summary: dict[str, Any],
 ) -> bool:
     """Enqueue ONE polling fire job; ``False`` when the enqueue raised.

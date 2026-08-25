@@ -47,9 +47,6 @@ class EvalResult(OrgScoped):
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     detail: Mapped[str | None] = mapped_column(String(2000))
     observed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
-    # FAR-377/FAR-382 version stamp: the eval-definition version the per-case
-    # outcome was produced under. NULL for legacy pipeline-path rows.
-    eval_definition_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.current_timestamp(), nullable=False
     )

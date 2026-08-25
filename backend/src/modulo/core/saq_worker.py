@@ -671,7 +671,7 @@ async def _enqueue_suite_run_execution(suite_run_id: str, org_id: str) -> str | 
     from saq.queue.redis import RedisQueue
 
     settings = get_settings()
-    redis_client = aioredis.from_url(
+    redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
         settings.redis_url,
         socket_connect_timeout=10,
         socket_keepalive=True,
