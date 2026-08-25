@@ -12,8 +12,16 @@ from modulo.db.models.error_event import ErrorEvent
 from modulo.db.models.error_forwarder_config import ErrorForwarderConfig
 from modulo.db.models.error_group import ErrorGroup
 from modulo.db.models.error_notification_rule import DeletedDefault, ErrorNotificationRule
+from modulo.db.models.eval_dataset import (
+    EvalCase,
+    EvalDataset,
+    compute_input_hash,
+    purge_soft_deleted_eval_cases,
+    validate_dataset_has_cases,
+)
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
+from modulo.db.models.eval_suite import EvalSuite
 from modulo.db.models.feedback_record import FeedbackRecord
 from modulo.db.models.hitl_claim import HitlClaim
 from modulo.db.models.journey import Journey
@@ -89,8 +97,11 @@ __all__ = [
     "ErrorForwarderConfig",
     "ErrorGroup",
     "ErrorNotificationRule",
+    "EvalCase",
+    "EvalDataset",
     "EvalDefinition",
     "EvalResult",
+    "EvalSuite",
     "FeatureFlagCatalog",
     "FeedbackRecord",
     "HitlClaim",
@@ -155,4 +166,7 @@ __all__ = [
     "WebhookDedupHash",
     "WebhookPayload",
     "WorkspaceLease",
+    "compute_input_hash",
+    "purge_soft_deleted_eval_cases",
+    "validate_dataset_has_cases",
 ]

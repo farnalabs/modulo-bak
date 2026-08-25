@@ -27,7 +27,7 @@ _VERSIONS = Path(__file__).resolve().parents[3] / "src" / "modulo" / "db" / "mig
 
 _MIGRATION_0006 = "0108_schema_org_identity"
 _MIGRATION_0113 = "0113_guardrail_summary"
-_HEAD_MIGRATION = "0125_soft_delete_lookup_indexes"
+_HEAD_MIGRATION = "0136_rename_remy_user_id_to_account_id"
 
 
 def _source(name: str) -> str:
@@ -77,5 +77,5 @@ class TestKillSwitchMigration:
         assert "guardrails_kill_switch" not in source_0114
         source_0115 = _source("0115_notification_preferences")
         assert "guardrails_kill_switch" not in source_0115
-        source_0116 = _source(_HEAD_MIGRATION)
+        source_0116 = _source("0116_guardrail_trust_pr_b")
         assert "guardrails_kill_switch" not in source_0116

@@ -33,8 +33,7 @@ from alembic.script import ScriptDirectory
 
 _MIGRATION_0008 = "0110_schema_pipeline_runtime"
 _MIGRATION_0113 = "0113_guardrail_summary"
-_HEAD_MIGRATION = "0125_soft_delete_lookup_indexes"
-
+_HEAD_MIGRATION = "0136_rename_remy_user_id_to_account_id"
 
 _VERSIONS_DIR = Path(__file__).resolve().parents[3] / "src" / "modulo" / "db" / "migrations" / "versions"
 

@@ -232,7 +232,7 @@ class UiCommandResultsBatch(BaseModel):
 def _serialise_session(s: ChatSession, message_count: int = 0) -> dict[str, Any]:
     return {
         "id": str(s.id),
-        "user_id": str(s.user_id),
+        "account_id": str(s.account_id),
         "name": s.name,
         "session_number": s.session_number,
         "provider": s.provider,
@@ -442,7 +442,7 @@ async def _get_owned_session(
     db: AsyncSession,
 ) -> ChatSession:
     chat_session = await db.get(ChatSession, session_id)
-    if chat_session is None or chat_session.user_id != principal.account_id:
+    if chat_session is None or chat_session.account_id != principal.account_id:
         raise HTTPException(status_code=404, detail=_MSG_SESSION_NOT_FOUND)
     return chat_session
 
@@ -1336,13 +1336,13 @@ async def list_sessions(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            total_q = select(func.count(ChatSession.id)).where(ChatSession.user_id == principal.account_id)
+            total_q = select(func.count(ChatSession.id)).where(ChatSession.account_id == principal.account_id)
             total_result = await session.execute(total_q)
             total = total_result.scalar() or 0
 
             q = (
                 select(ChatSession)
-                .where(ChatSession.user_id == principal.account_id)
+                .where(ChatSession.account_id == principal.account_id)
                 .order_by(ChatSession.updated_at.desc())
                 .offset((page - 1) * page_size)
                 .limit(page_size)
@@ -1439,7 +1439,7 @@ async def create_session(
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             max_sn = await session.execute(
                 select(func.coalesce(func.max(ChatSession.session_number), 0)).where(
-                    ChatSession.user_id == principal.account_id
+                    ChatSession.account_id == principal.account_id
                 )
             )
             next_session_number = (max_sn.scalar() or 0) + 1
@@ -1448,7 +1448,7 @@ async def create_session(
 
             chat_session = ChatSession(
                 organisation_id=principal.organisation_id,
-                user_id=principal.account_id,
+                account_id=principal.account_id,
                 name=req.name,
                 provider=provider,
                 model=model,
@@ -1804,13 +1804,9 @@ def _append_turn_messages(
 ) -> None:
     """Append the assistant message and tool results to the conversation for the next turn."""
     langchain_messages.append(AIMessage(content=full_content, tool_calls=tool_calls))
-    for tr in tool_results:
-        langchain_messages.append(
-            ToolMessage(
-                content=_tool_result_content(tr),
-                tool_call_id=tr["tool_call_id"],
-            )
-        )
+    langchain_messages.extend(
+        ToolMessage(content=_tool_result_content(tr), tool_call_id=tr["tool_call_id"]) for tr in tool_results
+    )
 
 
 def _ping_event_if_due(state: dict[str, Any]) -> str | None:
@@ -1870,6 +1866,59 @@ async def _run_stream_loop(
             yield ping
 
 
+async def _stream_event_generator(
+    session: AsyncSession,
+    request: Request,
+    principal: TenantPrincipal,
+    session_id: uuid.UUID,
+    req: StreamRequest,
+    settings: Settings,
+    chat_session: ChatSession,
+) -> AsyncGenerator[str, None]:
+    """SSE event generator — agentic loop with multi-turn LLM + UI commands."""
+    msg_id: str | None = None
+    try:
+        async with AsyncSession(session.bind, autobegin=False) as db_session:
+            ctx = _StreamContext(db_session, principal, session_id, req, settings, chat_session)
+
+            # 1-7. Resolve API key → build backend → system prompt →
+            # save user message → reconstruct → prepend → prune.
+            init = await _initialise_stream(ctx)
+            if init.error_detail is not None:
+                yield f"event: error\ndata: {json.dumps({'detail': init.error_detail})}\n\n"
+                return
+
+            backend = init.backend
+            if backend is None:
+                yield f"event: error\ndata: {json.dumps({'detail': MSG_UNEXPECTED_ERROR})}\n\n"
+                return
+
+            state: dict[str, Any] = {
+                "disconnected": False,
+                "full_content": "",
+                "should_break": False,
+                "msg_id": None,
+                "last_ping_at": _time.monotonic(),
+            }
+            async for event in _run_stream_loop(ctx, request, backend, init.messages, init.parent_msg_id, state):
+                yield event
+            msg_id = state["msg_id"]
+
+        yield f"event: done\ndata: {json.dumps({'message_id': msg_id})}\n\n"
+
+    except HTTPException as exc:
+        yield f"event: error\ndata: {json.dumps({'detail': exc.detail})}\n\n"
+    except ProgrammingError:
+        logger.exception("Remy streaming error — missing DB table or schema")
+        yield (_SSE_ERROR_PREFIX + json.dumps({"detail": MSG_FEATURE_NOT_AVAILABLE}) + "\n\n")
+    except SQLAlchemyError:
+        logger.exception(_CODE_REMY_DATABASE_ERROR)
+        yield (_SSE_ERROR_PREFIX + json.dumps({"detail": _MSG_DATABASE_ERROR_PLEASE_TRY}) + "\n\n")
+    except Exception:
+        logger.exception("Remy streaming error")
+        yield f"event: error\ndata: {json.dumps({'detail': 'An unexpected error occurred. Please try again.'})}\n\n"
+
+
 @router.post(
     "/sessions/{session_id}/stream",
     responses={
@@ -1919,52 +1968,8 @@ async def stream_chat(
         },
     )
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """SSE event generator — agentic loop with multi-turn LLM + UI commands."""
-        msg_id: str | None = None
-        try:
-            async with AsyncSession(session.bind, autobegin=False) as db_session:
-                ctx = _StreamContext(db_session, principal, session_id, req, settings, chat_session)
-
-                # 1-7. Resolve API key → build backend → system prompt →
-                # save user message → reconstruct → prepend → prune.
-                init = await _initialise_stream(ctx)
-                if init.error_detail is not None:
-                    yield f"event: error\ndata: {json.dumps({'detail': init.error_detail})}\n\n"
-                    return
-
-                backend = init.backend
-                if backend is None:
-                    yield f"event: error\ndata: {json.dumps({'detail': MSG_UNEXPECTED_ERROR})}\n\n"
-                    return
-
-                state: dict[str, Any] = {
-                    "disconnected": False,
-                    "full_content": "",
-                    "should_break": False,
-                    "msg_id": None,
-                    "last_ping_at": _time.monotonic(),
-                }
-                async for event in _run_stream_loop(ctx, request, backend, init.messages, init.parent_msg_id, state):
-                    yield event
-                msg_id = state["msg_id"]
-
-            yield f"event: done\ndata: {json.dumps({'message_id': msg_id})}\n\n"
-
-        except HTTPException as exc:
-            yield f"event: error\ndata: {json.dumps({'detail': exc.detail})}\n\n"
-        except ProgrammingError:
-            logger.exception("Remy streaming error — missing DB table or schema")
-            yield (_SSE_ERROR_PREFIX + json.dumps({"detail": MSG_FEATURE_NOT_AVAILABLE}) + "\n\n")
-        except SQLAlchemyError:
-            logger.exception(_CODE_REMY_DATABASE_ERROR)
-            yield (_SSE_ERROR_PREFIX + json.dumps({"detail": _MSG_DATABASE_ERROR_PLEASE_TRY}) + "\n\n")
-        except Exception:
-            logger.exception("Remy streaming error")
-            yield f"event: error\ndata: {json.dumps({'detail': 'An unexpected error occurred. Please try again.'})}\n\n"
-
     return StreamingResponse(
-        event_generator(),
+        _stream_event_generator(session, request, principal, session_id, req, settings, chat_session),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1979,7 +1984,10 @@ async def stream_chat(
 
 @router.post(
     "/sessions/{session_id}/permission-response",
-    responses={404: {"description": "Not Found"}},
+    responses={
+        404: {"description": "Not Found"},
+        403: {"description": "Permission request does not belong to this session"},
+    },
 )
 @handle_db_errors("remy.submit_permission_response")
 async def submit_permission_response(

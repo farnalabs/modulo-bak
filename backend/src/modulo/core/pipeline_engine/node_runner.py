@@ -70,7 +70,7 @@ from langgraph.types import interrupt
 from modulo.core.secret_patterns import AWS_ACCESS_KEY_PATTERN, GITHUB_PAT_PATTERN
 
 if TYPE_CHECKING:
-    from e2b import AsyncSandbox  # type: ignore[import-untyped]
+    from e2b import AsyncSandbox
 
 from modulo.core.cost_controller.breakdown.constants import (
     MAX_REPORTABLE_BAND_USD,
@@ -93,6 +93,7 @@ from modulo.core.run_context.autonomy import (
     should_notify_on_complete,
     should_skip_hitl_gate,
 )
+from modulo.core.run_context.autonomy_telemetry import emit_autonomy_telemetry
 from modulo.db.models.eval_result import EvalResult as EvalResultModel
 from modulo.db.rls import set_rls_execution_context, set_rls_org
 
@@ -1431,7 +1432,6 @@ async def _append_conformance_audit(
 
 def _resolve_node_run_overrides(
     run_context: dict[str, Any],
-    node_def: dict[str, Any],
     agent_id: uuid.UUID | None,
     *,
     model_backend_id_str: str | None,
@@ -1526,7 +1526,6 @@ def make_node_fn(
         # boundary (FAR-342 injection surface closed).
         model_backend_id_str, prompt_template = _resolve_node_run_overrides(
             run_context,
-            node_def,
             agent_id,
             model_backend_id_str=model_backend_id_str,
             prompt_template=prompt_template,
@@ -2128,9 +2127,31 @@ def make_hitl_gate_fn(
         # --- Autonomy skip/approve. ---
         autonomy, autonomy_result = _hitl_gate_autonomy_result(gate_id, state, human_only)
         if autonomy_result is not None:
+            # skipped (fully_autonomous) or auto_approved (notify_on_complete):
+            # record the effective autonomy granted as evidence (fail-open).
+            outcome = autonomy_result["artifacts"][0]["status"]
+            await emit_autonomy_telemetry(
+                session_factory,
+                org_id=org_id,
+                run_id=state.get("_run_id"),
+                gate_id=gate_id,
+                autonomy_level=autonomy.value,
+                gate_outcome=outcome,
+                human_only=human_only,
+            )
             return autonomy_result
 
         # --- First invocation — store config and interrupt. ---
+        # Gate fired (human path): record the effective autonomy + fired outcome.
+        await emit_autonomy_telemetry(
+            session_factory,
+            org_id=org_id,
+            run_id=state.get("_run_id"),
+            gate_id=gate_id,
+            autonomy_level=autonomy.value,
+            gate_outcome="fired",
+            human_only=human_only,
+        )
         hitl_gates: list[dict[str, Any]] = list(state.get("_hitl_gates") or [])
         hitl_gates.append(hitl_gate_config)
         state["_hitl_gates"] = hitl_gates
@@ -3628,7 +3649,7 @@ async def _sandbox_agent_impl(
     single_sandbox_node = config.single_sandbox_node
 
     from e2b import AsyncSandbox
-    from e2b.exceptions import RateLimitException  # type: ignore[import-untyped]
+    from e2b.exceptions import RateLimitException
     from opentelemetry import trace as _otel_trace
 
     from modulo.core.guardrails.loop_intercept import (
@@ -4780,9 +4801,9 @@ async def _sandbox_agent_impl(
         if _drain_fn is not None and sandbox is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(_drain_fn()), timeout=_IDEMPOTENCY_GATE_CANCEL_PERSIST_TIMEOUT)
-            # NOSONAR: deliberate — nested cancellation during idempotency-gate cleanup must
-            # not re-raise early or the delivery-done marker is skipped (FAR-228 fix); the
-            # original cancellation re-raises at line 4566.
+            # Nested cancellation here is deliberate — idempotency-gate cleanup
+            # must not re-raise early or the delivery-done marker is skipped
+            # (FAR-228 fix); the original cancellation re-raises at line 4566.
             except asyncio.CancelledError:  # NOSONAR
                 _uncancel_current_task()
             except Exception:
@@ -4818,9 +4839,9 @@ async def _sandbox_agent_impl(
                         attempt_key=attempt_key,
                         marker=_cancel_marker,
                     )
-                # NOSONAR: deliberate — nested cancellation during idempotency-gate cleanup must
-                # not re-raise early or the delivery-done marker is skipped (FAR-228 fix); the
-                # original cancellation re-raises at line 4566.
+                # Nested cancellation here is deliberate — idempotency-gate cleanup
+                # must not re-raise early or the delivery-done marker is skipped
+                # (FAR-228 fix); the original cancellation re-raises at line 4566.
                 except asyncio.CancelledError:  # NOSONAR
                     _uncancel_current_task()
                 except Exception:
@@ -4977,10 +4998,27 @@ async def _sandbox_cancel_retention_persist(
     _uncancel_current_task()
 
 
+def _coerce_stdout_percentage_delta(raw: Any) -> float | None:
+    """Coerce a node's ``stdout_percentage_delta`` to a (0, 1] fraction or None."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 0.0 < value <= 1.0 else None
+
+
+def _filter_watch_globs(raw: Any) -> list[str]:
+    """Filter a node's ``watch_globs`` to non-empty string entries."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [g for g in raw if isinstance(g, str) and g]
+
+
 def _build_sandbox_node_config(
     node_def: dict[str, Any],
     *,
-    timeout: float | None,
     session_factory: Callable[..., Any] | None,
     single_sandbox_node: bool,
 ) -> _SandboxNodeConfig:
@@ -5053,18 +5091,8 @@ def _build_sandbox_node_config(
     enable_heartbeat: bool = node_def.get("enable_heartbeat", True) is not False
     watch_log_path: str | None = node_def.get("watch_log_path")
     watch_log_path = watch_log_path if isinstance(watch_log_path, str) and watch_log_path else None
-    stdout_percentage_delta_raw: Any = node_def.get("stdout_percentage_delta")
-    stdout_percentage_delta: float | None = None
-    if stdout_percentage_delta_raw is not None:
-        try:
-            _d = float(stdout_percentage_delta_raw)
-            stdout_percentage_delta = _d if 0.0 < _d <= 1.0 else None
-        except (TypeError, ValueError):
-            stdout_percentage_delta = None
-    _watch_globs_raw: Any = node_def.get("watch_globs")
-    watch_globs: list[str] = (
-        [g for g in _watch_globs_raw if isinstance(g, str) and g] if isinstance(_watch_globs_raw, (list, tuple)) else []
-    )
+    stdout_percentage_delta: float | None = _coerce_stdout_percentage_delta(node_def.get("stdout_percentage_delta"))
+    watch_globs: list[str] = _filter_watch_globs(node_def.get("watch_globs"))
     # FAR-228: the opt-in delivery sentinel (full-line marker in sandbox output
     # that proves the side effect — e.g. an email — was sent) and the
     # single-node guard (the gate is inert on multi-node graphs).
@@ -5173,7 +5201,6 @@ def make_sandbox_agent_fn(
     """
     config = _build_sandbox_node_config(
         node_def,
-        timeout=timeout,
         session_factory=session_factory,
         single_sandbox_node=single_sandbox_node,
     )
