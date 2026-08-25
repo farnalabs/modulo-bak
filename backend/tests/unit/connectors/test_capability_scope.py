@@ -64,11 +64,12 @@ class _FakeCI:
 
 
 def test_validate_allowed_connectors_subset_accepts_granted_types():
-    validate_allowed_connectors_subset(
+    result = validate_allowed_connectors_subset(
         node_id="n1",
         allowed_connectors=["github", "slack"],
         granted_types={"github", "slack"},
     )
+    assert result is None
 
 
 def test_validate_allowed_connectors_subset_rejects_widen():
@@ -87,16 +88,17 @@ def test_validate_allowed_connectors_subset_rejects_widen():
 def test_validate_allowed_connectors_subset_accepts_instance_ids():
     """Instance-id entries are opaque at compile time and never rejected (run-time enforced)."""
     inst = str(uuid.uuid4())
-    validate_allowed_connectors_subset(
+    result = validate_allowed_connectors_subset(
         node_id="n1",
         allowed_connectors=[inst],
         granted_types=set(),
     )
+    assert result is None
 
 
 def test_validate_allowed_connectors_subset_no_scope_is_unrestricted():
-    validate_allowed_connectors_subset(node_id="n1", allowed_connectors=None, granted_types=set())
-    validate_allowed_connectors_subset(node_id="n1", allowed_connectors=[], granted_types=set())
+    assert validate_allowed_connectors_subset(node_id="n1", allowed_connectors=None, granted_types=set()) is None
+    assert validate_allowed_connectors_subset(node_id="n1", allowed_connectors=[], granted_types=set()) is None
 
 
 def test_agent_granted_connector_types_handles_both_shapes():
@@ -107,8 +109,8 @@ def test_agent_granted_connector_types_handles_both_shapes():
     # legacy string-list form
     assert agent_granted_connector_types(["github", "linear"]) == {"github", "linear"}
     # empty / None
-    assert agent_granted_connector_types(None) == set()
-    assert agent_granted_connector_types([]) == set()
+    assert not agent_granted_connector_types(None)
+    assert not agent_granted_connector_types([])
 
 
 # ---------------------------------------------------------------------------
@@ -223,16 +225,16 @@ async def test_initialise_unrestricted_default_fetches_all(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_scope_violation_is_typed_and_metric_emitting(caplog):
+def test_scope_violation_is_typed_and_metric_emitting():
     with patch("modulo.core.capability_scope.record_scope_violation") as mock_metric:
         # The message interpolates the structured context.
-        try:
+        with pytest.raises(ScopeViolationError) as exc_info:
             raise ScopeViolationError(node_id="n1", target="slack", kind="connector")
-        except ScopeViolationError as exc:
-            assert exc.node_id == "n1"
-            assert exc.target == "slack"
-            assert exc.kind == "connector"
-            assert "scope.violation node=n1 connector=slack" in str(exc)
+        exc = exc_info.value
+        assert exc.node_id == "n1"
+        assert exc.target == "slack"
+        assert exc.kind == "connector"
+        assert "scope.violation node=n1 connector=slack" in str(exc)
         # Metric helper fires without raising (fail-closed).
         mock_metric(node_id="n1", target="slack", kind="connector")
         mock_metric.assert_called_once_with(node_id="n1", target="slack", kind="connector")
@@ -374,7 +376,7 @@ async def test_make_connector_fn_scope_exclusion_fails_fast():
         assert artifact["status"] == "failed", artifact
         assert "scope.violation" in artifact["error"], artifact["error"]
         # The hub was never consulted (deny-by-default fires first).
-        assert hub.resolved == []
+        assert not hub.resolved
     finally:
         set_connector_hub(None)
 
