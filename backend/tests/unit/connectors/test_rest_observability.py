@@ -20,7 +20,7 @@ import pytest
 
 import modulo.connectors.rest.rest_metrics as rest_metrics
 from modulo.connectors.base import ConnectorQuery
-from modulo.connectors.rest import RESTConnectError, RestConnector, SecurityGuard
+from modulo.connectors.rest import RESTConnectError, RestConnector, RESTResponseTooLargeError, SecurityGuard
 from modulo.connectors.rest.rest_rollback import RestRollbackSignal, evaluate_rest_rollback, is_unknown_like
 
 
@@ -41,7 +41,6 @@ _HANDLE_NAMES = (
     "_retry_total",
     "_ssrf_blocked_total",
     "_redaction_total",
-    "_interval_total",
 )
 
 
@@ -128,7 +127,6 @@ class TestInstrumentRegistration:
         assert "modulo_rest_retry_total" in counters
         assert "modulo_rest_ssrf_blocked_total" in counters
         assert "modulo_rest_redaction_events_total" in counters
-        assert "modulo_rest_deduplicated_interval_total" in counters
 
 
 # ── record helpers ──────────────────────────────────────────────────────────
@@ -166,21 +164,12 @@ class TestRecordHelpers:
             rest_metrics.record_redaction_event()
         counters["modulo_rest_redaction_events_total"].add.assert_called_once_with(1)
 
-    def test_record_deduplicated_emits_key(self) -> None:
-        meter, _h, counters = _storage_meter()
-        with patch.object(rest_metrics, "_get_meter", return_value=meter):
-            rest_metrics.record_deduplicated("run-1:node-2:idx-0")
-        counters["modulo_rest_deduplicated_interval_total"].add.assert_called_once_with(
-            1, attributes={"idempotency_key": "run-1:node-2:idx-0"}
-        )
-
     def test_noop_when_no_meter_provider(self) -> None:
         with patch.object(rest_metrics, "_get_meter", return_value=None):
             rest_metrics.record_request_duration(1.0, host="h", method="GET", outcome="success")
             rest_metrics.record_retry("http_429")
             rest_metrics.record_ssrf_blocked("h")
             rest_metrics.record_redaction_event()
-            rest_metrics.record_deduplicated("k")
         # No handle was created, so nothing was recorded and nothing raised.
         assert rest_metrics._requests_histogram is None
 
@@ -256,6 +245,65 @@ class TestConnectorMetricWiring:
         assert retry.add.call_count == 1
         _, kwargs = retry.add.call_args
         assert kwargs["attributes"] == {"reason": "http_429"}
+
+    def test_failed_then_succeeded_retry_emits_single_terminal_sample(self) -> None:
+        """A retried op that succeeds emits ONE success sample — the intermediate
+        failed attempts must not leak extra samples into p95/success-rate."""
+        meter, histograms, counters = _storage_meter()
+        attempts: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            attempts.append(1)
+            if len(attempts) < 2:
+                return httpx.Response(429, text="throttled", headers={"Retry-After": "0"})
+            return httpx.Response(200, json={"ok": True})
+
+        async def fake_sleep(delay: float) -> None:
+            return None
+
+        c = RestConnector(
+            {"base_url": "https://api.example.com", "path": "/items"},
+            {"auth_mode": "bearer", "token": "t"},
+            transport=httpx.MockTransport(handler),
+            ssrf_validator=lambda url: None,
+            security_guard=_noop_guard(),
+            sleep=fake_sleep,
+        )
+        with patch.object(rest_metrics, "_get_meter", return_value=meter):
+            import asyncio
+
+            asyncio.run(c.query(ConnectorQuery(resource="default")))
+
+        hist = histograms["modulo_rest_request_duration_seconds"]
+        assert hist.record.call_count == 1
+        _, kwargs = hist.record.call_args
+        assert kwargs["attributes"]["outcome"] == rest_metrics.SUCCESS_OUTCOME
+        outcome = counters["modulo_rest_outcome_total"]
+        assert outcome.add.call_count == 1
+
+    def test_response_too_large_emits_cause_code(self) -> None:
+        meter, _h, counters = _storage_meter()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="x" * 2000, headers={"content-type": "text/plain"})
+
+        c = RestConnector(
+            {"base_url": "https://api.example.com", "path": "/items", "max_response_size": 50},
+            {"auth_mode": "bearer", "token": "t"},
+            transport=httpx.MockTransport(handler),
+            ssrf_validator=lambda url: None,
+            security_guard=_noop_guard(),
+        )
+        with patch.object(rest_metrics, "_get_meter", return_value=meter):
+            import asyncio
+
+            with pytest.raises(RESTResponseTooLargeError):
+                asyncio.run(c.query(ConnectorQuery(resource="default")))
+
+        outcome = counters["modulo_rest_outcome_total"]
+        assert outcome.add.call_count == 1
+        _, kwargs = outcome.add.call_args
+        assert kwargs["attributes"] == {"cause_code": rest_metrics.CAUSE_TOO_LARGE, "host": "api.example.com"}
 
     def test_ssrf_blocked_recorded(self) -> None:
         meter, _h, counters = _storage_meter()
@@ -349,7 +397,9 @@ class TestRestRollback:
         assert signal.unknown_rate == pytest.approx(0.03)
 
     def test_unknown_like_classification(self) -> None:
-        assert is_unknown_like("timeout") is True
+        # A transport timeout is a deterministic failure, classified as an error
+        # (never double-counted as UNKNOWN) — so it is NOT unknown-like.
+        assert is_unknown_like("timeout") is False
         assert is_unknown_like("unknown") is True
         assert is_unknown_like("http_429") is False
         assert is_unknown_like("success") is False

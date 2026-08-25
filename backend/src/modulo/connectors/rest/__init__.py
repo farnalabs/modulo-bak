@@ -239,8 +239,11 @@ class RESTStatusError(RESTError):
 class RESTConnectError(RESTError):
     """A transport-level failure (connect/timeout/read) — never retried here."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, cause_code: str = rest_metrics.CAUSE_CONNECT) -> None:
         super().__init__(message)
+        # Terminal cause-code for this transport failure (see ``rest_metrics``);
+        # the operation-scoped metric sampler classifies it deterministically.
+        self.cause_code = cause_code
 
 
 class RESTResponseTooLargeError(RESTError):
@@ -441,6 +444,7 @@ class RestConnector(ConnectorBase):
         max_keepalive_connections: int = 5,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        random_uniform: Callable[[float, float], float] | None = None,
         verify_tls: bool | None = None,
     ) -> None:
         self._config = config or {}
@@ -462,6 +466,12 @@ class RestConnector(ConnectorBase):
         # run on frozen time with no wall-clock dependency (FAR-320 flake lesson).
         self._clock = clock or time.monotonic
         self._sleep = sleep or asyncio.sleep
+        # ``random_uniform`` is the backoff-jitter seam: defaulting to
+        # ``random.uniform``, it produces the jitter component of each backoff
+        # delay. Injecting a deterministic callable lets timing tests assert the
+        # exact backoff schedule rather than the ±jitter range (the jitter used
+        # to defeat the deterministic sleep seam).
+        self._random = random_uniform or random.uniform
         self._ssrf_validator = ssrf_validator
         self._security_guard = security_guard or _stub_security_guard()
         self._base_url = str(self._config.get("base_url", "")).rstrip("/")
@@ -1091,6 +1101,15 @@ class RestConnector(ConnectorBase):
         applies. ``max_retries``, when provided (the fan-out path passes
         ``fan_out.max_retries``), is the retry budget in RETRIES; the loop runs
         ``max_retries + 1`` attempts (clamped to a sane upper bound).
+
+        The latency/outcome metrics are recorded HERE, once per logical operation —
+        a single duration spanning all retry attempts and a single terminal
+        outcome (success, or the cause of the final failure that escaped the
+        retry budget). A failed-then-succeeded operation therefore emits exactly
+        one success sample rather than one per attempt, which would skew
+        success-rate/p95. ``_perform_request`` is a single attempt and records
+        nothing, so the operation-scoped sample is recorded by ``_perform_with_metrics``
+        (non-retryable) or at the terminal outcome of ``_send_retryable``.
         """
         retries = _MAX_RETRIES - 1 if max_retries is None else max_retries
         retries = max(0, min(retries, _MAX_SANE_RETRIES))
@@ -1098,10 +1117,17 @@ class RestConnector(ConnectorBase):
         # timeout so a saturated destination never spins past the per-item budget.
         rate_wait_timeout = request_timeout if request_timeout is not None else self._timeout
         kwargs = self._request_kwargs(request)
+        host = self._host(request.url)
+        start = self._clock()
+
         if not self._is_retryable(request):
             await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
-            return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
-        return await self._send_retryable(client, request, kwargs, rate_wait_timeout, request_timeout, retries + 1)
+            return await self._perform_with_metrics(
+                client, request, kwargs, host, start, request_timeout=request_timeout
+            )
+        return await self._send_retryable(
+            client, request, kwargs, rate_wait_timeout, request_timeout, retries + 1, host, start
+        )
 
     async def _send_retryable(
         self,
@@ -1111,11 +1137,15 @@ class RestConnector(ConnectorBase):
         rate_wait_timeout: float | None,
         request_timeout: float | None,
         attempts: int,
+        host: str,
+        start: float,
     ) -> tuple[httpx.Response, str]:
         """Retry loop for idempotent verbs — see :meth:`_send` for the contract.
 
-        A token is acquired before every wire attempt so each retry is metered,
-        and a bounded backoff is applied between attempts.
+        A token is acquired before every wire attempt so each retry is metered, a
+        bounded backoff is applied between attempts, and one operation-scoped
+        latency/outcome sample is recorded at the terminal outcome (retries
+        included; ``_perform_request`` records nothing).
         """
         last_delay = 0.0
         retry_reason = "http_429"
@@ -1125,22 +1155,58 @@ class RestConnector(ConnectorBase):
                 rest_metrics.record_retry(retry_reason)
             await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             try:
-                return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
+                resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:
                 retry_reason = "http_429" if exc.status_code == 429 else "http_5xx"
                 if not self._is_status_retryable(exc, attempt, attempts):
+                    self._record_operation(start, host, request, rest_metrics.classify_status(exc.status_code))
                     raise
                 last_delay = self._retry_delay(exc, attempt)
-            except RESTConnectError:
+            except RESTConnectError as exc:
                 retry_reason = "transport"
                 if attempt == attempts - 1:
+                    self._record_operation(start, host, request, exc.cause_code)
                     raise
                 last_delay = self._backoff(attempt)
+            except RESTResponseTooLargeError:
+                self._record_operation(start, host, request, rest_metrics.CAUSE_TOO_LARGE)
+                raise
+            self._record_operation(start, host, request, rest_metrics.SUCCESS_OUTCOME)
+            return resp, body_text
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _is_status_retryable(self, exc: RESTStatusError, attempt: int, attempts: int) -> bool:
         """Whether a ``RESTStatusError`` should trigger another attempt."""
         return attempt != attempts - 1 and exc.status_code in _RETRYABLE_STATUS
+
+    async def _perform_with_metrics(
+        self,
+        client: httpx.AsyncClient,
+        request: RestRequest,
+        kwargs: dict[str, Any],
+        host: str,
+        start: float,
+        request_timeout: float | None = None,
+    ) -> tuple[httpx.Response, str]:
+        """Run a single (non-retryable) attempt, recording one sample at its terminal outcome."""
+        try:
+            resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
+        except RESTStatusError as exc:
+            self._record_operation(start, host, request, rest_metrics.classify_status(exc.status_code))
+            raise
+        except RESTConnectError as exc:
+            self._record_operation(start, host, request, exc.cause_code)
+            raise
+        except RESTResponseTooLargeError:
+            self._record_operation(start, host, request, rest_metrics.CAUSE_TOO_LARGE)
+            raise
+        self._record_operation(start, host, request, rest_metrics.SUCCESS_OUTCOME)
+        return resp, body_text
+
+    def _record_operation(self, start: float, host: str, request: RestRequest, outcome: str) -> None:
+        """Record one operation-scoped latency + outcome sample (retries included)."""
+        duration = self._clock() - start
+        rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
 
     def _request_kwargs(self, request: RestRequest) -> dict[str, Any]:
         """Build the httpx kwargs, injecting auth headers + idempotency key once."""
@@ -1183,15 +1249,11 @@ class RestConnector(ConnectorBase):
     ) -> tuple[httpx.Response, str]:
         """A single HTTP attempt: stream, cap the body, then classify the status.
 
-        Timing + outcome metrics are recorded here (FAR-413) so every attempt —
-        retryable or not, success or failure — emits a
-        ``modulo_rest_request_duration_seconds`` histogram sample and a
-        ``modulo_rest_outcome_total`` counter sample labelled by the stable
-        cause-code taxonomy.
+        This performs exactly ONE attempt and records NO metrics — the
+        operation-scoped latency/outcome sample is recorded by ``_perform_with_metrics``
+        in ``_send`` at the terminal outcome (see that docstring).
         """
         body_text = ""
-        host = self._host(request.url)
-        start = self._clock()
         try:
             stream_kwargs: dict[str, Any] = dict(kwargs)
             if request_timeout is not None:
@@ -1199,25 +1261,17 @@ class RestConnector(ConnectorBase):
             async with client.stream(request.method, request.url, **stream_kwargs) as resp:
                 body_text = await self._consume_body(resp)
         except httpx.HTTPError as exc:
-            outcome = self._classify_transport_error(exc)
-            duration = self._clock() - start
-            rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
             raise RESTConnectError(
-                self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}")
+                self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}"),
+                cause_code=self._classify_transport_error(exc),
             ) from exc
-        duration = self._clock() - start
         if resp.status_code >= 300:
-            outcome = rest_metrics.classify_status(resp.status_code)
-            rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
             raise RESTStatusError(
                 self._status_detail(resp, request, body_text),
                 status_code=resp.status_code,
                 location=resp.headers.get("location", ""),
                 retry_after=parse_retry_after(resp),
             )
-        rest_metrics.record_request_duration(
-            duration, host=host, method=request.method, outcome=rest_metrics.SUCCESS_OUTCOME
-        )
         return resp, body_text
 
     def _classify_transport_error(self, exc: httpx.HTTPError) -> str:
@@ -1249,19 +1303,22 @@ class RestConnector(ConnectorBase):
             chunks.append(chunk)
         return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
 
-    @staticmethod
-    def _backoff(attempt: int) -> float:
-        """Exponential backoff with jitter (0.5s, 1.0s, 2.0s)."""
-        base = 0.5 * (2**attempt)
-        return float(base + random.uniform(0, 0.25))  # noqa: S311 — jitter, not a security secret
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter (0.5s, 1.0s, 2.0s).
 
-    @staticmethod
-    def _retry_delay(exc: RESTStatusError, attempt: int) -> float:
+        The jitter comes from the injected ``random_uniform`` seam (``self._random``,
+        defaulting to ``random.uniform``) so timing tests can assert the exact
+        delay. The core delay is deterministic (``0.5 * 2**attempt``).
+        """
+        base = 0.5 * (2**attempt)
+        return float(base + self._random(0, 0.25))
+
+    def _retry_delay(self, exc: RESTStatusError, attempt: int) -> float:
         if exc.retry_after is not None:
             # Cap an untrusted Retry-After: a server can say 3600 and we must not
             # sleep ~1h per retry. The cap bounds every retry hop (default 30s).
             return min(max(0.0, exc.retry_after), _MAX_RETRY_WAIT)
-        return RestConnector._backoff(attempt)
+        return self._backoff(attempt)
 
     def _status_detail(self, resp: httpx.Response, request: RestRequest, body_text: str) -> str:
         location = resp.headers.get("location", "")

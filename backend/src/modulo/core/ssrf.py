@@ -89,32 +89,54 @@ def _validate_url_syntax(url: str) -> str:
     return hostname.rstrip(".").strip("[]")
 
 
+def _parse_ipv4_segment(segment: str) -> int:
+    """Parse one dot-separated IPv4 octet with per-segment base detection.
+
+    A resolver/httpx client is liber: ``0x7f`` (hex) and ``0177`` (octal) both
+    decode as an octet value. Without base detection a mixed-base dotted string
+    like ``0x7f.0.0.1`` would fall through to the DNS path (blocked only
+    incidentally by a resolver that fails to decode it), so we normalise each
+    segment to its integer value here. ``0x`` prefix -> hex; a leading ``0``
+    (with more digits) -> octal; else decimal. Raises ValueError when *segment*
+    is not a valid integer in its detected base.
+    """
+    if segment.startswith(("0x", "0X")):
+        return int(segment, 16)
+    if len(segment) > 1 and segment.startswith("0"):
+        return int(segment, 8)
+    return int(segment, 10)
+
+
 def _decode_noncanonical_ipv4(decoded: str) -> ipaddress.IPv4Address | None:
     """Return the IPv4Address for a non-canonical integer IPv4 encoding.
 
     ``ipaddress.ip_address`` accepts only dotted-quad IPv4 (or ``[::]`` IPv6)
     *strings*; a resolver/httpx client is far more liberal. An outbound URL that
     renders loopback/private IPv4 as a single decimal integer (``2130706433``
-    → ``127.0.0.1``) or a hex integer (``0x7f000001`` → ``127.0.0.1``) would
-    otherwise sail past the literal-IP branch and fall through to DNS — where a
-    resolver that decodes integer addresses turns it back into a private target.
-    This helper normalises those two forms (the common evasion encodings) so the
-    literal-IP guard can block them. Returns ``None`` when *decoded* is not an
-    integer-encodeable IPv4 address, leaving it to the DNS-resolution path.
+    → ``127.0.0.1``), a hex integer (``0x7f000001`` → ``127.0.0.1``), or a
+    mixed-base dotted string (``0x7f.0.0.1`` / ``0177.0.0.1`` → ``127.0.0.1``)
+    would otherwise sail past the literal-IP branch and fall through to DNS —
+    where a resolver that decodes integer addresses turns it back into a private
+    target. This helper normalises those forms (the common evasion encodings) so
+    the literal-IP guard can block them. Returns ``None`` when *decoded* is not
+    an integer-encodeable IPv4 address, leaving it to the DNS-resolution path.
     """
     candidate = decoded.strip()
-    if candidate.lower().startswith("0x"):
-        try:
-            value = int(candidate, 16)
-        except ValueError:
+    if "." in candidate:
+        parts = candidate.split(".")
+        if len(parts) != 4:
             return None
-    elif candidate.isdigit():
+        value = 0
         try:
-            value = int(candidate, 10)
+            for part in parts:
+                value = (value << 8) | _parse_ipv4_segment(part)
         except ValueError:
             return None
     else:
-        return None
+        try:
+            value = _parse_ipv4_segment(candidate)
+        except ValueError:
+            return None
     if 0 <= value <= 0xFFFFFFFF:
         try:
             return ipaddress.IPv4Address(value)

@@ -35,7 +35,7 @@ _DEFAULT_MIN_SAMPLES = 50
 # remote regressions surface while occasional 429/5xx noise does not.
 _DEFAULT_ERROR_RATE = 0.05
 _DEFAULT_UNKNOWN_RATE = 0.02
-_DEFAULT_UNKNOWN_LIKE = frozenset({"unknown", "timeout"})
+_DEFAULT_UNKNOWN_LIKE = frozenset({"unknown"})
 
 
 @dataclass(frozen=True)
@@ -131,8 +131,11 @@ def is_unknown_like(cause_code: str, unknown_like: frozenset[str] = _DEFAULT_UNK
     """Classify a cause code as part of the UNKNOWN-rate denominator bucket.
 
     The UNKNOWN rate tracks outcomes whose terminal state we could not
-    determine (a write-timeout where the remote may or may not have applied
-    the change). ``timeout`` and ``unknown`` are the canonical members; a
+    determine (a write where the remote's final state is genuinely
+    indeterminate). ``unknown`` is the canonical member. A transport timeout is
+    NOT counted here — it is a deterministic failure, classified as an error by
+    the connector (see ``rest_metrics._ERROR_CAUSE_CODES``), so the error and
+    UNKNOWN buckets stay disjoint and a timeout is never double-counted. A
     caller plumbing a custom taxonomy passes its own set. This is the
     connector-side classifier a metrics sampler uses to choose the bucket.
     """

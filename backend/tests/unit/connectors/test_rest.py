@@ -644,16 +644,24 @@ def test_write_does_not_retry_non_idempotent() -> None:
 
 
 def test_retry_delay_honours_retry_after() -> None:
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
     exc = RESTStatusError("boom", status_code=429, retry_after=2.5)
-    assert RestConnector._retry_delay(exc, 0) == 2.5
-    assert RestConnector._retry_delay(RESTStatusError("boom", status_code=429, retry_after=None), 1) >= 1.0
+    assert c._retry_delay(exc, 0) == 2.5
+    assert c._retry_delay(RESTStatusError("boom", status_code=429, retry_after=None), 1) >= 1.0
 
 
 def test_retry_delay_caps_huge_retry_after() -> None:
     """An untrusted Retry-After header must be capped so a server cannot make us sleep ~1h."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
     exc = RESTStatusError("boom", status_code=429, retry_after=3600)
-    assert RestConnector._retry_delay(exc, 0) == 30.0
-    assert RestConnector._retry_delay(exc, 3) == 30.0
+    assert c._retry_delay(exc, 0) == 30.0
+    assert c._retry_delay(exc, 3) == 30.0
 
 
 def test_dot_index_records_path_rejected() -> None:
@@ -1266,7 +1274,36 @@ def test_retry_uses_injected_sleep_not_wall_clock() -> None:
     assert sleeps == [0.0, 0.0]
 
 
-# ÔöÇÔöÇ FAR-413: idempotency-header behaviour ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+def test_retry_uses_injected_random_for_deterministic_backoff() -> None:
+    """The backoff jitter must come from the injected ``random_uniform`` seam so
+    the exact backoff schedule is assertable — previously the module-level
+    ``random.uniform`` jittered the delay even though the wait was otherwise
+    deterministic, defeating the injected ``sleep`` seam."""
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    c = RestConnector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+        transport=httpx.MockTransport(handler),
+        ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
+        sleep=fake_sleep,
+        random_uniform=lambda a, b: 0.1,
+    )
+    with pytest.raises(RESTConnectError):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
+    # attempt 0 fails -> sleep _backoff(0)=0.5*1+0.1=0.6;
+    # attempt 1 fails -> sleep _backoff(1)=0.5*2+0.1=1.1.
+    assert sleeps == [0.6, 1.1]
+
+
+# ── FAR-413: idempotency-header behaviour ───────────────────────────────────
 
 
 def test_idempotency_header_is_valid_uuid() -> None:
@@ -1404,11 +1441,11 @@ def test_retry_exhaust_on_5xx_surfaces_status_error() -> None:
 # ÔöÇÔöÇ FAR-413: response-size abort releases the stream ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
-def test_response_size_abort_releases_stream_for_follow_up() -> None:
-    """A chunked response that exceeds the cap must abort (raising the typed
-    error) and still release the pooled client so a follow-up request succeeds ÔÇö
-    the ``async with client.stream`` context manager closes the stream on the
-    error path (no leaked/held connection)."""
+def test_response_size_abort_connector_still_usable() -> None:
+    """After an abort the connector object remains usable — a follow-up request
+    on the SAME instance succeeds. (This narrows the previous stream-release
+    claim: MockTransport has no connection pool, so asserting 'the stream was
+    released' would be trivially true and unproveable in this harness.)"""
     big = [False]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1431,7 +1468,27 @@ def test_response_size_abort_releases_stream_for_follow_up() -> None:
     assert result.metadata["status_code"] == 200  # the same connector still works
 
 
-# ÔöÇÔöÇ FAR-413: redaction negative tests ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+def test_response_size_abort_on_chunked_response_without_content_length() -> None:
+    """A chunked (unknown-length) response with NO Content-Length must be capped
+    in the ``aiter_bytes()`` accumulation loop — the overflow path that the
+    Content-Length pre-check can never reach. We strip the auto-inserted
+    Content-Length so the streaming loop is genuinely exercised."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        resp = httpx.Response(200, content=b"x" * 2000, headers={"transfer-encoding": "chunked"})
+        resp.headers.pop("content-length", None)
+        return resp
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "max_response_size": 50},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    c._transport = httpx.MockTransport(handler)
+    with pytest.raises(RESTResponseTooLargeError, match="too large"):
+        asyncio_run(c.query(ConnectorQuery(resource="default")))
+
+
+# ── FAR-413: redaction negative tests ───────────────────────────────────────
 
 
 def test_no_secret_in_transport_error_detail() -> None:

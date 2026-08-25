@@ -310,6 +310,29 @@ class TestNonCanonicalIPEncodings:
         with pytest.raises(ValueError, match="private/internal"):
             ssrf.validate_outbound_url("http://0xa9fea9fe/")  # 169.254.169.254
 
+    def test_dotted_hex_ipv4_loopback_blocked(self) -> None:
+        # 0x7f.0.0.1 -> 127.0.0.1 (per-segment hex base detection).
+        with pytest.raises(ValueError, match="private/internal"):
+            ssrf.validate_outbound_url("http://0x7f.0.0.1/")
+
+    def test_dotted_octal_ipv4_loopback_blocked(self) -> None:
+        # 0177.0.0.1 -> 127.0.0.1 (per-segment octal base detection).
+        with pytest.raises(ValueError, match="private/internal"):
+            ssrf.validate_outbound_url("http://0177.0.0.1/")
+
+    def test_dotted_hex_hostname_not_spuriously_blocked_when_resolves_public(self) -> None:
+        """A hostname that merely CONTAINS a hex-looking segment must NOT be
+        spuriously treated as a non-canonical IPv4: the segment parser bails on
+        the non-numeric segment, so it falls through to the DNS path and is
+        accepted when it resolves to a public address."""
+
+        def fake_resolve(host: str) -> list[str]:
+            assert host == "0x7f.helpers.example.com"
+            return ["93.184.216.34"]
+
+        with patch.object(ssrf, "_resolve_all_sync", fake_resolve):
+            assert ssrf.validate_outbound_url("http://0x7f.helpers.example.com/") is None
+
     async def test_async_decimal_integer_ipv4_loopback_blocked(self) -> None:
         with pytest.raises(ValueError, match="private/internal"):
             await ssrf.validate_outbound_url_async("http://2130706433/")

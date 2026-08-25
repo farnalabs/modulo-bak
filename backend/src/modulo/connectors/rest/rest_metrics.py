@@ -59,7 +59,6 @@ _outcome_total: Any = None
 _retry_total: Any = None
 _ssrf_blocked_total: Any = None
 _redaction_total: Any = None
-_interval_total: Any = None
 
 
 def _get_meter() -> Any:
@@ -75,7 +74,7 @@ def _get_meter() -> Any:
 
 
 def _init() -> None:
-    global _requests_histogram, _outcome_total, _retry_total, _ssrf_blocked_total, _redaction_total, _interval_total
+    global _requests_histogram, _outcome_total, _retry_total, _ssrf_blocked_total, _redaction_total
 
     if _requests_histogram is not None and _outcome_total is not None:
         return
@@ -87,7 +86,7 @@ def _init() -> None:
     try:
         _requests_histogram = meter.create_histogram(
             name="modulo_rest_request_duration_seconds",
-            description="End-to-end REST connector request latency",
+            description="End-to-end REST connector operation latency (one sample per logical operation)",
             unit="s",
         )
     except Exception:
@@ -129,15 +128,6 @@ def _init() -> None:
     except Exception:
         _log.warning("rest_metrics.redaction_counter_failed")
 
-    try:
-        _interval_total = meter.create_counter(
-            name="modulo_rest_deduplicated_interval_total",
-            description="Total deduplicated (suppressed) re-runs of the same idempotency key",
-            unit="1",
-        )
-    except Exception:
-        _log.warning("rest_metrics.dedup_counter_failed")
-
     _log.info("rest_metrics.registered")
 
 
@@ -155,7 +145,13 @@ def classify_status(status_code: int) -> str:
 
 
 def record_request_duration(seconds: float, *, host: str, method: str, outcome: str) -> None:
-    """Record an end-to-end request latency + outcome (labelled host/method/outcome)."""
+    """Record an end-to-end operation latency + outcome (labelled host/method/outcome).
+
+    The duration spans a whole logical operation — all retry attempts up to the
+    terminal success or failure — so exactly one sample is emitted per operation
+    (never one per attempt), keeping success-rate and p95 undiluted by failed
+    intermediate attempts.
+    """
     if _requests_histogram is None:
         _init()
     if _requests_histogram is not None and seconds >= 0:
@@ -197,11 +193,3 @@ def record_redaction_event() -> None:
         _init()
     if _redaction_total is not None:
         _redaction_total.add(1)
-
-
-def record_deduplicated(key: str) -> None:
-    """Record a re-run suppressed because its idempotency key was already delivered."""
-    if _interval_total is None:
-        _init()
-    if _interval_total is not None:
-        _interval_total.add(1, attributes={"idempotency_key": key})
