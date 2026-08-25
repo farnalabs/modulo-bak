@@ -69,6 +69,7 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
           format: 'table'
+          skip-dirs: '.venv,node_modules,.git,.cache,dist,build'
 
   backend-test:
     name: Test (Backend)
