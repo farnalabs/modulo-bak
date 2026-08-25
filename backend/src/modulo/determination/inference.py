@@ -41,6 +41,20 @@ _CI_FILES = {
 }
 
 
+def _repo_name(rec: dict[str, Any]) -> str:
+    """Extract a repo/project identifier from a record.
+
+    Handles GitHub (``name``/``full_name``) and GitLab
+    (``path_with_namespace``/``name``) formats without crashing on records that
+    lack an identifier, returning ``""``.
+    """
+    for key in ("name", "path_with_namespace", "full_name"):
+        value = rec.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _age_days(value: Any) -> float | None:
     """Parse ISO datetime string and return days since then.
 
@@ -74,9 +88,12 @@ def infer(samples: list[ScanSample]) -> list[Finding]:
         match s.resource:
             case "repos" | "projects":
                 for rec in s.records:
-                    name = rec.get("name") or rec.get("path_with_namespace") or rec.get("full_name") or ""
+                    name = _repo_name(rec)
                     if name:
                         repo_names.append(name)
+                    desc = (rec.get("description") or "").lower()
+                    if any(ci in desc or ci in name.lower() for ci in _CI_FILES):
+                        has_ci_config = True
 
             case "pulls" | "mrs":
                 pull_requests.extend(s.records)
@@ -137,15 +154,6 @@ def infer(samples: list[ScanSample]) -> list[Finding]:
         )
 
     # --- Stage: CI/CD ---
-    for s in samples:
-        if s.resource in ("repos", "projects"):
-            for rec in s.records:
-                desc = (rec.get("description") or "").lower()
-                name = (rec.get("name") or rec.get("path_with_namespace") or rec.get("full_name") or "").lower()
-                if any(ci in desc or ci in name for ci in _CI_FILES):
-                    has_ci_config = True
-                    break
-
     if has_ci_config:
         findings.append(
             Finding(
