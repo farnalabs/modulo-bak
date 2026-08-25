@@ -20,7 +20,7 @@ from modulo.api.constants import MSG_RESOURCE_ALREADY_EXISTS, MSG_UNEXPECTED_ERR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature, require_permission
 from modulo.auth.jwt import TenantPrincipal
-from modulo.core.audit_logger import append_audit_event
+from modulo.core.audit_logger import append_audit_event_isolated
 from modulo.core.connector_hub import ConnectorHub
 from modulo.core.model_backend_hub import ModelBackendHub
 from modulo.core.schema_registry import (
@@ -961,34 +961,21 @@ async def infer_schema_endpoint(
         settings, mbs, records, connector_type=ci.connector_type_id
     )
 
-    try:
-        try:
-            async with session.begin():
-                await append_audit_event(
-                    session,
-                    org_id=principal.organisation_id,
-                    event_type="schema_inference_completed",
-                    actor_user_id=principal.account_id,
-                    resource_type="connector_instance",
-                    resource_id=req.connector_instance_id,
-                    payload_json={
-                        "connector_name": ci.name,
-                        "connector_type": ci.connector_type_id,
-                        "resource": req.sample_query.resource,
-                        "sample_count": len(records),
-                        "model_backend_id": str(first_backend_id),
-                    },
-                )
-        except ProgrammingError:
-            logger.exception("schemas.infer_schema_endpoint")
-            logger.warning("Audit event not recorded — schema inference table missing")
-
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.infer.audit_failed")
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="connector_instance",
+        resource_id=req.connector_instance_id,
+        event_type="schema_inference_completed",
+        payload={
+            "connector_name": ci.name,
+            "connector_type": ci.connector_type_id,
+            "resource": req.sample_query.resource,
+            "sample_count": len(records),
+            "model_backend_id": str(first_backend_id),
+        },
+        log_key="schemas.infer.audit_failed",
+    )
 
     return SchemaInferResponse(
         definition_json=definition_json,
@@ -1120,32 +1107,19 @@ async def generate_schema_endpoint(
 
     definition_json, first_backend_id = await _generate_schema(settings, mbs, req)
 
-    try:
-        try:
-            async with session.begin():
-                await append_audit_event(
-                    session,
-                    org_id=principal.organisation_id,
-                    event_type="schema_generation_completed",
-                    actor_user_id=principal.account_id,
-                    resource_type="schema",
-                    resource_id=None,
-                    payload_json={
-                        "description_length": len(req.description),
-                        "example_count": len(req.examples),
-                        "model_backend_id": str(first_backend_id),
-                    },
-                )
-        except ProgrammingError:
-            logger.exception("schemas.generate_schema_endpoint")
-            logger.warning("Audit event not recorded — schema generation table missing")
-
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.generate.audit_failed")
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=None,
+        event_type="schema_generation_completed",
+        payload={
+            "description_length": len(req.description),
+            "example_count": len(req.examples),
+            "model_backend_id": str(first_backend_id),
+        },
+        log_key="schemas.generate.audit_failed",
+    )
 
     return SchemaGenerateResponse(definition_json=definition_json)
 
@@ -1203,36 +1177,23 @@ async def _audit_migration(
     plan: Any,
 ) -> None:
     """Best-effort audit append; failures are logged and never break the response."""
-    try:
-        try:
-            async with session.begin():
-                await append_audit_event(
-                    session,
-                    org_id=principal.organisation_id,
-                    event_type="schema_migration_completed",
-                    actor_user_id=principal.account_id,
-                    resource_type="schema",
-                    resource_id=req.to_schema_id,
-                    payload_json={
-                        "from_schema_id": str(req.from_schema_id),
-                        "to_schema_id": str(req.to_schema_id),
-                        "dry_run": dry_run,
-                        "field_additions": len(plan.field_additions),
-                        "field_removals": len(plan.field_removals),
-                        "type_changes": len(plan.type_changes),
-                        "renames": len(plan.renames),
-                    },
-                )
-        except ProgrammingError:
-            logger.exception("schemas.migrate_audit")
-            logger.warning("Audit event not recorded — schema migration table missing")
-    except HTTPException as exc:
-        logger.debug("schemas.migrate.audit_http_error", extra={"detail": exc.detail})
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate.audit_failed")
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=req.to_schema_id,
+        event_type="schema_migration_completed",
+        payload={
+            "from_schema_id": str(req.from_schema_id),
+            "to_schema_id": str(req.to_schema_id),
+            "dry_run": dry_run,
+            "field_additions": len(plan.field_additions),
+            "field_removals": len(plan.field_removals),
+            "type_changes": len(plan.type_changes),
+            "renames": len(plan.renames),
+        },
+        log_key="schemas.migrate.audit_failed",
+    )
 
 
 @router.post(
@@ -1374,32 +1335,20 @@ async def migration_plan_endpoint(
         "renames": plan.renames,
     }
 
-    try:
-        try:
-            async with session.begin():
-                await append_audit_event(
-                    session,
-                    org_id=principal.organisation_id,
-                    event_type="schema_migration_planned",
-                    actor_user_id=principal.account_id,
-                    resource_type="schema",
-                    payload_json={
-                        "field_additions": len(plan.field_additions),
-                        "field_removals": len(plan.field_removals),
-                        "type_changes": len(plan.type_changes),
-                        "renames": len(plan.renames),
-                    },
-                )
-        except ProgrammingError:
-            logger.exception("schemas.migrate_plan_audit")
-            logger.warning("Audit event not recorded — schema migration table missing")
-    except HTTPException as exc:
-        logger.debug("schemas.migrate_plan.audit_http_error", extra={"detail": exc.detail})
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_plan.audit_failed")
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=None,
+        event_type="schema_migration_planned",
+        payload={
+            "field_additions": len(plan.field_additions),
+            "field_removals": len(plan.field_removals),
+            "type_changes": len(plan.type_changes),
+            "renames": len(plan.renames),
+        },
+        log_key="schemas.migrate_plan.audit_failed",
+    )
 
     return plan_dict
 
