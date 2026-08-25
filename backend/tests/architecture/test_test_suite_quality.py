@@ -5851,26 +5851,41 @@ def _unconditional_skip_marker_violations(tree: ast.AST) -> list[tuple[int, str]
     """
     found = []
 
-    def _marker_name(marker: ast.AST) -> str | None:
-        if isinstance(marker, ast.Call):
-            marker = marker.func
-        if isinstance(marker, ast.Attribute):
-            return marker.attr
-        if isinstance(marker, ast.Name):
-            return marker.id
-        return None
+    def _marker_prefix(marker: ast.AST) -> str:
+        """Return the dotted path *before* the terminal marker name, e.g.
+        ``pytest.mark.`` for ``pytest.mark.skip`` and ``''`` for a bare imported
+        ``skip`` (so the reported context reads ``@skip`` rather than the
+        misleading ``@pytest.mark.skip``)."""
+        node = marker.func if isinstance(marker, ast.Call) else marker
+        parts: list[str] = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        parts.reverse()
+        # Drop the terminal name (the marker itself, e.g. ``skip``).
+        if len(parts) >= 2:
+            return ".".join(parts[:-1]) + "."
+        return ""
 
-    def _report(marker: ast.AST, context: str, lineno: int) -> None:
-        name = _marker_name(marker)
-        if name != "skip":
+    def _report(marker: ast.AST, prefix: str, lineno: int) -> None:
+        # Reuse the module-level ``_decorator_name`` rather than re-deriving it.
+        if _decorator_name(marker) != "skip":
             return
         reason = ""
-        if isinstance(marker, ast.Call) and marker.args:
-            reason = f" ('{ast.unparse(marker.args[0])}')"
+        if isinstance(marker, ast.Call):
+            if marker.args:
+                reason = f" ('{ast.unparse(marker.args[0])}')"
+            else:
+                for kw in marker.keywords:
+                    if kw.arg == "reason":
+                        reason = f" ('{ast.unparse(kw.value)}')"
+                        break
         found.append(
             (
                 lineno,
-                f"{context}skip marker with no condition{reason} — "
+                f"{prefix}skip marker with no condition{reason} — "
                 "the test ALWAYS skips, so it never runs (replace with "
                 "@pytest.mark.skipif(<real condition>, ...) or delete the marker)",
             )
@@ -5884,9 +5899,14 @@ def _unconditional_skip_marker_violations(tree: ast.AST) -> list[tuple[int, str]
             if not is_test:
                 continue
             for dec in node.decorator_list:
-                _report(dec, "@pytest.mark.", node.lineno)
+                _report(dec, f"@{_marker_prefix(dec)}", node.lineno)
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in node.targets):
-            _report(node.value, "pytestmark = pytest.mark.", node.lineno)
+            value = node.value
+            # Unwrap list/tuple spellings (``pytestmark = [pytest.mark.skip(...)]``)
+            # — otherwise a whole-module deselect slips past the lens.
+            elements = value.elts if isinstance(value, (ast.List, ast.Tuple)) else [value]
+            for el in elements:
+                _report(el, f"pytestmark = {_marker_prefix(el)}", node.lineno)
     return found
 
 
@@ -5928,7 +5948,8 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
         "@pytest.mark.skip\ndef test_foo():\n    assert x\n",
         "@pytest.mark.skip()\ndef test_foo():\n    assert x\n",
         "@pytest.mark.skip(reason='not implemented')\ndef test_foo():\n    assert x\n",
-        "@pytest.mark.skip(reason='flaky in CI')\nasync def test_foo():\n    assert x\n",
+        "import pytest\n@skip\ndef test_foo():\n    assert x\n",
+        "@pytest.mark.skip(reason='flaky in CI')\nasync def test_foo():\n    await x\n",
         (
             "import pytest\n"
             "\n"
@@ -5939,6 +5960,8 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
         ),
         "pytestmark = pytest.mark.skip\ndef test_foo():\n    assert x\n",
         "pytestmark = pytest.mark.skip(reason='whole module dormant')\ndef test_foo():\n    assert x\n",
+        "pytestmark = [pytest.mark.skip(reason='whole module dormant')]\ndef test_foo():\n    assert x\n",
+        "pytestmark = (pytest.mark.skip(reason='whole module dormant'),)\ndef test_foo():\n    assert x\n",
     ]
     for source in positive_sources:
         tree = ast.parse(source)
