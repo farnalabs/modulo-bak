@@ -290,8 +290,8 @@ def _completed(org: uuid.UUID, *, created_at: datetime, tuple_sig: str, run_id: 
 
 async def test_baseline_first_run_warns_and_skips() -> None:
     current = _completed(uuid.uuid4(), created_at=datetime.now(UTC), tuple_sig="sig")
-    baseline, warning = await _resolve(current, [])
-    assert baseline is None
+    baselines, warning = await _resolve(current, [])
+    assert baselines == []
     assert warning is not None
     assert "comparison skipped" in warning
 
@@ -302,9 +302,9 @@ async def test_baseline_picks_latest_completed_same_tuple_prior() -> None:
     earlier = _completed(org, created_at=now - timedelta(hours=2), tuple_sig="sig")
     latest = _completed(org, created_at=now - timedelta(hours=1), tuple_sig="sig")
     current = _completed(org, created_at=now, tuple_sig="sig")
-    baseline, warning = await _resolve(current, [earlier, latest])
-    assert baseline is not None
-    assert baseline.id == latest.id
+    baselines, warning = await _resolve(current, [earlier, latest])
+    assert baselines
+    assert baselines[0].id == latest.id
     assert warning is None
 
 
@@ -315,8 +315,8 @@ async def test_baseline_ignores_non_completed_and_other_tuple() -> None:
     pending.state = "pending"
     diff_tuple = _completed(org, created_at=now - timedelta(hours=2), tuple_sig="OTHER")
     current = _completed(org, created_at=now, tuple_sig="sig")
-    baseline, _ = await _resolve(current, [pending, diff_tuple])
-    assert baseline is None
+    baselines, _ = await _resolve(current, [pending, diff_tuple])
+    assert baselines == []
 
 
 async def test_baseline_cross_org_never_selected() -> None:
@@ -325,8 +325,8 @@ async def test_baseline_cross_org_never_selected() -> None:
     now = datetime.now(UTC)
     cross_org = _completed(org_b, created_at=now - timedelta(hours=1), tuple_sig="sig")
     current = _completed(org_a, created_at=now, tuple_sig="sig")
-    baseline, warning = await _resolve(current, [cross_org])
-    assert baseline is None
+    baselines, warning = await _resolve(current, [cross_org])
+    assert baselines == []
     assert warning is not None
 
 
@@ -337,9 +337,32 @@ async def test_baseline_tiebreak_is_lexical_id() -> None:
     high_id = _completed(org, created_at=now - timedelta(hours=1), tuple_sig="sig", run_id=uuid.uuid4())
     low, high = sorted([low_id, high_id], key=lambda r: str(r.id))
     current = _completed(org, created_at=now, tuple_sig="sig")
-    baseline, _ = await _resolve(current, [low, high])
-    assert baseline is not None
-    assert baseline.id == high.id
+    baselines, _ = await _resolve(current, [low, high])
+    assert baselines
+    assert baselines[0].id == high.id
+
+
+async def test_baseline_window_returns_n_most_recent() -> None:
+    """FAR-379: a suite ``baseline_window`` of N widens the baseline to the N
+    most-recent completed same-tuple prior runs instead of only the latest.
+    Without the fix (window ignored) only one baseline is returned."""
+    org = uuid.uuid4()
+    now = datetime.now(UTC)
+    runs = [_completed(org, created_at=now - timedelta(hours=h), tuple_sig="sig") for h in (5, 4, 3, 2, 1)]
+    current = _completed(org, created_at=now, tuple_sig="sig")
+    session = AsyncMock()
+    session.scalars.return_value = _FakeScalarResult(runs)
+    baselines, warning = await resolve_baseline_run(session, current, baseline_window=3)
+    assert warning is None
+    assert len(baselines) == 3
+    # Most-recent-first: the last (h=1) run is the single latest.
+    assert baselines[0].id == runs[-1].id
+    assert baselines[2].id == runs[-3].id
+    # NULL window keeps the single-latest behaviour.
+    single, warning_single = await resolve_baseline_run(session, current, baseline_window=None)
+    assert warning_single is None
+    assert len(single) == 1
+    assert single[0].id == runs[-1].id
 
 
 # --------------------------------------------------------------------------- #

@@ -75,9 +75,12 @@ class EvalSuite(OrgScoped):
     # ------------------------------------------------------------------ #
     # Regression alerting config (FAR-379) — org-scoped via OrgScoped.   #
     # ------------------------------------------------------------------ #
-    # Rolling N-run baseline window used when comparing a run against its
-    # baseline. ``None`` = disabled (the Alerting layer requires an explicit
-    # baseline to be resolved before any alert can fire, never a default).
+    # Rolling N-run baseline window used when resolving the comparison baseline:
+    # ``N`` forms the baseline from the N most-recent completed same-tuple prior
+    # runs (``detect_regressions`` aggregates them); ``None`` keeps the
+    # single-latest baseline. The window controls HOW MANY prior runs form the
+    # baseline, never WHETHER to compare or alert — a NULL window still resolves
+    # a single-latest baseline and alerting is governed by the regression signal.
     baseline_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Pass-rate drop threshold (as a fraction, 0..1) the observed drop must
     # exceed before an alert is dispatched. ``None`` = defer entirely to the

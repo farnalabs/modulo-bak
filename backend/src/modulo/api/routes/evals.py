@@ -210,8 +210,11 @@ class EvalDefinitionListResponse(BaseModel):
 class EvalSuiteAlertingRequest(BaseModel):
     """Per-suite regression alerting configuration (FAR-379)."""
 
-    # Rolling N-run baseline window used when resolving the comparison baseline.
-    # NULL clears the config (alerting stays dormant until an explicit baseline).
+    # Rolling N-run baseline window used when resolving the comparison baseline:
+    # ``N`` forms the baseline from the N most-recent completed same-tuple prior
+    # runs; NULL keeps the single-latest baseline. The window controls HOW MANY
+    # prior runs form the baseline, never WHETHER to compare or alert — a NULL
+    # window does NOT disable alerting.
     baseline_window: int | None = Field(None, ge=1)
     # Pass-rate drop threshold (fraction 0..1) the observed drop must exceed.
     # NULL defers entirely to the Phase 3 ``regressed`` detection flag.
@@ -749,9 +752,13 @@ async def update_suite_alerting(
     Admin only. Sets the suite's ``baseline_window`` / ``minimum_delta`` /
     ``cooldown`` so the Alerting layer knows WHEN and HOW OFTEN to page: a
     regression must exceed ``minimum_delta``, and after it fires the suite is
-    silent for ``cooldown`` minutes. Additive/non-breaking — every field is
-    optional, and NULL clears that field (alerting requires an explicit
-    baseline before any alert fires, never a default).
+    silent for ``cooldown`` minutes. ``baseline_window`` controls how many of
+    the most-recent completed same-tuple prior runs form the comparison baseline
+    (``N`` — a rolling N-run baseline; NULL — single-latest). A NULL
+    ``baseline_window`` does NOT disable alerting: the window widens the baseline
+    but whether to alert is always governed by the comparison result and
+    ``minimum_delta``. Additive/non-breaking — every field is optional, and NULL
+    clears that field.
 
     The suite is looked up org-scoped (a cross-org suite can never be
     configured). NULL values are persisted as NULL, wiping the config.
@@ -1266,6 +1273,7 @@ async def _fetch_compare_evals(
                     await session.execute(
                         select(EvalResult).where(
                             EvalResult.run_id == req.run_id_a,
+                            EvalResult.organisation_id == principal.organisation_id,
                             non_guardrail_eval_results_clause(),
                         )
                     )
@@ -1279,6 +1287,7 @@ async def _fetch_compare_evals(
                     await session.execute(
                         select(EvalResult).where(
                             EvalResult.run_id == req.run_id_b,
+                            EvalResult.organisation_id == principal.organisation_id,
                             non_guardrail_eval_results_clause(),
                         )
                     )
@@ -1327,7 +1336,16 @@ async def _fetch_eval_definitions(
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             defs_rows = (
-                (await session.execute(select(EvalDefinition).where(EvalDefinition.id.in_(eval_ids)))).scalars().all()
+                (
+                    await session.execute(
+                        select(EvalDefinition).where(
+                            EvalDefinition.id.in_(eval_ids),
+                            EvalDefinition.organisation_id == principal.organisation_id,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
             )
             return {d.id: d for d in defs_rows}
     except HTTPException:

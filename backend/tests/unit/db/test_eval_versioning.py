@@ -179,3 +179,70 @@ def test_eval_def_to_dict_surfaces_version() -> None:
     assert payload["version"] == 5
     assert "pre_version_raw" in payload
     session.close()
+
+
+# --------------------------------------------------------------------------- #
+# Version snapshot actually persisted at a write site (FAR-382)               #
+# --------------------------------------------------------------------------- #
+async def test_gate_eval_persist_stamps_definition_version(monkeypatch) -> None:
+    """The DB ``EvalResult`` row built by a write site must carry the definition's
+    version snapshot. Regression guard for the FAR-382 write-site fix: without
+    ``eval_definition_version=eval_def.version`` the captured row is NULL and
+    ``resolve_eval_definition_version`` would resolve it to the definition's
+    current/latest version, silently erasing the version timeline.
+
+    Exercises ``node_runner._persist_gate_eval_results`` with a capturing
+    session factory and RLS helpers stubbed to no-ops.
+    """
+    from types import SimpleNamespace
+
+    from modulo.core.pipeline_engine import node_runner
+
+    async def _noop(session, *_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(node_runner, "set_rls_org", _noop)
+    monkeypatch.setattr(node_runner, "set_rls_execution_context", _noop)
+
+    captured: list[EvalResult] = []
+
+    class _Begin:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def begin(self):
+            return _Begin()
+
+        def add(self, obj: EvalResult) -> None:
+            captured.append(obj)
+
+    class _Factory:
+        def __call__(self):
+            return _FakeSession()
+
+    org_id = uuid.uuid4()
+    definition = _make_definition(org_id, version=9)
+    definition.id = uuid.uuid4()
+    state = {"_run_id": uuid.uuid4()}
+    eval_result = SimpleNamespace(passed=True, score=1.0, detail="ok")
+
+    await node_runner._persist_gate_eval_results(
+        state,
+        [definition],
+        {definition.name: eval_result},
+        _Factory(),
+        org_id,
+    )
+
+    assert captured, "write site must persist an EvalResult row"
+    assert captured[0].eval_definition_version == 9

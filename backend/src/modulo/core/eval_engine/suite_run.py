@@ -139,22 +139,35 @@ def _strictly_prior(run: SuiteRun, other: SuiteRun) -> bool:
     return str(other.id) < str(run.id)
 
 
-async def resolve_baseline_run(session: AsyncSession, run: SuiteRun) -> tuple[SuiteRun | None, str | None]:
-    """Resolve the same-tuple latest COMPLETED run prior to *run*.
+async def resolve_baseline_run(
+    session: AsyncSession,
+    run: SuiteRun,
+    baseline_window: int | None = None,
+) -> tuple[list[SuiteRun], str | None]:
+    """Resolve the same-tuple COMPLETED run(s) prior to *run* (FAR-379 window).
 
     Rules (deterministic):
     * Only same-organisation runs are candidate baselines — a cross-org run is
       never selected (org isolation).
     * Only ``completed`` runs qualify (``partial``/``failed``/``cancelled`` and
       the current run itself are excluded).
-    * The baseline must share the exact immutable ``baseline_tuple``.
-    * The baseline must be strictly prior to *run* by ``(created_at, id)``.
+    * Each baseline must share the exact immutable ``baseline_tuple``.
+    * Each baseline must be strictly prior to *run* by ``(created_at, id)``.
+    * ``baseline_window`` (a suite's ``EvalSuite.baseline_window``) controls how
+      many of the most-recent same-tuple prior runs form the baseline. ``None``
+      (or ``< 1``) keeps the single-latest behaviour; ``N`` returns the ``N``
+      most-recent prior runs — the rolling "N-run baseline". A window NEVER
+      disables comparison or suppresses alerting; it only widens the baseline,
+      so a NULL window still resolves a single-latest baseline and alerting is
+      governed by the regression signal, not by the window.
     * Tiebreak ``(created_at, id)``: the lexically-``id``-latest prior run wins
       deterministically so two concurrent workers cannot disagree.
 
-    Returns ``(baseline_run, warning)``. A warning is emitted (and ``None`` is
-    returned) when no completed prior run exists — the caller must SKIP the
-    comparison rather than flag a regression on a first run.
+    Returns ``(baseline_runs, warning)``. A warning is emitted (and an empty
+    list returned) when no completed prior run exists — the caller must SKIP the
+    comparison rather than flag a regression on a first run. The list is
+    ordered most-recent-first (``(created_at, id)`` desc), so ``baseline_runs[0]``
+    is the single "latest" baseline used when an alerting payload needs one.
 
     Concurrency: the runner holds an org-scoped advisory lock (see
     ``acquire_org_advisory_lock``) around the resolution for the SuiteRun path;
@@ -180,12 +193,14 @@ async def resolve_baseline_run(session: AsyncSession, run: SuiteRun) -> tuple[Su
         and _strictly_prior(run, c)
     ]
     if not matching:
-        return None, "no completed prior run with the same baseline tuple — comparison skipped"
+        return [], "no completed prior run with the same baseline tuple — comparison skipped"
     # Deterministic tiebreak (created_at, id) — the lexically-``id``-latest
     # prior run wins. Sorting in code (not only in SQL) keeps the decision
     # robust regardless of backend index/ordering guarantees.
     matching.sort(key=lambda r: (r.created_at, r.id), reverse=True)
-    return matching[0], None
+    if baseline_window is None or baseline_window < 1:
+        return matching[:1], None
+    return matching[:baseline_window], None
 
 
 async def acquire_org_advisory_lock(session: AsyncSession, run: SuiteRun) -> Any:
@@ -878,15 +893,20 @@ async def maybe_alert_eval_regression(
 # High-level orchestration                                                    #
 # --------------------------------------------------------------------------- #
 async def run_suite_comparison(
-    session: AsyncSession, run: SuiteRun, entity_thresholds: dict[str, Any]
+    session: AsyncSession,
+    run: SuiteRun,
+    entity_thresholds: dict[str, Any],
+    baseline_window: int | None = None,
 ) -> dict[str, Any]:
     """Persist the run completion record and run the comparison against baseline.
 
-    Resolves the same-tuple baseline, delegates the per-eval pass-rate comparison
-    to ``detect_regressions`` (``group_by="suite_id"``), records the regression
-    decision on the run, and (when a regression was flagged) emits the eval
-    notification through the existing ``Notifier`` path. Never builds a parallel
-    comparison store.
+    Resolves the same-tuple baseline (honouring the suite's ``baseline_window``,
+    which widens the baseline to the ``N`` most-recent same-tuple prior runs or
+    keeps the single-latest when ``None``), delegates the per-eval pass-rate
+    comparison to ``detect_regressions`` (``group_by="suite_id"``), records the
+    regression decision on the run, and (when a regression was flagged) emits the
+    eval notification through the existing ``Notifier`` path. Never builds a
+    parallel comparison store.
 
     ``entity_thresholds`` carries the configurable absolute/relative drop
     thresholds plus the per-suite spend ceiling.
@@ -895,9 +915,10 @@ async def run_suite_comparison(
     """
     from modulo.core.eval_engine.regression import detect_regressions
 
-    baseline_run, warning = await resolve_baseline_run(session, run)
+    baseline_runs, warning = await resolve_baseline_run(session, run, baseline_window=baseline_window)
+    baseline_run = baseline_runs[0] if baseline_runs else None
     comparison: dict[str, Any] = {"baseline_run_id": str(baseline_run.id) if baseline_run else None, "warning": warning}
-    if baseline_run is None:
+    if not baseline_runs:
         run.regressed = None
         return comparison
 
@@ -910,7 +931,7 @@ async def run_suite_comparison(
         threshold=abs_threshold,
         group_by="suite_id",
         current_run_ids=[run.id],
-        baseline_run_ids=[baseline_run.id],
+        baseline_run_ids=[r.id for r in baseline_runs],
         relative_threshold=rel_threshold,
     )
     regressed = bool(alerts)
@@ -930,11 +951,16 @@ async def run_suite_comparison(
     return comparison
 
 
-async def record_completion(session: AsyncSession, run: SuiteRun, entity_thresholds: dict[str, Any]) -> None:
+async def record_completion(
+    session: AsyncSession,
+    run: SuiteRun,
+    entity_thresholds: dict[str, Any],
+    baseline_window: int | None = None,
+) -> None:
     """Terminalize a SuiteRun as ``completed`` and persist its comparison."""
     await session.refresh(run)
     entity_thresholds = entity_thresholds or {}
-    comparison = await run_suite_comparison(session, run, entity_thresholds)
+    comparison = await run_suite_comparison(session, run, entity_thresholds, baseline_window=baseline_window)
     run.comparison_json = comparison
     await session.flush()
 
