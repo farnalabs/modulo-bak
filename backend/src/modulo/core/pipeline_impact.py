@@ -25,6 +25,12 @@ _DIR_OUTPUT = "output"
 # Maps a direction label to the node's JSON key for that port set.
 _DIRECTION_NODE_KEY = {_DIR_INPUT: "inputs", _DIR_OUTPUT: "outputs"}
 
+# Change-type labels for edge-port repoints (the edge now reads/writes a
+# different port of its endpoint node). These are emitted by
+# ``normalise_edge_port_delta`` and handled by the impact/breaking oracle.
+_CHANGE_EDGE_SOURCE = "edge_source_port_repoint"
+_CHANGE_EDGE_TARGET = "edge_target_port_repoint"
+
 
 def _port_schema_ref(port: Any) -> str | None:
     """Extract a canonical schema-ref string from a port entry.
@@ -149,6 +155,50 @@ def diff_edge_ports(ea: dict[str, Any], eb: dict[str, Any]) -> dict[str, Any]:
     return changes
 
 
+def normalise_edge_port_delta(edge: dict[str, Any], delta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Convert an edge-port delta (from ``diff_edge_ports``) into normalised
+    port-change entries so it propagates through the impact/breaking oracle.
+
+    ``diff_edge_ports`` returns ``{"source_port": {old,new}, ...}`` with no
+    ``node_id`` — the oracle's ``_normalise_changed_ports`` drops such entries,
+    which previously produced a false "safe" signal for edge repoints. We
+    attribute each field to the endpoint node it actually affects:
+
+    * ``source_port`` change -> the edge now reads a different OUTPUT port of its
+      source node (impact propagates downstream from the source).
+    * ``target_port`` change -> the edge now writes to a different INPUT port of
+      its target node (impact propagates downstream from the target).
+    """
+    src = edge.get("source") or edge.get("source_node_id")
+    tgt = edge.get("target") or edge.get("target_node_id")
+    changes: list[dict[str, Any]] = []
+    if "source_port" in delta:
+        changes.append(
+            {
+                "node_id": str(src),
+                "direction": _DIR_OUTPUT,
+                "port": delta["source_port"]["new"],
+                "change": _CHANGE_EDGE_SOURCE,
+                "old": delta["source_port"]["old"],
+                "new": delta["source_port"]["new"],
+                "edge": {"source": str(src), "target": str(tgt)},
+            }
+        )
+    if "target_port" in delta:
+        changes.append(
+            {
+                "node_id": str(tgt),
+                "direction": _DIR_INPUT,
+                "port": delta["target_port"]["new"],
+                "change": _CHANGE_EDGE_TARGET,
+                "old": delta["target_port"]["old"],
+                "new": delta["target_port"]["new"],
+                "edge": {"source": str(src), "target": str(tgt)},
+            }
+        )
+    return changes
+
+
 def _edge_source(edge: dict[str, Any]) -> str | None:
     raw = edge.get("source") or edge.get("source_node_id")
     return str(raw) if raw is not None else None
@@ -226,6 +276,65 @@ def compute_port_change_impact(graph: dict[str, Any], changed_ports: Iterable[An
     return impacted
 
 
+def _check_edge_repoint_breaking(
+    entry: Mapping[Any, Any],
+    graph_new: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Breaking check for an edge-port repoint (``normalise_edge_port_delta``).
+
+    The edge now reads a different port of its endpoint node. It is breaking
+    when the new port the edge points at is undeclared (the data read is
+    dropped — ``block``) or when the new port's schema-ref differs from the old
+    one (the data read may alter — ``warning``).
+    """
+    node_id = str(entry.get("node_id"))
+    direction = entry.get("direction")
+    if direction not in (_DIR_INPUT, _DIR_OUTPUT):
+        return []
+    new_port = entry.get("port")
+    old_port = entry.get("old")
+    edge = entry.get("edge") or {}
+    src = str(edge.get("source")) if edge.get("source") is not None else None
+    tgt = str(edge.get("target")) if edge.get("target") is not None else None
+
+    new_nodes = {str(n.get("id")): n for n in graph_new.get("nodes", []) if n.get("id")}
+    node = new_nodes.get(node_id)
+    if node is None:
+        return []
+
+    declared = node_port_signature(node)[direction]
+    findings: list[dict[str, Any]] = []
+    if new_port not in declared:
+        findings.append(
+            {
+                "severity": "block",
+                "node_id": node_id,
+                "direction": direction,
+                "port": new_port,
+                "edge": {"source": src, "target": tgt},
+                "reason": (
+                    f"edge {src} -> {tgt} reads {direction} port '{new_port}' of node "
+                    f"{node_id}, which the new graph does not declare — the data read is dropped"
+                ),
+            }
+        )
+    elif old_port is not None and old_port in declared and declared[old_port] != declared[new_port]:
+        findings.append(
+            {
+                "severity": "warning",
+                "node_id": node_id,
+                "direction": direction,
+                "port": new_port,
+                "edge": {"source": src, "target": tgt},
+                "reason": (
+                    f"edge {src} -> {tgt} changed the {direction} port it reads from "
+                    f"'{old_port}' to '{new_port}'; the schema-ref differs — the data read may alter"
+                ),
+            }
+        )
+    return findings
+
+
 def check_port_change_breaking(
     graph_old: dict[str, Any],
     graph_new: dict[str, Any],
@@ -253,22 +362,51 @@ def check_port_change_breaking(
             return [e for e in new_edges if _edge_source(e) == node_id]
         return [e for e in new_edges if _edge_target(e) == node_id]
 
-    for node_id, direction, port, change in _normalise_changed_ports(changed_ports):
-        if node_id not in signatures:
+    for item in changed_ports:
+        # Edge-port repoints carry their own semantics (the edge now reads a
+        # different port of its endpoint node) and are handled separately so the
+        # node-signature oracle below does not silently ignore them.
+        if isinstance(item, Mapping) and item.get("change") in (
+            _CHANGE_EDGE_SOURCE,
+            _CHANGE_EDGE_TARGET,
+        ):
+            findings.extend(_check_edge_repoint_breaking(item, graph_new))
             continue
-        # The node's port set for this direction is now empty — the default
-        # port a legacy (port-less) edge reads has disappeared.
-        now_empty = not signatures[node_id][direction]
+        for node_id, direction, port, change in _normalise_changed_ports([item]):
+            if node_id not in signatures:
+                continue
+            # The node's port set for this direction is now empty — the default
+            # port a legacy (port-less) edge reads has disappeared.
+            now_empty = not signatures[node_id][direction]
 
-        for edge in _consuming_edges(node_id, direction):
-            ref = edge.get("source_port") if direction == _DIR_OUTPUT else edge.get("target_port")
-            ref = str(ref) if ref is not None else None
-            src = _edge_source(edge)
-            tgt = _edge_target(edge)
+            for edge in _consuming_edges(node_id, direction):
+                ref = edge.get("source_port") if direction == _DIR_OUTPUT else edge.get("target_port")
+                ref = str(ref) if ref is not None else None
+                src = _edge_source(edge)
+                tgt = _edge_target(edge)
 
-            if ref is None:
-                # Port-less (legacy) edge reads the node's default port.
-                if change == "removed" and now_empty:
+                if ref is None:
+                    # Port-less (legacy) edge reads the node's default port.
+                    if change == "removed" and now_empty:
+                        findings.append(
+                            {
+                                "severity": "block",
+                                "node_id": node_id,
+                                "direction": direction,
+                                "port": port,
+                                "edge": {"source": src, "target": tgt},
+                                "reason": (
+                                    f"edge {src} -> {tgt} reads the default {direction} of node "
+                                    f"{node_id}, which no longer declares any {direction} port"
+                                ),
+                            }
+                        )
+                    continue
+
+                if ref != port:
+                    continue
+
+                if change == "removed":
                     findings.append(
                         {
                             "severity": "block",
@@ -277,42 +415,23 @@ def check_port_change_breaking(
                             "port": port,
                             "edge": {"source": src, "target": tgt},
                             "reason": (
-                                f"edge {src} -> {tgt} reads the default {direction} of node "
-                                f"{node_id}, which no longer declares any {direction} port"
+                                f"edge {src} -> {tgt} reads {direction} port '{ref}' of node "
+                                f"{node_id}, which the new node no longer declares"
                             ),
                         }
                     )
-                continue
-
-            if ref != port:
-                continue
-
-            if change == "removed":
-                findings.append(
-                    {
-                        "severity": "block",
-                        "node_id": node_id,
-                        "direction": direction,
-                        "port": port,
-                        "edge": {"source": src, "target": tgt},
-                        "reason": (
-                            f"edge {src} -> {tgt} reads {direction} port '{ref}' of node "
-                            f"{node_id}, which the new node no longer declares"
-                        ),
-                    }
-                )
-            elif change == "modified":
-                findings.append(
-                    {
-                        "severity": "warning",
-                        "node_id": node_id,
-                        "direction": direction,
-                        "port": port,
-                        "edge": {"source": src, "target": tgt},
-                        "reason": (
-                            f"edge {src} -> {tgt} reads {direction} port '{ref}' of node "
-                            f"{node_id}, whose schema-ref changed — the data read may alter"
-                        ),
-                    }
-                )
+                elif change == "modified":
+                    findings.append(
+                        {
+                            "severity": "warning",
+                            "node_id": node_id,
+                            "direction": direction,
+                            "port": port,
+                            "edge": {"source": src, "target": tgt},
+                            "reason": (
+                                f"edge {src} -> {tgt} reads {direction} port '{ref}' of node "
+                                f"{node_id}, whose schema-ref changed — the data read may alter"
+                            ),
+                        }
+                    )
     return findings

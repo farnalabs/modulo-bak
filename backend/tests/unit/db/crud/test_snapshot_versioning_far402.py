@@ -364,6 +364,84 @@ class TestDiffSnapshotsSemantic:
         assert not result["semantic"]["impacted_nodes"]
         assert not result["semantic"]["breaking_changes"]
 
+    async def test_diff_edge_source_port_repoint_reflects_impact(self):
+        # FAR-420 P6: an edge that only changes which output port it reads must
+        # surface in port_changes AND propagate downstream impact — previously
+        # it was silently dropped (false "safe" signal).
+        sid_a = uuid.uuid4()
+        sid_b = uuid.uuid4()
+        na = {
+            "id": "a",
+            "agent_id": "ag1",
+            "label": "A",
+            "outputs": [{"name": "out1", "schema_ref": "s"}, {"name": "out2", "schema_ref": "s"}],
+        }
+        nb = {"id": "b", "agent_id": "ag2", "label": "B"}
+        nc = {"id": "c", "agent_id": "ag3", "label": "C"}
+        snap_a = _mock_snapshot(
+            sid_a,
+            1,
+            nodes=[na, nb, nc],
+            edges=[
+                {"source": "a", "target": "b", "source_port": "out1"},
+                {"source": "b", "target": "c", "source_port": "x"},
+            ],
+        )
+        snap_b = _mock_snapshot(
+            sid_b,
+            2,
+            nodes=[na, nb, nc],
+            edges=[
+                {"source": "a", "target": "b", "source_port": "out2"},
+                {"source": "b", "target": "c", "source_port": "x"},
+            ],
+        )
+
+        session = _diff_session(snap_a, snap_b)
+        result = await diff_snapshots(session, sid_a, sid_b)
+        assert result is not None
+        semantic = result["semantic"]
+        assert any(
+            p.get("change") == "edge_source_port_repoint" and p.get("node_id") == "a" for p in semantic["port_changes"]
+        ), "edge source_port repoint must appear in port_changes"
+        # The repoint is attributed to the source node's output, so impact must
+        # reach the source and its full downstream (b, c).
+        assert semantic["impacted_nodes"] == ["a", "b", "c"]
+        # out1 -> out2 with equal schema_ref is not breaking on its own.
+        assert semantic["breaking_changes"] == []
+
+    async def test_diff_edge_source_port_repoint_to_missing_port_is_breaking(self):
+        # Repointing an edge at a port the new graph does not declare must be
+        # reported as a blocking change.
+        sid_a = uuid.uuid4()
+        sid_b = uuid.uuid4()
+        snap_a = _mock_snapshot(
+            sid_a,
+            1,
+            nodes=[
+                {"id": "a", "agent_id": "ag1", "label": "A", "outputs": [{"name": "out1", "schema_ref": "s"}]},
+                {"id": "b", "agent_id": "ag2", "label": "B"},
+            ],
+            edges=[{"source": "a", "target": "b", "source_port": "out1"}],
+        )
+        snap_b = _mock_snapshot(
+            sid_b,
+            2,
+            nodes=[
+                {"id": "a", "agent_id": "ag1", "label": "A", "outputs": [{"name": "out1", "schema_ref": "s"}]},
+                {"id": "b", "agent_id": "ag2", "label": "B"},
+            ],
+            edges=[{"source": "a", "target": "b", "source_port": "out2"}],
+        )
+
+        session = _diff_session(snap_a, snap_b)
+        result = await diff_snapshots(session, sid_a, sid_b)
+        assert result is not None
+        semantic = result["semantic"]
+        assert any(p.get("change") == "edge_source_port_repoint" for p in semantic["port_changes"])
+        assert semantic["breaking_changes"], "repoint to a missing port must be breaking"
+        assert semantic["breaking_changes"][0]["severity"] == "block"
+
     async def test_diff_report_node_modification_with_ports(self):
         sid_a = uuid.uuid4()
         sid_b = uuid.uuid4()

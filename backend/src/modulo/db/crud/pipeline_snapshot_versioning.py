@@ -16,6 +16,7 @@ from modulo.core.pipeline_impact import (
     compute_port_change_impact,
     diff_edge_ports,
     diff_node_ports,
+    normalise_edge_port_delta,
 )
 from modulo.db.crud.hitl_gate_guard import (
     HitlGateWeakeningDenied,
@@ -469,11 +470,17 @@ async def diff_snapshots(
     for m in modified_nodes:
         port_changes += m.get("changes", {}).get("ports", [])
     for m in modified_edges:
-        port_changes += m.get("changes", {}).get("ports", [])
+        # ``changes["ports"]`` is a ``diff_edge_ports`` delta dict (no node_id),
+        # so normalise it to the node-change shape the oracle can consume.
+        edge_port_delta: Any = m.get("changes", {}).get("ports")
+        if edge_port_delta:
+            port_changes += normalise_edge_port_delta(m["edge"], edge_port_delta)
     for node in added_nodes:
         port_changes += diff_node_ports({}, node)
     for edge in added_edges:
-        port_changes.append(diff_edge_ports({}, edge))
+        delta = diff_edge_ports({}, edge)
+        if delta:
+            port_changes += normalise_edge_port_delta(edge, delta)
 
     graph_b_for_impact: dict[str, Any] = {
         "nodes": b.graph_json.get("nodes", []),
