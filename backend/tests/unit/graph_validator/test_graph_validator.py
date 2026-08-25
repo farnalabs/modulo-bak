@@ -40,13 +40,18 @@ def _session_returning(rows: list[Any]) -> AsyncMock:
 
 
 def _connector_instance(
-    cid: uuid.UUID, *, status: str = "active", allowed_operations: list[str] | None = None
+    cid: uuid.UUID,
+    *,
+    status: str = "active",
+    allowed_operations: list[str] | None = None,
+    config_json: dict[str, Any] | None = None,
 ) -> MagicMock:
     c = MagicMock()
     c.id = cid
     c.name = f"conn-{cid}"
     c.status = status
     c.allowed_operations = allowed_operations or []
+    c.config_json = config_json or {}
     return c
 
 
@@ -1409,58 +1414,68 @@ async def test_sandbox_wallclock_budget_non_int_is_error():
 
 
 async def test_node_send_budget_oversubscribed_warns_with_retry_multiplier():
-    """fanout_cardinality x per_item_budget x (fanout_max_retries+1) must fit wait_for."""
+    """fan_out.max_cardinality x per_item_timeout x (max_retries+1) must fit timeout_seconds."""
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={
+            "fan_out": {"max_cardinality": 100, "per_item_timeout": 5, "max_retries": 2},
+        },
+    )
     graph = {
-        "nodes": [
-            {
-                "id": "fanout-node",
-                "fanout_cardinality": 100,
-                "per_item_budget": 5,
-                "timeout_seconds": 30,
-            }
-        ],
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
         "edges": [],
     }
-    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
     assert result.is_valid  # a warning is not a blocker
     oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
     assert len(oversub) == 1
-    # 100 * 5 * 3 (default 2 retries + 1) = 1500s > 30s budget.
+    # 100 * 5 * 3 (2 retries + 1) = 1500s > 30s budget.
     assert oversub[0].node_id == "fanout-node"
 
 
 async def test_node_send_budget_within_budget_no_warning():
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"max_cardinality": 2, "per_item_timeout": 1, "max_retries": 0}},
+    )
     graph = {
-        "nodes": [
-            {
-                "id": "fanout-node",
-                "fanout_cardinality": 2,
-                "per_item_budget": 1,
-                "timeout_seconds": 30,
-            }
-        ],
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
         "edges": [],
     }
-    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
     assert result.is_valid
     assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
 
 
 async def test_node_send_budget_retries_zero_uses_single_attempt():
-    """fanout_max_retries=0 collapses the multiplier to a single attempt per item."""
+    """fan_out.max_retries=0 collapses the multiplier to a single attempt per item."""
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"max_cardinality": 100, "per_item_timeout": 5, "max_retries": 0}},
+    )
     graph = {
-        "nodes": [
-            {
-                "id": "fanout-node",
-                "fanout_cardinality": 100,
-                "per_item_budget": 5,
-                "fanout_max_retries": 0,
-                "timeout_seconds": 30,
-            }
-        ],
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
         "edges": [],
     }
-    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
     # 100 * 5 * 1 = 500s > 30s — still over budget, but the multiplier is 1.
     oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
     assert len(oversub) == 1
@@ -1468,8 +1483,53 @@ async def test_node_send_budget_retries_zero_uses_single_attempt():
 
 
 async def test_node_send_budget_absent_keys_no_warning():
-    """Nodes without fan-out config keys are untouched."""
+    """Nodes bound to a connector without fan_out config (or with no binding) are untouched."""
     graph = {"nodes": [{"id": "plain-node"}], "edges": []}
-    result = await GraphValidator().validate_definition(graph, _session_returning([]), guardrail_definitions=[])
+    result = await GraphValidator().validate_definition(
+        graph, _session_returning([]), connector_bindings=[], guardrail_definitions=[]
+    )
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_no_fanout_config_skipped():
+    """A bound connector with no fan_out config produces no send-budget warning."""
+    cid = uuid.uuid4()
+    instance = _connector_instance(cid, config_json={})
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_uses_timeout_seconds_not_flat_keys():
+    """The reconcile reads config_json.fan_out, NOT fabricated flat node keys.
+
+    A node carrying the old flat keys (fanout_cardinality etc.) but no fan_out
+    connector config must NOT warn — that namespace was a dead check.
+    """
+    graph = {
+        "nodes": [
+            {
+                "id": "fanout-node",
+                "timeout_seconds": 30,
+                "fanout_cardinality": 1000,
+                "per_item_budget": 60,
+                "node_wait_for": 1,
+            }
+        ],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph, _session_returning([]), connector_bindings=[], guardrail_definitions=[]
+    )
     assert result.is_valid
     assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)

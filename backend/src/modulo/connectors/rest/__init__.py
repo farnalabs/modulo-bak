@@ -137,6 +137,7 @@ import json
 import logging
 import random
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
@@ -174,8 +175,17 @@ _CONTROL_CHARS = frozenset({chr(c) for c in range(0x20) if c != 0x09} | {"\x7f"}
 
 _DEFAULT_TIMEOUT = 30.0
 _DEFAULT_MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10 MiB
+# ``_MAX_RETRIES`` is the default number of ATTEMPTS for the retry loop (the
+# loop runs ``range(_MAX_RETRIES)``); a configured fan-out ``max_retries`` is
+# counted in RETRIES (attempts = max_retries + 1), so the default connector
+# retry semantics are ``_MAX_RETRIES - 1`` retries.
 _MAX_RETRIES = 3
+# Sane upper bound for a configured retry budget — a request with more retries
+# than this is clamped rather than honoured verbatim (backoff/Retry-After waits
+# mean the per-item budget is finite).
+_MAX_SANE_RETRIES = 10
 _DEFAULT_MAX_FANOUT_CARDINALITY = 1000
+_MAX_FANOUT_CARDINALITY_CAP = 100_000
 _RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 _RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 
@@ -292,7 +302,7 @@ class RESTFanOutFailureError(RESTError):
         success_count: int,
         failure_count: int,
         failed_index: int,
-        failed_item: Any,
+        failed_item: str,
         failed_error: str,
     ) -> None:
         super().__init__(message)
@@ -302,6 +312,41 @@ class RESTFanOutFailureError(RESTError):
         self.failed_index = failed_index
         self.failed_item = failed_item
         self.failed_error = failed_error
+
+
+class RESTRateLimitTimeoutError(RESTError):
+    """The per-destination rate-limit wait exceeded its bounded deadline.
+
+    Raised from :meth:`RestConnector._acquire_rate_token` when the token-bucket
+    refill cannot supply a token within ``request_timeout``; on the fan-out path
+    this surfaces as a per-item failure (never an unbounded spin).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+
+class RESTFanOutCancelledError(asyncio.CancelledError):
+    """A fan-out interrupted by cancellation, carrying partial outcome state.
+
+    Subclasses :class:`asyncio.CancelledError` so real cancellation semantics are
+    preserved at the caller, while the accumulated ``outcomes`` / ``success_count``
+    are attached for operator reconciliation (FAR-411): an operator can see exactly
+    which items were written before the run was cancelled.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcomes: list[dict[str, Any]],
+        success_count: int,
+        failure_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.outcomes = outcomes
+        self.success_count = success_count
+        self.failure_count = failure_count
 
 
 class SecurityGuard:
@@ -417,15 +462,26 @@ class RestConnector(ConnectorBase):
         self._fanout_config: dict[str, Any] = raw_fanout if isinstance(raw_fanout, dict) else {}
         self._fanout_enabled = bool(self._fanout_config.get("enabled") or self._fanout_config.get("items_path"))
         self._fanout_items_path = self._fanout_config.get("items_path")
-        self._max_fanout_cardinality = int(self._fanout_config.get("max_cardinality", _DEFAULT_MAX_FANOUT_CARDINALITY))
+        raw_cardinality = int(self._fanout_config.get("max_cardinality", _DEFAULT_MAX_FANOUT_CARDINALITY))
+        if raw_cardinality < 1:
+            raise ValueError(f"REST fan_out.max_cardinality must be >= 1 (got {raw_cardinality})")
+        if raw_cardinality > _MAX_FANOUT_CARDINALITY_CAP:
+            raise ValueError(
+                f"REST fan_out.max_cardinality must be <= {_MAX_FANOUT_CARDINALITY_CAP} (got {raw_cardinality})"
+            )
+        self._max_fanout_cardinality = raw_cardinality
         self._fanout_per_item_timeout = float(self._fanout_config.get("per_item_timeout", self._timeout))
         # max_retries (retries, not attempts); attempts = max_retries + 1. The
         # connector's own ``_send`` loop runs ``_MAX_RETRIES`` (3) attempts, so
         # the default of ``_MAX_RETRIES - 1`` retries keeps the vendor
-        # reconciliation (``attempts = max_retries + 1``) in lockstep.
+        # reconciliation (``attempts = max_retries + 1``) in lockstep. The
+        # configured value is clamped to a sane upper bound (honoured, not
+        # verbatim) because backoff/Retry-After waits make a huge budget
+        # pathological within a finite per-item timeout.
         self._fanout_max_retries = int(self._fanout_config.get("max_retries", _MAX_RETRIES - 1))
         if self._fanout_max_retries < 0:
             raise ValueError("REST fan_out.max_retries must be >= 0")
+        self._fanout_max_retries = min(self._fanout_max_retries, _MAX_SANE_RETRIES)
 
         # FAR-411 per-destination token bucket (single outbound enforcement point).
         # Best-effort per-process: each uvicorn/SAQ worker owns its own buckets.
@@ -593,10 +649,13 @@ class RestConnector(ConnectorBase):
         context["item_index"] = index
         return context
 
-    async def _acquire_rate_token(self, destination: str) -> None:
+    async def _acquire_rate_token(self, destination: str, *, deadline_seconds: float | None = None) -> None:
         """Consume one token from the per-destination bucket (best-effort).
 
-        Each call waits until a token is available (refill is continuous). A
+        Each call waits until a token is available (refill is continuous).
+        *deadline_seconds*, when provided, bounds the wait: if a token cannot be
+        supplied within that window a :class:`RESTRateLimitTimeoutError` is
+        raised rather than spinning forever (the per-item fan-out budget). A
         missing/disabled ``rate_limit`` config is a no-op. This is per-process —
         each uvicorn/SAQ worker owns its own bucket; it is NOT Redis-backed in
         v1 (future work).
@@ -617,11 +676,21 @@ class RestConnector(ConnectorBase):
                         burst=burst,
                     )
         bucket = self._rate_buckets[destination]
+        deadline = time.monotonic() + max(0.0, deadline_seconds) if deadline_seconds is not None else None
         # consume() returns False when the bucket is empty (consuming nothing);
-        # wait out a bounded refill hop and retry. The node's deadline cancels a
-        # fan-out that cannot fit in wall-clock (per-item timeout / node budget).
-        while not await bucket.consume():  # noqa: ASYNC110 — bounded refill poll, not an event wait
-            await asyncio.sleep(min(1.0 / requests_per_second, 1.0))
+        # wait out a bounded refill hop and retry. The deadline bounds the wait so
+        # a saturated per-destination bucket never spins past the per-item budget.
+        while not await bucket.consume():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise RESTRateLimitTimeoutError(
+                        f"REST rate-limit wait exceeded deadline {deadline_seconds:.1f}s for {destination}"
+                    )
+                hop = min(1.0 / requests_per_second, 1.0, remaining)
+            else:
+                hop = min(1.0 / requests_per_second, 1.0)
+            await asyncio.sleep(hop)
 
     async def _fanout_write(
         self,
@@ -641,17 +710,31 @@ class RestConnector(ConnectorBase):
         outcomes: list[dict[str, Any]] = []
         success_count = 0
         for index, item in enumerate(resolved):
-            outcome: dict[str, Any] = {"index": index, "item": item}
+            # ``item_summary`` (redacted + elided) is the ONLY item echo — the raw
+            # item payload is not persisted to an outcome record, so a
+            # credential-bearing item is never written to logs or the run result.
+            outcome: dict[str, Any] = {"index": index, "item_summary": self._item_summary(item)}
             try:
                 context = self._fanout_item_context(base_context, item, index)
                 request = await self._build_request(resource, context, surface="write")
-                result = await self._execute(request, surface="write", request_timeout=self._fanout_per_item_timeout)
+                result = await self._execute(
+                    request,
+                    surface="write",
+                    request_timeout=self._fanout_per_item_timeout,
+                    max_retries=self._fanout_max_retries,
+                )
                 outcome["status"] = "success"
-                outcome["result"] = result
+                outcome["result"] = self._result_summary(result)
                 success_count += 1
                 outcomes.append(outcome)
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as exc:
+                raise RESTFanOutCancelledError(
+                    f"REST fan-out cancelled at item {index} of {len(resolved)} "
+                    f"after {success_count} successful item(s)",
+                    outcomes=outcomes,
+                    success_count=success_count,
+                    failure_count=sum(1 for o in outcomes if o["status"] == "failure"),
+                ) from exc
             except Exception as exc:
                 outcome["status"] = "failure"
                 outcome["error"] = self._redact(str(exc))
@@ -662,7 +745,7 @@ class RestConnector(ConnectorBase):
                     success_count=success_count,
                     failure_count=1,
                     failed_index=index,
-                    failed_item=item,
+                    failed_item=self._item_summary(item),
                     failed_error=self._redact(str(exc)),
                 ) from exc
 
@@ -785,6 +868,31 @@ class RestConnector(ConnectorBase):
         for secret in self._secret_values():
             redacted = redacted.replace(secret, "***")
         return redacted
+
+    def _item_summary(self, item: Any) -> str:
+        """A bounded, redacted string summary of a fan-out item for outcome records.
+
+        The full item payload is never persisted — a credential-bearing item would
+        otherwise be echoed into logs and the persisted run result. Only a lightly
+        redacted, length-capped repr is kept (FAR-411).
+        """
+        try:
+            text = repr(item)
+        except Exception:
+            text = f"<{type(item).__name__}>"
+        redacted = self._redact(text)
+        return redacted if len(redacted) <= 80 else redacted[:77] + "..."
+
+    def _result_summary(self, result: Any) -> str:
+        """A bounded, redacted string summary of a fan-out result for outcome records."""
+        try:
+            text = json.dumps(result, default=str)
+        except (TypeError, ValueError):
+            text = repr(result)
+        redacted = self._redact(text)
+        if len(redacted) <= 200:
+            return redacted
+        return redacted[:197] + "..."
 
     # ── Templating ─────────────────────────────────────────────────────────
 
@@ -930,10 +1038,11 @@ class RestConnector(ConnectorBase):
         *,
         surface: str,
         request_timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> ConnectorResult | dict[str, Any]:
         """Resolve + send + surface-map — the one shared dispatch used by query/write."""
         client = self._client()
-        resp, body_text = await self._send(client, request, request_timeout=request_timeout)
+        resp, body_text = await self._send(client, request, request_timeout=request_timeout, max_retries=max_retries)
         if surface == "read":
             return self._transform(request, resp, body_text)
         return self._write_result(resp, body_text)
@@ -943,6 +1052,8 @@ class RestConnector(ConnectorBase):
         client: httpx.AsyncClient,
         request: RestRequest,
         request_timeout: float | None = None,
+        *,
+        max_retries: int | None = None,
     ) -> tuple[httpx.Response, str]:
         """Run the request with retry/backoff for idempotent verbs.
 
@@ -951,30 +1062,34 @@ class RestConnector(ConnectorBase):
         Mutating verbs without an idempotency header never retry. ``request_timeout``,
         when provided, is the per-request timeout (used by the fan-out path for
         a distinct ``per_item_timeout``); when None the pooled client's default
-        applies.
+        applies. ``max_retries``, when provided (the fan-out path passes
+        ``fan_out.max_retries``), is the retry budget in RETRIES; the loop runs
+        ``max_retries + 1`` attempts (clamped to a sane upper bound).
         """
-        # Per-destination rate limit — the ONE outbound enforcement point. Every
-        # outbound call (single write/query, fan-out item, health-check probe and
-        # each retry) consumes a token from the per-destination bucket. A missing
-        # ``rate_limit`` config is a no-op, so existing single-call behaviour is
-        # unchanged; REST is deliberately stricter than the bare github/linear
-        # connectors when a bucket IS configured.
-        await self._acquire_rate_token(self._base_url)
+        retries = _MAX_RETRIES - 1 if max_retries is None else max_retries
+        retries = max(0, min(retries, _MAX_SANE_RETRIES))
+        attempts = retries + 1
+        # Rate-limit wait deadline: bound the token-bucket refill by the per-request
+        # timeout so a saturated destination never spins past the per-item budget.
+        rate_wait_timeout = request_timeout if request_timeout is not None else self._timeout
         kwargs = self._request_kwargs(request)
         if not self._is_retryable(request):
+            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
         last_delay = 0.0
-        for attempt in range(_MAX_RETRIES):
+        for attempt in range(attempts):
             if attempt:
                 await asyncio.sleep(last_delay)
+            # Acquire a token before EACH wire attempt so every retry is metered.
+            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             try:
                 return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:
-                if exc.status_code not in _RETRYABLE_STATUS or attempt == _MAX_RETRIES - 1:
+                if exc.status_code not in _RETRYABLE_STATUS or attempt == attempts - 1:
                     raise
                 last_delay = self._retry_delay(exc, attempt)
             except RESTConnectError:
-                if attempt == _MAX_RETRIES - 1:
+                if attempt == attempts - 1:
                     raise
                 last_delay = self._backoff(attempt)
         raise AssertionError("unreachable")  # pragma: no cover
