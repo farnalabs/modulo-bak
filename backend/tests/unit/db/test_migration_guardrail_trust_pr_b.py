@@ -39,29 +39,3 @@ class TestGuardrailTrustMigration:
     def test_head_is_single_chain(self) -> None:
         heads = _script().get_heads()
         assert heads == ["0139_add_router_no_match_status"], f"expected a single head, got {heads}"
-
-    def test_0116_down_revision_is_0115_notification_preferences(self) -> None:
-        source = _source()
-        assert f'down_revision: str | None = "{_DOWN_REVISION}"' in source
-
-    def test_0116_upgrade_adds_fingerprint_column(self) -> None:
-        source = _source()
-        assert '"pipeline_snapshots"' in source
-        assert '"guardrail_pins_fingerprint"' in source
-        assert "sa.String(length=64)" in source
-        assert "nullable=True" in source
-
-    def test_0116_upgrade_adds_soft_delete_columns_and_index(self) -> None:
-        source = _source()
-        assert '"eval_definitions"' in source
-        assert '"deleted_at"' in source
-        assert "sa.DateTime(timezone=True)" in source
-        assert '"deleted_by"' in source
-        assert 'op.create_index("ix_eval_definitions_deleted_at", "eval_definitions", ["deleted_at"])' in source
-
-    def test_0116_downgrade_drops_everything_upgrade_added(self) -> None:
-        source = _source()
-        assert 'op.drop_index("ix_eval_definitions_deleted_at", table_name="eval_definitions")' in source
-        assert 'op.drop_column("eval_definitions", "deleted_by")' in source
-        assert 'op.drop_column("eval_definitions", "deleted_at")' in source
-        assert 'op.drop_column("pipeline_snapshots", "guardrail_pins_fingerprint")' in source

@@ -565,9 +565,10 @@ def test_single_migration_head() -> None:
     # -> 0142_merge_heads_add_fk_indexes (main FK-index merge-head migration).
     # -> 0143_rest_connector_profile (FAR-412 REST connector profile, renumbered
     #    from 0142 to avoid colliding with main's 0142_merge_heads_add_fk_indexes).
+    # -> 0144_broaden_notification_status_in_app (main: allow 'in_app' status on notification_delivery_log).
     # -> 0139_add_router_no_match_status (FAR-402 P1: router_no_match run status;
     #    renumbered from 0138 to avoid colliding with eval_versioning; re-parented
-    #    onto the 0143 head so the graph stays a single linear chain).
+    #    onto 0144 so the graph stays a single linear chain with 0139 as the head).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -594,9 +595,12 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0142 except 0143 (the FAR-412 REST connector profile, renumbered).
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
     assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
-    # Nothing chains off 0143 except 0139 (this PR's router_no_match migration, re-parented).
+    # 0144_broaden_notification_status_in_app (main) chains off 0143;
+    # 0139_add_router_no_match_status (this PR) re-parented onto 0144 and is the single head.
     chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
-    assert [_basename(p) for p in chaining_off_0143] == ["0139_add_router_no_match_status.py"]
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_broaden_notification_status_in_app.py"]
+    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_broaden_notification_status_in_app"]
+    assert [_basename(p) for p in chaining_off_0144] == ["0139_add_router_no_match_status.py"]
     # Nothing chains off 0139 -> it is the single head.
     chaining_off_0139 = [p for p in revisions if parents[p] == "0139_add_router_no_match_status"]
     assert chaining_off_0139 == []
