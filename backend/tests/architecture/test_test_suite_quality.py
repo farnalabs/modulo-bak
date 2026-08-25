@@ -5986,6 +5986,7 @@ def test_blocking_sleep_lens_flags_loop_blockers():
         tree = ast.parse(source)
         assert not _blocking_sleep_in_async_violations(tree), f"lens should NOT flag:\n{source}"
 
+
 _FRESH_VALUE_NAMES = frozenset({"uuid4", "uuid1", "uuid3", "uuid5", "token_hex", "token_bytes", "token_urlsafe"})
 #: Bare names (``from uuid import uuid4``, ``from secrets import token_hex``)
 #: that always evaluate to a freshly-generated, unique-per-call value. The
@@ -6096,6 +6097,7 @@ def _fresh_value_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
                     break
     return found
 
+
 def test_no_fresh_value_in_asserts():
     """An ``assert`` that generates a fresh non-deterministic value directly in
     its test expression is dead code with a fixed outcome: every UUID, secrets
@@ -6173,6 +6175,7 @@ def test_fresh_value_lens_flags_dead_asserts():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _fresh_value_assert_violations(tree), f"lens should NOT flag:\n{source}"
+
 
 _SKIP_XFAIL_NAMES = {"skip", "xfail"}
 
