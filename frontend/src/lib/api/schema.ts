@@ -1025,6 +1025,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/db-capacity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Db Capacity
+         * @description Return the live DB capacity status (the monitoring source of truth).
+         */
+        get: operations["get_db_capacity_api_v1_admin_db_capacity_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -8858,6 +8878,41 @@ export interface components {
             /** Total Estimated Bytes */
             total_estimated_bytes: number;
         };
+        /**
+         * CapabilityScope
+         * @description Node-level least-privilege contract (FAR-402 P4 / FAR-418).
+         *
+         *     A node may NARROW (never widen) what its referenced Agent is granted:
+         *
+         *     * ``allowed_connectors``: connector instance-ids and/or connector types the
+         *       node may resolve from the ConnectorHub. Each connector-TYPE entry must be
+         *       within the Agent's ``connector_type_refs`` (compile-time check); the
+         *       ConnectorHub is fetched with ONLY these connectors (deny-by-default).
+         *     * ``allowed_tools``: MCP/runtime tools the node's agent may invoke — an
+         *       additional narrowing filter wired through ``check_tool_scope``.
+         *     * ``context_scope``: allowlist of ``run_context`` keys the node may read
+         *       (need-to-know boundary).
+         *
+         *     Default is UNRESTRICTED: an absent ``capability_scope`` leaves behaviour
+         *     unchanged (the node may use all of its Agent's grants).
+         */
+        CapabilityScope: {
+            /**
+             * Allowed Connectors
+             * @description Connector instance-ids and/or connector types the node may resolve. Absent/empty = UNRESTRICTED (Agent grants).
+             */
+            allowed_connectors?: string[] | null;
+            /**
+             * Allowed Tools
+             * @description MCP/runtime tools the node's agent may invoke. Absent = NOT narrowed (additional role check still applies).
+             */
+            allowed_tools?: string[] | null;
+            /**
+             * Context Scope
+             * @description Allowlist of run_context keys the node may read. Absent = UNRESTRICTED (full run_context).
+             */
+            context_scope?: string[] | null;
+        };
         /** ChangeMemberRoleRequest */
         ChangeMemberRoleRequest: {
             /** Role */
@@ -9899,6 +9954,19 @@ export interface components {
             notifications: components["schemas"]["NotificationResponse"][];
             /** Total Unread */
             total_unread: number;
+        };
+        /** DbCapacityResponse */
+        DbCapacityResponse: {
+            /** Capacity Percent */
+            capacity_percent: number | null;
+            /** Mode */
+            mode: string;
+            /** Alert Level */
+            alert_level: string;
+            /** Used Bytes */
+            used_bytes: number;
+            /** Capacity Bytes */
+            capacity_bytes: number | null;
         };
         /** DeleteOAuthClientResponse */
         DeleteOAuthClientResponse: {
@@ -12888,6 +12956,7 @@ export interface components {
             output_schema_id?: string | null;
             input_schema_pin?: components["schemas"]["SchemaPin"] | null;
             output_schema_pin?: components["schemas"]["SchemaPin"] | null;
+            capability_scope?: components["schemas"]["CapabilityScope"] | null;
             /** Label */
             label?: string | null;
             /** Role */
@@ -19390,6 +19459,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CheckpointRetentionPurgeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_db_capacity_api_v1_admin_db_capacity_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DbCapacityResponse"];
                 };
             };
             /** @description Validation Error */
