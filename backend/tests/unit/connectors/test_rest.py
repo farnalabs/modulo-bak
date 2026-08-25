@@ -1329,7 +1329,8 @@ def test_idempotency_header_is_valid_uuid() -> None:
     # A bare UUID v4 ÔÇö uniquely identifies this attempt; never carries a run_id
     # fragment or any path segment (it is a single 36-char canonical UUID).
     assert parsed.version == 4
-    assert len(key) == 36 and key.count("-") == 4
+    assert len(key) == 36
+    assert key.count("-") == 4
 
 
 def test_mutating_verb_with_idempotency_header_retries() -> None:
@@ -1366,7 +1367,7 @@ def test_mutating_verb_with_idempotency_header_retries() -> None:
     # run+node+index persistence is a pipeline-level concern (FAR-410), not the
     # connector, so a fresh uuid is minted per logical request instead.
     assert keys[0] == keys[1]
-    assert keys[0] != ""
+    assert keys[0]
 
 
 def test_idempotency_header_is_distinct_across_writes() -> None:
@@ -1581,7 +1582,8 @@ def test_guard_neutralises_crlf_in_query_param_value() -> None:
     )
     c._transport = httpx.MockTransport(handler)
     asyncio_run(c.query(ConnectorQuery(resource="default", filters={"q": "x\r\nX-Evil: 1"})))
-    assert "\r" not in captured["url"] and "\n" not in captured["url"]
+    assert "\r" not in captured["url"]
+    assert "\n" not in captured["url"]
 
 
 def test_guard_rejects_crlf_in_header_name() -> None:
