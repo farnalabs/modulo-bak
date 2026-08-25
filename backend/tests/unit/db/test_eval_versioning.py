@@ -23,6 +23,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from modulo.core.eval_engine.suite_run import (
+    SuiteRunError,
     resolve_eval_definition_version,
 )
 from modulo.db.models import Base, EvalDefinition, EvalResult, EvalSuite
@@ -74,7 +75,8 @@ def test_eval_definition_version_columns_present() -> None:
 def test_eval_definition_version_defaults_to_one() -> None:
     col = EvalDefinition.__table__.c.version
     assert col.nullable is False
-    assert col.default is not None and col.default.arg == 1
+    assert col.default is not None
+    assert col.default.arg == 1
 
 
 def test_eval_suite_version_columns_present() -> None:
@@ -144,7 +146,7 @@ def test_resolve_unpinned_looks_up_latest_definition_version() -> None:
 
 def test_resolve_unpinned_raises_for_missing_definition() -> None:
     session = _async_session(row=None)
-    with pytest.raises(Exception, match="not found while resolving version"):
+    with pytest.raises(SuiteRunError, match="not found while resolving version"):
         asyncio.run(resolve_eval_definition_version(session, uuid.uuid4(), uuid.uuid4()))
 
 
