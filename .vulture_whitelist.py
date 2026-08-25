@@ -242,6 +242,14 @@ __all__ = [
     # --- Product analytics enforcement (FAR-361) ---
     "is_enforcement_active",
     "should_degrade_to_community",
+    # --- FAR-409 SSRF pinned-IP transport (core.ssrf pinned-IP capability) ---
+    # pinned_async_client is a public API exercised by tests/unit/core/test_ssrf.py;
+    # production callers (RestConnector, FAR-408) land in a follow-up, so vulture
+    # sees no prod call site yet.
+    "pinned_async_client",  # public SSRF pinned-IP client factory (FAR-409)
+    # _network_backend is an httpcore AsyncConnectionPool attribute consumed by
+    # httpcore itself; this module only assigns it to wire the pinned backend in.
+    "_network_backend",  # httpcore pool attr consumed by httpcore, not this module
     # --- FAR-410 REST retry / idempotency / UNKNOWN infrastructure — public API
     #     for the generic REST connector (FAR-401, separate ticket). Consumed
     #     only by tests today; vulture sees no prod call site yet. Each is a
