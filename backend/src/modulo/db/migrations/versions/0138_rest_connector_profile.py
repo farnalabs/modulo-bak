@@ -149,8 +149,8 @@ def upgrade() -> None:
     op.create_index("ix_connector_profiles_organisation_id", _TABLE, ["organisation_id"])
 
     if pg:
-        op.execute(f"ALTER TABLE {_TABLE} ENABLE ROW LEVEL SECURITY")
-        op.execute(f"ALTER TABLE {_TABLE} FORCE ROW LEVEL SECURITY")
+        op.execute('ALTER TABLE "connector_profiles" ENABLE ROW LEVEL SECURITY')
+        op.execute('ALTER TABLE "connector_profiles" FORCE ROW LEVEL SECURITY')
         op.execute(f"CREATE POLICY rls_org_isolation ON {_TABLE} USING ({_ORG_SCOPE})")
         if app_role:
             op.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {_TABLE} TO {_APP_ROLE}")
