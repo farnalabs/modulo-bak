@@ -19,6 +19,47 @@ LineDiffKind = Literal["unchanged", "removed", "added"]
 LineDiffT = tuple[LineDiffKind, str, int | None, int | None]
 
 
+def _yield_common_or_removed(
+    op: str,
+    i1: int,
+    i2: int,
+    lines_a: Sequence[str],
+    line_a: int,
+    line_b: int,
+) -> Iterator[tuple[LineDiffKind, str, int | None, int | None]]:
+    """Yield the ``unchanged`` (equal) or ``removed`` (delete) rows for one opcode."""
+    kind: LineDiffKind = "unchanged" if op == "equal" else "removed"
+    for idx in range(i1, i2):
+        n_b = line_b if kind == "unchanged" else None
+        yield kind, lines_a[idx].rstrip("\n"), line_a, n_b
+        line_a += 1
+        if kind == "unchanged":
+            line_b += 1
+    return line_a, line_b
+
+
+def _yield_replaced_and_added(
+    op: str,
+    i1: int,
+    i2: int,
+    j1: int,
+    j2: int,
+    lines_a: Sequence[str],
+    lines_b: Sequence[str],
+    line_a: int,
+    line_b: int,
+) -> Iterator[tuple[LineDiffKind, str, int | None, int | None]]:
+    """Yield the ``removed`` (replace) and ``added`` rows for one opcode."""
+    if op == "replace":
+        for idx in range(i1, i2):
+            yield "removed", lines_a[idx].rstrip("\n"), line_a, None
+            line_a += 1
+    for idx in range(j1, j2):
+        yield "added", lines_b[idx].rstrip("\n"), None, line_b
+        line_b += 1
+    return line_a, line_b
+
+
 def iter_line_diffs(lines_a: Sequence[str], lines_b: Sequence[str]) -> Iterator[LineDiffT]:
     """Yield ``(kind, content, line_a, line_b)`` rows describing a line-wise diff.
 
@@ -30,18 +71,6 @@ def iter_line_diffs(lines_a: Sequence[str], lines_b: Sequence[str]) -> Iterator[
     matcher = SequenceMatcher(None, lines_a, lines_b)
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if op in ("equal", "delete"):
-            kind: LineDiffKind = "unchanged" if op == "equal" else "removed"
-            for idx in range(i1, i2):
-                n_b = line_b if kind == "unchanged" else None
-                yield kind, lines_a[idx].rstrip("\n"), line_a, n_b
-                line_a += 1
-                if kind == "unchanged":
-                    line_b += 1
+            line_a, line_b = yield from _yield_common_or_removed(op, i1, i2, lines_a, line_a, line_b)
         else:
-            if op == "replace":
-                for idx in range(i1, i2):
-                    yield "removed", lines_a[idx].rstrip("\n"), line_a, None
-                    line_a += 1
-            for idx in range(j1, j2):
-                yield "added", lines_b[idx].rstrip("\n"), None, line_b
-                line_b += 1
+            line_a, line_b = yield from _yield_replaced_and_added(op, i1, i2, j1, j2, lines_a, lines_b, line_a, line_b)
