@@ -1,14 +1,16 @@
 """Add missing foreign-key lookup indexes (improve-database FK-index pass).
 
-Revision ID: 0141_merge_heads_add_fk_indexes
-Revises: 0140_eval_regression_alert
+Revision ID: 0142_merge_heads_add_fk_indexes
+Revises: 0141_pipeline_edge_ports
 Create Date: 2026-08-25
 
 This migration adds the missing B-tree indexes on foreign-key columns that
 are used as lookup / join / owner-scoping keys but were never indexed.
 Postgres does not create an index for a foreign key automatically, so queries
 that filter or join on these columns performed full table scans. It is a
-linear child of the single current head ``0140_eval_regression_alert``.
+linear child of the single current head ``0141_pipeline_edge_ports`` (the
+FAR-416 pipeline edge ports migration that landed on main after this branch
+was cut).
 
 Every index is created with IF NOT EXISTS and dropped with IF EXISTS so the
 migration is safe to re-run. The corresponding ORM models now declare
@@ -21,8 +23,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0141_merge_heads_add_fk_indexes"
-down_revision: str | None = "0140_eval_regression_alert"
+revision: str = "0142_merge_heads_add_fk_indexes"
+down_revision: str | None = "0141_pipeline_edge_ports"
 branch_labels: str | None = None
 depends_on: str | None = None
 
