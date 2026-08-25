@@ -5,6 +5,19 @@ an arbitrary HTTP request to an external system configured by the operator —
 no per-vendor client. It is the FAR-401 "point Modulo at any external system"
 implementation: a declarative, templated HTTP call.
 
+Because it is **verb-agnostic**, the connector does not infer meaning from the
+HTTP verb. You declare the method; the node surface fixes the access-control
+gate:
+
+| Node surface | ACL operation | Declared method |
+|---|---|---|
+| `query()` — read | `read` | `GET` (default), `HEAD` |
+| `write()` — write | `write` | `POST` (default), `PUT`, `PATCH`, `DELETE` |
+
+A `PUT` / `PATCH` / `DELETE` mutates the remote system, so it belongs on the
+**write** surface even though it is not a "create". The capability set is
+`{read, write}`.
+
 ## Configuration (`config_json`)
 
 A single connector instance describes one endpoint (or a map of named
@@ -31,6 +44,10 @@ Jinja2 against the runtime variables supplied per call
 | `verify_tls` | `bool` | `true` | Whether the client verifies the server certificate. Disable only for a self-hosted registry with a self-signed cert — the SSRF guard still blocks loopback/metadata targets regardless. |
 | `idempotency_header` | `str` | `null` | Header that makes a non-`GET`/`HEAD` request safe to retry; a fresh UUID is injected per attempt. |
 
+You can also declare **operations** — a map of named resources, each with its
+own method/path/headers/params/body/records_path. When present, a node must
+reference a declared resource; requesting an undeclared resource fails fast.
+
 ## Authentication (`credentials_ciphertext` / `creds`)
 
 Credentials are stored as an encrypted JSON dict so multi-field creds
@@ -41,6 +58,9 @@ round-trip. Read `auth_mode` + named fields from that dict:
 | `bearer` | `token` |
 | `api_key` | `api_key`, and `in` (`header` [default] or `query`), `header_name` (default `X-API-Key`) for header mode, `query_param_name` (default `api_key`) for query mode |
 | `basic` | `username`, `password` |
+
+Credentials are never written to LangGraph state, checkpoint, OTel span, or log;
+error detail redacts secret values.
 
 ## Behaviour
 

@@ -76,6 +76,19 @@ def upgrade() -> None:
             """
         )
     )
+    # Idempotent: drop any existing policy first so the migration is safe to
+    # re-apply against a database whose template already carries the migrated
+    # schema (e.g. the per-test private DB created in
+    # test_migration_0126_eval_suite), or a reused/persisted Postgres. CREATE
+    # POLICY has no native IF NOT EXISTS, so we DROP IF EXISTS then CREATE
+    # IF NOT EXISTS below.
+    op.execute(
+        sa.text(
+            """
+            DROP POLICY IF EXISTS rls_org_isolation ON "metrics_staging"
+            """
+        )
+    )
     op.execute(
         sa.text(
             """
@@ -83,7 +96,8 @@ def upgrade() -> None:
             BEGIN
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_policies
-                    WHERE tablename = 'metrics_staging'
+                    WHERE schemaname = 'public'
+                      AND tablename = 'metrics_staging'
                       AND policyname = 'rls_org_isolation'
                 ) THEN
                     CREATE POLICY rls_org_isolation ON "metrics_staging"

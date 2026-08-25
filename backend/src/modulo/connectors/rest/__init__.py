@@ -32,6 +32,8 @@ the runtime variables supplied per call:
     max_response_size:    <bytes>                              # optional max response body size (default 10 MiB)
     idempotency_header:   <header-name>                        # optional header that makes a
                                                                  #   non-GET/HEAD request safe to retry
+    timeout_seconds:      <number>                             # per-request timeout (default 30.0)
+    verify_tls:           true                                 # verify the server TLS cert (default true)
     fan_out:              {                                     # optional fan-out / iterator mode (FAR-411)
                             "enabled": true,                    #   when truthy + items_path set, write() iterates
                             "items_path": "data.items",         #   JMESPath into payload.data resolving to the
@@ -530,8 +532,8 @@ class RestConnector(ConnectorBase):
         if self._cached_client is None:
             kwargs: dict[str, Any] = {
                 "timeout": self._timeout,
-                "follow_redirects": False,
                 "verify": self._verify_tls,
+                "follow_redirects": False,
                 "limits": httpx.Limits(
                     max_connections=self._max_connections,
                     max_keepalive_connections=self._max_keepalive,
