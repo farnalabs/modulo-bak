@@ -476,7 +476,7 @@ def test_migration_is_reversible_single_head() -> None:
 
 
 def test_single_migration_head() -> None:
-    """Exactly one migration chains off each predecessor, and the head is 0137."""
+    """Exactly one migration chains off each predecessor, and the head is 0138."""
     import glob
     import re
 
@@ -509,7 +509,8 @@ def test_single_migration_head() -> None:
     # migrations + main's status_check_constraints + rename_remy migrations:
     # 0131 -> 0132 -> 0133_run_evidence_rls -> 0134_dismissals_org_rls
     # -> 0135_status_check_constraints -> 0136_rename_remy_user_id_to_account_id
-    # -> 0137_eval_suite_run (renumbered to resolve the 0135 collision).
+    # -> 0137_eval_suite_run (renumbered to resolve the 0135 collision)
+    # -> 0138_add_router_no_match_status (FAR-402 P1: router_no_match run status).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -522,9 +523,11 @@ def test_single_migration_head() -> None:
     assert [_basename(p) for p in chaining_off_0135] == ["0136_rename_remy_user_id_to_account_id.py"]
     chaining_off_0136 = [p for p in revisions if parents[p] == "0136_rename_remy_user_id_to_account_id"]
     assert [_basename(p) for p in chaining_off_0136] == ["0137_eval_suite_run.py"]
-    # Nothing chains off 0137 -> it is the single head.
     chaining_off_0137 = [p for p in revisions if parents[p] == "0137_eval_suite_run"]
-    assert chaining_off_0137 == []
+    assert [_basename(p) for p in chaining_off_0137] == ["0138_add_router_no_match_status.py"]
+    # Nothing chains off 0138 -> it is the single head.
+    chaining_off_0138 = [p for p in revisions if parents[p] == "0138_add_router_no_match_status"]
+    assert chaining_off_0138 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
