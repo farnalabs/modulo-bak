@@ -1272,6 +1272,7 @@ export default {
       "candidates_subtitle": "Up to 500 matching runs with an estimated per-run size.",
       "no_runs_match": "No runs match the current filters.",
       "confirm_warning": "This permanently deletes data and cannot be undone.",
+      "confirm_purge_detail": "{count} terminal run(s) matching the current filters will be purged, along with their checkpoints and related per-run rows. In-flight runs are never touched.",
       "purge_selected": "Purge selected",
       "cancel": "Cancel",
       "export_downloaded": "Export downloaded.",

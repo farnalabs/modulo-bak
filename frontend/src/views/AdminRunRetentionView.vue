@@ -211,9 +211,7 @@
         </template>
         <div class="space-y-3 text-sm">
           <p>
-            {{ terminalCandidates.length }} terminal run(s) matching the current filters will be
-            purged, along with their checkpoints and related per-run rows. In-flight runs are
-            never touched.
+            {{ $t('views.AdminRunRetentionView.confirm_purge_detail', { count: terminalCandidates.length }) }}
           </p>
           <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(totalEstimatedBytes) }}.</p>
         </div>
