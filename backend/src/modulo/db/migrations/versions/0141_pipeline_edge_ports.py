@@ -1,7 +1,7 @@
 """Add port-addressing columns to ``pipeline_edges`` (FAR-416 / FAR-402 F1).
 
-Revision ID: 0138_pipeline_edge_ports
-Revises: 0137_eval_suite_run
+Revision ID: 0141_pipeline_edge_ports
+Revises: 0140_eval_regression_alert
 Create Date: 2026-08-25
 
 F1 introduces port-addressed typed state. Edges gain ``source_port`` and
@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0138_pipeline_edge_ports"
-down_revision: str | None = "0137_eval_suite_run"
+revision: str = "0141_pipeline_edge_ports"
+down_revision: str | None = "0140_eval_regression_alert"
 branch_labels: str | None = None
 depends_on: str | None = None
 
