@@ -89,17 +89,55 @@ def _validate_url_syntax(url: str) -> str:
     return hostname.rstrip(".").strip("[]")
 
 
+def _decode_noncanonical_ipv4(decoded: str) -> ipaddress.IPv4Address | None:
+    """Return the IPv4Address for a non-canonical integer IPv4 encoding.
+
+    ``ipaddress.ip_address`` accepts only dotted-quad IPv4 (or ``[::]`` IPv6)
+    *strings*; a resolver/httpx client is far more liberal. An outbound URL that
+    renders loopback/private IPv4 as a single decimal integer (``2130706433``
+    → ``127.0.0.1``) or a hex integer (``0x7f000001`` → ``127.0.0.1``) would
+    otherwise sail past the literal-IP branch and fall through to DNS — where a
+    resolver that decodes integer addresses turns it back into a private target.
+    This helper normalises those two forms (the common evasion encodings) so the
+    literal-IP guard can block them. Returns ``None`` when *decoded* is not an
+    integer-encodeable IPv4 address, leaving it to the DNS-resolution path.
+    """
+    candidate = decoded.strip()
+    if candidate.lower().startswith("0x"):
+        try:
+            value = int(candidate, 16)
+        except ValueError:
+            return None
+    elif candidate.isdigit():
+        try:
+            value = int(candidate, 10)
+        except ValueError:
+            return None
+    else:
+        return None
+    if 0 <= value <= 0xFFFFFFFF:
+        try:
+            return ipaddress.IPv4Address(value)
+        except (ipaddress.AddressValueError, ValueError):  # pragma: no cover
+            return None
+    return None
+
+
 def _validate_literal_ip(decoded: str) -> bool:
     """Block private/internal literal IPs; return True when ``decoded`` is an IP.
 
     Returns False when ``decoded`` is a hostname (not a literal IP), signalling
     that the caller must DNS-resolve it. Raises ValueError for blocked literal
-    IPs (fail-closed).
+    IPs (fail-closed). Handles both canonical (``ipaddress``-parseable) and
+    common non-canonical integer encodings (decimal/hex) of IPv4.
     """
     try:
         ip = ipaddress.ip_address(decoded)
     except ValueError:
-        return False
+        alt = _decode_noncanonical_ipv4(decoded)
+        if alt is None:
+            return False
+        ip = alt
     if _is_blocked_ip(str(ip)):
         raise ValueError(
             f"URL targets a private/internal network address: {decoded}. "

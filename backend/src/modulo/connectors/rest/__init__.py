@@ -159,6 +159,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.connectors.rest import rest_metrics
 
 _log = logging.getLogger(__name__)
 
@@ -438,11 +439,29 @@ class RestConnector(ConnectorBase):
         timeout: float = _DEFAULT_TIMEOUT,
         max_connections: int = 10,
         max_keepalive_connections: int = 5,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        verify_tls: bool | None = None,
     ) -> None:
         self._config = config or {}
         self._creds = creds or {}
         self._transport = transport
-        self._timeout = float(timeout or _DEFAULT_TIMEOUT)
+        # ``timeout_seconds`` config overrides the ``timeout`` constructor arg
+        # (which the composition root uses to inject a global default); the
+        # connector never uses a config default that would surprise the hub.
+        raw_timeout = self._config.get("timeout_seconds", timeout)
+        self._timeout = float(raw_timeout or _DEFAULT_TIMEOUT)
+        # ``verify_tls`` config (default True) controls whether the pooled client
+        # verifies the server certificate. A self-hosted operator pointing at a
+        # private registry with a self-signed cert may disable it — the SSRF
+        # guard still blocks loopback/metadata targets regardless.
+        self._verify_tls = bool(verify_tls if verify_tls is not None else self._config.get("verify_tls", True))
+        # Single injected clock (FAR-413): ``clock`` is used for latency
+        # instrumentation and any reset-delay math; ``sleep`` is the retry
+        # backoff sleeper. Tests inject fake ``clock``/``sleep`` so timing tests
+        # run on frozen time with no wall-clock dependency (FAR-320 flake lesson).
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or asyncio.sleep
         self._ssrf_validator = ssrf_validator
         self._security_guard = security_guard or _stub_security_guard()
         self._base_url = str(self._config.get("base_url", "")).rstrip("/")
@@ -502,6 +521,7 @@ class RestConnector(ConnectorBase):
             kwargs: dict[str, Any] = {
                 "timeout": self._timeout,
                 "follow_redirects": False,
+                "verify": self._verify_tls,
                 "limits": httpx.Limits(
                     max_connections=self._max_connections,
                     max_keepalive_connections=self._max_keepalive,
@@ -866,7 +886,9 @@ class RestConnector(ConnectorBase):
         """Strip credential values from *text* so error detail never echoes secrets."""
         redacted = text
         for secret in self._secret_values():
-            redacted = redacted.replace(secret, "***")
+            if secret and secret in redacted:
+                redacted = redacted.replace(secret, "***")
+                rest_metrics.record_redaction_event()
         return redacted
 
     def _item_summary(self, item: Any) -> str:
@@ -1028,7 +1050,11 @@ class RestConnector(ConnectorBase):
             if inspect.isawaitable(result):
                 await result
             return
-        await self._security_guard.validate_url(url)
+        try:
+            await self._security_guard.validate_url(url)
+        except ValueError:
+            rest_metrics.record_ssrf_blocked(self._host(url))
+            raise
 
     # ── Send + transform ───────────────────────────────────────────────────
 
@@ -1092,16 +1118,21 @@ class RestConnector(ConnectorBase):
         and a bounded backoff is applied between attempts.
         """
         last_delay = 0.0
+        retry_reason = "http_429"
         for attempt in range(attempts):
-            await asyncio.sleep(last_delay)
+            if attempt:
+                await self._sleep(last_delay)
+                rest_metrics.record_retry(retry_reason)
             await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
             try:
                 return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:
+                retry_reason = "http_429" if exc.status_code == 429 else "http_5xx"
                 if not self._is_status_retryable(exc, attempt, attempts):
                     raise
                 last_delay = self._retry_delay(exc, attempt)
             except RESTConnectError:
+                retry_reason = "transport"
                 if attempt == attempts - 1:
                     raise
                 last_delay = self._backoff(attempt)
@@ -1150,8 +1181,17 @@ class RestConnector(ConnectorBase):
         kwargs: dict[str, Any],
         request_timeout: float | None = None,
     ) -> tuple[httpx.Response, str]:
-        """A single HTTP attempt: stream, cap the body, then classify the status."""
+        """A single HTTP attempt: stream, cap the body, then classify the status.
+
+        Timing + outcome metrics are recorded here (FAR-413) so every attempt —
+        retryable or not, success or failure — emits a
+        ``modulo_rest_request_duration_seconds`` histogram sample and a
+        ``modulo_rest_outcome_total`` counter sample labelled by the stable
+        cause-code taxonomy.
+        """
         body_text = ""
+        host = self._host(request.url)
+        start = self._clock()
         try:
             stream_kwargs: dict[str, Any] = dict(kwargs)
             if request_timeout is not None:
@@ -1159,17 +1199,38 @@ class RestConnector(ConnectorBase):
             async with client.stream(request.method, request.url, **stream_kwargs) as resp:
                 body_text = await self._consume_body(resp)
         except httpx.HTTPError as exc:
+            outcome = self._classify_transport_error(exc)
+            duration = self._clock() - start
+            rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
             raise RESTConnectError(
                 self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}")
             ) from exc
+        duration = self._clock() - start
         if resp.status_code >= 300:
+            outcome = rest_metrics.classify_status(resp.status_code)
+            rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
             raise RESTStatusError(
                 self._status_detail(resp, request, body_text),
                 status_code=resp.status_code,
                 location=resp.headers.get("location", ""),
                 retry_after=parse_retry_after(resp),
             )
+        rest_metrics.record_request_duration(
+            duration, host=host, method=request.method, outcome=rest_metrics.SUCCESS_OUTCOME
+        )
         return resp, body_text
+
+    def _classify_transport_error(self, exc: httpx.HTTPError) -> str:
+        if isinstance(exc, httpx.TimeoutException):
+            return rest_metrics.CAUSE_TIMEOUT
+        return rest_metrics.CAUSE_CONNECT
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return urlparse(url).hostname or ""
+        except Exception:
+            return ""
 
     async def _consume_body(self, resp: httpx.Response) -> str:
         """Read the body, aborting past ``max_response_size`` (never unbounded)."""
