@@ -1864,7 +1864,17 @@ class PipelineExecutor:
             FAILED rather than silently completing green with no connector work.
         """
         hub: Any | None = None
-        connectors_configured = False
+        # Fail-closed default (FAR-439): ``connectors_configured`` starts True so
+        # that ANY failure that prevents us from determining whether connectors
+        # exist — a failed session / RLS / ``session.execute`` read, a settings
+        # read, secrets_backend construction, ConnectorHub construction,
+        # ``__aenter__``, or ``initialise`` — takes the re-raise path below. It is
+        # set False ONLY when the reader query returns a confirmed-EMPTY result
+        # (no error): the single case where ``hub=None`` (vacuous success) is
+        # correct. A read/query error is NOT swallowed into the None path —
+        # "couldn't determine whether connectors exist" is a fatal hub-build
+        # failure (fail closed), not evidence that none are configured.
+        connectors_configured = True
         try:
             async with self._session_factory() as session, session.begin():
                 await set_rls_org(session, org_id)
@@ -1886,7 +1896,8 @@ class PipelineExecutor:
                     .all()
                 )
                 if isinstance(rows, list) and rows:
-                    connectors_configured = True
+                    # Connectors confirmed configured: build the hub. Any failure
+                    # below re-raises (fail closed) via the configured path.
                     from modulo.core.connector_hub import ConnectorHub
                     from modulo.core.pipeline_engine.decorator import set_connector_hub
                     from modulo.core.runtime_provider import create_default_hub
@@ -1907,6 +1918,12 @@ class PipelineExecutor:
                     await hub.__aenter__()
                     await hub.initialise(rows, allowed_connectors=allowed_connectors)
                     set_connector_hub(hub)
+                else:
+                    # Confirmed-EMPTY result (no error): the ONE genuine "no
+                    # connectors configured" case. ``connectors_configured`` False
+                    # -> ``hub=None`` (vacuous success). Unreachable from a read
+                    # error — the fail-closed default above re-raises instead.
+                    connectors_configured = False
         except asyncio.CancelledError:
             raise
         except SharedBudgetUnavailableError:
@@ -1921,18 +1938,20 @@ class PipelineExecutor:
             raise
         except Exception:
             if connectors_configured:
-                # Fail closed, loudly: a run WITH connectors configured must never
-                # fall through to `hub=None` on a construction/settings/secrets
-                # failure — the node_runner would treat it as vacuous success
-                # (None hub -> "no connector hub" fallback), silently no-op'ing a
-                # configured remote integration and finalising the run GREEN.
-                # Re-raise so the run terminalises as FAILED.
+                # Fail closed, loudly: connectors ARE configured, OR we could NOT
+                # establish that they are NOT (a read/query error with the
+                # fail-closed default). A run that may require connector work must
+                # never fall through to ``hub=None`` — the node_runner would treat
+                # it as vacuous success, silently no-op'ing a configured remote
+                # integration and finalising the run GREEN. Re-raise so the run
+                # terminalises as FAILED.
                 _log.exception("pipeline.connector_hub_init_failed_configured")
                 if hub is not None:
                     await _teardown_hub(hub)
                 raise
-            # No connectors configured (or the nothing-constructed path): a
-            # return of None is the correct vacuous-success result.
+            # Defensive: ``connectors_configured`` is False ONLY on a confirmed
+            # empty result, which never raises — this branch is otherwise
+            # unreachable. Keep the vacuous-success return for safety.
             _log.exception("pipeline.connector_hub_init_failed")
             if hub is not None:
                 await _teardown_hub(hub)
@@ -3173,12 +3192,28 @@ class PipelineExecutor:
         # connector-scoped the hub decrypts ONLY the union of their allowed
         # connectors, so out-of-scope credentials are never disclosed.
         from modulo.core.capability_scope import compute_run_fetch_scope
-
-        connector_hub = await self._init_connector_hub(
-            org_id,
-            allowed_connectors=compute_run_fetch_scope(graph_json),
-        )
-
+        
+        try:
+            connector_hub = await self._init_connector_hub(
+                org_id,
+                allowed_connectors=compute_run_fetch_scope(graph_json),
+            )
+        except BaseException:
+            # FAR-439: a configured-path connector-hub failure RAISES (fail closed).
+            # That raise propagates out of execute() BEFORE the post-stream
+            # try/finally runs, so the resources acquired above (the model-backend
+            # hub and its ContextVar, the run's cancellation-check / audit-hook
+            # ContextVars, and the broker) would leak. Tear them down before
+            # re-raising so no async client is left dangling and the re-entry gets
+            # a fresh broker — mirroring _cleanup_run_resources.
+            if model_backend_hub is not None:
+                await _teardown_hub(model_backend_hub)
+            set_model_backend_hub(None)
+            set_connector_hub(None)
+            set_cancellation_check(None)
+            set_audit_hook(None)
+            get_registry().close(run_id)
+            raise
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
         # guard B below both require this).
