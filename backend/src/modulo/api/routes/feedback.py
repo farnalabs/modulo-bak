@@ -681,7 +681,7 @@ async def update_feedback_status(
 
 
 async def _update_feedback_status_transaction(
-    session: AsyncSession, principal: TenantPrincipal, record_id: uuid.UUID, status: str
+    session: AsyncSession, principal: TenantPrincipal, record_id: uuid.UUID, new_status: str
 ) -> tuple[FeedbackRecord, str]:
     """Update the feedback status within a transaction, raising 404 if missing."""
     try:
@@ -692,7 +692,9 @@ async def _update_feedback_status_transaction(
             if record is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
             old_status = record.feedback_status
-            record = await mgr.update_status(record_id, status)
+            record = await mgr.update_status(record_id, new_status)
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
     except IntegrityError as exc:
         logger.exception(_CODE_FEEDBACK_UPDATE_FEEDBACK_STATUS)
         raise HTTPException(
