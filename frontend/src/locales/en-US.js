@@ -2408,7 +2408,8 @@ export default {
       }
     },
     "AdminHousekeepingView": {
-      "confirm_cleanup": "Confirm Cleanup"
+      "confirm_cleanup": "Confirm Cleanup",
+      "checkpoint_retention": "Checkpoint Retention"
     },
     "LifecycleMapList": {
       "create_lifecycle_map": "Create Lifecycle Map",
@@ -2547,6 +2548,16 @@ export default {
     "ViewToggle": {
       "saved_views": "Saved Views",
       "select_a_saved_view": "Select a saved view..."
+    },
+    "DbCapacityBanner": {
+      "warn_message": "Database is {percent}% full - clear down old runs to avoid hitting limits.",
+      "critical_message": "Database almost full ({percent}%). Clear old runs / run housekeeping now.",
+      "full_message": "Database full. New runs are disabled - export/clear old runs.",
+      "storage_usage": "{used} of {capacity} used",
+      "mode_note": "Mode: {mode}",
+      "run_retention_link": "Run Retention",
+      "housekeeping_link": "Run Housekeeping",
+      "operator_bypass_note": "Operators can bypass this limit if required."
     },
     "lifecycle-map": {
       "editor": {
