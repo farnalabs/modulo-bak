@@ -1,4 +1,4 @@
-﻿"""Unit tests for the generic REST connector (FAR-408)."""
+"""Unit tests for the generic REST connector (FAR-408)."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def _make_connector(
     )
 
 
-# â”€â”€ Connector type + capabilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Connector type + capabilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def test_connector_type_is_rest() -> None:
@@ -64,7 +64,7 @@ def test_connector_type_is_rest() -> None:
     assert ConnectorType.REST.capabilities == frozenset({"read", "write"})
 
 
-# â”€â”€ Query: records transform â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Query: records transform â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
 
 
 def test_query_records_path_extracts_list() -> None:
@@ -133,7 +133,7 @@ def test_query_empty_resource_raises() -> None:
         asyncio_run(c.query(ConnectorQuery(resource="")))
 
 
-# â”€â”€ Query: templating from filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Query: templating from filters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
 
 
 def test_query_templates_url_and_params_from_filters() -> None:
@@ -158,7 +158,7 @@ def test_query_templates_url_and_params_from_filters() -> None:
     assert captured["params"] == {"page": "2"}
 
 
-# â”€â”€ Auth modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Auth modes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â
 
 
 def test_auth_bearer() -> None:
@@ -265,7 +265,7 @@ def test_auth_basic() -> None:
     assert captured["authorization"].startswith("Basic ")
 
 
-# â”€â”€ Injection guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Injection guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
 
 
 def test_guard_rejects_auth_header_override() -> None:
@@ -358,7 +358,7 @@ def test_query_benign_injection_phrase_not_rejected() -> None:
     assert [r["id"] for r in result.records] == [1, 2]
 
 
-# â”€â”€ Write â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Write â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def test_write_posts_json_and_returns_dict() -> None:
@@ -377,7 +377,7 @@ def test_write_posts_json_and_returns_dict() -> None:
     assert result["name"] == "Ada"
 
 
-# â”€â”€ Health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ Health check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
 
 
 def test_health_check_ok() -> None:
@@ -411,7 +411,7 @@ def test_health_check_api_key_in_query_sends_creds() -> None:
     assert captured["params"] == {"api_key": "the-secret"}
 
 
-# â”€â”€ ConnectorHub multi-field creds round-trip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€ ConnectorHub multi-field creds round-trip â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def test_hub_ciphertext_round_trips_multi_field_json_dict() -> None:
@@ -701,7 +701,7 @@ def test_transport_errors_are_typed() -> None:
         asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 
-# ÔöÇÔöÇ Fan-out / iterator (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out / iterator (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔ
 
 
 def test_write_fanout_sequentially_emits_each_item() -> None:
@@ -911,7 +911,7 @@ def test_write_fanout_applies_per_destination_rate_limit() -> None:
     assert len(c._rate_buckets) == 1
 
 
-# ÔöÇÔöÇ Fan-out: configured retry budget (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out: configured retry budget (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_write_fanout_honors_configured_max_retries():
@@ -965,7 +965,7 @@ def test_write_fanout_default_retries_still_three_attempts():
     assert len(calls) == 3
 
 
-# ÔöÇÔöÇ Fan-out: token-per-attempt metering (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out: token-per-attempt metering (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_send_acquires_token_per_retry_attempt(monkeypatch):
@@ -997,7 +997,7 @@ def test_send_acquires_token_per_retry_attempt(monkeypatch):
     assert len(counts) == 3
 
 
-# ÔöÇÔöÇ Fan-out: bounded rate-limit wait (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out: bounded rate-limit wait (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_write_fanout_rate_limit_wait_is_bounded():
@@ -1070,7 +1070,7 @@ def test_write_fanout_cancellation_preserves_partial_outcomes(monkeypatch):
     assert exc.value.outcomes[0]["status"] == "success"
 
 
-# ÔöÇÔöÇ Fan-out: max_cardinality validation (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out: max_cardinality validation (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 @pytest.mark.parametrize("bad", [0, -1, 100_001])
@@ -1100,7 +1100,7 @@ def test_fanout_max_cardinality_cap_boundary_accepted():
     assert c._max_fanout_cardinality == 100_000
 
 
-# ÔöÇÔöÇ Fan-out: outcome redaction (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ Fan-out: outcome redaction (FAR-411) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_fanout_outcome_redacts_credential_bearing_item():
@@ -1392,7 +1392,7 @@ def test_idempotency_header_is_distinct_across_writes() -> None:
     assert len(set(captured)) == 2
 
 
-# ÔöÇÔöÇ FAR-413: UNKNOWN / terminal outcomes ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ FAR-413: UNKNOWN / terminal outcomes ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_write_timeout_is_typed_rest_connect_error_not_crash() -> None:
@@ -1438,7 +1438,7 @@ def test_retry_exhaust_on_5xx_surfaces_status_error() -> None:
     assert len(attempts) == 3  # 1 initial + 2 retries
 
 
-# ÔöÇÔöÇ FAR-413: response-size abort releases the stream ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ÔöÇÔöÇ FAR-413: response-size abort releases the stream ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔö
 
 
 def test_response_size_abort_connector_still_usable() -> None:
@@ -1644,8 +1644,6 @@ def test_config_defaults_preserved_when_absent() -> None:
     )
     assert c._timeout == 30.0
     assert c._verify_tls is True
-
-
 
 
 def asyncio_run(coro: Any) -> Any:

@@ -1162,12 +1162,14 @@ class RestConnector(ConnectorBase):
                     self._record_operation(start, host, request, rest_metrics.classify_status(exc.status_code))
                     raise
                 last_delay = self._retry_delay(exc, attempt)
+                continue
             except RESTConnectError as exc:
                 retry_reason = "transport"
                 if attempt == attempts - 1:
                     self._record_operation(start, host, request, exc.cause_code)
                     raise
                 last_delay = self._backoff(attempt)
+                continue
             except RESTResponseTooLargeError:
                 self._record_operation(start, host, request, rest_metrics.CAUSE_TOO_LARGE)
                 raise
