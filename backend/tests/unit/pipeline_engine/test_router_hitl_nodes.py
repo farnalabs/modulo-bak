@@ -166,11 +166,13 @@ def test_hitl_node_compiles_like_edge_gate():
     assert len(legacy_nodes) == 3
     assert len(new_nodes) == 3
     # The gate sits between the source and B in both.
-    assert ("B" in legacy_nodes) and ("B" in new_nodes)
+    assert "B" in legacy_nodes
+    assert "B" in new_nodes
     assert all("B" in t for (_, t) in legacy_edges)
     assert all("B" in t for (_, t) in new_edges)
     # Same number of edges (source->gate, gate->target).
-    assert len(legacy_edges) == len(new_edges) == 2
+    assert len(legacy_edges) == len(new_edges)
+    assert len(new_edges) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +200,8 @@ def test_loop_edge_compiles():
         ],
     }
     nodes, _, _ = _compiled_structure(graph_json)
-    assert "A" in nodes and "B" in nodes
+    assert "A" in nodes
+    assert "B" in nodes
     # A loop counter synthetic node is inserted.
     assert any("loop_counter" in str(n) for n in nodes)
 
@@ -222,4 +225,6 @@ def test_router_node_compiles():
         "edges": [{"source": "R", "target": "A"}, {"source": "R", "target": "B"}],
     }
     nodes, _, _ = _compiled_structure(graph_json)
-    assert "R" in nodes and "A" in nodes and "B" in nodes
+    assert "R" in nodes
+    assert "A" in nodes
+    assert "B" in nodes
