@@ -325,6 +325,30 @@ async def test_assert_no_secret_objects_rejects_connector():
     assert exc_info.value.kind == "secret"
 
 
+def test_assert_no_secret_objects_rejects_connector_inside_result():
+    """The production query path returns a ConnectorResult *dataclass* whose
+    ``records`` carry the payload. A connector object smuggled inside
+    ``ConnectorResult.records`` must be rejected — the guard must descend into
+    dataclass fields, not just dict/list/tuple."""
+    from modulo.connectors.base import ConnectorResult
+
+    class _FakeConnector2:
+        connector_type = "github"
+        query = lambda *a, **k: None  # noqa: E731
+
+    result = ConnectorResult(records=[{"raw": _FakeConnector2(), "data": {"ok": True}}])
+    with pytest.raises(ScopeViolationError) as exc_info:
+        assert_no_secret_objects(result, node_id="n1")
+    assert exc_info.value.kind == "secret"
+
+
+def test_assert_no_secret_objects_allows_plain_result():
+    """A ConnectorResult carrying only plain-serializable records is valid."""
+    from modulo.connectors.base import ConnectorResult
+
+    assert_no_secret_objects(ConnectorResult(records=[{"ok": True}]), node_id="n1")
+
+
 def test_assert_no_secret_objects_allows_plain_data():
     # Opaque connector ID strings + plain dicts/list are valid port payloads.
     assert_no_secret_objects({"connector_id": str(uuid.uuid4()), "records": [{"ok": True}]}, node_id="n1")
@@ -516,6 +540,200 @@ def test_mixed_union_dedupes_across_nodes():
     scope = compute_run_fetch_scope(graph)
     assert scope.count(shared) == 1
     assert set(scope) == {shared, "github", "slack"}
+
+
+# ---------------------------------------------------------------------------
+# Executor wiring — prove the run environment passes the computed fetch scope
+# through to ConnectorHub.initialise (FAR-418 prove-the-fix).
+#
+# This is the gap the review flagged: the unit tests cover
+# ``compute_run_fetch_scope`` and ``ConnectorHub.initialise`` in isolation, but
+# nothing exercised ``_init_run_environment`` -> ``_init_connector_hub`` with a
+# scoped graph. Removing the ``allowed_connectors=`` argument at
+# executor.py:3120 makes this test fail, so the feature cannot silently regress.
+# ---------------------------------------------------------------------------
+
+
+async def test_run_environment_wires_fetch_scope_to_hub(tmp_path, monkeypatch):
+    """When every node is connector-scoped, only the union of allowed
+    connectors is decrypted — an excluded connector's secrets entry is never
+    fetched. Exercises the real executor wiring end-to-end (with the DB session
+    and secrets backend stubbed, the hub confinement logic runs for real)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from modulo.core.capability_scope import compute_run_fetch_scope
+    from modulo.core.connector_hub import ConnectorNotFoundError
+    from modulo.core.pipeline_engine.decorator import set_connector_hub
+    from modulo.core.pipeline_engine.executor import PipelineExecutor
+
+    # --- Fake ConnectorInstance rows (no DB needed) ---
+    class _CI:
+        def __init__(self, cid: uuid.UUID, ctype: str) -> None:
+            self.id = cid
+            self.connector_type_id = ctype
+            self.config_json = {"base_path": str(tmp_path)}
+            self.credentials_ciphertext = b""
+            self.visibility = "org"
+            self.allowed_operations = None
+
+    allowed_id = uuid.uuid4()
+    denied_id = uuid.uuid4()
+
+    # --- Recording secrets backend: capture every get_secret call ---
+    fetched: list[str] = []
+    sb = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+
+    async def _get_secret(key: str) -> str:
+        fetched.append(key)
+        return "{}"
+
+    monkeypatch.setattr(sb, "get_secret", _get_secret)
+    monkeypatch.setattr("modulo.core.secrets_backend.create_secrets_backend", lambda *a, **k: sb)
+    monkeypatch.setattr("modulo.settings.get_settings", lambda: MagicMock(fernet_key=_KEY))
+
+    # --- Fake async session returning our rows ---
+    class _NullCtx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self._rows = [_CI(allowed_id, "filesystem"), _CI(denied_id, "filesystem")]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def begin(self):
+            return _NullCtx()
+
+        async def execute(self, *a, **k):
+            res = MagicMock()
+            sc = MagicMock()
+            sc.all.return_value = self._rows
+            res.scalars.return_value = sc
+            return res
+
+    # --- Executor with stubbed heavy deps ---
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = lambda: _FakeSession()
+    monkeypatch.setattr(executor, "_init_model_backend_hub", AsyncMock(return_value=None))
+    monkeypatch.setattr("modulo.core.pipeline_engine.executor.set_rls_org", AsyncMock())
+    monkeypatch.setattr("modulo.core.pipeline_engine.executor.set_rls_execution_context", AsyncMock())
+
+    org_id = uuid.uuid4()
+    graph = {"nodes": [{"capability_scope": {"allowed_connectors": [str(allowed_id)]}}]}
+    # Sanity: the run-level scope really is the single scoped connector.
+    assert compute_run_fetch_scope(graph) == [str(allowed_id)]
+
+    set_connector_hub(None)
+    try:
+        _, connector_hub, _, _ = await executor._init_run_environment(
+            org_id=org_id,
+            run_id=uuid.uuid4(),
+            pipeline_id=uuid.uuid4(),
+            graph_json=graph,
+        )
+    finally:
+        set_connector_hub(None)
+
+    assert connector_hub is not None
+    # Deny-by-default: only the scoped connector was fetched/decrypted; the
+    # excluded connector's secrets entry was never read.
+    assert fetched == [str(allowed_id)]
+    assert connector_hub.get(allowed_id) is not None
+    with pytest.raises(ConnectorNotFoundError):
+        connector_hub.get(denied_id)
+    await connector_hub.__aexit__()
+
+
+async def test_run_environment_unrestricted_node_fetches_all(tmp_path, monkeypatch):
+    """A run containing an unrestricted node fetches EVERY connector (the
+    backcompat guarantee) — proving the wiring threads the computed scope through
+    rather than always narrowing."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from modulo.core.pipeline_engine.decorator import set_connector_hub
+    from modulo.core.pipeline_engine.executor import PipelineExecutor
+
+    class _CI:
+        def __init__(self, cid: uuid.UUID) -> None:
+            self.id = cid
+            self.connector_type_id = "filesystem"
+            self.config_json = {"base_path": str(tmp_path)}
+            self.credentials_ciphertext = b""
+            self.visibility = "org"
+            self.allowed_operations = None
+
+    id1 = uuid.uuid4()
+    id2 = uuid.uuid4()
+
+    fetched: list[str] = []
+    sb = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+
+    async def _get_secret(key: str) -> str:
+        fetched.append(key)
+        return "{}"
+
+    monkeypatch.setattr(sb, "get_secret", _get_secret)
+    monkeypatch.setattr("modulo.core.secrets_backend.create_secrets_backend", lambda *a, **k: sb)
+    monkeypatch.setattr("modulo.settings.get_settings", lambda: MagicMock(fernet_key=_KEY))
+
+    class _NullCtx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeSession:
+        def __init__(self) -> None:
+            self._rows = [_CI(id1), _CI(id2)]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def begin(self):
+            return _NullCtx()
+
+        async def execute(self, *a, **k):
+            res = MagicMock()
+            sc = MagicMock()
+            sc.all.return_value = self._rows
+            res.scalars.return_value = sc
+            return res
+
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = lambda: _FakeSession()
+    monkeypatch.setattr(executor, "_init_model_backend_hub", AsyncMock(return_value=None))
+    monkeypatch.setattr("modulo.core.pipeline_engine.executor.set_rls_org", AsyncMock())
+    monkeypatch.setattr("modulo.core.pipeline_engine.executor.set_rls_execution_context", AsyncMock())
+
+    # One node unscoped -> run fetch scope is None -> hub fetches all.
+    graph = {"nodes": [{"node_type": "transform"}]}
+
+    set_connector_hub(None)
+    try:
+        _, connector_hub, _, _ = await executor._init_run_environment(
+            org_id=uuid.uuid4(),
+            run_id=uuid.uuid4(),
+            pipeline_id=uuid.uuid4(),
+            graph_json=graph,
+        )
+    finally:
+        set_connector_hub(None)
+
+    assert connector_hub is not None
+    assert set(fetched) == {str(id1), str(id2)}
+    await connector_hub.__aexit__()
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ heavy graph machinery.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import Any
@@ -218,14 +219,27 @@ def _is_connector_object(value: Any) -> bool:
     return hasattr(value, "connector_type") and callable(getattr(value, "query", None))
 
 
-def assert_no_secret_objects(value: Any, *, node_id: str) -> None:
+def assert_no_secret_objects(value: Any, *, node_id: str, _seen: set[int] | None = None) -> None:
     """Secret-hygiene guard: connector/secret OBJECTS are never valid port payloads.
 
     Only opaque connector IDs may appear in state/ports. Recursively rejects any
     connector/secret object (see :func:`_is_connector_object`) with a typed
     ``ScopeViolationError``; plain-serializable data always passes. Raises on the
     first offending nested value.
+
+    The production query path returns a ``ConnectorResult`` *dataclass* whose
+    ``records`` carry the real payload — a shape that is neither ``dict`` nor
+    ``list``/``tuple``, so the guard must descend into dataclass fields (and, as
+    a backstop, arbitrary object ``__dict__``) or a smuggled connector/secret
+    object riding inside ``ConnectorResult.records`` would slip past the guard.
+    A ``_seen`` id-set prevents infinite recursion on cyclic payloads.
     """
+    if _seen is None:
+        _seen = set()
+    obj_id = id(value)
+    if obj_id in _seen:
+        return
+    _seen.add(obj_id)
     if _is_connector_object(value):
         raise ScopeViolationError(
             node_id=node_id,
@@ -234,7 +248,15 @@ def assert_no_secret_objects(value: Any, *, node_id: str) -> None:
         )
     if isinstance(value, dict):
         for nested in value.values():
-            assert_no_secret_objects(nested, node_id=node_id)
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
     elif isinstance(value, (list, tuple)):
         for nested in value:
-            assert_no_secret_objects(nested, node_id=node_id)
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            assert_no_secret_objects(getattr(value, field.name), node_id=node_id, _seen=_seen)
+    elif hasattr(value, "__dict__") and not isinstance(value, (str, bytes, bytearray, int, float, bool)):
+        # Backstop for non-dataclass objects (agents may wrap payloads in plain
+        # classes). Skip primitives and types; descend into attributes.
+        for nested in vars(value).values():
+            assert_no_secret_objects(nested, node_id=node_id, _seen=_seen)
