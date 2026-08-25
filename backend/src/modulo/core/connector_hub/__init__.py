@@ -132,6 +132,11 @@ class ConnectorHub:
         self._runtime_provider_hub = runtime_provider_hub
         self._initialised = False
         self._init_lock = asyncio.Lock()
+        # Lazily-built shared Redis client used to wire the REST connector's
+        # shared per-destination rate-limit budget (FAR-439). Owned by the hub
+        # (closed at teardown), never by an individual connector.
+        self._shared_redis: Any = None
+        self._redis_attempted = False
 
     async def __aenter__(self) -> Self:
         return self
@@ -159,6 +164,44 @@ class ConnectorHub:
                     await result
             except Exception:
                 logger.warning("Failed to close connector", exc_info=True)
+        # The shared Redis client (FAR-439) is owned by the hub, not a connector —
+        # close it here so the rate-limit budget never leaks a pool connection.
+        shared_redis = self._shared_redis
+        self._shared_redis = None
+        if shared_redis is not None:
+            try:
+                await shared_redis.aclose()
+            except Exception:
+                logger.warning("Failed to close shared Redis client", exc_info=True)
+
+    def _shared_redis_client(self) -> Any | None:
+        """Return the lazily-built shared Redis client, or None when not configured.
+
+        Best-effort: only built when ``settings.redis_url`` is set (and the DB is
+        not SQLite). A connection failure yields ``None`` so the REST connector
+        degrades to its connector-local bucket rather than failing open. The
+        single client is shared by every connector built by this hub.
+        """
+        if self._shared_redis is not None or self._redis_attempted:
+            return self._shared_redis
+        self._redis_attempted = True
+        try:
+            from modulo.settings import get_settings
+
+            settings = get_settings()
+            if not settings.redis_url or settings.modulo_db.lower() == "sqlite":
+                return None
+            from redis.asyncio import Redis
+
+            self._shared_redis = Redis.from_url(
+                settings.redis_url, decode_responses=False, socket_connect_timeout=5, socket_timeout=10
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Shared Redis unavailable — REST connectors use the local rate-limit bucket", exc_info=True)
+            self._shared_redis = None
+        return self._shared_redis
 
     def close(self) -> None:
         """Release every held connector and its decrypted credentials.
@@ -260,6 +303,8 @@ class ConnectorHub:
                         creds,
                         runtime_provider=self._runtime_provider,
                         runtime_provider_hub=self._runtime_provider_hub,
+                        redis_client=self._shared_redis_client(),
+                        tenant_id=str(self._org_id) if self._org_id else None,
                     )
                     acl = ConnectorACL(
                         visibility=ci.visibility,
@@ -553,6 +598,9 @@ def _build_connector(
     creds: dict[str, Any],
     runtime_provider: Any = None,
     runtime_provider_hub: Any = None,
+    *,
+    redis_client: Any = None,
+    tenant_id: str | None = None,
 ) -> ConnectorBase:
     config = config or {}
     match type_id:
@@ -712,7 +760,13 @@ def _build_connector(
             # Multi-field auth (auth_mode/token/api_key/username/password/...)
             # arrives as a JSON dict via secrets_backend OR credentials_ciphertext
             # — not the single api_key fallback (see initialise()).
-            return RestConnector(config=config, creds=creds, security_guard=_core_security_guard())
+            return RestConnector(
+                config=config,
+                creds=creds,
+                security_guard=_core_security_guard(),
+                redis_client=redis_client,
+                tenant_id=tenant_id,
+            )
         case "ticket-tracker":
             provider = config.get("provider", "github")
             if provider == "github":

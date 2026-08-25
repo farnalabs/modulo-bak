@@ -47,6 +47,12 @@ the runtime variables supplied per call:
                             "requests_per_second": 10.0,        #   refill rate
                             "burst": 20                         #   burst capacity
                           }
+                            #   FAR-439: when a Redis client is wired at the composition
+                            #   root (app.modulo.run multi-worker / fleet), the bucket is
+                            #   SHARED across workers — one budget per <tenant, host+path>
+                            #   — enforced atomically in Redis. Without Redis (single-worker
+                            #   dev, or a Redis outage) it degrades to the connector-local
+                            #   per-process bucket (no failing open).
 
 FAN-OUT / ITERATOR (FAR-411)
 ---------------------------
@@ -65,10 +71,13 @@ sequence inside the write ``data``, ``write()`` fans out ONE request per item:
   fan-out is a no-op, not a failure).
 * **Per-destination token bucket** — the ONE outbound-call enforcement point.
   Each item consumes a token from a :class:`modulo.connectors._rate_bucket.TokenBucket`
-  keyed by host; when empty the call awaits refill. This is **per-process**
-  (each uvicorn/SAQ worker owns its own bucket) and **best-effort** — it is
-  NOT Redis-backed in this ticket. Note the divergence: existing connectors
-  (github, linear, …) have no bucket, so REST is deliberately stricter.
+  keyed by host+path; when empty the call awaits refill. Per-process by default
+  (each uvicorn/SAQ worker owns its own bucket), and SHARED across the fleet via
+  Redis when a ``redis_client`` is wired at the composition root (FAR-439): one
+  atomic budget per <tenant, host+path> is enforced across all workers, falling
+  back to the connector-local bucket when Redis is unavailable. Note the
+  divergence: existing connectors (github, linear, …) have no bucket, so REST is
+  deliberately stricter.
 * **Per-item outcome state** — the result carries ``outcomes`` (one record per
   item: index, item, status ``success``/``failure``, result/error), plus
   ``success_count``/``failure_count`` and an explicit ``cardinality_over_cap``
@@ -150,7 +159,7 @@ import httpx
 import jmespath
 from jinja2.sandbox import SandboxedEnvironment
 
-from modulo.connectors._rate_bucket import TokenBucket
+from modulo.connectors._rate_bucket import PerDestinationRateLimiter, TokenBucket
 from modulo.connectors._retry_headers import parse_retry_after
 from modulo.connectors._safe_page import safe_records_list
 from modulo.connectors.base import (
@@ -430,7 +439,10 @@ class RestConnector(ConnectorBase):
     dict (see the module docstring for both shapes). ``transport`` and
     ``ssrf_validator`` are test seams — production callers pass neither.
     ``security_guard`` is the injection/SSRF port; the composition root wires the
-    production ``modulo.core`` implementation.
+    production ``modulo.core`` implementation. ``redis_client`` and ``tenant_id``
+    enable the shared per-destination budget (FAR-439): a Redis-backed atomic
+    bucket keyed per <tenant_id, host+path> is enforced across workers, else the
+    connector-local bucket is used.
     """
 
     def __init__(
@@ -448,6 +460,8 @@ class RestConnector(ConnectorBase):
         sleep: Callable[[float], Awaitable[None]] | None = None,
         random_uniform: Callable[[float, float], float] | None = None,
         verify_tls: bool | None = None,
+        redis_client: Any = None,
+        tenant_id: str | None = None,
     ) -> None:
         self._config = config or {}
         self._creds = creds or {}
@@ -515,11 +529,19 @@ class RestConnector(ConnectorBase):
         self._fanout_max_retries = min(self._fanout_max_retries, _MAX_SANE_RETRIES)
 
         # FAR-411 per-destination token bucket (single outbound enforcement point).
-        # Best-effort per-process: each uvicorn/SAQ worker owns its own buckets.
+        # FAR-439: shared Redis-backed limiter when a ``redis_client`` is supplied
+        # at the composition root (multi-worker/fleet enforces ONE budget per
+        # destination); otherwise the same per-process local bucket is used, so
+        # single-worker dev and Redis outages degrade to the connector-local
+        # bucket rather than failing open.
         raw_rate = self._config.get("rate_limit")
         self._rate_limit_config: dict[str, Any] = raw_rate if isinstance(raw_rate, dict) else {}
-        self._rate_buckets: dict[str, Any] = {}
-        self._rate_lock = asyncio.Lock()
+        self._rate_buckets: dict[str, TokenBucket] = {}
+        self._redis_client = redis_client
+        self._tenant_id = tenant_id
+        # Built lazily on first rate-limit use so a REST connector with no
+        # ``rate_limit`` config never touches Redis or allocation.
+        self._rate_limiter: PerDestinationRateLimiter | None = None
 
     # ── ConnectorBase surface ──────────────────────────────────────────────
 
@@ -681,6 +703,23 @@ class RestConnector(ConnectorBase):
         context["item_index"] = index
         return context
 
+    def _get_rate_limiter(self, requests_per_second: float, burst: int) -> PerDestinationRateLimiter:
+        """Return the lazily-built per-destination limiter (one per connector).
+
+        The limiter shares ``self._rate_buckets`` as its local fallback store so
+        the connector-local bucket is used verbatim when Redis is unavailable,
+        and so tests that pre-seed ``_rate_buckets`` keep working.
+        """
+        if self._rate_limiter is None:
+            self._rate_limiter = PerDestinationRateLimiter(
+                rate=requests_per_second,
+                burst=burst,
+                redis_client=self._redis_client,
+                tenant_id=self._tenant_id,
+                buckets=self._rate_buckets,
+            )
+        return self._rate_limiter
+
     async def _acquire_rate_token(self, destination: str, *, deadline_seconds: float | None = None) -> None:
         """Consume one token from the per-destination bucket (best-effort).
 
@@ -688,9 +727,10 @@ class RestConnector(ConnectorBase):
         *deadline_seconds*, when provided, bounds the wait: if a token cannot be
         supplied within that window a :class:`RESTRateLimitTimeoutError` is
         raised rather than spinning forever (the per-item fan-out budget). A
-        missing/disabled ``rate_limit`` config is a no-op. This is per-process —
-        each uvicorn/SAQ worker owns its own bucket; it is NOT Redis-backed in
-        v1 (future work).
+        missing/disabled ``rate_limit`` config is a no-op. When a ``redis_client``
+        is supplied the shared Redis bucket is authoritative (one budget across
+        workers); otherwise the per-process connector-local bucket is used, and a
+        Redis failure degrades to that same local bucket rather than failing open.
         """
         rate = self._rate_limit_config.get("requests_per_second")
         if rate is None:
@@ -700,19 +740,12 @@ class RestConnector(ConnectorBase):
         if requests_per_second <= 0:
             return
 
-        if destination not in self._rate_buckets:
-            async with self._rate_lock:
-                if destination not in self._rate_buckets:
-                    self._rate_buckets[destination] = TokenBucket(
-                        rate=requests_per_second,
-                        burst=burst,
-                    )
-        bucket = self._rate_buckets[destination]
+        limiter = self._get_rate_limiter(requests_per_second, burst)
         deadline = time.monotonic() + max(0.0, deadline_seconds) if deadline_seconds is not None else None
-        # consume() returns False when the bucket is empty (consuming nothing);
+        # consume() returns False when the budget is exhausted (consuming nothing);
         # wait out a bounded refill hop and retry. The deadline bounds the wait so
         # a saturated per-destination bucket never spins past the per-item budget.
-        while not await bucket.consume():
+        while not await limiter.consume(destination):
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
@@ -1123,7 +1156,7 @@ class RestConnector(ConnectorBase):
         start = self._clock()
 
         if not self._is_retryable(request):
-            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
+            await self._acquire_rate_token(str(request.url), deadline_seconds=rate_wait_timeout)
             return await self._perform_with_metrics(
                 client, request, kwargs, host, start, request_timeout=request_timeout
             )
@@ -1155,7 +1188,7 @@ class RestConnector(ConnectorBase):
             if attempt:
                 await self._sleep(last_delay)
                 rest_metrics.record_retry(retry_reason)
-            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
+            await self._acquire_rate_token(str(request.url), deadline_seconds=rate_wait_timeout)
             try:
                 resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:

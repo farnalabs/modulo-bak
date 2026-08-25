@@ -1,9 +1,18 @@
-"""Unit tests for REST connector observability (FAR-413).
+"""Unit tests for REST connector observability (FAR-413) + shared rate-limit budget (FAR-439).
 
-Covers ``modulo.connectors.rest.rest_metrics`` (OTel instrument registration +
-record helpers), the connector's metric wiring (that a real request emits the
-exact metric names/attributes), and ``modulo.connectors.rest.rest_rollback``
-(threshold evaluator + cause-code classification).
+FAR-413 observability: covers ``modulo.connectors.rest.rest_metrics`` (OTel
+instrument registration + record helpers), the connector's metric wiring (that a
+real request emits the exact metric names/attributes), and
+``modulo.connectors.rest.rest_rollback`` (threshold evaluator + cause-code
+classification).
+
+FAR-439 shared budget: covers the SHARED Redis-backed per-destination rate
+limiter so multiple workers enforce ONE budget per destination, keyed per-tenant,
+with a connector-local bucket fallback and no lost-token race. Tests the
+primitives directly (:class:`RedisTokenBucket` / :class:`PerDestinationRateLimiter`)
+and the RestConnector composition. No real Redis is used -- a fake Redis client
+replicates the Lua script's atomic semantics in-process so multiple limiter
+instances sharing one store simulate a multi-worker fleet.
 
 These are pure unit tests: no network, no DB, no real meter provider. The OTel
 meter is injected via ``sys.modules``/``_get_meter`` the same way
@@ -12,16 +21,27 @@ meter is injected via ``sys.modules``/``_get_meter`` the same way
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections.abc import Iterator
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from redis.exceptions import RedisError
 
 import modulo.connectors.rest.rest_metrics as rest_metrics
 import modulo.connectors.rest.rest_rollback as rest_rollback
-from modulo.connectors.base import ConnectorQuery
-from modulo.connectors.rest import RESTConnectError, RestConnector, RESTResponseTooLargeError, SecurityGuard
+from modulo.connectors._rate_bucket import PerDestinationRateLimiter, RedisTokenBucket
+from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+from modulo.connectors.rest import (
+    RESTConnectError,
+    RESTFanOutFailureError,
+    RESTResponseTooLargeError,
+    RestConnector,
+    SecurityGuard,
+)
 from modulo.connectors.rest.rest_rollback import RestRollbackSignal, evaluate_rest_rollback, is_unknown_like
 
 
@@ -96,7 +116,7 @@ def _run_query(meter: MagicMock) -> None:
         asyncio.run(c.query(ConnectorQuery(resource="default")))
 
 
-# ── classify_status ─────────────────────────────────────────────────────────
+# ÔöÇÔöÇ classify_status ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
 class TestClassifyStatus:
@@ -115,7 +135,7 @@ class TestClassifyStatus:
         assert rest_metrics.classify_status(status) == expected
 
 
-# ── instrument registration ─────────────────────────────────────────────────
+# ÔöÇÔöÇ instrument registration ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
 class TestInstrumentRegistration:
@@ -130,7 +150,7 @@ class TestInstrumentRegistration:
         assert "modulo_rest_redaction_events_total" in counters
 
 
-# ── record helpers ──────────────────────────────────────────────────────────
+# ÔöÇÔöÇ record helpers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
 class TestRecordHelpers:
@@ -175,7 +195,7 @@ class TestRecordHelpers:
         assert rest_metrics._requests_histogram is None
 
 
-# ── connector metric wiring (end-to-end over a MockTransport) ───────────────
+# ÔöÇÔöÇ connector metric wiring (end-to-end over a MockTransport) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
 class TestConnectorMetricWiring:
@@ -248,7 +268,7 @@ class TestConnectorMetricWiring:
         assert kwargs["attributes"] == {"reason": "http_429"}
 
     def test_failed_then_succeeded_retry_emits_single_terminal_sample(self) -> None:
-        """A retried op that succeeds emits ONE success sample — the intermediate
+        """A retried op that succeeds emits ONE success sample ÔÇö the intermediate
         failed attempts must not leak extra samples into p95/success-rate."""
         meter, histograms, counters = _storage_meter()
         attempts: list[int] = []
@@ -351,7 +371,7 @@ class TestConnectorMetricWiring:
         assert redaction.add.called  # the secret was redacted, emitting an event
 
 
-# ── rollback threshold evaluator ────────────────────────────────────────────
+# ÔöÇÔöÇ rollback threshold evaluator ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
 
 
 class TestRestRollback:
@@ -399,7 +419,7 @@ class TestRestRollback:
 
     def test_unknown_like_classification(self) -> None:
         # A transport timeout is a deterministic failure, classified as an error
-        # (never double-counted as UNKNOWN) — so it is NOT unknown-like.
+        # (never double-counted as UNKNOWN) ÔÇö so it is NOT unknown-like.
         assert is_unknown_like("timeout") is False
         assert is_unknown_like("unknown") is True
         assert is_unknown_like("http_429") is False
@@ -408,7 +428,7 @@ class TestRestRollback:
     def test_unknown_outcome_not_double_counted_in_error_bucket(self) -> None:
         """``unknown`` must never be classified as an error. A producer that
         builds error_requests from ``_ERROR_CAUSE_CODES`` and unknown_requests
-        from ``is_unknown_like`` must not count the same cause in both — the
+        from ``is_unknown_like`` must not count the same cause in both ÔÇö the
         two cause sets are genuinely disjoint."""
         error_causes = frozenset(rest_metrics._ERROR_CAUSE_CODES)
         unknown_like = frozenset(rest_rollback._DEFAULT_UNKNOWN_LIKE)
@@ -433,3 +453,244 @@ class TestRestRollback:
     def test_logs_structured_warning_on_trigger(self, caplog: pytest.LogCaptureFixture) -> None:
         evaluate_rest_rollback(url="https://a.example", total_requests=100, error_requests=50, unknown_requests=0)
         assert "rest_rollback.threshold_triggered" in caplog.text
+
+
+class _FakeRedis:
+    """In-process stand-in for ``redis.asyncio.Redis``.
+
+    ``register_script`` returns an async callable that reproduces the token-bucket
+    Lua semantics atomically under a lock. ``store`` is shared by every client, so
+    multiple limiter instances pointing at the same store simulate a fleet of
+    workers hitting one Redis.
+    """
+
+    def __init__(self, store: dict[str, dict[str, float]] | None = None) -> None:
+        self._store: dict[str, dict[str, float]] = store if store is not None else {}
+        self._lock = asyncio.Lock()
+
+    def register_script(self, script: str) -> Any:
+        of_self = self
+
+        async def run(keys: list[str], args: list[Any]) -> int:
+            key = keys[0]
+            rate = float(args[0])
+            burst = float(args[1])
+            cost = float(args[2])
+            now = float(args[3])
+            async with of_self._lock:
+                st = of_self._store.get(key)
+                if st is None:
+                    st = {"tokens": burst, "ts": now}
+                elapsed = max(0.0, now - st["ts"])
+                st["tokens"] = min(burst, st["tokens"] + elapsed * rate)
+                st["ts"] = now
+                if st["tokens"] >= cost:
+                    st["tokens"] -= cost
+                    of_self._store[key] = st
+                    return 1
+                of_self._store[key] = st
+                return 0
+
+        return run
+
+
+class _BrokenRedis:
+    """A Redis client whose script execution always fails (unavailable)."""
+
+    def register_script(self, script: str) -> Any:
+        async def run(keys: list[str], args: list[Any]) -> int:
+            raise RedisError("Redis unavailable")
+
+        return run
+
+
+def _make_connector(
+    config: dict[str, Any] | None,
+    creds: dict[str, Any] | None,
+    *,
+    redis_client: Any = None,
+    tenant_id: str | None = None,
+) -> RestConnector:
+    return RestConnector(
+        config,
+        creds,
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})),
+        ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
+        redis_client=redis_client,
+        tenant_id=tenant_id,
+    )
+
+
+# ÔöÇÔöÇ RedisTokenBucket: shared budget + no lost-token race ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
+
+async def test_redis_token_bucket_no_lost_token_race_under_concurrency() -> None:
+    """Concurrent consumes never over-spend the shared budget (atomic in Redis).
+
+    With a fixed ``now`` (no refill), exactly ``burst`` concurrent consumes
+    succeed ÔÇö never more ÔÇö proving the token check-and-decrement is not racy.
+    """
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    bucket = RedisTokenBucket(redis, rate=0.0001, burst=5, key_prefix="rl:")
+
+    grant_count = sum(await asyncio.gather(*[bucket.consume("k", tokens=1.0, now=1000.0) for _ in range(50)]))
+    assert grant_count == 5
+    assert store["rl:k"]["tokens"] >= 0
+
+
+async def test_redis_token_bucket_refills_over_wall_clock() -> None:
+    """A shared bucket refills continuously, so a later call re-acquires."""
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    bucket = RedisTokenBucket(redis, rate=2.0, burst=1, key_prefix="rl:")
+
+    assert await bucket.consume("k", tokens=1.0, now=1000.0) is True
+    # Immediately after spend, no refill -> denied.
+    assert await bucket.consume("k", tokens=1.0, now=1000.0) is False
+    # One second later the 2/s rate refilled a token.
+    assert await bucket.consume("k", tokens=1.0, now=1001.0) is True
+
+
+# ÔöÇÔöÇ PerDestinationRateLimiter: shared budget across simulated workers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
+
+async def test_shared_budget_enforced_across_simulated_workers() -> None:
+    """Two limiter instances (two workers) share ONE Redis budget."""
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    worker_a = PerDestinationRateLimiter(rate=0.0001, burst=3, redis_client=redis, tenant_id="org-1")
+    worker_b = PerDestinationRateLimiter(rate=0.0001, burst=3, redis_client=redis, tenant_id="org-1")
+
+    results = []
+    for _ in range(5):
+        results.append(await worker_a.consume("api.example.com/x"))
+        results.append(await worker_b.consume("api.example.com/x"))
+
+    # 3-token budget shared by both workers -> 3 grants, 7 denies (no refill).
+    assert results.count(True) == 3
+    assert len(worker_a.buckets) == 0  # never fell back to local
+
+
+async def test_per_tenant_weighting_separates_budgets() -> None:
+    """Different tenants get independent shared budgets for the same destination."""
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    tenant_a = PerDestinationRateLimiter(rate=0.0001, burst=2, redis_client=redis, tenant_id="org-A")
+    tenant_b = PerDestinationRateLimiter(rate=0.0001, burst=2, redis_client=redis, tenant_id="org-B")
+
+    assert await tenant_a.consume("dest") is True
+    assert await tenant_a.consume("dest") is True
+    assert await tenant_a.consume("dest") is False  # org-A budget exhausted
+
+    # org-B still has its own full budget.
+    assert await tenant_b.consume("dest") is True
+    assert await tenant_b.consume("dest") is True
+    assert await tenant_b.consume("dest") is False
+
+    assert tenant_a.key("dest") != tenant_b.key("dest")
+
+
+async def test_fallback_to_local_bucket_when_redis_unavailable(caplog: Any) -> None:
+    """A Redis outage degrades to the connector-local bucket (never fails open)."""
+    with caplog.at_level(logging.WARNING, logger="modulo.connectors._rate_bucket"):
+        limiter = PerDestinationRateLimiter(rate=1.0, burst=2, redis_client=_BrokenRedis(), tenant_id="org-1")
+
+        assert await limiter.consume("dest") is True
+        assert await limiter.consume("dest") is True
+        assert await limiter.consume("dest") is False  # local budget (burst 2) exhausted
+
+    assert len(limiter.buckets) == 1  # fell back to the local per-process bucket
+    assert "rest.rate_limit.redis_fallback" in [r.message for r in caplog.records]
+
+
+async def test_saturation_signal_recorded_on_deny(caplog: Any) -> None:
+    """A denied consume records saturation (counter + structured alert log)."""
+    store: dict[str, dict[str, float]] = {}
+    limiter = PerDestinationRateLimiter(rate=1.0, burst=1, redis_client=_FakeRedis(store), tenant_id="org-1")
+
+    assert await limiter.consume("dest") is True
+    with caplog.at_level(logging.WARNING, logger="modulo.connectors._rate_bucket"):
+        assert await limiter.consume("dest") is False
+
+    assert limiter.saturation_count == 1
+    assert limiter.saturations["dest"] == 1
+    alerts = [r for r in caplog.records if r.message == "rest.rate_limit.saturated"]
+    assert alerts
+    assert alerts[0].destination == "dest"
+    assert alerts[0].tenant == "org-1"
+
+
+# ÔöÇÔöÇ RestConnector composition ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+
+
+def test_rest_connector_uses_shared_redis_budget_per_destination() -> None:
+    """The connector enforces one shared Redis budget across its fan-out."""
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "per_item_timeout": 0.001},
+            "rate_limit": {"requests_per_second": 0.001, "burst": 2},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+        redis_client=redis,
+        tenant_id="org-1",
+    )
+
+    with pytest.raises(RESTFanOutFailureError, match="rate-limit wait exceeded") as exc:
+        asyncio.run(
+            c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(3)]}))
+        )
+    assert "rate-limit wait exceeded" in exc.value.failed_error
+    # Budget keyed per <tenant, host+path>.
+    assert any("org-1" in k and "https://api.example.com/users" in k for k in store)
+    assert len(store) == 1
+
+
+def test_rest_connector_local_bucket_when_no_redis() -> None:
+    """Without a redis_client the connector stays on the per-process bucket."""
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "per_item_timeout": 0.001},
+            "rate_limit": {"requests_per_second": 0.001, "burst": 2},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+
+    with pytest.raises(RESTFanOutFailureError, match="rate-limit wait exceeded"):
+        asyncio.run(
+            c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(3)]}))
+        )
+    # Local store carried the destination bucket.
+    assert len(c._rate_buckets) == 1
+
+
+def test_rest_connector_redis_failure_falls_back_to_local_bucket() -> None:
+    """A broken Redis client makes the connector use its connector-local bucket."""
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users",
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "per_item_timeout": 0.001},
+            "rate_limit": {"requests_per_second": 0.001, "burst": 2},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+        redis_client=_BrokenRedis(),
+        tenant_id="org-1",
+    )
+
+    with pytest.raises(RESTFanOutFailureError, match="rate-limit wait exceeded"):
+        asyncio.run(
+            c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(3)]}))
+        )
+    # Even with Redis configured, the connector-local bucket was the fallback.
+    assert len(c._rate_buckets) == 1

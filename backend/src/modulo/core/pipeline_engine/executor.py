@@ -1890,6 +1890,7 @@ class PipelineExecutor:
                     hub = ConnectorHub(
                         secrets_backend=secrets_backend,
                         runtime_provider=runtime_hub,
+                        org_id=str(org_id),
                     )
                     await hub.__aenter__()
                     await hub.initialise(rows, allowed_connectors=allowed_connectors)
