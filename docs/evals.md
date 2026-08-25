@@ -249,3 +249,43 @@ The SuiteRun / comparison ENDPOINTS and UI are gated behind the existing
 `eval_maturity` flag (`eval_maturity_enabled()`), fail-closed to the legacy
 suite path. The data layer is always present; only the new comparison surface is
 gated.
+
+## Leaderboard / rollup read-model (FAR-378)
+
+The READ side of the eval flywheel is a pure read-model over the now-structured
+`SuiteRun` / `eval_results` data. It is **live aggregation** over the existing
+tables — there is no parallel materialised table, no new "scores over time"
+store — so it can never diverge from what the writer actually persisted.
+
+Two endpoints:
+
+* `GET /api/v1/evals/leaderboard?group_by=pipeline|node|agent` — per-axis
+  leaderboard ranked by aggregate pass-rate, optional `eval_id` filter (the
+  cross-pipeline rollup), plus `pipeline_id` / `node_id` / `model_backend_id`
+  and `days` filters.
+* `GET /api/v1/evals/{eval_id}/timeseries` — day-bucketed pass-rate series for
+  one eval, with a window `summary` and a `pipelines` cross-pipeline rollup.
+
+### The pass-rate-only rule (non-circular)
+
+Leaderboards and time-series rank and aggregate on **pass-rate only** — the
+`passed` boolean, never the raw `score` column. A raw score is not comparable
+across differing `eval_type` (an `llm_judge` 0.8 and a `regex` 0.6 measure
+different things), so every aggregation **partitions by `eval_type`** and rolls
+up by *counting passes*, never by *averaging scores*. A mixed-`eval_type` axis
+is never ranked on a raw score:
+
+* each leaderboard entry carries a per-`eval_type` `by_type` breakdown
+  (`pass_rate` / `passed` / `total` / `run_count`); the entry-level
+  `pass_rate` is `passed/total` across the boolean partitions, never a score
+  mean;
+* the timeseries buckets `eval_type` separately too.
+
+### Isolation and determinism
+
+Every query injects the explicit `organisation_id = :org` predicate —
+`modulo_app` is BYPASSRLS, so the predicate is the ONLY isolation control
+(`set_rls_org` remains defense-in-depth). Suite-run outcomes count only when the
+run is terminal (`completed`/`partial`), so the read-model is deterministic
+across two calls; legacy pipeline-path rows (no `suite_run_id`) are always
+included. Guardrail rows are excluded (the standard eval consumer contract).

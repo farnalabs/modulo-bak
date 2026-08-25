@@ -10,12 +10,12 @@ URLs:
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +24,16 @@ from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_permission
 from modulo.auth.jwt import TenantPrincipal
 from modulo.core.audit_logger import append_audit_event
+from modulo.core.eval_engine.suite_run import (
+    EVAL_LEADERBOARD_DEFAULT_DAYS,
+    EVAL_LEADERBOARD_MAX_DAYS,
+    aggregate_eval_leaderboard,
+    bucket_eval_timeseries,
+    build_eval_leaderboard_query,
+    build_eval_pipelines_query,
+    build_eval_timeseries_query,
+    summarise_eval_timeseries,
+)
 from modulo.core.node_output_split import node_return
 from modulo.db.crud.eval_run import non_guardrail_eval_results_clause
 from modulo.db.models.eval_definition import EvalDefinition
@@ -43,6 +53,8 @@ _CODE_EVALS_DELETE_EVAL_DEFINITION = "evals.delete_eval_definition"
 _CODE_EVALS_LIST_RUN_EVALS = "evals.list_run_evals"
 _CODE_EVALS_COMPARE_EVALS = "evals.compare_evals"
 _CODE_EVALS_CREATE_EVAL_RUN = "evals.create_eval_from_run"
+_CODE_EVALS_LEADERBOARD = "evals.leaderboard"
+_CODE_EVALS_TIMESERIES = "evals.timeseries"
 _EVAL_TYPE_PATTERN = r"^(llm_judge|regex|json_schema|custom_function|guardrail|human_set)$"
 _MSG_PIPELINE_NOT_FOUND = "Pipeline not found"
 
@@ -466,6 +478,205 @@ async def eval_coverage(
             "uncovered_nodes": total - covered_count,
             "coverage_pct": pct,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/evals/leaderboard  (must be before /evals/{eval_id} to avoid
+# the literal "leaderboard" segment being parsed as a {eval_id} uuid)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/evals/leaderboard",
+    status_code=status.HTTP_200_OK,
+    responses={
+        404: {"description": "Not Found"},
+        409: {"description": "Conflict"},
+        500: {"description": "Internal Server Error"},
+        501: {"description": "Not Implemented"},
+        503: {"description": "Service Unavailable"},
+    },
+)
+@handle_db_errors(_CODE_EVALS_LEADERBOARD)
+async def eval_leaderboard(
+    group_by: str = Query("pipeline", pattern="^(pipeline|node|agent)$"),
+    days: int = Query(EVAL_LEADERBOARD_DEFAULT_DAYS, ge=1, le=EVAL_LEADERBOARD_MAX_DAYS),
+    eval_id: uuid.UUID | None = None,
+    pipeline_id: uuid.UUID | None = None,
+    node_id: uuid.UUID | None = None,
+    model_backend_id: uuid.UUID | None = None,
+    session: AsyncSession = Depends(get_db_session),
+    principal: TenantPrincipal = require_permission(_CODE_EVAL_LIST),
+) -> dict[str, Any]:
+    """Return a per-axis leaderboard ranked by aggregate pass-rate (FAR-378).
+
+    A pure read-model over the ``SuiteRun``/``eval_results`` data. The axis is
+    ``pipeline`` | ``node`` | ``agent`` (the model backend that produced the
+    output). Pass-rate is computed from the ``passed`` boolean ONLY — raw
+    ``score`` is never compared across differing ``eval_type``; each axis entry
+    carries a per-``eval_type`` partition (``by_type``) so a mixed-type suite is
+    never ranked on a raw score. Org-scoped: every query carries the explicit
+    ``organisation_id`` predicate.
+    """
+    try:
+        async with session.begin():
+            await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
+
+            statement, params = build_eval_leaderboard_query(
+                org_id=principal.organisation_id,
+                group_by=group_by,
+                days=days,
+                eval_id=eval_id,
+                pipeline_id=pipeline_id,
+                node_id=node_id,
+                model_backend_id=model_backend_id,
+            )
+            rows = (await session.execute(text(statement), params)).all()
+    except HTTPException:
+        raise
+    except IntegrityError:
+        _log.exception(_CODE_EVALS_LEADERBOARD)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=MSG_RESOURCE_ALREADY_EXISTS,
+        ) from None
+    except ProgrammingError:
+        _log.exception(_CODE_EVALS_LEADERBOARD)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=MSG_FEATURE_NOT_AVAILABLE,
+        ) from None
+    except SQLAlchemyError:
+        _log.exception(_CODE_EVALS_LEADERBOARD)
+        _log.warning("evals.leaderboard_db_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=MSG_DB_OPERATION_FAILED,
+        ) from None
+    except Exception:
+        _log.exception("evals.leaderboard_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while computing the eval leaderboard.",
+        ) from None
+
+    entries = aggregate_eval_leaderboard(rows, group_by=group_by)
+    return {"group_by": group_by, "days": days, "entries": entries}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/evals/{eval_id}/timeseries
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/evals/{eval_id}/timeseries",
+    status_code=status.HTTP_200_OK,
+    responses={
+        404: {"description": "Not Found"},
+        409: {"description": "Conflict"},
+        500: {"description": "Internal Server Error"},
+        501: {"description": "Not Implemented"},
+        503: {"description": "Service Unavailable"},
+    },
+)
+@handle_db_errors(_CODE_EVALS_TIMESERIES)
+async def eval_timeseries(
+    eval_id: uuid.UUID,
+    days: int = Query(EVAL_LEADERBOARD_DEFAULT_DAYS, ge=1, le=EVAL_LEADERBOARD_MAX_DAYS),
+    pipeline_id: uuid.UUID | None = None,
+    node_id: uuid.UUID | None = None,
+    model_backend_id: uuid.UUID | None = None,
+    session: AsyncSession = Depends(get_db_session),
+    principal: TenantPrincipal = require_permission(_CODE_EVAL_LIST),
+) -> dict[str, Any]:
+    """Return a day-bucketed pass-rate time-series for a single eval (FAR-378).
+
+    Zeros the day grid from the window start through today so the series is
+    continuous; an absent day is emitted with ``total=0`` and ``pass_rate=None``
+    (never ``0.0``). Carries a cross-pipeline rollup (``pipelines``) and a
+    window ``summary``. Pass-rate is computed from ``passed`` only, partitioned
+    by ``eval_type``.
+    """
+    try:
+        async with session.begin():
+            await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
+
+            eval_def = (
+                await session.execute(
+                    select(EvalDefinition).where(
+                        EvalDefinition.id == eval_id,
+                        EvalDefinition.organisation_id == principal.organisation_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if eval_def is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_EVAL_DEFINITION_NOT_FOUND)
+
+            statement, params = build_eval_timeseries_query(
+                org_id=principal.organisation_id,
+                eval_id=eval_id,
+                days=days,
+                pipeline_id=pipeline_id,
+                node_id=node_id,
+                model_backend_id=model_backend_id,
+            )
+            rows = (await session.execute(text(statement), params)).all()
+
+            pipeline_statement, pipeline_params = build_eval_pipelines_query(
+                org_id=principal.organisation_id,
+                eval_id=eval_id,
+                days=days,
+                node_id=node_id,
+                model_backend_id=model_backend_id,
+            )
+            pipeline_rows = (await session.execute(text(pipeline_statement), pipeline_params)).all()
+    except HTTPException:
+        raise
+    except IntegrityError:
+        _log.exception(_CODE_EVALS_TIMESERIES)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=MSG_RESOURCE_ALREADY_EXISTS,
+        ) from None
+    except ProgrammingError:
+        _log.exception(_CODE_EVALS_TIMESERIES)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=MSG_FEATURE_NOT_AVAILABLE,
+        ) from None
+    except SQLAlchemyError:
+        _log.exception(_CODE_EVALS_TIMESERIES)
+        _log.warning("evals.timeseries_db_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=MSG_DB_OPERATION_FAILED,
+        ) from None
+    except Exception:
+        _log.exception("evals.timeseries_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while computing the eval time-series.",
+        ) from None
+
+    since = datetime.now(UTC) - timedelta(days=days)
+    buckets = bucket_eval_timeseries(rows, since=since)
+    summary = summarise_eval_timeseries(buckets)
+    pipelines = [
+        {"pipeline_id": str(r.pipeline_id), "pipeline_name": r.pipeline_name}
+        for r in pipeline_rows
+        if r.pipeline_id is not None
+    ]
+    return {
+        "eval_id": str(eval_id),
+        "eval_name": eval_def.name,
+        "days": days,
+        "buckets": buckets,
+        "summary": summary,
+        "pipelines": pipelines,
     }
 
 
