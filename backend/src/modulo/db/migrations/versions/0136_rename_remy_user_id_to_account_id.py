@@ -33,7 +33,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0136_rename_remy_user_id_to_account_id"
-down_revision: str | None = "0131_eval_dataset_corpus"
+down_revision: str | None = "0135_status_check_constraints"
 branch_labels: str | None = None
 depends_on: str | None = None
 
