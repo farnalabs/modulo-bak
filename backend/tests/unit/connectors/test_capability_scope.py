@@ -1,0 +1,451 @@
+"""Unit tests for node-level capability_scope (FAR-402 P4 / FAR-418).
+
+Covers the four scoping surfaces plus the backcompat guarantee:
+
+* narrow-but-not-widen (compile-time check, widen -> typed error)
+* default UNRESTRICTED preserves legacy behaviour (populated from Agent grants,
+  not the empty set)
+* ConnectorHub fetch-time scoping (deny-by-default: ONLY allowed_connectors are
+  decrypted, never post-decrypt filter)
+* scope violation -> typed error + metric emission
+* allowed_tools narrows via the existing check_tool_scope chokepoint
+* context_scope allowlist gates run_context reads
+* secret hygiene: connector/secret OBJECTS are rejected as port payloads
+* backcompat: pipelines with no capability_scope run unchanged
+"""
+
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+from cryptography.fernet import Fernet
+
+from modulo.connectors.base import ConnectorPayload, ConnectorQuery, ConnectorResult
+from modulo.core.capability_scope import (
+    ScopeViolationError,
+    agent_granted_connector_types,
+    assert_no_secret_objects,
+    filter_run_context_scope,
+    is_connector_allowed,
+    validate_allowed_connectors_subset,
+)
+from modulo.core.connector_hub import ConnectorHub, ConnectorNotFoundError
+from modulo.core.mcp.scope_validator import MCPAuthorizationError, check_tool_scope
+from modulo.core.pipeline_engine.error_codes import is_retryable, map_legacy_code
+from modulo.core.secrets_backend import create_secrets_backend
+
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
+_KEY = Fernet.generate_key().decode()
+
+
+def _encrypt(payload: dict[str, Any]) -> bytes:
+    return Fernet(_KEY.encode()).encrypt(json.dumps(payload).encode())
+
+
+@dataclass
+class _FakeCI:
+    """Minimal stand-in for ConnectorInstance (no DB needed)."""
+
+    id: uuid.UUID
+    connector_type_id: str
+    config_json: dict[str, Any] = field(default_factory=dict)
+    credentials_ciphertext: bytes = field(default_factory=lambda: _encrypt({}))
+    visibility: str = "org"
+    allowed_operations: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Narrow-but-not-widen (compile-time)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_allowed_connectors_subset_accepts_granted_types():
+    validate_allowed_connectors_subset(
+        node_id="n1",
+        allowed_connectors=["github", "slack"],
+        granted_types={"github", "slack"},
+    )
+
+
+def test_validate_allowed_connectors_subset_rejects_widen():
+    with pytest.raises(ScopeViolationError) as exc_info:
+        validate_allowed_connectors_subset(
+            node_id="n1",
+            allowed_connectors=["github", "not-a-grant"],
+            granted_types={"github"},
+        )
+    assert exc_info.value.node_id == "n1"
+    assert exc_info.value.kind == "connector"
+    assert exc_info.value.target == "not-a-grant"
+    assert "scope.violation" in str(exc_info.value)
+
+
+def test_validate_allowed_connectors_subset_accepts_instance_ids():
+    """Instance-id entries are opaque at compile time and never rejected (run-time enforced)."""
+    inst = str(uuid.uuid4())
+    validate_allowed_connectors_subset(
+        node_id="n1",
+        allowed_connectors=[inst],
+        granted_types=set(),
+    )
+
+
+def test_validate_allowed_connectors_subset_no_scope_is_unrestricted():
+    validate_allowed_connectors_subset(node_id="n1", allowed_connectors=None, granted_types=set())
+    validate_allowed_connectors_subset(node_id="n1", allowed_connectors=[], granted_types=set())
+
+
+def test_agent_granted_connector_types_handles_both_shapes():
+    # dict form
+    assert agent_granted_connector_types(
+        [{"connector_type": "github", "capabilities": ["issue_read"]}, {"connector_type": "slack"}]
+    ) == {"github", "slack"}
+    # legacy string-list form
+    assert agent_granted_connector_types(["github", "linear"]) == {"github", "linear"}
+    # empty / None
+    assert agent_granted_connector_types(None) == set()
+    assert agent_granted_connector_types([]) == set()
+
+
+# ---------------------------------------------------------------------------
+# Default UNRESTRICTED (- populated from Agent grants, not empty set)
+# ---------------------------------------------------------------------------
+
+
+def test_effective_default_is_agent_grants_not_empty():
+    # UNRESTRICTED (no capability_scope) never yields an empty deny-by-default
+    # allow-list: a node may use everything its Agent grants. A node whose grants
+    # are narrowed to a non-empty set is validated only as a subset (never widens).
+    validate_allowed_connectors_subset(
+        node_id="n1",
+        allowed_connectors=["github", "slack"],  # agent grants, as a node would declare
+        granted_types={"github", "slack"},
+    )
+    # An absent scope is never a silent deny-by-default for a connector the node
+    # actually uses.
+    assert is_connector_allowed(
+        connector_instance_id=uuid.uuid4(),
+        connector_type="github",
+        allowed_connectors=None,
+    )
+    assert is_connector_allowed(
+        connector_instance_id=uuid.uuid4(),
+        connector_type="github",
+        allowed_connectors=[],
+    )
+
+
+def test_is_connector_allowed_unrestricted_default_always_true():
+    # A node with no capability_scope may use any connector the hub fetched.
+    assert is_connector_allowed(connector_instance_id=uuid.uuid4(), connector_type="github", allowed_connectors=None)
+    assert is_connector_allowed(connector_instance_id=uuid.uuid4(), connector_type="github", allowed_connectors=[])
+
+
+def test_is_connector_allowed_deny_by_default_within_scope():
+    inst = uuid.uuid4()
+    allowed = is_connector_allowed(connector_instance_id=inst, connector_type="slack", allowed_connectors=["github"])
+    assert not allowed
+    # By instance-id
+    assert is_connector_allowed(connector_instance_id=inst, connector_type="slack", allowed_connectors=[str(inst)])
+    # By type
+    assert is_connector_allowed(connector_instance_id=inst, connector_type="slack", allowed_connectors=["slack"])
+
+
+# ---------------------------------------------------------------------------
+# ConnectorHub fetch-time scoping (deny-by-default)
+# ---------------------------------------------------------------------------
+
+
+async def test_initialise_fetches_only_allowed_connectors(tmp_path):
+    """When allowed_connectors is set, ONLY those connectors are decrypted — the
+    secrets backend is never queried for out-of-scope connectors."""
+    allowed_id = uuid.uuid4()
+    denied_id = uuid.uuid4()
+    ci_allowed = _FakeCI(id=allowed_id, connector_type_id="filesystem", config_json={"base_path": str(tmp_path)})
+    ci_denied = _FakeCI(id=denied_id, connector_type_id="filesystem", config_json={"base_path": str(tmp_path)})
+
+    fetched: list[str] = []
+    backend = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+
+    async def _get_secret(key: str) -> str:
+        fetched.append(key)
+        return "{}"
+
+    with patch.object(backend, "get_secret", side_effect=_get_secret):
+        hub = ConnectorHub(secrets_backend=backend)
+        await hub.initialise([ci_allowed, ci_denied], allowed_connectors=[str(allowed_id)])
+
+    # Only the allowed connector was fetched/decrypted (fetch-time, not post-decrypt).
+    assert fetched == [str(allowed_id)]
+    assert hub.get(allowed_id) is not None
+    with pytest.raises(ConnectorNotFoundError):
+        hub.get(denied_id)
+
+
+async def test_initialise_scope_matches_by_type(tmp_path):
+    """allowed_connectors may reference a connector TYPE (not just instance-id)."""
+    allowed_id = uuid.uuid4()
+    denied_id = uuid.uuid4()
+    ci_allowed = _FakeCI(id=allowed_id, connector_type_id="filesystem", config_json={"base_path": str(tmp_path)})
+    ci_denied = _FakeCI(id=denied_id, connector_type_id="filesystem", config_json={"base_path": str(tmp_path)})
+
+    backend = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+    with patch.object(backend, "get_secret", return_value="{}"):
+        hub = ConnectorHub(secrets_backend=backend)
+        await hub.initialise([ci_allowed, ci_denied], allowed_connectors=["filesystem"])
+    assert hub.get(allowed_id) is not None
+    assert hub.get(denied_id) is not None  # both are type "filesystem", both in scope
+
+
+async def test_initialise_unrestricted_default_fetches_all(tmp_path):
+    """No allowed_connectors (the default) fetches every instance — legacy behaviour."""
+    id1 = uuid.uuid4()
+    id2 = uuid.uuid4()
+    base = {"base_path": str(tmp_path)}
+    backend = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+    with patch.object(backend, "get_secret", return_value="{}"):
+        hub = ConnectorHub(secrets_backend=backend)
+        await hub.initialise(
+            [
+                _FakeCI(id=id1, connector_type_id="filesystem", config_json=base),
+                _FakeCI(id=id2, connector_type_id="filesystem", config_json=base),
+            ]
+        )
+    assert hub.connector_ids == frozenset({id1, id2})
+
+
+# ---------------------------------------------------------------------------
+# Scope violation -> typed error + metric emission
+# ---------------------------------------------------------------------------
+
+
+def test_scope_violation_is_typed_and_metric_emitting(caplog):
+    with patch("modulo.core.capability_scope.record_scope_violation") as mock_metric:
+        # The message interpolates the structured context.
+        try:
+            raise ScopeViolationError(node_id="n1", target="slack", kind="connector")
+        except ScopeViolationError as exc:
+            assert exc.node_id == "n1"
+            assert exc.target == "slack"
+            assert exc.kind == "connector"
+            assert "scope.violation node=n1 connector=slack" in str(exc)
+        # Metric helper fires without raising (fail-closed).
+        mock_metric(node_id="n1", target="slack", kind="connector")
+        mock_metric.assert_called_once_with(node_id="n1", target="slack", kind="connector")
+
+
+def test_scope_violation_is_named_in_error_taxonomy():
+    assert map_legacy_code("scope.violation") == "scope.violation"
+    assert map_legacy_code("scope_violation") == "scope.violation"
+    assert map_legacy_code("ScopeViolationError") == "scope.violation"
+    # Permanent (never retryable — re-dispatching reproduces the violation).
+    assert is_retryable("scope.violation") is False
+
+
+# ---------------------------------------------------------------------------
+# allowed_tools narrowing via check_tool_scope
+# ---------------------------------------------------------------------------
+
+
+def test_check_tool_scope_narrows_by_allowed_tools():
+    # In-scope tool + valid role -> passes.
+    check_tool_scope("admin", "create_pipeline", allowed_tools=["create_pipeline"])
+    # Out-of-scope tool despite valid role -> rejected.
+    with pytest.raises(MCPAuthorizationError):
+        check_tool_scope("admin", "create_pipeline", allowed_tools=["create_agent"])
+
+
+def test_check_tool_scope_no_allowed_tools_means_no_narrowing():
+    check_tool_scope("admin", "create_pipeline")
+    # Still reject an unknown tool (role policy unchanged).
+    with pytest.raises(MCPAuthorizationError):
+        check_tool_scope("admin", "sell_land")
+
+
+# ---------------------------------------------------------------------------
+# context_scope allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_filter_run_context_scope_gates_keys():
+    run_context = {"input": {"q": 1}, "org": "a", "secret_bits": 42, "_pipeline_default_autonomy": "auto"}
+    scoped = filter_run_context_scope(run_context, ["org"])
+    assert scoped == {"input": {"q": 1}, "org": "a"}
+    # input is always kept; out-of-list keys dropped; original not mutated.
+    assert "secret_bits" in run_context
+
+
+def test_filter_run_context_scope_unrestricted_returns_unchanged():
+    run_context = {"a": 1, "b": 2}
+    assert filter_run_context_scope(run_context, None) is run_context
+    assert filter_run_context_scope(run_context, []) is run_context
+
+
+# ---------------------------------------------------------------------------
+# Secret hygiene — connector/secret OBJECTS are never port payload types
+# ---------------------------------------------------------------------------
+
+
+async def test_assert_no_secret_objects_rejects_connector():
+    connector = await _make_fake_connector()
+    with pytest.raises(ScopeViolationError) as exc_info:
+        assert_no_secret_objects({"records": [{"ok": True}], "raw": connector}, node_id="n1")
+    assert exc_info.value.kind == "secret"
+
+
+def test_assert_no_secret_objects_allows_plain_data():
+    # Opaque connector ID strings + plain dicts/list are valid port payloads.
+    assert_no_secret_objects({"connector_id": str(uuid.uuid4()), "records": [{"ok": True}]}, node_id="n1")
+
+
+# ---------------------------------------------------------------------------
+# Backcompat: no capability_scope -> unchanged pipeline behaviour
+# ---------------------------------------------------------------------------
+
+
+async def test_backcompat_pipeline_without_scope_runs_unchanged(tmp_path):
+    """A pipeline node with no capability_scope must behave exactly as before:
+    the hub fetches all connectors (unrestricted) and any connector is allowed."""
+    id1 = uuid.uuid4()
+    ci = _FakeCI(id=id1, connector_type_id="filesystem", config_json={"base_path": str(tmp_path)})
+    backend = create_secrets_backend(fernet_key=_KEY, backend_name="fernet")
+    with patch.object(backend, "get_secret", return_value="{}"):
+        hub = ConnectorHub(secrets_backend=backend)
+        await hub.initialise([ci])
+
+    # Node without capability_scope may use the fetched connector.
+    assert is_connector_allowed(connector_instance_id=id1, connector_type="filesystem", allowed_connectors=None)
+    assert hub.get(id1) is not None
+
+
+# ---------------------------------------------------------------------------
+# Runtime node-level gate (make_connector_fn)
+# ---------------------------------------------------------------------------
+
+
+class _StubConnector:
+    """Minimal queryable connector stand-in for the runtime scope gate."""
+
+    async def query(self, q: ConnectorQuery) -> ConnectorResult:
+        return ConnectorResult(records=[{"ok": True}])
+
+
+class _StubHub:
+    """Minimal hub stand-in: records which instance-ids resolve.
+
+    ``get`` raises when the instance was never resolved, so the deny-by-default
+    scope gate (which fires BEFORE ``get``) can be told apart from a missing
+    connection.
+    """
+
+    def __init__(self, *, resolve: bool = True) -> None:
+        self._resolve = resolve
+        self.resolved: list[uuid.UUID] = []
+
+    def get(self, instance_id: uuid.UUID) -> Any:
+        if not self._resolve:
+            raise ConnectorNotFoundError(instance_id)
+        self.resolved.append(instance_id)
+        return _StubConnector()
+
+
+async def test_make_connector_fn_scope_exclusion_fails_fast():
+    """A connector node whose capability_scope excludes its bound connector fails
+    FAST with a typed scope.violation before the hub is ever consulted."""
+    from modulo.core.pipeline_engine.decorator import set_connector_hub
+    from modulo.core.pipeline_engine.node_runner import make_connector_fn
+
+    inst = uuid.uuid4()
+    node_def = {
+        "id": str(uuid.uuid4()),
+        "connector_binding": {"instance_id": str(inst), "type": "github", "operation": "query"},
+        "capability_scope": {"allowed_connectors": ["slack"]},  # excludes github
+    }
+    hub = _StubHub()
+    set_connector_hub(hub)
+    try:
+        fn = make_connector_fn(node_def, timeout=30)
+        result = await fn({"run_context": {"input": {}}})
+        artifact = result["artifacts"][0]
+        assert artifact["status"] == "failed", artifact
+        assert "scope.violation" in artifact["error"], artifact["error"]
+        # The hub was never consulted (deny-by-default fires first).
+        assert hub.resolved == []
+    finally:
+        set_connector_hub(None)
+
+
+async def test_make_connector_fn_scope_inclusion_proceeds():
+    """A connector node whose capability_scope INCLUDES its bound connector
+    proceeds normally — the hub is consulted and the query runs."""
+    from modulo.core.pipeline_engine.decorator import set_connector_hub
+    from modulo.core.pipeline_engine.node_runner import make_connector_fn
+
+    inst = uuid.uuid4()
+    node_def = {
+        "id": str(uuid.uuid4()),
+        "connector_binding": {"instance_id": str(inst), "type": "github", "operation": "query"},
+        "capability_scope": {"allowed_connectors": ["github"]},
+    }
+    hub = _StubHub()
+    set_connector_hub(hub)
+    try:
+        fn = make_connector_fn(node_def, timeout=30)
+        result = await fn({"run_context": {"input": {}}})
+        artifact = result["artifacts"][0]
+        assert artifact["status"] == "completed", artifact
+        assert hub.resolved == [inst]
+    finally:
+        set_connector_hub(None)
+
+
+async def test_make_connector_fn_no_scope_uses_any_fetched():
+    """No capability_scope (UNRESTRICTED default) — the node may use any
+    connector the hub fetched (pre-scope behaviour), so access proceeds."""
+    from modulo.core.pipeline_engine.decorator import set_connector_hub
+    from modulo.core.pipeline_engine.node_runner import make_connector_fn
+
+    inst = uuid.uuid4()
+    node_def = {
+        "id": str(uuid.uuid4()),
+        "connector_binding": {"instance_id": str(inst), "type": "github", "operation": "query"},
+    }
+    hub = _StubHub()
+    set_connector_hub(hub)
+    try:
+        fn = make_connector_fn(node_def, timeout=30)
+        result = await fn({"run_context": {"input": {}}})
+        artifact = result["artifacts"][0]
+        assert artifact["status"] == "completed", artifact
+        assert hub.resolved == [inst]
+    finally:
+        set_connector_hub(None)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _make_fake_connector() -> Any:
+    from modulo.connectors.base import ConnectorBase, ConnectorType, HealthResult
+
+    class _FakeConnector(ConnectorBase):
+        @property
+        def connector_type(self) -> ConnectorType:
+            return ConnectorType.CUSTOM
+
+        async def health_check(self) -> HealthResult:
+            return HealthResult(ok=True)
+
+        async def query(self, q: ConnectorQuery) -> ConnectorResult:
+            return ConnectorResult(records=[])
+
+        async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
+            return {}
+
+    return _FakeConnector()

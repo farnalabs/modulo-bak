@@ -12,6 +12,7 @@ registry is the single source of truth (ADR 017).
 """
 
 import types
+from collections.abc import Sequence
 from logging import getLogger
 
 from modulo.auth.permissions import (
@@ -134,6 +135,7 @@ def check_tool_scope(
     current_role: str | None,
     tool_name: str,
     action: str | None = None,
+    allowed_tools: Sequence[str] | None = None,
 ) -> None:
     if current_role is None:
         _log.warning("Scope check failed: no authentication context")
@@ -144,6 +146,23 @@ def check_tool_scope(
         raise MCPAuthorizationError("Tool name must be a string")
 
     normalized = _sanitize(tool_name, name="tool_name")
+
+    # FAR-418: node-level allowed_tools narrowing. When a node's capability_scope
+    # declares an allowed-tool allow-list, it is an ADDITIONAL filter layered on
+    # the (already-validated) role check — the role must still permit the tool,
+    # and the tool must be on the node's list. Absent/empty (the UNRESTRICTED
+    # default) performs no narrowing, preserving pre-scope behaviour.
+    if allowed_tools:
+        allowed = {_sanitize(t, name="allowed_tool") for t in allowed_tools}
+        if normalized not in allowed:
+            _log.warning(
+                "Tool '%s' is outside the node's allowed_tools scope (allowed=%s)",
+                tool_name,
+                ",".join(sorted(allowed)),
+            )
+            raise MCPAuthorizationError(
+                f"Tool '{tool_name}' is outside the node's allowed_tools scope",
+            )
 
     if action is not None:
         if not isinstance(action, str):
