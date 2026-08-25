@@ -1,0 +1,206 @@
+"""Node-level capability scoping (FAR-402 P4 / FAR-418).
+
+A pipeline node may declare a least-privilege contract — ``capability_scope`` —
+that narrows (never widens) what the node's Agent is granted:
+
+* ``allowed_connectors``: connector instance-ids and/or connector types the node
+  may resolve from the ``ConnectorHub``. Deny-by-default within the scope: the
+  hub is fetched with ONLY these connectors (fetch-time scoping — the security
+  win is that non-scoped credentials are never decrypted at all).
+* ``allowed_tools``: MCP/runtime tools the node's agent may invoke. Wired as an
+  additional narrowing filter through the existing ``check_tool_scope``
+  chokepoint (``modulo.core.mcp.scope_validator``) — no parallel tool-scope
+  system.
+* ``context_scope``: allowlist of ``run_context`` keys the node may read
+  (need-to-know boundary).
+
+Default = UNRESTRICTED. When ``capability_scope`` is absent the node behaves
+exactly as before (it may use all of its Agent's grants); the effective
+allow-list for that default is populated from the Agent's existing
+``connector_type_refs`` (NOT the empty set), so there is no silent break.
+
+Scope violation semantics: a node that would use a connector/tool/context key
+excluded by its scope fails fast with a typed, logged, metric-emitting
+``ScopeViolationError`` (stable error code ``scope.violation``).
+
+This module is intentionally lightweight (no DB, no LangGraph) so it is
+importable from the API layer, the node runner, and unit tests without pulling
+heavy graph machinery.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Stable dotted error-code taxonomy entry (see pipeline_engine.error_codes).
+SCOPE_VIOLATION_CODE = "scope.violation"
+
+# OTel meter namespace shared with the pipeline engine.
+_METER_NAME = "modulo.pipeline_engine"
+
+# run_context keys never dropped by context_scope gating: the node's own input
+# is already schema-gated upstream and is required for the node to run.
+_CONTEXT_ALWAYS_KEPT = ("input",)
+
+
+class ScopeViolationError(ValueError):
+    """Raised when a node uses a capability outside its capability_scope.
+
+    Carries the structured context (node_id, scoped target, kind) so the
+    executor can publish the typed ``scope.violation`` error code. The message
+    interpolates all three attributes for log readability.
+    """
+
+    def __init__(self, *, node_id: str, target: str, kind: str) -> None:
+        self.node_id = node_id
+        self.target = target
+        self.kind = kind
+        super().__init__(f"scope.violation node={node_id} {kind}={target}")
+
+
+def record_scope_violation(*, node_id: str, target: str, kind: str, graph_id: str | None = None) -> None:
+    """Emit the ``scope.violation{graph_id,node_id,connector|tool}`` OTel metric.
+
+    Fail-closed: metrics are advisory, so this never raises — a metric backend
+    outage must not mask the (already-emitted) typed error or abort the run.
+    """
+    try:
+        from opentelemetry import metrics
+
+        provider = metrics.get_meter_provider()
+        if provider is None:
+            return
+        meter = provider.get_meter(_METER_NAME, version="0.1.0")
+        counter = meter.create_counter(
+            name="scope_violations_total",
+            description="Node capability_scope violations, by node and scoped target",
+            unit="1",
+        )
+        counter.add(1, {"graph_id": graph_id or "", "node_id": node_id, kind: target})
+    except Exception:
+        logger.debug("scope.metrics_unavailable", exc_info=True)
+
+
+def agent_granted_connector_types(connector_type_refs: Any) -> set[str]:
+    """Extract the granted connector-type strings from an Agent's connector_type_refs.
+
+    Handles both persisted shapes: the dict form ``{"connector_type": "github",
+    "capabilities": ["issue_read"]}`` and the legacy string-list form
+    ``["github"]``. Returns the empty set for a missing/None column (an agent
+    with no grants narrows every node against nothing — nodes that reference no
+    connectors are unaffected).
+    """
+    types: set[str] = set()
+    if not connector_type_refs:
+        return types
+    for ref in connector_type_refs:
+        if isinstance(ref, str):
+            types.add(ref)
+        elif isinstance(ref, dict):
+            connector_type = ref.get("connector_type")
+            if isinstance(connector_type, str):
+                types.add(connector_type)
+    return types
+
+
+def _looks_like_instance_id(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_allowed_connectors_subset(
+    *,
+    node_id: str,
+    allowed_connectors: list[str] | None,
+    granted_types: set[str],
+) -> None:
+    """Compile-time narrow-not-widen check (never widens).
+
+    Every connector-TYPE entry in ``allowed_connectors`` must exist in the
+    node's Agent grants. Connector instance-id entries cannot be checked against
+    ``connector_type_refs`` (which carries types only) — they are opaque at
+    compile time and enforced at run time by the deny-by-default fetch scope.
+    A widen attempt raises ``ScopeViolationError`` so the graph save rejects it.
+
+    When ``allowed_connectors`` is ``None``/empty the node is unrestricted
+    (default), so nothing is rejected.
+    """
+    if not allowed_connectors:
+        return
+    for entry in allowed_connectors:
+        if _looks_like_instance_id(entry):
+            continue
+        if entry not in granted_types:
+            raise ScopeViolationError(node_id=node_id, target=entry, kind="connector")
+
+
+def is_connector_allowed(
+    *,
+    connector_instance_id: uuid.UUID,
+    connector_type: str,
+    allowed_connectors: list[str] | None,
+) -> bool:
+    """Runtime allow-check for a single connector against a node's scope.
+
+    Unrestricted (``allowed_connectors`` is ``None`` or empty) -> always True,
+    matching the pre-scope default (a node may use everything the hub fetched).
+    Otherwise the connector must be named by instance-id OR type.
+    """
+    if not allowed_connectors:
+        return True
+    id_str = str(connector_instance_id)
+    return any(entry in (id_str, connector_type) for entry in allowed_connectors)
+
+
+def filter_run_context_scope(run_context: dict[str, Any], context_scope: list[str] | None) -> dict[str, Any]:
+    """Allowlist-gate the ``run_context`` keys visible to a node's agent.
+
+    Unrestricted (``context_scope`` ``None``/empty) -> ``run_context`` returned
+    unchanged. When set, only ``context_scope`` keys (plus ``_CONTEXT_ALWAYS_KEPT``)
+    are retained — a need-to-know boundary. Returns a shallow copy; the original
+    mapping is never mutated.
+    """
+    if not context_scope:
+        return run_context
+    allowed = set(context_scope)
+    return {k: v for k, v in run_context.items() if k in allowed or k in _CONTEXT_ALWAYS_KEPT}
+
+
+def _is_connector_object(value: Any) -> bool:
+    """Duck-typed connector/secret-object identity check (no heavy import).
+
+    A packaged connector object exposes a ``connector_type`` property and a
+    callable ``query`` — the _TracedConnector proxy forwards both via
+    ``__getattr__``, so this also rejects the wrapped (secret-bearing) form.
+    Plain dicts / ConnectorResult records are never matched.
+    """
+    return hasattr(value, "connector_type") and callable(getattr(value, "query", None))
+
+
+def assert_no_secret_objects(value: Any, *, node_id: str) -> None:
+    """Secret-hygiene guard: connector/secret OBJECTS are never valid port payloads.
+
+    Only opaque connector IDs may appear in state/ports. Recursively rejects any
+    connector/secret object (see :func:`_is_connector_object`) with a typed
+    ``ScopeViolationError``; plain-serializable data always passes. Raises on the
+    first offending nested value.
+    """
+    if _is_connector_object(value):
+        raise ScopeViolationError(
+            node_id=node_id,
+            target=type(value).__name__,
+            kind="secret",
+        )
+    if isinstance(value, dict):
+        for nested in value.values():
+            assert_no_secret_objects(nested, node_id=node_id)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            assert_no_secret_objects(nested, node_id=node_id)

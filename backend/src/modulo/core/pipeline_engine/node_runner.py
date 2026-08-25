@@ -70,6 +70,7 @@ from langgraph.types import interrupt
 if TYPE_CHECKING:
     from e2b import AsyncSandbox
 
+from modulo.core.capability_scope import filter_run_context_scope
 from modulo.core.cost_controller.breakdown.constants import (
     MAX_REPORTABLE_BAND_USD,
     MAX_REPORTABLE_USD_MIN,
@@ -1527,9 +1528,15 @@ def make_node_fn(
 
         env = SandboxedEnvironment()
         template = env.from_string(prompt_template)
+        # FAR-418: context_scope — the agent's run_context VIEW (the keys fed to
+        # the prompt template) is allowlist-gated to the node's need-to-know set.
+        # The machinery reads (run_overrides, autonomy) still use the full
+        # run_context so internal control keys are never starved.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
         template_vars: dict[str, Any] = {
             "state": state,
-            "run_context": run_context,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         # Inject resolved parameters as {{ parameter.<key> }}.
@@ -2247,6 +2254,13 @@ def make_connector_fn(
     node_id: str = str(node_def["id"])
     binding = node_def.get("connector_binding") or {}
     op: str = binding.get("operation", "query")
+    # FAR-418: node-level capability_scope. ``allowed_connectors`` narrows (never
+    # widens) which connectors this node may resolve — deny-by-default within the
+    # scope. Absent/empty (the UNRESTRICTED default) preserves the pre-scope
+    # behaviour: the node may use anything the hub fetched.
+    scope = node_def.get("capability_scope") or {}
+    allowed_connectors: list[str] | None = scope.get("allowed_connectors")
+    connector_type: str = binding.get("type", "")
 
     @cancellable_node(timeout=timeout)
     async def _connector_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -2261,6 +2275,12 @@ def make_connector_fn(
         )
 
         from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+        from modulo.core.capability_scope import (
+            ScopeViolationError,
+            assert_no_secret_objects,
+            is_connector_allowed,
+            record_scope_violation,
+        )
         from modulo.core.pipeline_engine.decorator import get_connector_hub
 
         hub = get_connector_hub()
@@ -2273,8 +2293,23 @@ def make_connector_fn(
 
         import uuid as _uuid
 
+        instance_uuid = _uuid.UUID(str(instance_id_str))
+        # FAR-418: deny-by-default within the node's connector scope. A node that
+        # targets a connector excluded by its capability_scope fails FAST with a
+        # typed, logged, metric-emitting ScopeViolationError (never silently).
+        if not is_connector_allowed(
+            connector_instance_id=instance_uuid,
+            connector_type=connector_type,
+            allowed_connectors=allowed_connectors,
+        ):
+            target = connector_type or str(instance_uuid)
+            scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+            record_scope_violation(node_id=node_id, target=target, kind="connector")
+            _log.error("scope.violation node=%s connector=%s", node_id, target)
+            return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
         try:
-            connector = hub.get(_uuid.UUID(str(instance_id_str)))
+            connector = hub.get(instance_uuid)
         except Exception as _conn_exc:
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": f"connector error: {_conn_exc}"}]}
 
@@ -2300,6 +2335,16 @@ def make_connector_fn(
                 result = await connector.query(query)
         except Exception as exc:
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(exc)}]}
+
+        # FAR-418: secret hygiene — connector/secret OBJECTS are never valid port
+        # payload types; only opaque connector IDs may enter state. Guard the
+        # output before it is written into the run's state/ports.
+        try:
+            assert_no_secret_objects(result, node_id=node_id)
+        except ScopeViolationError as scope_err:
+            record_scope_violation(node_id=node_id, target=scope_err.target, kind="secret")
+            _log.error("scope.violation node=%s secret=%s", node_id, scope_err.target)
+            return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
 
         return {
             "artifacts": [{"node_id": node_id, "status": "completed", "output": result}],
