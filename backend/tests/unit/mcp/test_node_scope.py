@@ -57,11 +57,11 @@ class TestCheckAgentToolScope:
 
     def test_no_node_scope_is_role_only(self) -> None:
         with self._with_scope("admin", None):
-            _check_agent_tool_scope("create_pipeline")
+            assert _check_agent_tool_scope("create_pipeline") is None
 
     def test_in_scope_tool_passes(self) -> None:
         with self._with_scope("admin", ["create_pipeline", "delete_pipeline"]):
-            _check_agent_tool_scope("create_pipeline")
+            assert _check_agent_tool_scope("create_pipeline") is None
 
     def test_out_of_scope_tool_rejected_despite_valid_role(self) -> None:
         with (
