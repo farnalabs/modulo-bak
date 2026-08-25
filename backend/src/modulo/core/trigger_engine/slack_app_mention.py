@@ -241,7 +241,7 @@ async def _resolve_signing_secret(trigger_id: uuid.UUID, cfg: dict[str, Any]) ->
         return decode_stored_secret(signing_secret_raw, _get_settings().fernet_key)
     except Exception:
         _log.exception("slack_app_mention.signing_secret_decrypt_failed trigger=%s", trigger_id)
-        return signing_secret_raw
+        return str(signing_secret_raw)
 
 
 async def _parse_mention(
@@ -392,8 +392,8 @@ async def _create_run(
         raise PipelineRateLimitError(
             pipeline_id,
             exc.rate_limit_key,
-            max_triggers,
-            window_seconds,
+            max_triggers if max_triggers is not None else 0,
+            window_seconds if window_seconds is not None else 0,
         ) from exc
 
 
