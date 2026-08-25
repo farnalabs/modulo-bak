@@ -592,14 +592,6 @@ def _as_int_or_none(value: Any) -> int | None:
         return None
 
 
-def _as_positive_number(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (ValueError, TypeError):
-        return None
-    return number if number > 0 else None
-
-
 def _check_sandbox_stall_detectors(node: dict[str, Any], nid: str, result: ValidationResult) -> None:
     """Sandbox check 8: FAR-306 opt-in stall-detector field validation.
 

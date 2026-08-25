@@ -78,6 +78,10 @@ __all__ = [
     "get_api_key_role_cap_count",  # test-support diagnostic getter for API-key role-cap security counter
     # runs.py wrapper kept for test_prompt_reveal (reveal_node_prompt uses _build_messages)
     "_build_messages_from_agent_and_state",
+    # GraphValidator._check_node_send_budget — flat node-key send-budget reconcile kept for
+    # tests/unit/graph_validator/test_edges_and_sandbox_validation.py (FAR-410); the validate
+    # path uses _check_node_send_budget_bindings, so vulture cannot see a prod call site.
+    "_check_node_send_budget",
     # --- Service methods exercised by tests / framework wiring (no direct prod call site vulture can see) ---
     "get_override",
     "expire_stale",
