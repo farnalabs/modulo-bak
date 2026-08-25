@@ -87,7 +87,7 @@ def _feature_literals_in_root(root: Path) -> set[str]:
 
 def test_product_map_entry_links_resolve():
     """The ``docs/product-map/`` index only links entries that exist."""
-    readme = (PRODUCT_MAP_DIR / "README.md")
+    readme = PRODUCT_MAP_DIR / "README.md"
     if not readme.exists():
         raise AssertionError(f"product map index missing: {readme.relative_to(REPO_ROOT)}")
     links = {
@@ -98,9 +98,8 @@ def test_product_map_entry_links_resolve():
         )
     }
     dangling = {target: (target.split("#")[0]) for target in links.values() if not (PRODUCT_MAP_DIR / target).exists()}
-    assert not dangling, (
-        "docs/product-map/README.md links to missing feature-graph entries:\n"
-        + "\n".join(f"  {target}" for target in sorted(dangling))
+    assert not dangling, "docs/product-map/README.md links to missing feature-graph entries:\n" + "\n".join(
+        f"  {target}" for target in sorted(dangling)
     )
 
 
