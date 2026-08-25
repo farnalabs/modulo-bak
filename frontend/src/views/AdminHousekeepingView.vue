@@ -242,6 +242,7 @@ interface CheckpointRetentionPurgeResponse {
 }
 
 const { get, post } = useApi()
+const { t } = useI18n()
 
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -284,7 +285,7 @@ async function scan() {
     totalCount.value = resp.total_count ?? 0
     selectedIds.value = new Set()
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : useI18n().t('views.AdminHousekeepingView.scan_error')
+    error.value = e instanceof Error ? e.message : t('views.AdminHousekeepingView.scan_error')
   } finally {
     loading.value = false
   }
@@ -318,7 +319,7 @@ async function doCheckpointPurge() {
     ckptConfirming.value = false
     await scan()
   } catch (e: unknown) {
-    ckptError.value = e instanceof Error ? e.message : 'Checkpoint purge failed'
+    ckptError.value = e instanceof Error ? e.message : t('views.AdminHousekeepingView.checkpoint_purge_failed')
   } finally {
     ckptPurgeLoading.value = false
   }
@@ -414,7 +415,7 @@ async function doCleanup() {
     showConfirm.value = false
     await scan()
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : useI18n().t('views.AdminHousekeepingView.cleanup_error')
+    error.value = e instanceof Error ? e.message : t('views.AdminHousekeepingView.cleanup_error')
   } finally {
     cleaningUp.value = false
   }

@@ -2440,7 +2440,8 @@ export default {
       "checkpoint_purged_prefix": "Purged",
       "checkpoint_purged_rows": "{count} checkpoint row | {count} checkpoint rows",
       "checkpoint_purged_from": "from {count} run | from {count} runs",
-      "checkpoint_freed": "· freed {bytes}"
+      "checkpoint_freed": "· freed {bytes}",
+      "checkpoint_purge_failed": "Checkpoint purge failed"
     },
     "LifecycleMapList": {
       "create_lifecycle_map": "Create Lifecycle Map",
