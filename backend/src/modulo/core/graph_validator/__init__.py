@@ -71,14 +71,16 @@ _KNOWN_SANDBOX_TEMPLATES = frozenset({"opencode", "modulo-opencode"})
 _RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure"})
 _RETRY_POLICY_MAX_RETRIES = 5
 
-# REST connector fan-out effective defaults — mirrored from
-# modulo/connectors/rest/__init__.py (``_DEFAULT_MAX_FANOUT_CARDINALITY`` and
-# ``_DEFAULT_TIMEOUT``). The connector defaults both ``max_cardinality`` and
-# ``per_item_timeout`` (to the connector's top-level ``timeout``) when the
-# fan_out config omits them, so the send-budget reconcile must apply the SAME
-# defaults or it silently skips the most common minimal fan-out config.
-_REST_DEFAULT_FANOUT_MAX_CARDINALITY = 1000.0
-_REST_DEFAULT_TIMEOUT = 30.0
+# REST connector fan-out effective defaults. The connector defaults
+# ``max_cardinality`` to ``_DEFAULT_MAX_FANOUT_CARDINALITY`` and
+# ``per_item_timeout`` to its ``_DEFAULT_TIMEOUT`` when the ``fan_out`` config
+# omits them. Note: the connector does NOT read a top-level ``timeout`` config
+# key — the timeout is a constructor parameter defaulted to ``_DEFAULT_TIMEOUT``
+# that the production composition root never overrides, so the connector ALWAYS
+# executes 30.0s per item in production. The send-budget reconcile applies the
+# SAME defaults, imported in _check_node_send_budget directly from the connector
+# module as the single source of truth, so it cannot diverge from what the
+# connector actually executes.
 
 
 def _is_pre_existing(snapshot: PipelineSnapshot) -> bool:
@@ -2482,26 +2484,37 @@ class GraphValidator:
             fanout = (instance.config_json or {}).get("fan_out")
             if not isinstance(fanout, dict):
                 continue
-            # The REST connector DEFAULTS both keys when absent (max_cardinality
-            # -> 1000, per_item_timeout -> the connector's effective timeout,
-            # i.e. the top-level ``timeout`` config or 30s). Substitute those
-            # defaults so a minimal fan_out config still gets reconciled; an
-            # explicitly-malformed value (present but not a positive number) is
-            # still skipped via _as_positive_number.
+            # The connector only fans out when ``enabled`` or ``items_path`` is
+            # truthy (rest/__init__.py ``_fanout_enabled``). A present-but-inert
+            # ``fan_out`` dict (``{}`` or ``{"enabled": false}``) runs as a SINGLE
+            # call, so it must not be reconciled against a fan-out send budget.
+            # Gate on the SAME activation predicate so a disabled fan-out is
+            # skipped rather than spuriously warned about.
+            if not (fanout.get("enabled") or fanout.get("items_path")):
+                continue
+            # The connector DEFAULTS both keys when absent (max_cardinality ->
+            # 1000, per_item_timeout -> its ``_DEFAULT_TIMEOUT``, which is ALWAYS
+            # 30.0s in production — the connector never reads a top-level
+            # ``timeout`` config key, and the composition root constructs it with
+            # no ``timeout`` arg). Substitute those defaults, imported from the
+            # connector module as the single source of truth, so a minimal
+            # fan_out config still gets reconciled; an explicitly-malformed value
+            # (present but not a positive number) is still skipped via
+            # _as_positive_number.
+            from modulo.connectors.rest import _DEFAULT_MAX_FANOUT_CARDINALITY, _DEFAULT_TIMEOUT
+
             if "max_cardinality" in fanout:
                 max_cardinality = _as_positive_number(fanout.get("max_cardinality"))
                 if max_cardinality is None:
                     continue
             else:
-                max_cardinality = _REST_DEFAULT_FANOUT_MAX_CARDINALITY
+                max_cardinality = float(_DEFAULT_MAX_FANOUT_CARDINALITY)
             if "per_item_timeout" in fanout:
                 per_item_timeout = _as_positive_number(fanout.get("per_item_timeout"))
                 if per_item_timeout is None:
                     continue
             else:
-                conn_config = instance.config_json or {}
-                conn_timeout = _as_positive_number(conn_config.get("timeout"))
-                per_item_timeout = _REST_DEFAULT_TIMEOUT if conn_timeout is None else conn_timeout
+                per_item_timeout = _DEFAULT_TIMEOUT
             max_retries_raw = fanout.get("max_retries")
             if isinstance(max_retries_raw, int) and not isinstance(max_retries_raw, bool) and max_retries_raw >= 0:
                 attempts = max_retries_raw + 1

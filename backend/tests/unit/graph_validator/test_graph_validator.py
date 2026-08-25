@@ -1419,7 +1419,7 @@ async def test_node_send_budget_oversubscribed_warns_with_retry_multiplier():
     instance = _connector_instance(
         cid,
         config_json={
-            "fan_out": {"max_cardinality": 100, "per_item_timeout": 5, "max_retries": 2},
+            "fan_out": {"enabled": True, "max_cardinality": 100, "per_item_timeout": 5, "max_retries": 2},
         },
     )
     graph = {
@@ -1443,7 +1443,7 @@ async def test_node_send_budget_within_budget_no_warning():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"max_cardinality": 2, "per_item_timeout": 1, "max_retries": 0}},
+        config_json={"fan_out": {"enabled": True, "max_cardinality": 2, "per_item_timeout": 1, "max_retries": 0}},
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
@@ -1464,7 +1464,7 @@ async def test_node_send_budget_retries_zero_uses_single_attempt():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"max_cardinality": 100, "per_item_timeout": 5, "max_retries": 0}},
+        config_json={"fan_out": {"enabled": True, "max_cardinality": 100, "per_item_timeout": 5, "max_retries": 0}},
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
@@ -1570,12 +1570,19 @@ async def test_node_send_budget_minimal_fanout_defaults_warn():
 
 async def test_node_send_budget_minimal_fanout_uses_connector_timeout():
     """A fan_out config that omits per_item_timeout but sets max_cardinality
-    substitutes the connector's EFFECTIVE timeout (top-level ``timeout`` config)
-    rather than skipping the reconcile."""
+    substitutes the connector's single source of truth for the per-item timeout
+    — its ``_DEFAULT_TIMEOUT`` (30.0s), NOT any top-level ``timeout`` config key.
+
+    The connector NEVER reads ``config_json["timeout"]``: the timeout is a
+    constructor parameter defaulted to ``_DEFAULT_TIMEOUT`` that the production
+    composition root never overrides, so the connector always executes 30.0s per
+    item. A top-level ``timeout: 50`` is present here as dead, ignored config to
+    prove the reconcile does not let it diverge and under-warn.
+    """
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"max_cardinality": 100}, "timeout": 50},
+        config_json={"fan_out": {"enabled": True, "max_cardinality": 100}, "timeout": 50},
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 300}],
@@ -1590,8 +1597,8 @@ async def test_node_send_budget_minimal_fanout_uses_connector_timeout():
     assert result.is_valid
     oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
     assert len(oversub) == 1
-    # 100 * 50 (top-level timeout, not the 30s default) * 3 = 15000s > 300s.
-    assert "per_item_timeout=50.0" in oversub[0].message
+    # 100 * 30.0 (connector default, ignoring the dead top-level timeout:50) * 3 = 9000s > 300s.
+    assert "per_item_timeout=30.0" in oversub[0].message
 
 
 async def test_node_send_budget_explicit_malformed_value_skipped():
@@ -1600,7 +1607,34 @@ async def test_node_send_budget_explicit_malformed_value_skipped():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"max_cardinality": "many", "per_item_timeout": 5}},
+        config_json={"fan_out": {"enabled": True, "max_cardinality": "many", "per_item_timeout": 5}},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_disabled_fanout_skipped():
+    """A present-but-inert ``fan_out`` dict (``{"enabled": false}``) runs as a
+    SINGLE call — the connector only fans out when ``enabled`` or ``items_path``
+    is truthy — so it must not be reconciled against a fan-out send budget.
+
+    Before the activation-predicate gate this spuriously warned against
+    1000 x 30 x 3 for a connector that never fans out (FAR-411).
+    """
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"enabled": False}},
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
