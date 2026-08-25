@@ -1639,8 +1639,16 @@ def make_node_fn(
         # run_context so internal control keys are never starved.
         _node_cap = node_def.get("capability_scope") or {}
         scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+        # FAR-418 (MAJOR-3 fix): the need-to-know boundary must also bind the
+        # ``state.run_context`` view. ``state`` otherwise carries the full,
+        # unscoped run_context, so a template could read gated keys via
+        # ``{{ state.run_context.<key> }}`` and defeat the boundary. Pass a
+        # shallow copy with the scoped run_context in place — the live state dict
+        # is never mutated.
+        scoped_state = dict(state)
+        scoped_state["run_context"] = scoped_run_context
         rendered_prompt, routing_mode = _render_agent_prompt(
-            state=state,
+            state=scoped_state,
             run_context=scoped_run_context,
             raw_input=raw_input,
             prompt_template=prompt_template,

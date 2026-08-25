@@ -1818,11 +1818,18 @@ class PipelineExecutor:
             hub = None
         return hub
 
-    async def _init_connector_hub(self, org_id: uuid.UUID) -> Any | None:
+    async def _init_connector_hub(self, org_id: uuid.UUID, graph_json: dict[str, Any] | None = None) -> Any | None:
         """Load active ConnectorInstance rows for the org and initialise ConnectorHub.
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
+
+        FAR-418 (MAJOR-2 fix): when *graph_json* is supplied the per-run union of
+        every node's ``capability_scope.allowed_connectors`` is passed to
+        ``ConnectorHub.initialise`` so the hub decrypts ONLY the in-scope
+        connectors (deny-by-default) instead of every active org connector. If any
+        node is UNRESTRICTED (absent/empty scope) the hub stays unrestricted and
+        fetches everything, preserving the pre-scope behaviour.
         """
         hub: Any | None = None
         try:
@@ -1863,7 +1870,12 @@ class PipelineExecutor:
                         runtime_provider=runtime_hub,
                     )
                     await hub.__aenter__()
-                    await hub.initialise(rows)
+                    # FAR-418 (MAJOR-2 fix): wire fetch-time scoping into the run
+                    # path. Compute the per-run union of every node's
+                    # allowed_connectors; an unrestricted node forces the hub to
+                    # stay unrestricted (fetch everything).
+                    fetch_scope = _compute_connector_fetch_scope(graph_json)
+                    await hub.initialise(rows, allowed_connectors=fetch_scope)
                     set_connector_hub(hub)
         except asyncio.CancelledError:
             raise
@@ -3100,7 +3112,7 @@ class PipelineExecutor:
         # Load model backends for this run's org — provides LLM access to agent nodes.
         model_backend_hub = await self._init_model_backend_hub(org_id)
         # Load connector hub for this run's org — provides connector access to connector nodes.
-        connector_hub = await self._init_connector_hub(org_id)
+        connector_hub = await self._init_connector_hub(org_id, graph_json=graph_json)
 
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
@@ -4305,3 +4317,28 @@ class PipelineExecutor:
             if run_root_token is not None:
                 context_api.detach(run_root_token)
             self._otel_bridge.end_run_root()
+
+
+def _compute_connector_fetch_scope(graph_json: dict[str, Any] | None) -> list[str] | None:
+    """Compute the connector fetch scope for a run from its graph (FAR-418).
+
+    Returns the per-run union of every node's ``capability_scope.allowed_connectors``
+    so ``ConnectorHub.initialise`` decrypts only those connectors. Returns ``None``
+    (unrestricted — fetch every active connector) when *graph_json* is absent, the
+    graph has no nodes, or ANY node declares an UNRESTRICTED scope (absent/empty
+    ``allowed_connectors``), since an unrestricted node must be able to use any
+    connector the hub fetched.
+    """
+    if not graph_json:
+        return None
+    nodes = graph_json.get("nodes") or []
+    fetch_scope: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        scope = node.get("capability_scope") or {}
+        allowed = scope.get("allowed_connectors")
+        if not allowed:  # UNRESTRICTED node -> must fetch everything
+            return None
+        fetch_scope.update(allowed)
+    return list(fetch_scope) if fetch_scope else None
