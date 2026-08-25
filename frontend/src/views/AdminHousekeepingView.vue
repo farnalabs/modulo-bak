@@ -2,12 +2,12 @@
   <FeatureGate feature-name="admin_housekeeping" required-tier="community" show-disabled>
     <div class="page-wide">
       <PageHeader
-        title="Housekeeping"
-        subtitle="Scan for cleanup candidates across your organisation"
+        :title="$t('views.AdminHousekeepingView.title')"
+        :subtitle="$t('views.AdminHousekeepingView.subtitle')"
       >
-        <template #actions>
+        <template #right>
           <Button severity="secondary" outlined data-testid="hk-refresh" :disabled="loading" @click="scan">
-            {{ loading ? 'Scanning…' : 'Refresh Scan' }}
+            {{ loading ? $t('views.AdminHousekeepingView.scanning') : $t('views.AdminHousekeepingView.refresh_scan') }}
           </Button>
         </template>
       </PageHeader>
@@ -23,14 +23,14 @@
       >
         <p class="text-sm text-destructive">{{ error }}</p>
         <Button severity="secondary" outlined size="small" class="mt-2" @click="scan" data-testid="hk-retry">
-          Retry
+          {{ $t('views.AdminHousekeepingView.retry') }}
         </Button>
       </div>
 
       <EmptyState
         v-else-if="categories.length === 0"
-        title="All Clean!"
-        description="No cleanup candidates found. Everything looks tidy."
+        :title="$t('views.AdminHousekeepingView.all_clean_title')"
+        :description="$t('views.AdminHousekeepingView.all_clean_description')"
         data-testid="hk-empty"
       />
 
@@ -44,17 +44,17 @@
               data-testid="hk-select-all"
               @change="toggleSelectAll"
             />
-            Select All
+            {{ $t('views.AdminHousekeepingView.select_all') }}
           </label>
           <span class="text-sm text-muted-foreground">
-            {{ selectedCount }} of {{ totalCount }} selected
+            {{ $t('views.AdminHousekeepingView.selected_count', { count: selectedCount, total: totalCount }) }}
           </span>
           <span class="text-sm text-muted-foreground">
-            {{ totalCount }} total candidate{{ totalCount === 1 ? '' : 's' }}
+            {{ $t('views.AdminHousekeepingView.total_candidates', totalCount) }}
           </span>
           <div class="ml-auto">
             <Button v-if="selectedCount > 0" severity="danger" data-testid="hk-delete-selected" @click="confirmDelete">
-              Delete {{ selectedCount }} Selected
+              {{ $t('views.AdminHousekeepingView.delete_selected', { count: selectedCount }) }}
             </Button>
           </div>
         </div>
@@ -78,11 +78,11 @@
               <h3 class="font-semibold">{{ cat.label }}</h3>
               <p class="text-xs text-muted-foreground">{{ cat.description }}</p>
             </div>
-            <span class="text-sm text-muted-foreground">{{ cat.count }} item{{ cat.count === 1 ? '' : 's' }}</span>
+            <span class="text-sm text-muted-foreground">{{ $t('views.AdminHousekeepingView.item_count', cat.count) }}</span>
           </div>
 
           <div v-if="cat.candidates.length === 0" class="px-4 py-3 text-sm text-muted-foreground">
-            No candidates found.
+            {{ $t('views.AdminHousekeepingView.no_candidates') }}
           </div>
 
           <div
@@ -119,7 +119,7 @@
           <div>
             <div class="text-lg font-semibold">{{ $t('views.AdminHousekeepingView.confirm_cleanup') }}</div>
             <div class="mt-0.5 text-sm text-muted-foreground">
-              This will delete the following items. This action cannot be undone.
+              {{ $t('views.AdminHousekeepingView.delete_warning') }}
             </div>
           </div>
         </template>
@@ -131,10 +131,10 @@
         <template #footer>
           <div class="flex gap-2 justify-end">
             <Button severity="secondary" outlined @click="showConfirm = false" data-testid="hk-cancel-cleanup">
-              Cancel
+              {{ $t('views.AdminHousekeepingView.cancel') }}
             </Button>
             <Button severity="danger" :disabled="cleaningUp" data-testid="hk-confirm-cleanup" @click="doCleanup">
-              {{ cleaningUp ? 'Cleaning up…' : `Delete ${selectedCount} items` }}
+              {{ cleaningUp ? $t('views.AdminHousekeepingView.cleaning_up') : $t('views.AdminHousekeepingView.delete_items', { count: selectedCount }) }}
             </Button>
           </div>
         </template>
@@ -145,6 +145,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
+import { useI18n } from 'vue-i18n'
 import { useApi } from '../composables/useApi'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
@@ -209,7 +210,7 @@ async function scan() {
     totalCount.value = resp.total_count ?? 0
     selectedIds.value = new Set()
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : 'Failed to scan for housekeeping candidates'
+    error.value = e instanceof Error ? e.message : useI18n().t('views.AdminHousekeepingView.scan_error')
   } finally {
     loading.value = false
   }
@@ -315,7 +316,7 @@ async function doCleanup() {
     showConfirm.value = false
     await scan()
   } catch (e: unknown) {
-    error.value = e instanceof Error ? e.message : 'Cleanup failed'
+    error.value = e instanceof Error ? e.message : useI18n().t('views.AdminHousekeepingView.cleanup_error')
   } finally {
     cleaningUp.value = false
   }

@@ -2408,6 +2408,25 @@ export default {
       }
     },
     "AdminHousekeepingView": {
+      "title": "Housekeeping",
+      "subtitle": "Scan for cleanup candidates across your organisation",
+      "refresh_scan": "Refresh Scan",
+      "scanning": "Scanning…",
+      "retry": "Retry",
+      "all_clean_title": "All Clean!",
+      "all_clean_description": "No cleanup candidates found. Everything looks tidy.",
+      "select_all": "Select All",
+      "selected_count": "{count} of {total} selected",
+      "total_candidates": "{count} candidate | {count} candidates",
+      "delete_selected": "Delete {count} Selected",
+      "no_candidates": "No candidates found.",
+      "item_count": "{count} item | {count} items",
+      "cleaning_up": "Cleaning up…",
+      "delete_items": "Delete {count} items",
+      "delete_warning": "This will delete the following items. This action cannot be undone.",
+      "cancel": "Cancel",
+      "scan_error": "Failed to scan for housekeeping candidates",
+      "cleanup_error": "Cleanup failed",
       "confirm_cleanup": "Confirm Cleanup"
     },
     "LifecycleMapList": {
