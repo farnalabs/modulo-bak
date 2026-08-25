@@ -174,7 +174,7 @@ class TestEvaluateCoverageGap:
         ]
         summary = evaluate_coverage_gap(runs, evals, eval_names=_eval_defs(eval_id), min_runs=3)
         assert summary.status == "insufficient_data"
-        assert summary.evals == []
+        assert not summary.evals
         assert summary.run_count == 2
 
     def test_only_terminal_runs_count(self) -> None:

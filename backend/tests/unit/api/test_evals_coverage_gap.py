@@ -129,7 +129,7 @@ class TestEvalCoverageGap:
 
         kwargs = mock_compute.await_args.kwargs
         assert kwargs["min_runs"] == 5
-        assert kwargs["divergence_threshold"] == 0.4
+        assert kwargs["divergence_threshold"] == pytest.approx(0.4)
 
     async def test_raises_422_when_unscoped(self) -> None:
         principal = make_mock_principal()
