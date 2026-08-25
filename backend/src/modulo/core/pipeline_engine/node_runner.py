@@ -1006,7 +1006,7 @@ async def _persist_raw_output_marker(
 
 
 async def _write_raw_output_marker(
-    session_factory: Callable[..., Any] | None,
+    session_factory: Callable[..., Any],
     *,
     org_uuid: uuid.UUID | None,
     run_id: str,
