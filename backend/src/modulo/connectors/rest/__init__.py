@@ -50,9 +50,15 @@ the runtime variables supplied per call:
                             #   FAR-439: when a Redis client is wired at the composition
                             #   root (app.modulo.run multi-worker / fleet), the bucket is
                             #   SHARED across workers — one budget per <tenant, host+path>
-                            #   — enforced atomically in Redis. Without Redis (single-worker
-                            #   dev, or a Redis outage) it degrades to the connector-local
-                            #   per-process bucket (no failing open).
+                            #   — enforced atomically in Redis. The key is derived from the
+                            #   STATIC path template (not the fully-rendered URL) so a
+                            #   templated path or query string never fragments the budget.
+                            #   When Redis is NOT configured (single-worker dev — no fleet)
+                            #   the connector-local per-process bucket is authoritative.
+                            #   When Redis IS configured but unavailable the limiter FAILS
+                            #   CLOSED (after a single retry of the shared charge) rather
+                            #   than silently falling back to N per-process buckets — see
+                            #   modulo.connectors._rate_bucket.
 
 FAN-OUT / ITERATOR (FAR-411)
 ---------------------------
@@ -74,9 +80,11 @@ sequence inside the write ``data``, ``write()`` fans out ONE request per item:
   keyed by host+path; when empty the call awaits refill. Per-process by default
   (each uvicorn/SAQ worker owns its own bucket), and SHARED across the fleet via
   Redis when a ``redis_client`` is wired at the composition root (FAR-439): one
-  atomic budget per <tenant, host+path> is enforced across all workers, falling
-  back to the connector-local bucket when Redis is unavailable. Note the
-  divergence: existing connectors (github, linear, …) have no bucket, so REST is
+  atomic budget per <tenant, host+path> is enforced across all workers. The key
+  is derived from the STATIC path template so a templated/queried URL never
+  fragments the budget. When Redis is unavailable the limiter FAILS CLOSED
+  (never mints from an uncounted per-process bucket). Note the divergence:
+  existing connectors (github, linear, …) have no bucket, so REST is
   deliberately stricter.
 * **Per-item outcome state** — the result carries ``outcomes`` (one record per
   item: index, item, status ``success``/``failure``, result/error), plus
@@ -153,7 +161,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 import jmespath
@@ -209,6 +217,30 @@ _MAX_RETRY_WAIT = 30.0
 _DOT_INDEX = re.compile(r"\.\d+(?![A-Za-z_])")
 
 SsrfValidator = Callable[[str], Awaitable[None] | None]
+
+
+def _canonical_rate_key(base_url: str, path_template: str | None) -> str:
+    """Stable, low-cardinality rate-limit key from ``base_url`` + the STATIC path.
+
+    Prevents a templated path (``/users/{{ id }}``) or a rendered query string
+    from fragmenting the per-destination budget into one sub-budget per rendered
+    value — the whole point of a shared budget is that every value of ``id``
+    draws on the SAME pool. The key keeps the literal template braces so all
+    rendered values share one key, drops query + fragment, lowercases the host,
+    strips the default port, and normalises the trailing slash.
+    """
+    raw = base_url.rstrip("/") + "/" + (path_template or "").lstrip("/")
+    parts = urlsplit(raw)
+    scheme = (parts.scheme or "https").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    port = parts.port
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    path = parts.path or "/"
+    stripped = path.strip("/")
+    path = f"/{stripped}" if stripped else "/"
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _collect_strings(value: Any) -> list[str]:
@@ -430,6 +462,7 @@ class RestRequest:
     next_cursor_path: str | None = None
     passthrough: bool = False
     idempotency_header: str | None = None
+    rate_limit_key: str | None = None
 
 
 class RestConnector(ConnectorBase):
@@ -706,9 +739,12 @@ class RestConnector(ConnectorBase):
     def _get_rate_limiter(self, requests_per_second: float, burst: int) -> PerDestinationRateLimiter:
         """Return the lazily-built per-destination limiter (one per connector).
 
-        The limiter shares ``self._rate_buckets`` as its local fallback store so
-        the connector-local bucket is used verbatim when Redis is unavailable,
-        and so tests that pre-seed ``_rate_buckets`` keep working.
+        The limiter shares ``self._rate_buckets`` as its connector-local store so
+        the per-process bucket is authoritative when no ``redis_client`` is wired
+        (single-worker dev — no fleet to multiply), and so tests that pre-seed
+        ``_rate_buckets`` keep working. When a ``redis_client`` IS wired the
+        shared limiter fails closed on a Redis outage rather than using this
+        store (see :class:`modulo.connectors._rate_bucket.PerDestinationRateLimiter`).
         """
         if self._rate_limiter is None:
             self._rate_limiter = PerDestinationRateLimiter(
@@ -721,40 +757,54 @@ class RestConnector(ConnectorBase):
         return self._rate_limiter
 
     async def _acquire_rate_token(self, destination: str, *, deadline_seconds: float | None = None) -> None:
-        """Consume one token from the per-destination bucket (best-effort).
+        """Consume one token from the per-destination bucket (fail-closed).
 
         Each call waits until a token is available (refill is continuous).
         *deadline_seconds*, when provided, bounds the wait: if a token cannot be
         supplied within that window a :class:`RESTRateLimitTimeoutError` is
-        raised rather than spinning forever (the per-item fan-out budget). A
+        raised rather than spinning forever (the per-item fan-out budget). The
+        deadline is enforced DURING each ``consume`` (via ``asyncio.wait_for``),
+        not just between hops, so a slow Redis round-trip cannot overshoot it. A
         missing/disabled ``rate_limit`` config is a no-op. When a ``redis_client``
         is supplied the shared Redis bucket is authoritative (one budget across
-        workers); otherwise the per-process connector-local bucket is used, and a
-        Redis failure degrades to that same local bucket rather than failing open.
+        workers) and FAILS CLOSED on a Redis outage — it never mints from an
+        uncounted per-process budget; otherwise the per-process connector-local
+        bucket is used.
         """
         rate = self._rate_limit_config.get("requests_per_second")
         if rate is None:
             return
         requests_per_second = float(rate)
-        burst = int(self._rate_limit_config.get("burst", max(1, int(requests_per_second))))
         if requests_per_second <= 0:
-            return
+            raise ValueError(f"REST rate_limit.requests_per_second must be > 0 (got {requests_per_second})")
+        burst = int(self._rate_limit_config.get("burst", max(1, int(requests_per_second))))
+        if burst < 1:
+            raise ValueError(f"REST rate_limit.burst must be >= 1 (got {burst})")
 
         limiter = self._get_rate_limiter(requests_per_second, burst)
         deadline = time.monotonic() + max(0.0, deadline_seconds) if deadline_seconds is not None else None
         # consume() returns False when the budget is exhausted (consuming nothing);
-        # wait out a bounded refill hop and retry. The deadline bounds the wait so
-        # a saturated per-destination bucket never spins past the per-item budget.
-        while not await limiter.consume(destination):
+        # wait out a bounded refill hop and retry. The deadline bounds EACH Redis
+        # hop via wait_for, so a Redis socket timeout cannot overshoot the deadline.
+        while True:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     raise RESTRateLimitTimeoutError(
                         f"REST rate-limit wait exceeded deadline {deadline_seconds:.1f}s for {destination}"
                     )
+                try:
+                    ok = await asyncio.wait_for(limiter.consume(destination), timeout=remaining)
+                except TimeoutError as exc:
+                    raise RESTRateLimitTimeoutError(
+                        f"REST rate-limit wait exceeded deadline {deadline_seconds:.1f}s for {destination}"
+                    ) from exc
                 hop = min(1.0 / requests_per_second, 1.0, remaining)
             else:
+                ok = await limiter.consume(destination)
                 hop = min(1.0 / requests_per_second, 1.0)
+            if ok:
+                return
             await asyncio.sleep(hop)
 
     async def _fanout_write(
@@ -1060,6 +1110,7 @@ class RestConnector(ConnectorBase):
             next_cursor_path=spec["next_cursor_path"],
             passthrough=spec["passthrough"],
             idempotency_header=spec["idempotency_header"],
+            rate_limit_key=_canonical_rate_key(self._base_url, path),
         )
 
     async def _build_health_request(self) -> RestRequest:
@@ -1067,7 +1118,14 @@ class RestConnector(ConnectorBase):
         path = self._config.get("path")
         url = self._base_url + (str(self._render(path, {})) if path else "")
         await self._validate_target_url(url)
-        return RestRequest(method="GET", url=url, headers={}, params={}, body=None)
+        return RestRequest(
+            method="GET",
+            url=url,
+            headers={},
+            params={},
+            body=None,
+            rate_limit_key=_canonical_rate_key(self._base_url, path),
+        )
 
     async def _validate_target_url(self, url: str) -> None:
         """Enforce the scheme/host allowlist and SSRF safety on *url*.
@@ -1156,7 +1214,9 @@ class RestConnector(ConnectorBase):
         start = self._clock()
 
         if not self._is_retryable(request):
-            await self._acquire_rate_token(str(request.url), deadline_seconds=rate_wait_timeout)
+            await self._acquire_rate_token(
+                request.rate_limit_key or str(request.url), deadline_seconds=rate_wait_timeout
+            )
             return await self._perform_with_metrics(
                 client, request, kwargs, host, start, request_timeout=request_timeout
             )
@@ -1188,7 +1248,9 @@ class RestConnector(ConnectorBase):
             if attempt:
                 await self._sleep(last_delay)
                 rest_metrics.record_retry(retry_reason)
-            await self._acquire_rate_token(str(request.url), deadline_seconds=rate_wait_timeout)
+            await self._acquire_rate_token(
+                request.rate_limit_key or str(request.url), deadline_seconds=rate_wait_timeout
+            )
             try:
                 resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:

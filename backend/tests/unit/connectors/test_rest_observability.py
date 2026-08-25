@@ -33,7 +33,7 @@ from redis.exceptions import RedisError
 
 import modulo.connectors.rest.rest_metrics as rest_metrics
 import modulo.connectors.rest.rest_rollback as rest_rollback
-from modulo.connectors._rate_bucket import PerDestinationRateLimiter, RedisTokenBucket
+from modulo.connectors._rate_bucket import PerDestinationRateLimiter, RedisTokenBucket, SharedBudgetUnavailableError
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery
 from modulo.connectors.rest import (
     RESTConnectError,
@@ -592,17 +592,23 @@ async def test_per_tenant_weighting_separates_budgets() -> None:
     assert tenant_a.key("dest") != tenant_b.key("dest")
 
 
-async def test_fallback_to_local_bucket_when_redis_unavailable(caplog: Any) -> None:
-    """A Redis outage degrades to the connector-local bucket (never fails open)."""
+async def test_redis_outage_fails_closed_when_configured(caplog: Any) -> None:
+    """A Redis outage when configured FAILS CLOSED ÔÇö never mints a per-worker budget.
+
+    Falling back to each worker's own full-burst bucket would multiply the
+    effective cap by the worker count (N x burst), defeating the single-budget
+    guarantee. With a ``redis_client`` configured the limiter must refuse to
+    charge rather than fail open.
+    """
     with caplog.at_level(logging.WARNING, logger="modulo.connectors._rate_bucket"):
         limiter = PerDestinationRateLimiter(rate=1.0, burst=2, redis_client=_BrokenRedis(), tenant_id="org-1")
 
-        assert await limiter.consume("dest") is True
-        assert await limiter.consume("dest") is True
-        assert await limiter.consume("dest") is False  # local budget (burst 2) exhausted
+        with pytest.raises(SharedBudgetUnavailableError):
+            await limiter.consume("dest")
 
-    assert len(limiter.buckets) == 1  # fell back to the local per-process bucket
-    assert "rest.rate_limit.redis_fallback" in [r.message for r in caplog.records]
+    assert limiter.buckets == {}  # never created a per-process fallback bucket
+    assert "rest.rate_limit.degraded" in [r.message for r in caplog.records]
+    assert "rest.rate_limit.redis_error" in [r.message for r in caplog.records]
 
 
 async def test_saturation_signal_recorded_on_deny(caplog: Any) -> None:
@@ -620,6 +626,27 @@ async def test_saturation_signal_recorded_on_deny(caplog: Any) -> None:
     assert alerts
     assert alerts[0].destination == "dest"
     assert alerts[0].tenant == "org-1"
+
+
+async def test_saturation_warning_throttled_on_deny_after_grant(caplog: Any) -> None:
+    """A repeated deny does NOT re-emit the saturated WARNING (counters still rise).
+
+    The WARNING fires only on the deny-after-grant transition; back-to-back
+    denies keep incrementing the counters (the metric) without flooding an alert
+    per deny.
+    """
+    store: dict[str, dict[str, float]] = {}
+    limiter = PerDestinationRateLimiter(rate=0.0001, burst=1, redis_client=_FakeRedis(store), tenant_id="org-1")
+
+    assert await limiter.consume("dest") is True  # grant ÔÇö resets the transition state
+    with caplog.at_level(logging.WARNING, logger="modulo.connectors._rate_bucket"):
+        assert await limiter.consume("dest") is False  # deny ÔÇö transition, WARNING
+        assert await limiter.consume("dest") is False  # deny ÔÇö still saturated, no WARNING
+
+    assert limiter.saturation_count == 2
+    assert limiter.saturations["dest"] == 2
+    alerts = [r for r in caplog.records if r.message == "rest.rate_limit.saturated"]
+    assert len(alerts) == 1
 
 
 # ÔöÇÔöÇ RestConnector composition ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
@@ -652,6 +679,51 @@ def test_rest_connector_uses_shared_redis_budget_per_destination() -> None:
     assert len(store) == 1
 
 
+def test_templated_path_and_query_share_single_canonical_bucket() -> None:
+    """A templated path + query strings map to ONE canonical budget key (FAR-439).
+
+    The destination key is derived from the STATIC path template, so different
+    rendered IDs and query strings never fragment the shared budget.
+    """
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/users/{{ user_id }}",
+            "params": {"page": "{{ page }}", "q": "{{ q }}"},
+            "body": {"name": "{{ name }}"},
+            "fan_out": {"enabled": True, "items_path": "items", "per_item_timeout": 0.001},
+            "rate_limit": {"requests_per_second": 1000.0, "burst": 100},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+        redis_client=redis,
+        tenant_id="org-1",
+    )
+
+    result = asyncio.run(
+        c.write(
+            ConnectorPayload(
+                resource="default",
+                data={
+                    "items": [
+                        {"user_id": 1, "page": 1, "q": "a", "name": "n1"},
+                        {"user_id": 2, "page": 2, "q": "b", "name": "n2"},
+                    ]
+                },
+            )
+        )
+    )
+    assert result["success_count"] == 2
+    assert len(store) == 1
+    (key,) = store.keys()
+    # Canonical key = base_url + the STATIC template (rendered ids/query dropped),
+    # prefixed by the shared-bucket key prefix.
+    assert key == "rest_rate_limit:org-1:https://api.example.com/users/{{ user_id }}"
+    assert "page" not in key
+    assert "q=" not in key
+
+
 def test_rest_connector_local_bucket_when_no_redis() -> None:
     """Without a redis_client the connector stays on the per-process bucket."""
     c = _make_connector(
@@ -673,8 +745,8 @@ def test_rest_connector_local_bucket_when_no_redis() -> None:
     assert len(c._rate_buckets) == 1
 
 
-def test_rest_connector_redis_failure_falls_back_to_local_bucket() -> None:
-    """A broken Redis client makes the connector use its connector-local bucket."""
+def test_rest_connector_redis_failure_fails_closed() -> None:
+    """A broken Redis client makes the connector fail closed (no per-worker budget)."""
     c = _make_connector(
         {
             "base_url": "https://api.example.com",
@@ -688,9 +760,9 @@ def test_rest_connector_redis_failure_falls_back_to_local_bucket() -> None:
         tenant_id="org-1",
     )
 
-    with pytest.raises(RESTFanOutFailureError, match="rate-limit wait exceeded"):
+    with pytest.raises(RESTFanOutFailureError, match="rate-limit budget unavailable"):
         asyncio.run(
             c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(3)]}))
         )
-    # Even with Redis configured, the connector-local bucket was the fallback.
-    assert len(c._rate_buckets) == 1
+    # With Redis configured, the connector must NOT fall back to a per-process bucket.
+    assert len(c._rate_buckets) == 0
