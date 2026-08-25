@@ -995,6 +995,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/housekeeping/checkpoints/purge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Purge Checkpoints
+         * @description Purge LangGraph checkpoint rows for old terminal runs (keep the ``runs``).
+         *
+         *     FAR-432: a terminal run's checkpoint rows are unread after the run finishes
+         *     and dominate DB volume. This releases them for TERMINAL runs older than
+         *     ``max_age_days`` (default ``CHECKPOINT_RETENTION_DAYS`` = 3) while leaving
+         *     the ``runs`` rows intact (outputs, telemetry, classification stay for audit
+         *     + analytics, ADR 020). Never purges a non-terminal / HITL-paused run — an
+         *     ``awaiting_human`` run keeps its interrupt checkpoint so ``resume_run``
+         *     continues the graph instead of re-running side-effectful nodes.
+         *
+         *     Requires ``confirm: true``. Scoped to the caller's organisation (RLS).
+         */
+        post: operations["purge_checkpoints_api_v1_admin_housekeeping_checkpoints_purge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -5629,6 +5659,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/evals/leaderboard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Eval Leaderboard
+         * @description Return a per-axis leaderboard ranked by aggregate pass-rate (FAR-378).
+         *
+         *     A pure read-model over the ``SuiteRun``/``eval_results`` data. The axis is
+         *     ``pipeline`` | ``node`` | ``agent`` (the model backend that produced the
+         *     output). Pass-rate is computed from the ``passed`` boolean ONLY — raw
+         *     ``score`` is never compared across differing ``eval_type``; each axis entry
+         *     carries a per-``eval_type`` partition (``by_type``) so a mixed-type suite is
+         *     never ranked on a raw score. Org-scoped: every query carries the explicit
+         *     ``organisation_id`` predicate.
+         */
+        get: operations["eval_leaderboard_api_v1_evals_leaderboard_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/evals/{eval_id}/timeseries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Eval Timeseries
+         * @description Return a day-bucketed pass-rate time-series for a single eval (FAR-378).
+         *
+         *     Zeros the day grid from the window start through today so the series is
+         *     continuous; an absent day is emitted with ``total=0`` and ``pass_rate=None``
+         *     (never ``0.0``). Carries a cross-pipeline rollup (``pipelines``) and a
+         *     window ``summary``. Pass-rate is computed from ``passed`` only, partitioned
+         *     by ``eval_type``.
+         */
+        get: operations["eval_timeseries_api_v1_evals__eval_id__timeseries_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/evals/suites/{suite_id}/alerting": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Update Suite Alerting
+         * @description Configure regression alerting for an eval suite (FAR-379).
+         *
+         *     Admin only. Sets the suite's ``baseline_window`` / ``minimum_delta`` /
+         *     ``cooldown`` so the Alerting layer knows WHEN and HOW OFTEN to page: a
+         *     regression must exceed ``minimum_delta``, and after it fires the suite is
+         *     silent for ``cooldown`` minutes. ``baseline_window`` controls how many of
+         *     the most-recent completed same-tuple prior runs form the comparison baseline
+         *     (``N`` — a rolling N-run baseline; NULL — single-latest). A NULL
+         *     ``baseline_window`` does NOT disable alerting: the window widens the baseline
+         *     but whether to alert is always governed by the comparison result and
+         *     ``minimum_delta``. Additive/non-breaking — every field is optional, and NULL
+         *     clears that field.
+         *
+         *     The suite is looked up org-scoped (a cross-org suite can never be
+         *     configured). NULL values are persisted as NULL, wiping the config.
+         */
+        put: operations["update_suite_alerting_api_v1_evals_suites__suite_id__alerting_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/evals/{eval_id}": {
         parameters: {
             query?: never;
@@ -8747,6 +8865,25 @@ export interface components {
             /** Detail */
             detail?: string | null;
         };
+        /** CheckpointRetentionPurgeRequest */
+        CheckpointRetentionPurgeRequest: {
+            /** Max Age Days */
+            max_age_days?: number | null;
+            /**
+             * Confirm
+             * @default false
+             */
+            confirm: boolean;
+        };
+        /** CheckpointRetentionPurgeResponse */
+        CheckpointRetentionPurgeResponse: {
+            /** Checkpoints Purged */
+            checkpoints_purged: number;
+            /** Threads Purged */
+            threads_purged: number;
+            /** Bytes Freed */
+            bytes_freed: number;
+        };
         /** CircuitBreakerResetResponse */
         CircuitBreakerResetResponse: {
             /** Pipeline Id */
@@ -10285,10 +10422,45 @@ export interface components {
             /** Suite Id */
             suite_id?: string | null;
             /**
+             * Version
+             * @default 1
+             */
+            version: number;
+            /** Pre Version Raw */
+            pre_version_raw?: {
+                [key: string]: unknown;
+            } | null;
+            /**
              * Created By
              * Format: uuid
              */
             created_by: string;
+        };
+        /**
+         * EvalSuiteAlertingRequest
+         * @description Per-suite regression alerting configuration (FAR-379).
+         */
+        EvalSuiteAlertingRequest: {
+            /** Baseline Window */
+            baseline_window?: number | null;
+            /** Minimum Delta */
+            minimum_delta?: number | null;
+            /** Cooldown */
+            cooldown?: number | null;
+        };
+        /** EvalSuiteAlertingResponse */
+        EvalSuiteAlertingResponse: {
+            /**
+             * Suite Id
+             * Format: uuid
+             */
+            suite_id: string;
+            /** Baseline Window */
+            baseline_window: number | null;
+            /** Minimum Delta */
+            minimum_delta: number | null;
+            /** Cooldown */
+            cooldown: number | null;
         };
         /** ExportPreviewResponse */
         ExportPreviewResponse: {
@@ -12672,6 +12844,18 @@ export interface components {
              * @description JMESPath expression for conditional edge routing. Evaluated against pipeline state; if truthy, routes to target.
              */
             condition_expression?: string | null;
+            /**
+             * Source Port
+             * @description Output port on the source node this edge originates from.
+             * @default out
+             */
+            source_port: string;
+            /**
+             * Target Port
+             * @description Input port on the target node this edge delivers into.
+             * @default in
+             */
+            target_port: string;
         };
         /** PipelineGraphNode */
         PipelineGraphNode: {
@@ -12809,6 +12993,20 @@ export interface components {
              * @description Filesystem detector: globs of sandbox paths whose change counts as activity.
              */
             watch_globs?: string[];
+            /**
+             * Inputs
+             * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.
+             */
+            inputs?: {
+                [key: string]: unknown;
+            }[] | null;
+            /**
+             * Outputs
+             * @description Output ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'out' port at compile time.
+             */
+            outputs?: {
+                [key: string]: unknown;
+            }[] | null;
         };
         /** PipelineGraphResponse */
         PipelineGraphResponse: {
@@ -19099,6 +19297,41 @@ export interface operations {
             };
         };
     };
+    purge_checkpoints_api_v1_admin_housekeeping_checkpoints_purge_post: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CheckpointRetentionPurgeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CheckpointRetentionPurgeResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     login_api_v1_auth_login_post: {
         parameters: {
             query?: {
@@ -19607,7 +19840,6 @@ export interface operations {
             query?: {
                 format?: string;
                 offset?: number;
-                limit?: number;
                 dimension?: components["schemas"]["AnalyticsDimension"] | null;
                 trigger_type?: components["schemas"]["AnalyticsTriggerType"] | null;
                 status?: components["schemas"]["AnalyticsStatus"] | null;
@@ -19616,6 +19848,7 @@ export interface operations {
                 folder_id?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;
+                limit?: number;
                 _fresh?: boolean;
             };
             header?: never;
@@ -29777,6 +30010,233 @@ export interface operations {
                         [key: string]: unknown;
                     };
                 };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    eval_leaderboard_api_v1_evals_leaderboard_get: {
+        parameters: {
+            query?: {
+                group_by?: string;
+                days?: number;
+                eval_id?: string | null;
+                pipeline_id?: string | null;
+                node_id?: string | null;
+                model_backend_id?: string | null;
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    eval_timeseries_api_v1_evals__eval_id__timeseries_get: {
+        parameters: {
+            query?: {
+                days?: number;
+                pipeline_id?: string | null;
+                node_id?: string | null;
+                model_backend_id?: string | null;
+                _fresh?: boolean;
+            };
+            header?: never;
+            path: {
+                eval_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_suite_alerting_api_v1_evals_suites__suite_id__alerting_put: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path: {
+                suite_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EvalSuiteAlertingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EvalSuiteAlertingResponse"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Not Found */
             404: {

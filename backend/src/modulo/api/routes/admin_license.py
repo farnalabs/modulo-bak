@@ -72,9 +72,10 @@ class LicenseIssueResponse(BaseModel):
     org_id: str
 
 
-def _license_response_from(data: LicenseData) -> LicenseStatusResponse:
+def _license_status(data: LicenseData, *, has_license: bool = True) -> LicenseStatusResponse:
+    """Build a ``LicenseStatusResponse`` from a signed-license payload."""
     return LicenseStatusResponse(
-        has_license=True,
+        has_license=has_license,
         tier=data.tier,
         features=data.features,
         expires_at=data.expires_at or None,
@@ -82,32 +83,32 @@ def _license_response_from(data: LicenseData) -> LicenseStatusResponse:
     )
 
 
-def _license_response_for_key(key: str | None) -> LicenseStatusResponse | None:
-    """Verify a raw license key and return its status response, or ``None`` if invalid."""
-    if not key:
+def _resolve_license_key(raw_key: str) -> LicenseStatusResponse | None:
+    """Validate ``raw_key`` and return its license status, or ``None`` if unusable."""
+    if not raw_key:
         return None
-    validation = parse_and_verify(key)
-    if validation.valid and validation.license_data is not None:
-        return _license_response_from(validation.license_data)
-    return None
+    validation = parse_and_verify(raw_key)
+    if not validation.valid or validation.license_data is None:
+        return None
+    return _license_status(validation.license_data)
 
 
 def _resolve_effective_license(settings: Settings, org: Organisation | None = None) -> LicenseStatusResponse:
     """Resolve the effective license, checking org-level, then in-memory, then system-level (env var)."""
     if org is not None:
         org_key = org.settings_json.get("license_key") if org.settings_json else None
-        response = _license_response_for_key(org_key)
-        if response is not None:
-            return response
+        resolved = _resolve_license_key(str(org_key) if org_key else "")
+        if resolved is not None:
+            return resolved
 
     lic = get_license()
     if lic is not None:
-        return _license_response_from(lic)
+        return _license_status(lic)
 
-    raw_key = getattr(settings, "modulo_license_key", "") or ""
-    response = _license_response_for_key(raw_key)
-    if response is not None:
-        return response
+    # 3. System-level env var
+    resolved = _resolve_license_key(getattr(settings, "modulo_license_key", "") or "")
+    if resolved is not None:
+        return resolved
 
     return LicenseStatusResponse(has_license=False, tier="community")
 
