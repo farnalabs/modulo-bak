@@ -1847,13 +1847,13 @@ class PipelineExecutor:
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
-        
+
         *allowed_connectors* (FAR-418) wires fetch-time capability scoping into the
         production run path: when every node in the run is connector-scoped the hub
         decrypts ONLY those connectors, so out-of-scope credentials are never
         disclosed. Pass ``None`` (the default) to fetch every active org connector,
         preserving the pre-scope behaviour (used for compensation and unscoped runs).
-        
+
         Contract (fail-closed on the configured path):
           - If NO active connectors are configured for this run, returns None —
             the node_runner treats a None hub as vacuous success, which is correct
@@ -3192,7 +3192,7 @@ class PipelineExecutor:
         # connector-scoped the hub decrypts ONLY the union of their allowed
         # connectors, so out-of-scope credentials are never disclosed.
         from modulo.core.capability_scope import compute_run_fetch_scope
-        
+
         try:
             connector_hub = await self._init_connector_hub(
                 org_id,

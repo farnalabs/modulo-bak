@@ -2958,7 +2958,7 @@ class _FakeConnectorHub:
     async def __aexit__(self, *_args: object) -> None:
         return None
 
-    async def initialise(self, _rows: list[Any]) -> None:
+    async def initialise(self, _rows: list[Any], allowed_connectors: list[Any] | None = None) -> None:
         raise self._exc
 
 

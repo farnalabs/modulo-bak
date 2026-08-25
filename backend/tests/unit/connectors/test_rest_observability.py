@@ -38,9 +38,9 @@ from modulo.connectors._rate_bucket import PerDestinationRateLimiter, RedisToken
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery
 from modulo.connectors.rest import (
     RESTConnectError,
+    RestConnector,
     RESTFanOutFailureError,
     RESTResponseTooLargeError,
-    RestConnector,
     SecurityGuard,
 )
 from modulo.connectors.rest.rest_rollback import RestRollbackSignal, evaluate_rest_rollback, is_unknown_like
@@ -117,7 +117,7 @@ def _run_query(meter: MagicMock) -> None:
         asyncio.run(c.query(ConnectorQuery(resource="default")))
 
 
-# ÔöÇÔöÇ classify_status ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── classify_status ─────────────────────────────────────────────────────────
 
 
 class TestClassifyStatus:
@@ -136,7 +136,7 @@ class TestClassifyStatus:
         assert rest_metrics.classify_status(status) == expected
 
 
-# ÔöÇÔöÇ instrument registration ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── instrument registration ─────────────────────────────────────────────────
 
 
 class TestInstrumentRegistration:
@@ -151,7 +151,7 @@ class TestInstrumentRegistration:
         assert "modulo_rest_redaction_events_total" in counters
 
 
-# ÔöÇÔöÇ record helpers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── record helpers ──────────────────────────────────────────────────────────
 
 
 class TestRecordHelpers:
@@ -196,7 +196,7 @@ class TestRecordHelpers:
         assert rest_metrics._requests_histogram is None
 
 
-# ÔöÇÔöÇ connector metric wiring (end-to-end over a MockTransport) ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── connector metric wiring (end-to-end over a MockTransport) ───────────────
 
 
 class TestConnectorMetricWiring:
@@ -269,7 +269,7 @@ class TestConnectorMetricWiring:
         assert kwargs["attributes"] == {"reason": "http_429"}
 
     def test_failed_then_succeeded_retry_emits_single_terminal_sample(self) -> None:
-        """A retried op that succeeds emits ONE success sample ÔÇö the intermediate
+        """A retried op that succeeds emits ONE success sample — the intermediate
         failed attempts must not leak extra samples into p95/success-rate."""
         meter, histograms, counters = _storage_meter()
         attempts: list[int] = []
@@ -372,7 +372,7 @@ class TestConnectorMetricWiring:
         assert redaction.add.called  # the secret was redacted, emitting an event
 
 
-# ÔöÇÔöÇ rollback threshold evaluator ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── rollback threshold evaluator ────────────────────────────────────────────
 
 
 class TestRestRollback:
@@ -420,7 +420,7 @@ class TestRestRollback:
 
     def test_unknown_like_classification(self) -> None:
         # A transport timeout is a deterministic failure, classified as an error
-        # (never double-counted as UNKNOWN) ÔÇö so it is NOT unknown-like.
+        # (never double-counted as UNKNOWN) — so it is NOT unknown-like.
         assert is_unknown_like("timeout") is False
         assert is_unknown_like("unknown") is True
         assert is_unknown_like("http_429") is False
@@ -429,7 +429,7 @@ class TestRestRollback:
     def test_unknown_outcome_not_double_counted_in_error_bucket(self) -> None:
         """``unknown`` must never be classified as an error. A producer that
         builds error_requests from ``_ERROR_CAUSE_CODES`` and unknown_requests
-        from ``is_unknown_like`` must not count the same cause in both ÔÇö the
+        from ``is_unknown_like`` must not count the same cause in both — the
         two cause sets are genuinely disjoint."""
         error_causes = frozenset(rest_metrics._ERROR_CAUSE_CODES)
         unknown_like = frozenset(rest_rollback._DEFAULT_UNKNOWN_LIKE)
@@ -533,14 +533,14 @@ def _make_connector(
     )
 
 
-# ÔöÇÔöÇ RedisTokenBucket: shared budget + no lost-token race ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── RedisTokenBucket: shared budget + no lost-token race ─────────────────────
 
 
 async def test_redis_token_bucket_no_lost_token_race_under_concurrency() -> None:
     """Concurrent consumes never over-spend the shared budget (atomic in Redis).
 
     With a fixed ``now`` (no refill), exactly ``burst`` concurrent consumes
-    succeed ÔÇö never more ÔÇö proving the token check-and-decrement is not racy.
+    succeed — never more — proving the token check-and-decrement is not racy.
     """
     store: dict[str, dict[str, float]] = {}
     redis = _FakeRedis(store, clock=lambda: 1000.0)
@@ -574,7 +574,7 @@ async def test_redis_token_bucket_refills_over_wall_clock() -> None:
     assert redis.pexpire_ttl == 60000
 
 
-# ÔöÇÔöÇ PerDestinationRateLimiter: shared budget across simulated workers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── PerDestinationRateLimiter: shared budget across simulated workers ─────────
 
 
 async def test_shared_budget_enforced_across_simulated_workers() -> None:
@@ -634,7 +634,7 @@ async def test_shared_limiter_without_tenant_raises() -> None:
 
 
 async def test_redis_outage_fails_closed_when_configured(caplog: Any) -> None:
-    """A Redis outage when configured FAILS CLOSED ÔÇö never mints a per-worker budget.
+    """A Redis outage when configured FAILS CLOSED — never mints a per-worker budget.
 
     Falling back to each worker's own full-burst bucket would multiply the
     effective cap by the worker count (N x burst), defeating the single-budget
@@ -679,10 +679,10 @@ async def test_saturation_warning_throttled_on_deny_after_grant(caplog: Any) -> 
     store: dict[str, dict[str, float]] = {}
     limiter = PerDestinationRateLimiter(rate=0.0001, burst=1, redis_client=_FakeRedis(store), tenant_id="org-1")
 
-    assert await limiter.consume("dest") is True  # grant ÔÇö resets the transition state
+    assert await limiter.consume("dest") is True  # grant — resets the transition state
     with caplog.at_level(logging.WARNING, logger="modulo.connectors._rate_bucket"):
-        assert await limiter.consume("dest") is False  # deny ÔÇö transition, WARNING
-        assert await limiter.consume("dest") is False  # deny ÔÇö still saturated, no WARNING
+        assert await limiter.consume("dest") is False  # deny — transition, WARNING
+        assert await limiter.consume("dest") is False  # deny — still saturated, no WARNING
 
     assert limiter.saturation_count == 2
     assert limiter.saturations["dest"] == 2
@@ -690,7 +690,7 @@ async def test_saturation_warning_throttled_on_deny_after_grant(caplog: Any) -> 
     assert len(alerts) == 1
 
 
-# ÔöÇÔöÇ RestConnector composition ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ
+# ── RestConnector composition ─────────────────────────────────────────────────
 
 
 def test_rest_connector_uses_shared_redis_budget_per_destination() -> None:
