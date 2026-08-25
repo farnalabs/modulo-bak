@@ -1231,7 +1231,7 @@ def test_connector_blocks_decimal_ipv4_loopback_via_ssrf() -> None:
             {"auth_mode": "bearer", "token": "t"},
             security_guard=_real_ssrf_guard(),
         )
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match=r"decimal/octal integer IP literal|hex-encoded IP literal"):
             asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 

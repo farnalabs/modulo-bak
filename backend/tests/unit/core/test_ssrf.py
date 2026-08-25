@@ -818,29 +818,31 @@ class TestHostnameResolution:
 
 class TestNonCanonicalIPEncodings:
     def test_decimal_integer_ipv4_loopback_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        # main's _reject_noncanonical_ip_literal rejects decimal-integer IP
+        # literals at the host-parsing stage (defense-in-depth) before DNS.
+        with pytest.raises(ValueError, match="decimal/octal integer IP literal"):
             ssrf.validate_outbound_url("http://2130706433/")
 
     def test_decimal_integer_ipv4_private_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="decimal/octal integer IP literal"):
             ssrf.validate_outbound_url("http://167772161/")  # 10.0.0.1
 
     def test_hex_integer_ipv4_loopback_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="hex-encoded IP literal"):
             ssrf.validate_outbound_url("http://0x7f000001/")
 
     def test_hex_integer_ipv4_metadata_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="hex-encoded IP literal"):
             ssrf.validate_outbound_url("http://0xa9fea9fe/")  # 169.254.169.254
 
     def test_dotted_hex_ipv4_loopback_blocked(self) -> None:
         # 0x7f.0.0.1 -> 127.0.0.1 (per-segment hex base detection).
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="non-canonical dotted-numeric IP literal"):
             ssrf.validate_outbound_url("http://0x7f.0.0.1/")
 
     def test_dotted_octal_ipv4_loopback_blocked(self) -> None:
         # 0177.0.0.1 -> 127.0.0.1 (per-segment octal base detection).
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="non-canonical dotted-numeric IP literal"):
             ssrf.validate_outbound_url("http://0177.0.0.1/")
 
     def test_dotted_hex_hostname_not_spuriously_blocked_when_resolves_public(self) -> None:
@@ -857,17 +859,19 @@ class TestNonCanonicalIPEncodings:
             assert ssrf.validate_outbound_url("http://0x7f.helpers.example.com/") is None
 
     async def test_async_decimal_integer_ipv4_loopback_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        with pytest.raises(ValueError, match="decimal/octal integer IP literal"):
             await ssrf.validate_outbound_url_async("http://2130706433/")
 
     def test_encode_percent_host_is_fail_closed(self) -> None:
-        # A %-encoded host is NOT decoded by urlparse, so the guard treats it as
-        # a hostname and fails closed on the (invalid) DNS resolution.
-        with pytest.raises(ValueError, match="DNS resolution failed"):
+        # A %-encoded host is rejected by _reject_noncanonical_ip_literal at the
+        # host-parsing stage (fail-closed) rather than reaching DNS resolution.
+        with pytest.raises(ValueError, match="scope/percent-encoded IP literal"):
             ssrf.validate_outbound_url("http://127.0.0.1%00/")
 
     def test_userinfo_loopback_still_blocked(self) -> None:
-        with pytest.raises(ValueError, match="private/internal"):
+        # main's URL syntax check rejects userinfo credentials outright, so the
+        # loopback target is blocked before literal-IP validation is reached.
+        with pytest.raises(ValueError, match="userinfo credentials"):
             ssrf.validate_outbound_url("http://user:pass@127.0.0.1/")
 
     def test_ipv4_mapped_ipv6_loopback_blocked(self) -> None:
