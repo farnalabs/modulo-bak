@@ -299,7 +299,7 @@ def test_exclude_eval_families_drops_eval_events() -> None:
     watch = {"run_failed", "run_stalled", "eval_regression", "feedback", "suite_run"}
     assert exclude_eval_families(watch) == {"run_failed", "run_stalled"}
     assert {"eval_regression", "eval_blocked", "suite_run", "eval_result", "feedback"} <= EVAL_WATCH_EVENT_FAMILIES
-    assert exclude_eval_families(None) == set()
+    assert not exclude_eval_families(None)
 
 
 async def test_suite_run_completion_writes_only_eval_results(session) -> None:
@@ -458,7 +458,7 @@ def _suite_run_trigger() -> SimpleNamespace:
     )
 
 
-async def test_suite_run_execution_jobs_are_registered_on_runs_worker() -> None:
+def test_suite_run_execution_jobs_are_registered_on_runs_worker() -> None:
     """The dispatch wiring exists: the runs worker registers both suite jobs.
 
     Prove-the-fix: without the FAR-377 wiring, a ``suite_run`` trigger would
