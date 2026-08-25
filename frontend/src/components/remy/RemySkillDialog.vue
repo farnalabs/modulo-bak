@@ -111,7 +111,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive } from "vue";
+import { ref, reactive, computed } from "vue";
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
 import { api } from "@/lib/api/client";
