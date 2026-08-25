@@ -416,3 +416,114 @@ async def test_execute_router_no_match_not_classed_as_failed():
 
     assert mock_finalize.await_args.kwargs["status"] != "failed"
     assert mock_finalize.await_args.kwargs["status"] == "router_no_match"
+
+
+# ---------------------------------------------------------------------------
+# DB-layer acceptance: router_no_match must be accepted by the status CHECK
+# constraint, the persistence whitelist, and the shared terminal set — otherwise
+# the executor's terminal write (the path above mocks it) raises ValueError at
+# runtime, the run is never recorded, and the regression is invisible to CI.
+# Mirrors the establish pattern in test_executor_stalled_status.py.
+# ---------------------------------------------------------------------------
+
+from sqlalchemy import CheckConstraint, select  # noqa: E402
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
+
+from modulo.db.crud.run import RUN_STATUS_WHITELIST, update_run_status  # noqa: E402
+from modulo.db.models.base import Base  # noqa: E402
+from modulo.db.models.run import TERMINAL_STATUSES, Run  # noqa: E402
+
+
+def test_run_model_check_constraint_allows_router_no_match():
+    table_args = Run.__table_args__
+    check_sql = " ".join(
+        arg.sqltext.text for arg in table_args if isinstance(arg, CheckConstraint) and arg.name == "ck_runs_status"
+    )
+    assert "'router_no_match'" in check_sql
+
+
+def test_run_status_whitelist_includes_router_no_match():
+    assert "router_no_match" in RUN_STATUS_WHITELIST
+
+
+def test_terminal_statuses_include_router_no_match():
+    assert "router_no_match" in TERMINAL_STATUSES
+
+
+@pytest.fixture
+async def _sqlite_runs_engine():
+    eng = create_async_engine("sqlite+aiosqlite://", echo=False)
+    async with eng.begin() as conn:
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=[Run.__table__]))
+    yield eng
+    await eng.dispose()
+
+
+async def test_update_run_status_persists_router_no_match_with_completed_at(_sqlite_runs_engine):
+    """Persistence-layer coverage: update_run_status accepts 'router_no_match'
+    and stamps completed_at on the real row — the end-to-end write a no-match
+    run goes through in finalize_cost. Without the whitelist + completed_at
+    wiring this raises ValueError or leaves completed_at NULL (the executor-only
+    test above never reaches this layer)."""
+    factory = async_sessionmaker(_sqlite_runs_engine, expire_on_commit=False)
+    org_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    async with factory() as session, session.begin():
+        session.add(
+            Run(
+                id=run_id,
+                organisation_id=org_id,
+                pipeline_id=uuid.uuid4(),
+                snapshot_id=uuid.uuid4(),
+                trigger_type="manual",
+                status="running",
+                run_number=1,
+                input_hash="a" * 64,
+                langgraph_thread_id=f"thread-{run_id}",
+            )
+        )
+        await session.flush()
+
+    async with factory() as session, session.begin():
+        run = await update_run_status(session, run_id, "router_no_match")
+        assert run is not None
+        assert run.status == "router_no_match"
+        assert run.completed_at is not None
+
+    async with factory() as session:
+        persisted = await session.execute(select(Run).where(Run.id == run_id))
+        row = persisted.scalar_one_or_none()
+    assert row is not None
+    assert row.status == "router_no_match"
+    assert row.completed_at is not None
+
+
+async def test_update_run_status_router_no_match_in_transition_terminal_set(_sqlite_runs_engine):
+    """Prove-the-fix (FAR-415): a router_no_match run is terminal and accepted by
+    the fenced UPDATE / transition SQL terminal set, so the executor's terminal
+    write is not rejected by the status guard. Exercises the real persistence
+    path the executor funnels into (finalize_cost -> update_run_status)."""
+    factory = async_sessionmaker(_sqlite_runs_engine, expire_on_commit=False)
+    run_id = uuid.uuid4()
+    async with factory() as session, session.begin():
+        session.add(
+            Run(
+                id=run_id,
+                organisation_id=uuid.uuid4(),
+                pipeline_id=uuid.uuid4(),
+                snapshot_id=uuid.uuid4(),
+                trigger_type="manual",
+                status="running",
+                run_number=1,
+                input_hash="a" * 64,
+                langgraph_thread_id=f"thread-{run_id}",
+            )
+        )
+        await session.flush()
+
+    async with factory() as session, session.begin():
+        # Idempotent re-terminalize must be accepted (terminal -> terminal).
+        run = await update_run_status(session, run_id, "router_no_match")
+        assert run.status == "router_no_match"
+        run2 = await update_run_status(session, run_id, "router_no_match")
+        assert run2.status == "router_no_match"
