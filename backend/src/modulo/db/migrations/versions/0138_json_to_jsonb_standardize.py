@@ -104,7 +104,7 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
 )
 
 
-def _promote(target: str, using: str) -> None:
+def _promote(target: str) -> None:
     bind = op.get_bind()
     if bind.dialect.name != "postgresql":
         return
@@ -115,8 +115,8 @@ def _promote(target: str, using: str) -> None:
 
 
 def upgrade() -> None:
-    _promote("jsonb", "jsonb")
+    _promote("jsonb")
 
 
 def downgrade() -> None:
-    _promote("json", "json")
+    _promote("json")
