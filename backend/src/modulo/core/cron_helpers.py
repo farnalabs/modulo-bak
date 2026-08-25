@@ -1931,6 +1931,145 @@ async def fire_ongoing_trigger(
             await redis_client.aclose()
 
 
+async def fire_suite_run_trigger(
+    *,
+    trigger_id: uuid.UUID,
+    org_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Per-item fire job for a ``run_kind='suite_run'`` cron/event trigger (FAR-377).
+
+    Builds a ``pending`` SuiteRun instead of a pipeline ``Run``. Uses the
+    SUITE-RUN spend pool (over ``suite_runs``, never ``runs``) and its own
+    concurrency pool (non-terminal ``suite_runs`` for the trigger's suite +
+    dataset). It writes NO ``TriggerEvent`` and NO ``Run`` — a SuiteRun is the
+    audit record, and writing into the trigger-watch/dedup event set would
+    violate the loop guard (a finished eval must never re-fire an eval).
+
+    Returns ``{'status': 'fired', 'suite_run_id': <id>}`` on success, or a skip
+    dict. The caller (SAQ wrapper) enqueues the ``execute_suite_run`` job after
+    commit.
+    """
+    from decimal import Decimal
+
+    from sqlalchemy import func, update
+
+    from modulo.core.eval_engine.execute_suite_run import (
+        SuiteRunEmptyDatasetError,
+        SuiteRunExecutionError,
+        build_suite_run,
+        suite_run_daily_spend_exceeded,
+        suite_run_daily_spend_used,
+    )
+    from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
+    from modulo.db.models.trigger import Trigger
+
+    factory = _open_factory()
+    async with factory() as session, session.begin():
+        await _set_rls_org(session, org_id)
+
+        # Advisory lock on the trigger so two ticks cannot double-fire it.
+        from modulo.core.connector_hub.locking import _uuid_to_lock_keys
+
+        key1, key2 = _uuid_to_lock_keys(trigger_id)
+        lock_result = await session.execute(text(_SQL_TRY_ADVISORY_LOCK), {"key1": key1, "key2": key2})
+        if not lock_result.scalar_one():
+            return {"status": "skipped", "reason": "trigger_busy"}
+
+        trigger = (
+            await session.execute(
+                select(Trigger).where(
+                    Trigger.id == trigger_id,
+                    Trigger.organisation_id == org_id,
+                    Trigger.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+        if trigger is None or not trigger.active:
+            return {"status": "skipped", "reason": "trigger_inactive_or_missing"}
+        if trigger.run_kind != "suite_run" or trigger.eval_suite_id is None:
+            return {"status": "skipped", "reason": "not_suite_run_trigger"}
+
+        # Org-wide pause (kill-switch) — race backstop before building the run.
+        if await _org_is_paused_degraded(session, org_id):
+            return {"status": "skipped", "reason": PAUSE_SKIP_REASON}
+
+        config = trigger.config_json or {}
+        dataset_id_raw = config.get("dataset_id")
+        model_backend_id_raw = config.get("model_backend_id")
+        if not dataset_id_raw or not model_backend_id_raw:
+            return {"status": "skipped", "reason": "missing_suite_run_config"}
+        try:
+            dataset_id = uuid.UUID(str(dataset_id_raw))
+            model_backend_id = uuid.UUID(str(model_backend_id_raw))
+        except (ValueError, TypeError):
+            return {"status": "skipped", "reason": "invalid_suite_run_config"}
+
+        # Separate concurrency pool: non-terminal SuiteRuns for this suite+dataset.
+        active_count = (
+            await session.execute(
+                select(func.count()).where(
+                    SuiteRun.organisation_id == org_id,
+                    SuiteRun.suite_id == trigger.eval_suite_id,
+                    SuiteRun.dataset_id == dataset_id,
+                    SuiteRun.state.in_([SuiteRunState.PENDING.value, SuiteRunState.RUNNING.value]),
+                )
+            )
+        ).scalar_one() or 0
+        if int(active_count) >= int(trigger.max_concurrent_runs):
+            return {
+                "status": "skipped",
+                "reason": "concurrency_limit",
+                "active_suite_runs": int(active_count),
+            }
+
+        # Separate daily spend pool: sum TODAY's suite_runs cost (never runs).
+        if trigger.daily_spend_limit is not None:
+            used = await suite_run_daily_spend_used(session, org_id)
+            if suite_run_daily_spend_exceeded(used, trigger.daily_spend_limit):
+                return {
+                    "status": "skipped",
+                    "reason": "spend_limit",
+                    "daily_spend_limit": str(trigger.daily_spend_limit),
+                    "today_cost": str(used),
+                }
+
+        scenario_inputs = config.get("scenario_inputs") or {}
+        try:
+            run = await build_suite_run(
+                session,
+                org_id=org_id,
+                suite_id=trigger.eval_suite_id,
+                dataset_id=dataset_id,
+                model_backend_id=model_backend_id,
+                scenario_inputs=scenario_inputs,
+                pipeline_id=pipeline_id,
+            )
+        except SuiteRunEmptyDatasetError as exc:
+            # Never a silent pass — surface the empty dataset as a missed run.
+            return {"status": "skipped", "reason": "empty_dataset", "detail": str(exc)}
+        except SuiteRunExecutionError as exc:
+            return {"status": "skipped", "reason": "suite_run_config_error", "detail": str(exc)}
+
+        # Stamp the config-derived execution context + the owning trigger id
+        # onto the run so the SAQ job can run it and a finished eval never
+        # touches the production pool.
+        run.extra = {
+            "trigger_id": str(trigger_id),
+            "dataset_id": str(dataset_id),
+            "model_backend_id": str(model_backend_id),
+            "scenario_inputs": scenario_inputs,
+            "entity_thresholds": config.get("entity_thresholds") or {},
+            "suite_ceiling": config.get("suite_ceiling"),
+            "eval_definition_version": int(config.get("eval_definition_version", 1)),
+            "cost_per_llm_case": Decimal(str(config.get("cost_per_llm_case", "0.001"))),
+        }
+        await session.flush()
+        await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))
+        _log.info("suite_run trigger %s fired -> suite_run %s", trigger_id, run.id)
+        return {"status": "fired", "suite_run_id": str(run.id), "trigger_id": str(trigger_id)}
+
+
 def _suppress_aclose() -> Any:
     from contextlib import suppress
 
@@ -2200,16 +2339,26 @@ async def _enqueue_catchup_fire(
     unchanged from ``_fire_missed_cron_epochs`` (complexity bound).
     """
     try:
-        job_id = await _enqueue_fire_job_async(
-            q,
-            "modulo.core.saq_worker.fire_cron_trigger",
-            f"fire:{row.id}:{int(now.timestamp())}",
-            trigger_id=str(row.id),
-            org_id=str(org_id),
-            pipeline_id=str(row.pipeline_id),
-            cron_expression=row.cron_expression,
-            snapshot_id=str(snapshot_id) if snapshot_id else "",
-        )
+        if getattr(row, "run_kind", "run") == "suite_run":
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_suite_run_trigger",
+                f"suite_catchup:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+            )
+        else:
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_cron_trigger",
+                f"fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+                cron_expression=row.cron_expression,
+                snapshot_id=str(snapshot_id) if snapshot_id else "",
+            )
         if job_id is not None:
             summary["cron_catchup_enqueued"] += 1
         await _mark_catchup_fired(redis_client, row.id, missed_epoch)
@@ -2285,6 +2434,7 @@ async def _fire_missed_cron_epochs(
                     Trigger.cron_timezone,
                     Trigger.next_fire_at,
                     Trigger.last_fired_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "cron",
                     Trigger.active.is_(True),
@@ -2571,6 +2721,8 @@ async def _process_due_cron_scan(
                     Trigger.cron_expression,
                     Trigger.cron_timezone,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
+                    Trigger.eval_suite_id,
                 ).where(
                     Trigger.trigger_type == "cron",
                     Trigger.active.is_(True),
@@ -2786,18 +2938,33 @@ async def _enqueue_cron_fire(
     the job (a concurrent machine already enqueued the same epoch) so the
     catch-up scan never re-fires it. Extracted unchanged from
     ``_process_due_cron_rows`` (complexity bound).
+
+    FAR-377: a ``run_kind == 'suite_run'`` cron row enqueues the
+    ``fire_suite_run_trigger`` per-item job (with NO snapshot — the suite run
+    resolves its own dataset/backend from the trigger config) instead of
+    ``fire_cron_trigger``.
     """
     try:
-        job_id = await _enqueue_fire_job_async(
-            q,
-            "modulo.core.saq_worker.fire_cron_trigger",
-            f"fire:{row.id}:{int(now.timestamp())}",
-            trigger_id=str(row.id),
-            org_id=str(org_id),
-            pipeline_id=str(row.pipeline_id),
-            cron_expression=row.cron_expression,
-            snapshot_id=str(snapshot_id) if snapshot_id else "",
-        )
+        if getattr(row, "run_kind", "run") == "suite_run":
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_suite_run_trigger",
+                f"suite_fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+            )
+        else:
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_cron_trigger",
+                f"fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+                cron_expression=row.cron_expression,
+                snapshot_id=str(snapshot_id) if snapshot_id else "",
+            )
     except asyncio.CancelledError:
         raise
     except Exception:

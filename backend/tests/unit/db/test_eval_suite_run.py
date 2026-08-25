@@ -563,6 +563,8 @@ def test_single_migration_head() -> None:
     # -> 0140_eval_regression_alert (FAR-379 alerting config on eval_suites).
     # -> 0141_pipeline_edge_ports (FAR-416, renumbered from 0138 to avoid
     #    colliding with eval_versioning; chains off the eval_regression_alert head).
+    # -> 0142_merge_heads_add_fk_indexes (FK-index sweep).
+    # -> 0143_suite_run_trigger_kind (FAR-377, renumbered off the 0142 head).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -586,9 +588,12 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0141 except 0142 (the FK-index migration).
     chaining_off_0141 = [p for p in revisions if parents[p] == "0141_pipeline_edge_ports"]
     assert [_basename(p) for p in chaining_off_0141] == ["0142_merge_heads_add_fk_indexes.py"]
-    # Nothing chains off 0142 -> it is the single head.
+    # What chains off 0142 -> the FAR-377 suite-run trigger-kind migration.
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
-    assert chaining_off_0142 == []
+    assert [_basename(p) for p in chaining_off_0142] == ["0143_suite_run_trigger_kind.py"]
+    # Nothing chains off 0143 -> it is the single head.
+    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_suite_run_trigger_kind"]
+    assert chaining_off_0143 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

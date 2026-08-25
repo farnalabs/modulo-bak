@@ -622,6 +622,127 @@ async def fire_ongoing_trigger(
     )
 
 
+async def fire_suite_run_trigger(
+    ctx: dict[str, Any],
+    *,
+    trigger_id: str,
+    org_id: str,
+    pipeline_id: str,
+    cron_expression: str = "",
+    snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Per-item fire job for a ``run_kind='suite_run'`` trigger (SAQ, FAR-377).
+
+    Builds a ``pending`` SuiteRun via ``cron_helpers.fire_suite_run_trigger``
+    (which enforces the suite-run concurrency + spend pools and writes NO
+    trigger-watch event), then — post-commit — enqueues the
+    ``execute_suite_run`` job. A fired run is dispatched exactly like a fired
+    pipeline run, but runs through the ``execute_suite_run`` SAQ job instead of
+    ``execute_run``.
+    """
+    from modulo.core import cron_helpers as _ch
+
+    result = await _ch.fire_suite_run_trigger(
+        trigger_id=uuid.UUID(trigger_id),
+        org_id=uuid.UUID(org_id),
+        pipeline_id=uuid.UUID(pipeline_id),
+    )
+    if result.get("status") == "fired" and result.get("suite_run_id"):
+        try:
+            await _enqueue_suite_run_execution(result["suite_run_id"], org_id)
+            result["dispatched"] = "enqueued"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("fire_suite_run_trigger: enqueue failed for suite_run %s", result.get("suite_run_id"))
+            result["dispatched"] = "enqueue_failed"
+    return result
+
+
+async def _enqueue_suite_run_execution(suite_run_id: str, org_id: str) -> str | None:
+    """Enqueue the ``execute_suite_run`` job on the runs queue (no Run capacity gate).
+
+    A SuiteRun is not a pipeline ``Run``, so ``dispatch_run`` (which loads a
+    ``Run`` and checks pipeline/org capacity) does not apply. The job key is
+    deterministic so SAQ dedupe never double-runs a suite, and a re-fire uses a
+    fresh suite_run anyway (each fire is a distinct SuiteRun row).
+    """
+    from saq.queue.redis import RedisQueue
+
+    settings = get_settings()
+    redis_client = aioredis.from_url(
+        settings.redis_url,
+        socket_connect_timeout=10,
+        socket_keepalive=True,
+        max_connections=settings.saq_redis_pool_size,
+    )
+    queue = RedisQueue(redis_client, name=settings.saq_runs_queue)
+    try:
+        job = await queue.enqueue(
+            "modulo.core.saq_worker.execute_suite_run",
+            key=f"suite_run:{suite_run_id}",
+            timeout=300,
+            heartbeat=30,
+            retries=2,
+            ttl=300,
+            suite_run_id=suite_run_id,
+            org_id=org_id,
+        )
+        return job.id if job is not None else None
+    finally:
+        with contextlib.suppress(Exception):
+            await redis_client.aclose()
+
+
+async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: str) -> dict[str, Any]:
+    """SAQ ``execute_suite_run`` job — run a scheduled SuiteRun to terminal (FAR-377).
+
+    Called for a ``run_kind='suite_run'`` trigger that a fire job (or the
+    ``fire_suite_run`` dispatch path) enqueued. Loads the persisted SuiteRun
+    (carrying the immutable baseline tuple + any config-derived ceiling from
+    ``extra``), executes it end-to-end (pending -> terminal) via the
+    ``execute_suite_run`` runner, and returns the terminal stats. On an
+    orchestration failure the runner already transitioned the run to ``failed``;
+    the job re-raises so the SAQ ``after_process`` hook sinks it to the Error
+    Dashboard (the monitored failure sink).
+    """
+    from modulo.core.eval_engine.execute_suite_run import execute_suite_run as _run_exec
+    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.rls import set_rls_org
+
+    rid = uuid.UUID(suite_run_id)
+    oid = uuid.UUID(org_id)
+    factory = _make_session_factory()
+    try:
+        async with factory() as session, session.begin():
+            await set_rls_org(session, oid)
+            run = await session.get(SuiteRun, rid)
+            if run is None:
+                _log.warning("SAQ execute_suite_run: suite_run %s not found", rid)
+                return {"status": "missing"}
+            extra = run.extra or {}
+            stats = await _run_exec(
+                session,
+                run,
+                entity_thresholds=extra.get("entity_thresholds"),
+                suite_ceiling=extra.get("suite_ceiling"),
+                scenario_inputs=extra.get("scenario_inputs"),
+                eval_definition_version=int(extra.get("eval_definition_version", 1)),
+            )
+            run.extra = {**extra, "execution": stats}
+            await session.flush()
+        _log.info(
+            "saq.execute_suite_run.done",
+            extra={"suite_run_id": str(rid), "state": stats.get("state"), "org": str(oid)},
+        )
+        return stats
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("SAQ execute_suite_run failed for suite_run %s", rid)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Job functions — system worker (plan F1 / F3c / PR B step 6)
 # ---------------------------------------------------------------------------
@@ -1049,10 +1170,12 @@ def _runs_functions() -> list[tuple[str, Any]]:
     return [
         ("modulo.core.saq_worker.execute_run", execute_run),
         ("modulo.core.saq_worker.resume_run", resume_run),
+        ("modulo.core.saq_worker.execute_suite_run", execute_suite_run),
         ("modulo.core.saq_worker.fire_cron_trigger", fire_cron_trigger),
         ("modulo.core.saq_worker.fire_polling_trigger", fire_polling_trigger),
         ("modulo.core.saq_worker.fire_report_trigger", fire_report_trigger),
         ("modulo.core.saq_worker.fire_ongoing_trigger", fire_ongoing_trigger),
+        ("modulo.core.saq_worker.fire_suite_run_trigger", fire_suite_run_trigger),
     ]
 
 
