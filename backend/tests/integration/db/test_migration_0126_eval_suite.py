@@ -145,7 +145,11 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
     admin_engine = create_async_engine(db_url, poolclass=NullPool, execution_options={"isolation_level": "AUTOCOMMIT"})
     db_name = f"eval_suite_iso_{uuid.uuid4().hex[:10]}"
     async with admin_engine.connect() as conn:
-        await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+        # Clone template0 (always empty) rather than the default template1,
+        # which in CI can already carry the modulo schema. A non-empty clone
+        # would make ``command.upgrade(PREV_REV)`` recreate tables and fail with
+        # ``DuplicateTable: relation "library_sync_state" already exists``.
+        await conn.execute(text(f'CREATE DATABASE "{db_name}" WITH TEMPLATE template0'))
     await admin_engine.dispose()
 
     iso_url = _swap_db_name(db_url, db_name)
