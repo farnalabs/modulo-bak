@@ -1419,7 +1419,13 @@ async def test_node_send_budget_oversubscribed_warns_with_retry_multiplier():
     instance = _connector_instance(
         cid,
         config_json={
-            "fan_out": {"enabled": True, "max_cardinality": 100, "per_item_timeout": 5, "max_retries": 2},
+            "fan_out": {
+                "enabled": True,
+                "items_path": "data.items",
+                "max_cardinality": 100,
+                "per_item_timeout": 5,
+                "max_retries": 2,
+            },
         },
     )
     graph = {
@@ -1443,7 +1449,15 @@ async def test_node_send_budget_within_budget_no_warning():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"enabled": True, "max_cardinality": 2, "per_item_timeout": 1, "max_retries": 0}},
+        config_json={
+            "fan_out": {
+                "enabled": True,
+                "items_path": "data.items",
+                "max_cardinality": 2,
+                "per_item_timeout": 1,
+                "max_retries": 0,
+            }
+        },
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
@@ -1464,7 +1478,15 @@ async def test_node_send_budget_retries_zero_uses_single_attempt():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"enabled": True, "max_cardinality": 100, "per_item_timeout": 5, "max_retries": 0}},
+        config_json={
+            "fan_out": {
+                "enabled": True,
+                "items_path": "data.items",
+                "max_cardinality": 100,
+                "per_item_timeout": 5,
+                "max_retries": 0,
+            }
+        },
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
@@ -1582,7 +1604,7 @@ async def test_node_send_budget_minimal_fanout_uses_connector_timeout():
     cid = uuid.uuid4()
     instance = _connector_instance(
         cid,
-        config_json={"fan_out": {"enabled": True, "max_cardinality": 100}, "timeout": 50},
+        config_json={"fan_out": {"enabled": True, "items_path": "data.items", "max_cardinality": 100}, "timeout": 50},
     )
     graph = {
         "nodes": [{"id": "fanout-node", "timeout_seconds": 300}],
@@ -1624,9 +1646,12 @@ async def test_node_send_budget_explicit_malformed_value_skipped():
 
 
 async def test_node_send_budget_disabled_fanout_skipped():
-    """A present-but-inert ``fan_out`` dict (``{"enabled": false}``) runs as a
-    SINGLE call — the connector only fans out when ``enabled`` or ``items_path``
-    is truthy — so it must not be reconciled against a fan-out send budget.
+    """A present-but-inert ``fan_out`` dict (``{"enabled": False}``) runs as a
+    SINGLE call — the connector only fans out when ``items_path`` is truthy
+    (write() gates on ``_fanout_enabled AND _fanout_items_path``, and
+    ``_fanout_enabled = bool(enabled or items_path)`` so the effective
+    predicate reduces to ``bool(items_path)``) — so it must not be reconciled
+    against a fan-out send budget.
 
     Before the activation-predicate gate this spuriously warned against
     1000 x 30 x 3 for a connector that never fans out (FAR-411).
@@ -1648,3 +1673,58 @@ async def test_node_send_budget_disabled_fanout_skipped():
     )
     assert result.is_valid
     assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_enabled_no_items_path_skipped():
+    """``{"fan_out": {"enabled": true}}`` with NO ``items_path`` runs as a SINGLE
+    call — ``enabled`` alone is NOT sufficient to fan out (write() gated on
+    ``_fanout_enabled AND _fanout_items_path`` where the latter is ``items_path``
+    itself) — so it must not be reconciled against a fan-out send budget.
+
+    Before the effective-predicate gate this spuriously warned against the
+    connector DEFAULTS (1000 x 30 x 3) for a connector that never fans out
+    (FAR-411).
+    """
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"enabled": True}},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid
+    assert not any(i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED" for i in result.issues)
+
+
+async def test_node_send_budget_enabled_false_with_items_path_warns():
+    """``{"fan_out": {"enabled": false, "items_path": "data.items"}}`` STILL fans
+    out — the effective predicate is simply ``bool(items_path)`` — so it must be
+    reconciled against a fan-out send budget and warn when oversubscribed.
+    """
+    cid = uuid.uuid4()
+    instance = _connector_instance(
+        cid,
+        config_json={"fan_out": {"enabled": False, "items_path": "data.items"}},
+    )
+    graph = {
+        "nodes": [{"id": "fanout-node", "timeout_seconds": 30}],
+        "edges": [],
+    }
+    result = await GraphValidator().validate_definition(
+        graph,
+        _session_returning([instance]),
+        connector_bindings=[{"node_id": "fanout-node", "connector_instance_id": str(cid)}],
+        guardrail_definitions=[],
+    )
+    assert result.is_valid  # a warning is not a blocker
+    oversub = [i for i in result.issues if i.code == "NODE_SEND_BUDGET_OVERSUBSCRIBED"]
+    assert len(oversub) == 1
+    assert oversub[0].node_id == "fanout-node"

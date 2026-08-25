@@ -2484,13 +2484,17 @@ class GraphValidator:
             fanout = (instance.config_json or {}).get("fan_out")
             if not isinstance(fanout, dict):
                 continue
-            # The connector only fans out when ``enabled`` or ``items_path`` is
-            # truthy (rest/__init__.py ``_fanout_enabled``). A present-but-inert
-            # ``fan_out`` dict (``{}`` or ``{"enabled": false}``) runs as a SINGLE
+            # The connector only fans out when ``_fanout_enabled AND
+            # _fanout_items_path`` are both truthy (rest/__init__.py write()).
+            # ``_fanout_enabled = bool(enabled or items_path)`` and
+            # ``_fanout_items_path = items_path``, so the effective activation
+            # predicate reduces to ``bool(items_path)`` — ``enabled`` alone is
+            # NOT sufficient. A ``fan_out`` dict with ``enabled`` but NO
+            # ``items_path`` (``{}`` or ``{"enabled": true}``) runs as a SINGLE
             # call, so it must not be reconciled against a fan-out send budget.
-            # Gate on the SAME activation predicate so a disabled fan-out is
-            # skipped rather than spuriously warned about.
-            if not (fanout.get("enabled") or fanout.get("items_path")):
+            # Gate on the SAME effective predicate (``items_path`` truthy) so an
+            # inert fan-out is skipped rather than spuriously warned about.
+            if not fanout.get("items_path"):
                 continue
             # The connector DEFAULTS both keys when absent (max_cardinality ->
             # 1000, per_item_timeout -> its ``_DEFAULT_TIMEOUT``, which is ALWAYS
