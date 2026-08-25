@@ -19,20 +19,11 @@ from modulo.connectors.rest import (
     SecurityGuard,
 )
 from tests.connectors._conformance import assert_result_shape, assert_write_result_shape
+from tests.connectors._noop_guard import make_noop_security_guard as _noop_guard
 
 
 def _default_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={})
-
-
-def _noop_guard() -> SecurityGuard:
-    async def validate_url(url: str) -> None:
-        return None
-
-    def filter_strings(values: list[str], resource: str) -> None:
-        return None
-
-    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
 
 
 def _make_connector(
@@ -710,8 +701,19 @@ def test_default_timeout_is_30_seconds() -> None:
     assert c._timeout == 30.0
 
 
-def test_verify_tls_false_passes_verify_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """config_json verify_tls: false must reach the AsyncClient as verify=False (FAR-412)."""
+@pytest.mark.parametrize(
+    ("verify_tls_config", "expected_verify"),
+    [
+        ({"verify_tls": False}, False),
+        ({}, True),
+    ],
+)
+def test_verify_tls_passes_through_to_client(
+    monkeypatch: pytest.MonkeyPatch,
+    verify_tls_config: dict[str, Any],
+    expected_verify: bool,
+) -> None:
+    """config_json verify_tls must reach the AsyncClient as verify=... (FAR-412)."""
     captured: dict[str, Any] = {}
     real_client = httpx.AsyncClient
 
@@ -721,35 +723,14 @@ def test_verify_tls_false_passes_verify_to_client(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr("modulo.connectors.rest.httpx.AsyncClient", factory)
     c = RestConnector(
-        {"base_url": "https://api.example.com", "path": "/items", "verify_tls": False},
+        {"base_url": "https://api.example.com", "path": "/items", **verify_tls_config},
         {"auth_mode": "bearer", "token": "t"},
         transport=httpx.MockTransport(_default_handler),
         ssrf_validator=lambda url: None,
         security_guard=_noop_guard(),
     )
     c._client()
-    assert captured.get("verify") is False
-
-
-def test_verify_tls_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Absent verify_tls keeps the secure default (verify=True) (FAR-412)."""
-    captured: dict[str, Any] = {}
-    real_client = httpx.AsyncClient
-
-    def factory(**kwargs: Any) -> Any:
-        captured.update(kwargs)
-        return real_client(**kwargs)
-
-    monkeypatch.setattr("modulo.connectors.rest.httpx.AsyncClient", factory)
-    c = RestConnector(
-        {"base_url": "https://api.example.com", "path": "/items"},
-        {"auth_mode": "bearer", "token": "t"},
-        transport=httpx.MockTransport(_default_handler),
-        ssrf_validator=lambda url: None,
-        security_guard=_noop_guard(),
-    )
-    c._client()
-    assert captured.get("verify") is True
+    assert captured.get("verify") is expected_verify
 
 
 def asyncio_run(coro: Any) -> Any:

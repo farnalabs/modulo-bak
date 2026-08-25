@@ -9,21 +9,9 @@ import httpx
 import pytest
 
 from modulo.connectors.base import ConnectorBase
-from modulo.connectors.rest import RestConnector, SecurityGuard
+from modulo.connectors.rest import RestConnector
 from tests.connectors._conformance import get_registered_fixture, get_registered_types, register_conformance_connector
-
-
-def _noop_security_guard() -> SecurityGuard:
-    """Inert guard for the REST conformance fixture (no SSRF/injection enforcement)."""
-
-    async def validate_url(url: str) -> None:
-        return None
-
-    def filter_strings(values: list[str], resource: str) -> None:
-        return None
-
-    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
-
+from tests.connectors._noop_guard import make_noop_security_guard
 
 # ── Connector fixture definitions ──────────────────────────────────────────
 
@@ -96,7 +84,7 @@ def rest_connector():
         {"auth_mode": "bearer", "token": "test-token"},
         transport=httpx.MockTransport(handler),
         ssrf_validator=lambda url: None,
-        security_guard=_noop_security_guard(),
+        security_guard=make_noop_security_guard(),
     )
 
 
