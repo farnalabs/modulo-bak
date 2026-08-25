@@ -259,7 +259,7 @@ async def test_sandbox_agent_fan_out_honored_and_delivers_item(monkeypatch: pyte
 
 def test_validate_scatter_join_node_allows_sandbox_agent_fan_out():
     # fan_out on sandbox_agent is a supported, executable shape.
-    validate_scatter_join_node({"node_type": "sandbox_agent", "fan_out": {"split": "items"}})
+    assert validate_scatter_join_node({"node_type": "sandbox_agent", "fan_out": {"split": "items"}}) is None
 
 
 def test_validate_scatter_join_node_rejects_composite_fan_out():
