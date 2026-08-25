@@ -1,7 +1,7 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0144_suite_run_trigger_kind
-Revises: 0143_rest_connector_profile
+Revision ID: 0145_suite_run_trigger_kind
+Revises: 0144_broaden_notification_status_in_app
 Create Date: 2026-08-25
 
 Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
@@ -14,6 +14,12 @@ Renumbered a second time from ``0143_suite_run_trigger_kind`` to
 ``0144_suite_run_trigger_kind`` to resolve the collision with main's merged
 ``0143_rest_connector_profile`` (FAR-412, PR 2009's merge base). It now chains
 off the real main head ``0143_rest_connector_profile``.
+
+Renumbered a third time from ``0144_suite_run_trigger_kind`` to
+``0145_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0144_broaden_notification_status_in_app`` (PR 2009's second merge base). It now
+chains off the real main head ``0144_broaden_notification_status_in_app`` and is
+the single head of the merged tree.
 
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
@@ -44,8 +50,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0144_suite_run_trigger_kind"
-down_revision: str | None = "0143_rest_connector_profile"
+revision: str = "0145_suite_run_trigger_kind"
+down_revision: str | None = "0144_broaden_notification_status_in_app"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

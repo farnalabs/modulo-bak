@@ -566,7 +566,8 @@ def test_single_migration_head() -> None:
     # -> 0142_merge_heads_add_fk_indexes (FK-index sweep).
     # -> 0143_rest_connector_profile (FAR-412 REST connector profile, renumbered
     #    from 0142 to avoid colliding with main's 0142_merge_heads_add_fk_indexes).
-    # -> 0144_suite_run_trigger_kind (FAR-377, renumbered off the 0143 head).
+    # -> 0144_broaden_notification_status_in_app (main: allow 'in_app' notification status).
+    # -> 0145_suite_run_trigger_kind (FAR-377, renumbered off the 0144 head).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -593,12 +594,15 @@ def test_single_migration_head() -> None:
     # What chains off 0142 -> the FAR-412 REST connector profile migration.
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
     assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
-    # What chains off 0143 (REST connector profile) -> the FAR-377 suite-run trigger-kind migration.
+    # What chains off 0143 (REST connector profile) -> main's 0144_broaden_notification_status_in_app.
     chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
-    assert [_basename(p) for p in chaining_off_0143] == ["0144_suite_run_trigger_kind.py"]
-    # Nothing chains off 0144 -> it is the single head.
-    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_suite_run_trigger_kind"]
-    assert chaining_off_0144 == []
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_broaden_notification_status_in_app.py"]
+    # What chains off 0144 (broaden notification status) -> the FAR-377 suite-run trigger-kind migration.
+    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_broaden_notification_status_in_app"]
+    assert [_basename(p) for p in chaining_off_0144] == ["0145_suite_run_trigger_kind.py"]
+    # Nothing chains off 0145 -> it is the single head.
+    chaining_off_0145 = [p for p in revisions if parents[p] == "0145_suite_run_trigger_kind"]
+    assert chaining_off_0145 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
