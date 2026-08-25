@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 import modulo.connectors.rest.rest_metrics as rest_metrics
+import modulo.connectors.rest.rest_rollback as rest_rollback
 from modulo.connectors.base import ConnectorQuery
 from modulo.connectors.rest import RESTConnectError, RestConnector, RESTResponseTooLargeError, SecurityGuard
 from modulo.connectors.rest.rest_rollback import RestRollbackSignal, evaluate_rest_rollback, is_unknown_like
@@ -403,6 +404,31 @@ class TestRestRollback:
         assert is_unknown_like("unknown") is True
         assert is_unknown_like("http_429") is False
         assert is_unknown_like("success") is False
+
+    def test_unknown_outcome_not_double_counted_in_error_bucket(self) -> None:
+        """``unknown`` must never be classified as an error. A producer that
+        builds error_requests from ``_ERROR_CAUSE_CODES`` and unknown_requests
+        from ``is_unknown_like`` must not count the same cause in both — the
+        two cause sets are genuinely disjoint."""
+        error_causes = frozenset(rest_metrics._ERROR_CAUSE_CODES)
+        unknown_like = frozenset(rest_rollback._DEFAULT_UNKNOWN_LIKE)
+
+        # The two buckets share no cause value at all.
+        assert error_causes.isdisjoint(unknown_like)
+        assert rest_metrics.CAUSE_UNKNOWN not in rest_metrics._ERROR_CAUSE_CODES
+        assert is_unknown_like(rest_metrics.CAUSE_UNKNOWN) is True
+
+        # Every error cause is deterministic; none is UNKNOWN-like.
+        assert rest_metrics.CAUSE_TIMEOUT in error_causes
+        assert is_unknown_like(rest_metrics.CAUSE_TIMEOUT) is False
+
+        # A producer bucketising a batch never doubles an outcome: an
+        # ``unknown`` outcome is counted in the UNKNOWN bucket only.
+        batch = ["success", rest_metrics.CAUSE_429, rest_metrics.CAUSE_UNKNOWN]
+        counted_errors = [c for c in batch if c in error_causes]
+        counted_unknown = [c for c in batch if is_unknown_like(c)]
+        assert counted_errors == [rest_metrics.CAUSE_429]
+        assert counted_unknown == [rest_metrics.CAUSE_UNKNOWN]
 
     def test_logs_structured_warning_on_trigger(self, caplog: pytest.LogCaptureFixture) -> None:
         evaluate_rest_rollback(url="https://a.example", total_requests=100, error_requests=50, unknown_requests=0)

@@ -51,7 +51,7 @@ CAUSE_UNKNOWN = "unknown"
 # is not an error (no redirect is followed, the operation surfaces it); a 4xx
 # client mistake is not a downstream anomaly — only 429/5xx/transport/timeout
 # indicate an unhealthy remote we might need to roll back from.
-_ERROR_CAUSE_CODES = frozenset({CAUSE_429, CAUSE_5XX, CAUSE_CONNECT, CAUSE_TIMEOUT, CAUSE_UNKNOWN})
+_ERROR_CAUSE_CODES = frozenset({CAUSE_429, CAUSE_5XX, CAUSE_CONNECT, CAUSE_TIMEOUT})
 
 # Module-level handles — initialised once by _init().
 _requests_histogram: Any = None
