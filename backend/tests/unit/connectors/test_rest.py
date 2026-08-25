@@ -809,7 +809,7 @@ def test_write_fanout_empty_iterator_vacuous_success() -> None:
     assert result["total"] == 0
     assert result["success_count"] == 0
     assert result["failure_count"] == 0
-    assert result["outcomes"] == []
+    assert not result["outcomes"]
     assert len(requests) == 0
 
 
