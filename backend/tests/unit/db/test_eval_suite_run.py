@@ -525,7 +525,7 @@ def test_migration_is_reversible_single_head() -> None:
 
 
 def test_single_migration_head() -> None:
-    """Exactly one migration chains off each predecessor, and the head is 0137."""
+    """Exactly one migration chains off each predecessor, and the head is 0138."""
     import glob
     import re
 
@@ -561,8 +561,8 @@ def test_single_migration_head() -> None:
     # -> 0137_eval_suite_run (renumbered to resolve the 0135 collision)
     # -> 0138_eval_versioning (FAR-382).
     # -> 0140_eval_regression_alert (FAR-379 alerting config on eval_suites).
-    # -> 0141_pipeline_edge_ports (FAR-416, renumbered from 0138 to avoid
-    #    colliding with eval_versioning; chains off the eval_regression_alert head).
+    # -> 0143_rest_connector_profile (FAR-412 REST connector profile, renumbered
+    #    from 0142 to avoid colliding with main's 0142_merge_heads_add_fk_indexes).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -581,18 +581,21 @@ def test_single_migration_head() -> None:
     chaining_off_0138 = [p for p in revisions if parents[p] == "0138_eval_versioning"]
     assert [_basename(p) for p in chaining_off_0138] == ["0140_eval_regression_alert.py"]
     # 0141_pipeline_edge_ports (FAR-416, main) chains off 0140, and
-    # 0143_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0142.
+    # 0144_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0143_rest_connector_profile.
     chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
     assert [_basename(p) for p in chaining_off_0140] == ["0141_pipeline_edge_ports.py"]
     # 0142_merge_heads_add_fk_indexes (main, FK-index pass) chains off 0141.
     chaining_off_0141 = [p for p in revisions if parents[p] == "0141_pipeline_edge_ports"]
     assert [_basename(p) for p in chaining_off_0141] == ["0142_merge_heads_add_fk_indexes.py"]
-    # 0143_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0142.
+    # 0143_rest_connector_profile (FAR-412, main) chains off 0142.
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
-    assert [_basename(p) for p in chaining_off_0142] == ["0143_pipeline_snapshot_versioning_far420.py"]
-    # Nothing chains off 0143 -> it is the single head.
-    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_pipeline_snapshot_versioning_far420"]
-    assert chaining_off_0143 == []
+    assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
+    # 0144_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0143_rest_connector_profile.
+    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_pipeline_snapshot_versioning_far420.py"]
+    # Nothing chains off 0144 -> it is the single head.
+    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_pipeline_snapshot_versioning_far420"]
+    assert chaining_off_0144 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
