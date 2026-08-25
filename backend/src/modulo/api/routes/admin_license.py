@@ -228,19 +228,12 @@ async def issue_license(
     When ``email`` is provided, the license key is also emailed to the customer
     via a background task so this request stays fast.
     """
-    try:
-        license_key = generate_team_license(
-            req.org_name,
-            term_months=req.term_months,
-            features=req.features if req.features is not None else TEAM_FEATURES,
-            private_key_hex=settings.modulo_license_private_key or None,
-        )
-    except ValueError as exc:
-        logger.exception("license.issue_generation_failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
+    license_key = generate_team_license(
+        req.org_name,
+        term_months=req.term_months,
+        features=req.features if req.features is not None else TEAM_FEATURES,
+        private_key_hex=settings.modulo_license_private_key or None,
+    )
 
     validation = parse_and_verify(license_key)
     if not validation.valid or validation.license_data is None:

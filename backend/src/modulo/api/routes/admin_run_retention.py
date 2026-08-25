@@ -202,7 +202,7 @@ async def export(
     )
 
 
-@router.post("/purge", response_model=PurgeResponse, dependencies=[require_feature("admin_run_retention")])
+@router.post("/purge", dependencies=[require_feature("admin_run_retention")])
 async def purge(
     req: PurgeRequest,
     session: Annotated[AsyncSession, Depends(get_db_session)],

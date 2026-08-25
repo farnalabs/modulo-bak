@@ -883,6 +883,43 @@ async def _infer_definition(
     return definition_json, first_backend_id
 
 
+async def _resolve_infer_context(
+    session: AsyncSession, principal: TenantPrincipal, req: SchemaInferRequest
+) -> tuple[Any, Any]:
+    """Load and validate the connector + model backends for schema inference."""
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        await set_rls_user_context(session, principal.account_id, principal.org_role)
+
+        ci = await get_connector_instance(session, req.connector_instance_id)
+        if ci is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connector instance not found",
+            )
+
+        # Connector-types currently supported for schema inference. Single
+        # source of truth lives in `schema_registry/inference.py` and is
+        # derived from the `ConnectorType` enum + the connector-type-aware
+        # field-extraction categories (PRD §8.16), so this list can't drift
+        # from the category map or the enum.
+        supported_inference_types = SUPPORTED_INFERENCE_TYPES
+        if ci.connector_type_id not in supported_inference_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Connector type '{ci.connector_type_id}' does not support schema inference. "
+                f"Supported types: {', '.join(sorted(supported_inference_types))}",
+            )
+
+        mbs = await list_model_backends(session, org_id=principal.organisation_id, page_size=1)
+        if not mbs.items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No model backends configured; cannot perform inference",
+            )
+        return ci, mbs
+
+
 @router.post("/infer")
 @handle_db_errors("schemas.infer_schema_endpoint")
 async def infer_schema_endpoint(
@@ -897,36 +934,7 @@ async def infer_schema_endpoint(
     save via the standard POST /api/v1/schemas endpoint.
     """
     try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            await set_rls_user_context(session, principal.account_id, principal.org_role)
-
-            ci = await get_connector_instance(session, req.connector_instance_id)
-            if ci is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Connector instance not found",
-                )
-
-            # Connector-types currently supported for schema inference. Single
-            # source of truth lives in `schema_registry/inference.py` and is
-            # derived from the `ConnectorType` enum + the connector-type-aware
-            # field-extraction categories (PRD §8.16), so this list can't drift
-            # from the category map or the enum.
-            supported_inference_types = SUPPORTED_INFERENCE_TYPES
-            if ci.connector_type_id not in supported_inference_types:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Connector type '{ci.connector_type_id}' does not support schema inference. "
-                    f"Supported types: {', '.join(sorted(supported_inference_types))}",
-                )
-
-            mbs = await list_model_backends(session, org_id=principal.organisation_id, page_size=1)
-            if not mbs.items:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No model backends configured; cannot perform inference",
-                )
+        ci, mbs = await _resolve_infer_context(session, principal, req)
     except IntegrityError:
         logger.exception("schemas.infer_schema_endpoint")
         raise HTTPException(
@@ -1196,6 +1204,38 @@ async def _audit_migration(
     )
 
 
+def _create_migration_plan(from_definition: dict[str, Any], to_definition: dict[str, Any]) -> Any:
+    """Compute a migration plan, mapping failures to a 500 HTTP response."""
+    try:
+        return create_migration(from_definition, to_definition)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("schemas.migrate_create_plan")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to compute migration plan.",
+        ) from None
+
+
+def _apply_migration_safe(data: dict[str, Any], plan: Any) -> Any:
+    """Apply a migration plan to data, mapping failures to a 500 HTTP response."""
+    try:
+        return apply_migration(data, plan)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("schemas.migrate_apply")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to apply migration to data.",
+        ) from None
+
+
 @router.post(
     "/migrate",
     responses={
@@ -1253,18 +1293,7 @@ async def migrate_data_endpoint(
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
 
-    try:
-        plan = create_migration(from_sv.definition_json, to_sv.definition_json)
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_create_plan")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to compute migration plan.",
-        ) from None
+    plan = _create_migration_plan(from_sv.definition_json, to_sv.definition_json)
 
     plan_dict: dict[str, Any] = {
         "field_additions": plan.field_additions,
@@ -1282,18 +1311,7 @@ async def migrate_data_endpoint(
             plan=plan_dict,
         )
 
-    try:
-        migrated = apply_migration(req.data, plan)
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_apply")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to apply migration to data.",
-        ) from None
+    migrated = _apply_migration_safe(req.data, plan)
 
     return SchemaMigrationResponse(
         migrated_data=migrated,
@@ -1381,6 +1399,21 @@ class SchemaValidateResponse(BaseModel):
     errors: list[SchemaValidationError]
 
 
+def _json_path_exists(target: Any, parts: list[str]) -> bool:
+    """Return whether ``parts`` resolves to an existing location in ``target``."""
+    for part in parts:
+        if isinstance(target, dict):
+            target = target.get(part, {})
+        elif isinstance(target, list):
+            try:
+                target = target[int(part)]
+            except (ValueError, IndexError):
+                return False
+        else:
+            return False
+    return True
+
+
 def _find_json_location(raw: str, error_path: str) -> tuple[int | None, int | None]:
     """Best-effort line/column lookup for a validation error path in raw JSON text."""
     try:
@@ -1389,22 +1422,10 @@ def _find_json_location(raw: str, error_path: str) -> tuple[int | None, int | No
         return None, None
 
     parts = error_path.strip("/").split("/") if error_path else []
-    target = parsed
-    for part in parts:
-        if isinstance(target, dict):
-            target = target.get(part, {})
-        elif isinstance(target, list):
-            try:
-                target = target[int(part)]
-            except (ValueError, IndexError):
-                return None, None
-        else:
-            return None, None
-
-    # Seek the key in raw text
-    if not parts:
+    if not parts or not _json_path_exists(parsed, parts):
         return None, None
 
+    # Seek the key in raw text
     key_to_find = parts[-1]
     lines = raw.split("\n")
     for i, line in enumerate(lines):
