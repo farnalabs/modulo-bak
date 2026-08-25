@@ -802,6 +802,7 @@ async def _fallback_write(
     )
     if is_terminal:
         await _record_fallback_terminal_facts(session, run_id, status, merged.outputs)
+    return total
 
 
 def _fallback_wall_hours(merged_outputs: dict[str, Any], merged_telemetry: Any) -> float:
@@ -1024,6 +1025,15 @@ async def _ledger_block(
             spend_ceiling_cents=org_row.spend_ceiling_cents,
         )
         if not decision.allowed:
+            # Preserve an explicit terminal CANCEL (B6 / user-requested halt) so
+            # the ceiling refuse does NOT overwrite it and feed the wrong status
+            # to journey advancement. The ledger is still refused (the run is not
+            # billed beyond its ceiling) — only the status is left untouched.
+            if locked.status == "cancelled":
+                locked.ledger_refused_at = datetime.now(UTC)
+                record_limit_refused("spend_ceiling")
+                await session.flush()
+                return
             locked.ledger_refused_at = datetime.now(UTC)
             locked.status = "cost_ceiling_exceeded"
             locked.error_code = decision.reason
@@ -1537,7 +1547,7 @@ async def finalize_cost(
         status, error_code, error_detail = await _apply_agent_budget_override(
             session, run, merged_usage, is_terminal, status, error_code, error_detail
         )
-        await _fallback_write(
+        fallback_total = await _fallback_write(
             session,
             run_id,
             status,
@@ -1547,6 +1557,38 @@ async def finalize_cost(
             is_terminal=is_terminal,
             claim_token=claim_token,
         )
+        # FAR-391 — the never-fail fallback MUST still run the terminal ledger
+        # block so the spend-ceiling gate refuses the ledger and the org's
+        # consumed total is accrued. Otherwise a breached ceiling is silently
+        # skipped on the legacy path. Keep it inside the never-fail envelope:
+        # a ledger failure here must never resurrect the original exception.
+        if is_terminal:
+            run_date = _ledger_run_date(is_terminal, fallback_total, run)
+            if run_date is not None:
+                try:
+                    await _ledger_block(
+                        session,
+                        run_id=run_id,
+                        org_id=org_id,
+                        status=status,
+                        total=fallback_total,
+                        owner_team_id=run.owner_team_id,
+                        run_date=run_date,
+                        finalize_fields={
+                            "error_code": error_code,
+                            "error_detail": error_detail,
+                            "total_cost_usd": fallback_total,
+                        },
+                        session_factory=session_factory,
+                        claim_token=claim_token,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.exception(
+                        "cost_ledger.fallback_block_failed",
+                        extra={"run_id": str(run_id)},
+                    )
         return
 
     # --- Ledger block — terminal only, guarded, converged (§4.2/§4.6) ---

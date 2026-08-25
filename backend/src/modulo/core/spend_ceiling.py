@@ -2,14 +2,21 @@
 
 These ceilings are a HARD stop on billable work (spec §5.1 cost controls):
 
-- *Per-run ceiling* (``max_run_cost_cents``): a single run must never cost more
-  than this. Enforced BEFORE a billable step is spawned — if the run's already
-  recorded cost plus the next step's estimated cost would exceed the ceiling,
-  the run is halted rather than spawning further LLM / E2B calls.
+- *Per-run ceiling* (``max_run_cost_cents``): a single run must never be billed
+  beyond this. Enforced at the terminal ledger block (post-hoc): once a run has
+  incurred cost, ``finalize_cost`` refuses the daily-ledger write and
+  terminalizes the run as ``cost_ceiling_exceeded`` (the org's consumed total is
+  NOT incremented) if the run's recorded cost exceeds the ceiling. This is a
+  *post-hoc ledger refusal*, not a pre-spawn halt — a run that overshoots its
+  ceiling is still billed up to the point it completed, then stopped from
+  accruing further.
 - *Per-org ceiling* (``spend_ceiling_cents``): the organisation's lifetime
-  budget. Enforced against ``organisations.org_cumulative_spend_cents`` (the
-  running consumed total) — when the remaining budget would be exhausted the
-  run is halted before any new billable step.
+  budget. Enforced on TWO surfaces: (1) a FAIL-OPEN pre-step gate in the
+  executor (``PipelineExecutor._check_spend_ceiling_gate``) halts a brand-new
+  run BEFORE any billable step when the org has zero remaining budget, and (2)
+  the terminal ledger block refuses the ledger when a run would push the org's
+  consumed total (``organisations.org_cumulative_spend_cents``) past its
+  ceiling, terminalizing as ``cost_ceiling_exceeded`` and halting future runs.
 
 Both values are stored in integer CENTS to avoid floating-point drift in the
 limit comparison (the same discipline as the daily ledger's ``Decimal`` column,
@@ -81,13 +88,15 @@ def evaluate_run_spend_ceiling(
     estimated_next_step_cents: int = 0,
     max_run_cost_cents: int | None,
 ) -> SpendCeilingDecision:
-    """Halt a run BEFORE a billable step pushes it past its per-run ceiling.
+    """Refuse a run whose recorded cumulative cost passes its per-run ceiling.
 
-    ``run_cost_so_far_cents`` is the run's recorded cumulative cost (from
-    completed nodes); ``estimated_next_step_cents`` is the conservative estimate
-    of the next billable step (LLM + sandbox). When their sum would exceed
+    This is evaluated at the terminal ledger block (post-hoc): ``run_cost_so_far_cents``
+    is the run's recorded cumulative cost (from completed nodes) and
+    ``estimated_next_step_cents`` is a conservative estimate of any further
+    billable step (LLM + sandbox). When their sum would exceed
     ``max_run_cost_cents`` the decision is ``allowed=False`` with reason
-    ``run_cost_ceiling_exceeded``.
+    ``run_cost_ceiling_exceeded`` — the run's ledger write is refused and it is
+    terminalized as ``cost_ceiling_exceeded``.
 
     A ``None`` ceiling means "unlimited" (no check). A ceiling of ``0`` blocks
     every run that would cost anything (``projected > 0``), which is the
@@ -134,12 +143,15 @@ def evaluate_org_spend_ceiling(
     additional_cents: int = 0,
     spend_ceiling_cents: int | None,
 ) -> SpendCeilingDecision:
-    """Halt a run BEFORE it exhausts the org's remaining lifetime budget.
+    """Refuse a run that would push the org past its lifetime spend ceiling.
 
     ``org_cumulative_spend_cents`` is the org's persisted consumed total;
     ``additional_cents`` is the run's cost being added now. When their sum would
     exceed ``spend_ceiling_cents`` the decision is ``allowed=False`` with reason
-    ``org_spend_ceiling_exceeded``.
+    ``org_spend_ceiling_exceeded``. The executor's FAIL-OPEN pre-step gate also
+    halts brand-new runs before any billable step when the org has zero remaining
+    budget, but the authoritative refusal happens here at the terminal ledger
+    block.
 
     A ``None`` ceiling means "unlimited". A ceiling of ``0`` blocks every run
     once any spend is pending (``projected > 0``).

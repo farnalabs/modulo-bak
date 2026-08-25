@@ -108,6 +108,39 @@ async def test_run_ceiling_exceeded_refuses_ledger() -> None:
     assert run.error_code == RUN_CEILING_EXCEEDED
 
 
+async def test_ceiling_refusal_preserves_explicit_cancelled_status() -> None:
+    """FAR-391 regression — Minor 1: an explicit terminal CANCEL must not be
+    overwritten by the ceiling refusal (which would feed the wrong status to
+    journey advancement). The ledger is still refused, but the status stays
+    ``cancelled``.
+    """
+    run = _make_run()
+    run.status = "cancelled"
+    org = _make_org(spend_ceiling_cents=100, org_cumulative_spend_cents=100)
+    session = _session_for(run, org)
+
+    await _ledger_block(
+        session,
+        run_id=run.id,
+        org_id=org.id,
+        status="cancelled",
+        total=Decimal("2.00"),
+        owner_team_id=None,
+        run_date=date(2026, 6, 24),
+        finalize_fields={},
+        session_factory=None,
+        claim_token=None,
+    )
+
+    # Refused (no billing beyond the ceiling) ...
+    assert run.ledger_refused_at is not None
+    # ... but the explicit cancel status is preserved, not overwritten.
+    assert run.status == "cancelled"
+    # The cancel branch leaves error_code untouched (it was None before).
+    assert run.error_code is None
+    assert org.org_cumulative_spend_cents == 100
+
+
 async def test_within_ceilings_increments_org_cumulative() -> None:
     run = _make_run()
     org = _make_org(spend_ceiling_cents=10_000, org_cumulative_spend_cents=500)  # $100 ceiling, $5 consumed
