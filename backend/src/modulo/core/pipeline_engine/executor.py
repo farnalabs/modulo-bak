@@ -1847,14 +1847,24 @@ class PipelineExecutor:
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
-
+        
         *allowed_connectors* (FAR-418) wires fetch-time capability scoping into the
         production run path: when every node in the run is connector-scoped the hub
         decrypts ONLY those connectors, so out-of-scope credentials are never
         disclosed. Pass ``None`` (the default) to fetch every active org connector,
         preserving the pre-scope behaviour (used for compensation and unscoped runs).
+        
+        Contract (fail-closed on the configured path):
+          - If NO active connectors are configured for this run, returns None —
+            the node_runner treats a None hub as vacuous success, which is correct
+            only when no connector work is expected.
+          - If connectors ARE configured, any failure to build the hub (settings
+            read, secrets_backend construction, ConnectorHub construction,
+            ``__aenter__``, or ``initialise``) RAISES, so the run terminalises as
+            FAILED rather than silently completing green with no connector work.
         """
         hub: Any | None = None
+        connectors_configured = False
         try:
             async with self._session_factory() as session, session.begin():
                 await set_rls_org(session, org_id)
@@ -1876,6 +1886,7 @@ class PipelineExecutor:
                     .all()
                 )
                 if isinstance(rows, list) and rows:
+                    connectors_configured = True
                     from modulo.core.connector_hub import ConnectorHub
                     from modulo.core.pipeline_engine.decorator import set_connector_hub
                     from modulo.core.runtime_provider import create_default_hub
@@ -1909,6 +1920,19 @@ class PipelineExecutor:
                 await _teardown_hub(hub)
             raise
         except Exception:
+            if connectors_configured:
+                # Fail closed, loudly: a run WITH connectors configured must never
+                # fall through to `hub=None` on a construction/settings/secrets
+                # failure — the node_runner would treat it as vacuous success
+                # (None hub -> "no connector hub" fallback), silently no-op'ing a
+                # configured remote integration and finalising the run GREEN.
+                # Re-raise so the run terminalises as FAILED.
+                _log.exception("pipeline.connector_hub_init_failed_configured")
+                if hub is not None:
+                    await _teardown_hub(hub)
+                raise
+            # No connectors configured (or the nothing-constructed path): a
+            # return of None is the correct vacuous-success result.
             _log.exception("pipeline.connector_hub_init_failed")
             if hub is not None:
                 await _teardown_hub(hub)

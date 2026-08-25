@@ -2990,3 +2990,50 @@ async def test_init_connector_hub_propagates_shared_budget_error():
         pytest.raises(SharedBudgetUnavailableError),
     ):
         await executor._init_connector_hub(org_id)
+
+
+async def test_init_connector_hub_raises_when_configured_but_build_fails():
+    """FAR-439 root cause: a run WITH connectors configured must fail loudly.
+
+    A construction/settings failure (here ``get_settings`` raising) on a run that
+    HAS active connector rows must RAISE out of ``_init_connector_hub`` — never
+    return None. Returning None would let the node_runner vacuously "succeed"
+    with the ``no connector hub`` fallback, silently no-op'ing the configured
+    remote integration and finalising the run GREEN.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([MagicMock()])
+    )
+
+    with (
+        patch("modulo.settings.get_settings", side_effect=RuntimeError("settings unavailable")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        pytest.raises(RuntimeError),
+    ):
+        await executor._init_connector_hub(org_id)
+
+
+async def test_init_connector_hub_returns_none_when_no_connectors_configured():
+    """FAR-439: a run with NO active connector bindings returns None (vacuous success).
+
+    Vacuous success is only correct when no connector work is expected — the
+    ``hub=None`` fallback must never be reached for a configured run (see the
+    sibling fail-loudly tests). With zero rows the hub is never constructed so
+    the None return is the safe, correct result.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([])
+    )
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+    ):
+        result = await executor._init_connector_hub(org_id)
+
+    assert result is None
