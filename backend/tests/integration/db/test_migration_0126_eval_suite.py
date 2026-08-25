@@ -133,7 +133,7 @@ def _swap_db_name(db_url: str, new_db: str) -> str:
 
 
 @pytest_asyncio.fixture
-async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
+async def isolated_db_url(db_url: str, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
     """A fresh, private Postgres database migrated only up to ``PREV_REV``.
 
     ``test_0126`` downgrades the schema (dropping ``eval_suites`` /
@@ -169,14 +169,14 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
     # surfacing as ``relation "library_sync_state" already exists``. Restoring
     # the previous value keeps the shared session env untouched for other tests.
     prev_db_url = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = iso_url
+    monkeypatch.setenv("DATABASE_URL", iso_url)
     try:
         command.upgrade(_alembic_config(iso_url), PREV_REV)
     finally:
         if prev_db_url is None:
-            os.environ.pop("DATABASE_URL", None)
+            monkeypatch.delenv("DATABASE_URL", raising=False)
         else:
-            os.environ["DATABASE_URL"] = prev_db_url
+            monkeypatch.setenv("DATABASE_URL", prev_db_url)
 
     try:
         yield iso_url
