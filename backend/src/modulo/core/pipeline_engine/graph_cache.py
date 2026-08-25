@@ -400,7 +400,7 @@ def make_scatter_node_fn(
     timeout: int,
     session_factory: Callable[..., Any] | None = None,
     single_sandbox_node: bool = False,
-) -> Callable[[dict[str, Any]], dict[str, Any]]:
+) -> Any:
     """Build the runtime node function for a scatter (fan-out) node.
 
     At execution the split source port is read from ``state``; it is expanded
@@ -414,7 +414,7 @@ def make_scatter_node_fn(
     split = fan_out.get("split") if isinstance(fan_out, dict) else fan_out.split
 
     def _fn(state: dict[str, Any]) -> dict[str, Any]:
-        items = state.get(split) or []
+        items = state.get(split) or [] if split is not None else []
         manifest: list[str] = []
 
         def execute_child(child_def: dict[str, Any]) -> Any:
@@ -439,7 +439,7 @@ def make_scatter_node_fn(
 
 def make_join_node_fn(
     node_def: dict[str, Any],
-) -> Callable[[dict[str, Any]], dict[str, Any]]:
+) -> Any:
     """Build the runtime node function for a join (fan-in) node.
 
     Gathers each collected branch's output from ``state`` (located via the

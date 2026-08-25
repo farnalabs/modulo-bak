@@ -10219,6 +10219,33 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /**
+         * FanOutConfig
+         * @description Declares a scatter (fan-out) on an agent / sandbox_agent node.
+         */
+        FanOutConfig: {
+            /**
+             * Split
+             * @description Name of the source port / state key to split.
+             */
+            split: string;
+            /**
+             * Strategy
+             * @default list
+             * @enum {string}
+             */
+            strategy: "list" | "batch";
+            /**
+             * Max Items
+             * @description Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.
+             */
+            max_items?: number | null;
+            /**
+             * Batch Size
+             * @description Items per batch when strategy='batch'.
+             */
+            batch_size?: number | null;
+        };
         /** FeatureFlagInfo */
         FeatureFlagInfo: {
             /** Name */
@@ -10859,6 +10886,43 @@ export interface components {
         InstallRequest: {
             /** Target Team Id */
             target_team_id?: string | null;
+        };
+        /**
+         * JoinAggregateSpec
+         * @description Aggregation applied by a join node to its collected branches.
+         */
+        JoinAggregateSpec: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "concat" | "merge_by_key" | "map" | "custom_function";
+            /**
+             * Key
+             * @description Field name for merge_by_key (read from each collected item's output).
+             */
+            key?: string | null;
+            /**
+             * Map Expression
+             * @description JMESPath expression for map aggregation.
+             */
+            map_expression?: string | null;
+        };
+        /**
+         * JoinCollectSpec
+         * @description One upstream branch a join node collects from.
+         */
+        JoinCollectSpec: {
+            /**
+             * Node
+             * @description Parent (scatter) node id this branch belongs to.
+             */
+            node: string;
+            /**
+             * Port
+             * @description Upstream output port / state key to read.
+             */
+            port: string;
         };
         /**
          * JourneyCurrentStage
@@ -12590,7 +12654,7 @@ export interface components {
              * @default agent
              * @enum {string}
              */
-            node_type: "agent" | "manual" | "composite" | "sandbox_agent";
+            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "join";
             /** Agent Id */
             agent_id?: string | null;
             position: components["schemas"]["GraphPosition"];
@@ -12714,6 +12778,21 @@ export interface components {
              * @description Filesystem detector: globs of sandbox paths whose change counts as activity.
              */
             watch_globs?: string[];
+            fan_out?: components["schemas"]["FanOutConfig"] | null;
+            /** Collect */
+            collect?: components["schemas"]["JoinCollectSpec"][] | null;
+            aggregate?: components["schemas"]["JoinAggregateSpec"] | null;
+            /**
+             * Join Partial Policy
+             * @default collect_and_proceed
+             * @enum {string}
+             */
+            join_partial_policy: "collect_and_proceed" | "fail";
+            /**
+             * Join Deadline Seconds
+             * @description Join deadline (seconds) for partial-result policy.
+             */
+            join_deadline_seconds?: number | null;
         };
         /** PipelineGraphResponse */
         PipelineGraphResponse: {
