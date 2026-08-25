@@ -3,7 +3,7 @@
 import contextlib
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -149,7 +149,7 @@ class CategoryResult:
         }
 
 
-def _connector_secret_keys(connectors: list[Any]) -> set[str]:
+def _connector_secret_keys(connectors: Sequence[Any]) -> set[str]:
     """Collect every secret key referenced by connector configs."""
     referenced: set[str] = set()
     for c in connectors:
@@ -159,7 +159,7 @@ def _connector_secret_keys(connectors: list[Any]) -> set[str]:
     return referenced
 
 
-def _agent_secret_keys(agents: list[Any]) -> set[str]:
+def _agent_secret_keys(agents: Sequence[Any]) -> set[str]:
     """Collect every secret key referenced by agent connector_type_refs."""
     referenced: set[str] = set()
     for a in agents:
