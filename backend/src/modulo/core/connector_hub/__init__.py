@@ -24,6 +24,7 @@ from typing import Any, Self, cast
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.connectors.asana import AsanaConnector
 from modulo.connectors.azure_key_vault import AzureKeyVaultConnector
 from modulo.connectors.azure_pipelines import AzurePipelinesConnector
@@ -134,9 +135,12 @@ class ConnectorHub:
         self._init_lock = asyncio.Lock()
         # Lazily-built shared Redis client used to wire the REST connector's
         # shared per-destination rate-limit budget (FAR-439). Owned by the hub
-        # (closed at teardown), never by an individual connector.
+        # (closed at teardown), never by an individual connector. When the client
+        # is configured but cannot be constructed (bad redis_url), the failure is
+        # recorded so every later call fails closed.
         self._shared_redis: Any = None
         self._redis_attempted = False
+        self._redis_error: Exception | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -175,13 +179,31 @@ class ConnectorHub:
                 logger.warning("Failed to close shared Redis client", exc_info=True)
 
     def _shared_redis_client(self) -> Any | None:
-        """Return the lazily-built shared Redis client, or None when not configured.
+        """Return the lazily-built shared Redis client, or None when NOT configured.
 
-        Best-effort: only built when ``settings.redis_url`` is set (and the DB is
-        not SQLite). A connection failure yields ``None`` so the REST connector
-        degrades to its connector-local bucket rather than failing open. The
-        single client is shared by every connector built by this hub.
+        The shared Redis client is ONLY wired on the run-executor path — a
+        ``ConnectorHub`` constructed with an ``org_id``. Non-executor hubs
+        (health-check probes, schema-inference, determination scanning) construct
+        the hub WITHOUT an ``org_id``: wiring them to Redis would bucket every
+        organisation's rate-limited REST connector under a single ``"default"``
+        tenant key, sharing ONE budget across distinct orgs (a cross-tenant
+        leak). Those short-lived probes stay on the connector-local per-process
+        bucket, which is correct — there is no fleet-wide budget to multiply.
+
+        When Redis *is* wired (executor path, ``settings.redis_url`` set and the
+        DB is not SQLite), the shared client is AUTHORITATIVE: ``Redis.from_url``
+        only PARSES the URL, so any construction failure is a hard, fail-closed
+        error — :class:`SharedBudgetUnavailableError` is raised and recorded so
+        every later call fails too. Only the genuinely-not-configured / non-executor
+        paths return ``None`` (which is correct, not a degrade); we NEVER degrade
+        a configured Redis to ``None``, because returning ``None`` would make the
+        REST connector fall back to its per-process local bucket, silently
+        reconstructing the fleet-wide ``N x burst`` fail-open that FAR-439 removed.
         """
+        if self._redis_error is not None:
+            raise SharedBudgetUnavailableError(
+                f"shared rate-limit Redis client is configured but could not be constructed: {self._redis_error}"
+            ) from self._redis_error
         if self._shared_redis is not None or self._redis_attempted:
             return self._shared_redis
         self._redis_attempted = True
@@ -189,8 +211,29 @@ class ConnectorHub:
             from modulo.settings import get_settings
 
             settings = get_settings()
-            if not settings.redis_url or settings.modulo_db.lower() == "sqlite":
-                return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Settings could not be read to determine whether a shared Redis is
+            # configured — treat as not configured (local bucket). This is NOT a
+            # "configured Redis failed to build" case, so fail-closed does not
+            # apply.
+            logger.warning(
+                "Unable to read settings for the shared Redis rate limiter — using the local bucket",
+                exc_info=True,
+            )
+            return None
+        if not settings.redis_url or settings.modulo_db.lower() == "sqlite":
+            # Redis is genuinely NOT configured — the connector-local bucket is
+            # correct (no shared budget exists to multiply).
+            return None
+        if self._org_id is None:
+            # Non-executor hub (no tenant): never wire a shared budget here —
+            # every org would otherwise land on the "default" tenant key and
+            # share one Redis budget across distinct orgs (cross-tenant leak).
+            # These short-lived probes stay on the connector-local bucket.
+            return None
+        try:
             from redis.asyncio import Redis
 
             self._shared_redis = Redis.from_url(
@@ -198,9 +241,21 @@ class ConnectorHub:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.warning("Shared Redis unavailable — REST connectors use the local rate-limit bucket", exc_info=True)
-            self._shared_redis = None
+        except Exception as exc:
+            # Redis IS configured (executor path) but the client could not be
+            # constructed. ``Redis.from_url`` only parses the URL, so a failure
+            # here is a malformed/unsupported ``redis_url`` — a hard config
+            # error. Never degrade to the local bucket (that would reconstruct
+            # the fleet-wide fail-open FAR-439 removed). Record it so every later
+            # call fails closed too.
+            logger.error(
+                "Shared Redis client construction failed — fail-closed (no local-bucket fallback)",
+                exc_info=True,
+            )
+            self._redis_error = exc
+            raise SharedBudgetUnavailableError(
+                f"shared rate-limit Redis client is configured but could not be constructed: {exc}"
+            ) from exc
         return self._shared_redis
 
     def close(self) -> None:
@@ -333,6 +388,12 @@ class ConnectorHub:
                         ci.connector_type_id,
                         exc_info=True,
                     )
+                except SharedBudgetUnavailableError:
+                    # A configured-but-unconstructable shared Redis client is a
+                    # hard config error (FAR-439): degrade to the local bucket
+                    # would reconstruct the fleet-wide fail-open. Propagate so the
+                    # run fails closed (loudly) instead of silently mis-limiting.
+                    raise
                 except asyncio.CancelledError:
                     raise
                 except Exception:

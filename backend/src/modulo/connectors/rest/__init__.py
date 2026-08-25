@@ -564,9 +564,10 @@ class RestConnector(ConnectorBase):
         # FAR-411 per-destination token bucket (single outbound enforcement point).
         # FAR-439: shared Redis-backed limiter when a ``redis_client`` is supplied
         # at the composition root (multi-worker/fleet enforces ONE budget per
-        # destination); otherwise the same per-process local bucket is used, so
-        # single-worker dev and Redis outages degrade to the connector-local
-        # bucket rather than failing open.
+        # <tenant, destination>); otherwise the same per-process local bucket is
+        # used for single-worker dev, where no fleet-wide budget exists to
+        # multiply. A Redis outage on a configured limiter does NOT degrade to the
+        # local bucket — the limiter stays fail-closed (see _rate_bucket).
         raw_rate = self._config.get("rate_limit")
         self._rate_limit_config: dict[str, Any] = raw_rate if isinstance(raw_rate, dict) else {}
         self._rate_buckets: dict[str, TokenBucket] = {}

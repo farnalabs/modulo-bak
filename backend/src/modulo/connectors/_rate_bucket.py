@@ -10,7 +10,10 @@ FAR-439 adds a SHARED, Redis-backed limiter so a fleet of uvicorn/SAQ workers
 enforces ONE budget per destination instead of ``N`` independent per-process
 budgets. A destination is keyed per-tenant (``<tenant_id>:<destination>``) where
 the destination is the resolved host + path, so different tenants never share a
-budget. The shared limiter composes with the local bucket:
+budget. A SHARED limiter requires a real (non-empty) ``tenant_id`` — passing a
+``redis_client`` without one raises, because silently coercing to ``"default"``
+would funnel every organisation into a single cross-tenant Redis budget. The
+shared limiter composes with the local bucket:
 
 * **Redis available** — every worker acquires a token through a single atomic
   Redis token bucket (a Lua script), so concurrent workers across the fleet can
@@ -249,6 +252,16 @@ class PerDestinationRateLimiter:
             raise ValueError("rate must be > 0")
         if burst <= 0:
             raise ValueError("burst must be >= 1")
+        if redis_client is not None and not tenant_id:
+            # A SHARED (Redis) budget keyed by ``<tenant_id>:<destination>`` must
+            # never be created without a real tenant: silently coercing a missing
+            # tenant to "default" would bucket every caller into ONE Redis budget
+            # across distinct orgs (a cross-tenant leak). Require a tenant at the
+            # composition root — fail loud rather than share a budget.
+            raise ValueError(
+                "a shared (Redis) per-destination rate limiter requires a non-empty tenant_id; "
+                "refusing to bucket every caller into a shared 'default' budget (cross-tenant leak)"
+            )
         self.rate = float(rate)
         self.burst = int(burst)
         self._redis_client = redis_client

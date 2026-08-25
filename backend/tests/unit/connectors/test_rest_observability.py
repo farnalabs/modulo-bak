@@ -592,6 +592,26 @@ async def test_per_tenant_weighting_separates_budgets() -> None:
     assert tenant_a.key("dest") != tenant_b.key("dest")
 
 
+async def test_shared_limiter_without_tenant_raises() -> None:
+    """A shared (Redis) limiter without a tenant_id FAILS LOUDLY (FAR-439).
+
+    Silently coercing a missing tenant to "default" would bucket every
+    organisation into ONE cross-tenant Redis budget — a cross-org leak. A
+    ``redis_client`` wired without a ``tenant_id`` must raise at construction
+    rather than share a budget; the connector-local (no-Redis) path is exempt
+    because a per-process bucket is inherently per-tenant.
+    """
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store)
+    with pytest.raises(ValueError, match="requires a non-empty tenant_id"):
+        PerDestinationRateLimiter(rate=1.0, burst=2, redis_client=redis, tenant_id=None)
+
+    # A local (non-shared) limiter still accepts a missing tenant — it is
+    # per-process and cannot leak across orgs.
+    local = PerDestinationRateLimiter(rate=1.0, burst=2, redis_client=None, tenant_id=None)
+    assert await local.consume("dest") is True
+
+
 async def test_redis_outage_fails_closed_when_configured(caplog: Any) -> None:
     """A Redis outage when configured FAILS CLOSED ÔÇö never mints a per-worker budget.
 
