@@ -1,7 +1,7 @@
 """runs — add ``router_no_match`` to the ``ck_runs_status`` CHECK constraint.
 
-Revision ID: 0135_add_router_no_match_status
-Revises: 0134_dismissals_org_rls
+Revision ID: 0137_add_router_no_match_status
+Revises: 0136_rename_remy_user_id_to_account_id
 Create Date: 2026-08-24
 
 FAR-402 P1 (FAR-415) introduces the ``router_no_match`` terminal run status
@@ -21,17 +21,17 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0135_add_router_no_match_status"
-down_revision: str | None = "0134_dismissals_org_rls"
+revision: str = "0137_add_router_no_match_status"
+down_revision: str | None = "0136_rename_remy_user_id_to_account_id"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
 _UPGRADE_SQL = (
     "DO $$ BEGIN "
-    "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status') "
+    "IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status' "
     "AND regexp_replace(pg_get_constraintdef(oid), '\\s+', '', 'g') "
-    "NOT LIKE '%router_no_match%' THEN "
-    "ALTER TABLE public.runs DROP CONSTRAINT ck_runs_status; "
+    "NOT LIKE '%router_no_match%') THEN "
+    "ALTER TABLE public.runs DROP CONSTRAINT IF EXISTS ck_runs_status; "
     "END IF; "
     "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status') THEN "
     "ALTER TABLE public.runs ADD CONSTRAINT ck_runs_status "
