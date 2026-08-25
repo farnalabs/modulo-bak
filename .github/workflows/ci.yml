@@ -60,6 +60,9 @@ jobs:
       - run: uv run --no-build --no-sync pip-audit
       - name: Import-linter architecture contracts
         run: uv run --no-build --no-sync lint-imports
+      - name: Validate sidebar nav translations
+        working-directory: .
+        run: uv run --no-build --project backend --no-sync python scripts/run_validate_translations.py
 
   backend-test:
     name: Test (Backend)
