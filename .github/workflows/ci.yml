@@ -60,6 +60,15 @@ jobs:
       - run: uv run --no-build --no-sync pip-audit
       - name: Import-linter architecture contracts
         run: uv run --no-build --no-sync lint-imports
+      - name: Trivy filesystem scan (dependency CVEs + misconfigs)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+          format: 'table'
 
   backend-test:
     name: Test (Backend)
