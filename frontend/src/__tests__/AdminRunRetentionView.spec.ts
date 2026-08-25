@@ -83,7 +83,7 @@ describe('AdminRunRetentionView', () => {
   it('shows candidate summary from the API', async () => {
     const wrapper = await mountView()
     expect(wrapper.find('[data-testid="admin-run-retention-total-runs"]').text()).toBe('3')
-    expect(wrapper.find('[data-testid="admin-run-retention-total-bytes"]').text()).toBe('60.0 MB')
+    expect(wrapper.find('[data-testid="admin-run-retention-total-bytes"]').text()).toBe('50.0 MB')
     expect(wrapper.find('[data-testid="admin-run-retention-terminal-runs"]').text()).toBe('2')
   })
 
@@ -184,6 +184,33 @@ describe('AdminRunRetentionView', () => {
     createObjectURLSpy.mockRestore()
     revokeObjectURLSpy.mockRestore()
     clickSpy.mockRestore()
+  })
+
+  it('purges the applied snapshot, not unapplied filter edits', async () => {
+    const wrapper = await mountView()
+    // Edit a filter WITHOUT clicking Apply, so the displayed/confirmed set
+    // still reflects the last load (empty applied filters).
+    await wrapper.find('[data-testid="admin-run-retention-date-from"]').setValue('2026-07-01T00:00')
+    await flushPromises()
+    await flushPromises()
+
+    await wrapper.find('[data-testid="admin-run-retention-purge"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    const confirmBtn = document.body.querySelector('[data-testid="admin-run-retention-purge-confirm"]') as HTMLElement
+    expect(confirmBtn).not.toBeNull()
+    confirmBtn.click()
+    await flushPromises()
+    await flushPromises()
+
+    const postMock = api.POST as Mock
+    const purgeCall = postMock.mock.calls.find((c: unknown[]) => c[0] === '/api/v1/admin/run-retention/purge')
+    expect(purgeCall).toBeDefined()
+    const body = (purgeCall![1] as { body: Record<string, unknown> }).body
+    // The purge must target the applied snapshot (empty filters), never the
+    // unapplied date_from edit — otherwise it could purge a different set than confirmed.
+    expect(body.date_from).toBeNull()
   })
 
   it('surfaces an export error when the export endpoint fails', async () => {

@@ -139,7 +139,7 @@
               <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.matching_runs') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
-              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(totalEstimatedBytes) }}</p>
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(terminalEstimatedBytes) }}</p>
               <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
@@ -213,7 +213,7 @@
           <p>
             {{ $t('views.AdminRunRetentionView.confirm_purge_detail', { count: terminalCandidates.length }) }}
           </p>
-          <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(totalEstimatedBytes) }}.</p>
+           <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(terminalEstimatedBytes) }}.</p>
         </div>
         <template #footer>
           <div class="flex justify-end gap-2">
@@ -261,6 +261,15 @@ const dateTo = ref('')
 const selectedPipelineId = ref<string | null>(null)
 const selectedStatus = ref<string | null>(null)
 
+interface AppliedFilters {
+  dateFrom: string
+  dateTo: string
+  pipelineId: string | null
+  status: string | null
+}
+
+const appliedFilters = ref<AppliedFilters | null>(null)
+
 const candidates = ref<RetentionCandidate[]>([])
 const totalCount = ref(0)
 const totalEstimatedBytes = ref(0)
@@ -281,6 +290,9 @@ const pipelineOptions = computed(() => pipelines.value.map(p => ({ value: p.id, 
 const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({ value: s, label: s.replace(/_/g, ' ') })))
 
 const terminalCandidates = computed(() => candidates.value.filter(c => isTerminalStatus(c.status.toLowerCase())))
+const terminalEstimatedBytes = computed(() =>
+  terminalCandidates.value.reduce((sum, c) => sum + (c.estimated_bytes ?? 0), 0),
+)
 
 function toIso(value: string): string | null {
   if (!value) return null
@@ -289,22 +301,34 @@ function toIso(value: string): string | null {
 }
 
 function buildQuery(): Record<string, unknown> {
+  const f = appliedFilters.value ?? {
+    dateFrom: dateFrom.value,
+    dateTo: dateTo.value,
+    pipelineId: selectedPipelineId.value,
+    status: selectedStatus.value,
+  }
   const q: Record<string, unknown> = { limit: 500 }
-  const df = toIso(dateFrom.value)
-  const dt = toIso(dateTo.value)
+  const df = toIso(f.dateFrom)
+  const dt = toIso(f.dateTo)
   if (df) q.date_from = df
   if (dt) q.date_to = dt
-  if (selectedPipelineId.value) q.pipeline_id = selectedPipelineId.value
-  if (selectedStatus.value) q.status = selectedStatus.value
+  if (f.pipelineId) q.pipeline_id = f.pipelineId
+  if (f.status) q.status = f.status
   return q
 }
 
 function buildBody(): Record<string, unknown> {
-  return {
-    date_from: toIso(dateFrom.value),
-    date_to: toIso(dateTo.value),
-    pipeline_id: selectedPipelineId.value,
+  const f = appliedFilters.value ?? {
+    dateFrom: dateFrom.value,
+    dateTo: dateTo.value,
+    pipelineId: selectedPipelineId.value,
     status: selectedStatus.value,
+  }
+  return {
+    date_from: toIso(f.dateFrom),
+    date_to: toIso(f.dateTo),
+    pipeline_id: f.pipelineId,
+    status: f.status,
   }
 }
 
@@ -317,7 +341,7 @@ function resetFilters() {
 }
 
 async function loadPipelines() {
-  const res = await api.GET('/api/v1/pipelines', {})
+    const res = await api.GET('/api/v1/pipelines', { params: { query: { page_size: 100 } } })
   if (!res.error && res.data) {
     pipelines.value = res.data.items
   }
@@ -335,6 +359,12 @@ async function loadCandidates() {
     candidates.value = data?.runs ?? []
     totalCount.value = data?.total_count ?? 0
     totalEstimatedBytes.value = data?.total_estimated_bytes ?? 0
+    appliedFilters.value = {
+      dateFrom: dateFrom.value,
+      dateTo: dateTo.value,
+      pipelineId: selectedPipelineId.value,
+      status: selectedStatus.value,
+    }
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : t('views.AdminRunRetentionView.failed_to_load_candidates')
   } finally {
@@ -350,6 +380,7 @@ function openPurgeConfirm() {
 async function executePurge() {
   purging.value = true
   purgeError.value = null
+  purgeResult.value = null
   try {
     const res = await api.POST('/api/v1/admin/run-retention/purge', {
       body: { ...buildBody(), confirm: true } as any,
