@@ -512,6 +512,26 @@ class TestMaskOutputValueSecretValues:
         assert result["port"] == "http://localhost:8080/health"
         assert result["score"] == pytest.approx(3.14)
 
+    def test_does_not_overmask_host_port_followed_by_email(self) -> None:
+        from modulo.api.routes.runs import _mask_output_value
+
+        # A ``scheme://host:PORT`` with no credentials, followed later in the SAME
+        # string by an unrelated ``@`` (an email), must keep the benign span
+        # between the port and the email intact. Regression for the greedy
+        # ``(.*)`` capture that wiped everything up to the final ``@``.
+        value = {"note": "curl http://127.0.0.1:8080 health check ok; contact admin@example.com for help"}
+        result = _mask_output_value(value)
+        assert result["note"] == value["note"]
+
+        value2 = {"note": "server at http://localhost:9090; engineer joe@corp.io on call; next deploy 18:00"}
+        result2 = _mask_output_value(value2)
+        assert result2["note"] == value2["note"]
+
+        # A genuine credential-bearing connection string is still masked.
+        secret = {"note": "postgres://u:pa@ss@host:5432/db"}
+        result3 = _mask_output_value(secret)
+        assert "pa@ss" not in result3["note"]
+
     def test_masks_secret_in_nested_list_item(self) -> None:
         from modulo.api.routes.runs import _mask_output_value
 

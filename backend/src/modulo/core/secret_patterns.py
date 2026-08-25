@@ -39,10 +39,14 @@ GITHUB_PAT_PATTERN = re.compile(r"github_pat_[0-9A-Za-z_]{50,}")
 AWS_ACCESS_KEY_PATTERN = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
 
 # Connection strings with inline credentials: scheme://user:PASSWORD@host.
-# The password group is greedy (``.*``) so it consumes every character up to the
-# FINAL ``@`` (the host separator) — including passwords that themselves contain
-# ``@`` / ``:`` / ``/``. This masks the whole secret, not just the first chunk.
-CONNECTION_STRING_PATTERN = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]*:)(.*)(@)")
+# The password group captures ``\S+`` (one whitespace-free token) so it never
+# crosses a space: a ``scheme://host:PORT`` (no credentials) that is later
+# followed by an unrelated ``@`` (e.g. an email such as ``admin@example.com`` in
+# the same free-text string) is NOT mistaken for a secret and left untouched.
+# A genuine password that itself contains ``@`` / ``:`` / ``/`` is still wholly
+# masked because ``\S+`` is greedy within its contiguous run and backtracks to
+# that run's final ``@`` (the host separator).
+CONNECTION_STRING_PATTERN = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^\s:/@]*:)(\S+)(@)")
 # Private key blocks (multiline, any flavour). Uses a nested quantifier, so it
 # is fed bounded slices of :data:`SECRET_VALUE_REDACT_CHAR_CAP` at masking time.
 PRIVATE_KEY_PATTERN = re.compile(
@@ -196,11 +200,12 @@ def _mask_bounded_pattern(text: str, pattern: re.Pattern[str], replacement: Any)
         # a regex) so a secret longer than the ReDoS cap is still found. If no
         # close follows the anchor it is not a real secret — leave it untouched.
         if pattern is CONNECTION_STRING_PATTERN:
-            # The connection-string regex is greedy on ``(.*)`` so it masks up to
-            # the FINAL ``@`` (the host separator), not the first. A password may
-            # itself contain ``@`` (e.g. ``pa@ss``), so the bounded window must
-            # span to that final ``@`` — otherwise the password tail leaks. Search
-            # the bounded region for the LAST ``@`` rather than the first.
+            # The connection-string regex captures ``\S+`` (a contiguous
+            # whitespace-free run) so it masks up to the FINAL ``@`` of that run
+            # (the host separator), not the first. A password may itself contain
+            # ``@`` (e.g. ``pa@ss``), so the bounded window must span to that
+            # final ``@`` — otherwise the password tail leaks. Search the bounded
+            # region for the LAST ``@`` rather than the first.
             region_end = window_start + SECRET_VALUE_REDACT_CHAR_CAP
             last_at = text.find(close, off + len(anchor))
             while True:
