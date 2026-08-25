@@ -15,6 +15,7 @@ kept for correctness if compilation becomes async in the future.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import uuid
 from collections import OrderedDict, defaultdict
@@ -34,12 +35,18 @@ from modulo.core.pipeline_engine.node_runner import (
     make_node_fn,
     make_sandbox_agent_fn,
 )
+from modulo.core.pipeline_engine.port_resolver import (
+    synthesize_node_ports,
+)
 
 # Cache key: (pipeline_id, snapshot_id, pipeline_node_timeout_seconds). The
 # third element matters because the compiled graph bakes the effective per-node
 # timeout in — without it, PATCHing node_timeout_seconds would be a no-op until
-# LRU eviction/restart.
-CacheKey = tuple[uuid.UUID, uuid.UUID, int]
+# LRU eviction/restart. The fourth element is a deterministic structural hash of
+# the graph's port topology (FAR-416 / F1): it forces a recompile when ports or
+# node types change, even though the (pipeline_id, snapshot_id, timeout) triple
+# is unchanged.
+CacheKey = tuple[uuid.UUID, uuid.UUID, int, str]
 
 # OrderedDict-based LRU cache. Accessing an entry moves it to the end;
 # when full, the least-recently-used entry (first in order) is evicted.
@@ -56,18 +63,21 @@ def get_or_compile(
     factory: Callable[[], Any],
     *,
     pipeline_node_timeout_seconds: int = 300,
+    graph_struct_hash: str = "",
 ) -> Any:
     """Return cached compiled graph or call factory() and cache the result.
 
     The cache key includes ``pipeline_node_timeout_seconds`` because the
     compiled graph embeds the effective per-node timeout (the pipeline value is
     used for every node with a null ``timeout_seconds``). Keying on it means a
-    PATCH to the pipeline setting takes effect immediately.
+    PATCH to the pipeline setting takes effect immediately. ``graph_struct_hash``
+    (FAR-416 / F1) folds the port topology into the key so a port change forces
+    a fresh compile rather than serving a stale cached graph.
 
     Uses a per-key lock so concurrent calls for the same uncached key
     compile only once.
     """
-    key = (pipeline_id, snapshot_id, pipeline_node_timeout_seconds)
+    key = (pipeline_id, snapshot_id, pipeline_node_timeout_seconds, graph_struct_hash)
     if key in _CACHE:
         _CACHE.move_to_end(key)
         return _CACHE[key]
@@ -223,6 +233,7 @@ def make_loop_counter_fn(loop_key: str) -> Any:
     async def _counter_node(state: dict[str, Any]) -> dict[str, Any]:
         counts = dict(state.get("_iteration_counts") or {})
         counts[loop_key] = int(counts.get(loop_key, 0)) + 1
+        await asyncio.sleep(0)
         return {"_iteration_counts": counts}
 
     _counter_node.__name__ = f"loop_counter_{loop_key}"
@@ -366,48 +377,29 @@ def _add_node_to_graph(
 
     connector_binding = node_def.get("connector_binding")
 
+    node_fn: Any
     if node_type == "sandbox_agent":
-        graph.add_node(
-            node_id,
-            make_sandbox_agent_fn(
-                node_def,
-                timeout=timeout,
-                session_factory=session_factory,
-                single_sandbox_node=single_sandbox_node,
-            ),
+        node_fn = make_sandbox_agent_fn(
+            node_def,
+            timeout=timeout,
+            session_factory=session_factory,
+            single_sandbox_node=single_sandbox_node,
         )
-    elif node_type == "agent" and node_def.get("agent_id"):
-        graph.add_node(
-            node_id,
-            make_node_fn(
-                node_def,
-                role=role,
-                timeout=timeout,
-                max_input_length=max_input_length,
-                token_budget=token_budget,
-            ),
-        )
-    elif connector_binding:
-        graph.add_node(
-            node_id,
-            make_connector_fn(node_def, timeout=timeout),
-        )
+    elif connector_binding and not (node_type == "agent" and node_def.get("agent_id")):
+        node_fn = make_connector_fn(node_def, timeout=timeout)
     elif node_type == "manual":
-        graph.add_node(
-            node_id,
-            make_manual_node_fn(node_def, timeout=timeout),
-        )
+        node_fn = make_manual_node_fn(node_def, timeout=timeout)
     else:
-        graph.add_node(
-            node_id,
-            make_node_fn(
-                node_def,
-                role=role,
-                timeout=timeout,
-                max_input_length=max_input_length,
-                token_budget=token_budget,
-            ),
+        # agent nodes (with or without a frozen agent_id) and connector nodes
+        # without a binding default to the general agent node factory.
+        node_fn = make_node_fn(
+            node_def,
+            role=role,
+            timeout=timeout,
+            max_input_length=max_input_length,
+            token_budget=token_budget,
         )
+    graph.add_node(node_id, node_fn)
 
 
 def _build_reject_targets(edges: list[dict[str, Any]]) -> dict[str, str]:
@@ -679,7 +671,11 @@ def build_graph_from_json(
     state_schema = cast("type[Any]", Annotated[dict[str, Any], _pipeline_state_reducer])
     graph: StateGraph[Any] = StateGraph(state_schema)
 
-    nodes: list[dict[str, Any]] = graph_json.get("nodes", [])
+    # FAR-416 (FAR-402 F1): lazy backfill. Synthesize default out/in ports for
+    # legacy (port-less) nodes at load/first-compile. Ports are ADDITIVE metadata
+    # over the flat run_context/artifact dict — the runtime still reads/writes
+    # the flat dict unchanged; this only ensures every node has a port model.
+    nodes: list[dict[str, Any]] = [synthesize_node_ports(n) for n in graph_json.get("nodes", [])]
     edges: list[dict[str, Any]] = graph_json.get("edges", [])
 
     if not nodes:

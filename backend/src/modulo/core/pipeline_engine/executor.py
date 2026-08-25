@@ -97,6 +97,7 @@ from modulo.core.pipeline_engine.node_runner import (
     set_conformance_ctx,
 )
 from modulo.core.pipeline_engine.output_filter import OutputRejectedError
+from modulo.core.pipeline_engine.port_resolver import compute_port_topology_hash
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
 from modulo.core.trigger_engine.agent_signal import fire_agent_signal
 from modulo.db.crud.pipeline import get_pipeline
@@ -311,7 +312,7 @@ def _stall_event_matches(event_set: set[Any], final_status: str, code: str, mapp
 def _timeout_event_matches(event_set: set[Any], code: str, mapped: str) -> bool:
     """``timeout`` event matches a node.timeout / node.runaway code."""
     return "timeout" in event_set and (
-        code in ("node_timeout", "TimeoutError") or mapped in ("node.timeout", "node.runaway")
+        code in ("node_timeout", "TimeoutError") or mapped in (_ERROR_CODE_NODE_TIMEOUT, "node.runaway")
     )
 
 
@@ -370,7 +371,7 @@ def _failure_event_matches(
         # Timeout is a distinct event — a "failure"-only policy must not retry
         # a timeout outcome, and a stall is not a generic failure.
         or code in ("node_timeout", "TimeoutError", "executor_stalled")
-        or mapped in ("node.timeout", "node.runaway", "agent.stall")
+        or mapped in (_ERROR_CODE_NODE_TIMEOUT, "node.runaway", "agent.stall")
     ):
         return False
     # FAR-296 Phase 2: never-retryable script-mode terminal codes are excluded
@@ -589,6 +590,45 @@ def _graph_has_script_mode(graph_json: dict[str, Any] | None) -> bool:
         ):
             return True
     return False
+
+
+# Node types that can PAUSE a run for human input and therefore REQUIRE a
+# LangGraph checkpointer to be able to resume. Any pipeline containing one is
+# "interactive". Everything else (agent / connector / sandbox_agent) is a
+# batch pipeline that never pauses, so its checkpoints are pure overhead.
+_INTERACTIVE_NODE_TYPES: frozenset[str] = frozenset({"manual"})
+
+
+def _graph_is_interactive(graph_json: dict[str, Any] | None) -> bool:
+    """True when the graph needs checkpoint persistence (HITL/interactive).
+
+    A checkpoint is only useful for a run that can PAUSE and RESUME. Two graph
+    shapes make a pipeline interactive, matching exactly the LangGraph paths
+    that call ``interrupt()`` (node_runner):
+      - an edge carrying ``hitl_gate_config`` (a HITL gate is inserted between
+        source and target and interrupts for human approval / review), and
+      - a node with ``node_type == "manual"`` (a manual-input node that
+        interrupts and waits for human output).
+
+    Batch pipelines (pure ``agent`` / ``connector`` / ``sandbox_agent`` nodes,
+    no HITL gates) never pause, so persisting a checkpoint after every
+    superstep is pure overhead (FAR-432: drive persist-off for them).
+
+    When the graph cannot be inspected (None / not a dict) we are conservative
+    and return True so a genuinely interactive pipeline is never broken by
+    lacking a checkpointer — the only caller (``_execute_stream``) always has a
+    real ``graph_json``.
+    """
+    if not isinstance(graph_json, dict):
+        return True
+    any_interactive_node = any(
+        isinstance(node, dict) and str(node.get("node_type", "")).strip() in _INTERACTIVE_NODE_TYPES
+        for node in graph_json.get("nodes", []) or []
+    )
+    any_hitl_gate_edge = any(
+        isinstance(edge, dict) and edge.get("hitl_gate_config") for edge in graph_json.get("edges", []) or []
+    )
+    return any_interactive_node or any_hitl_gate_edge
 
 
 async def _script_lease_probe_ok(
@@ -1648,6 +1688,7 @@ class PipelineExecutor:
                         failure_behaviour=e.failure_behaviour,
                         pass_threshold=e.pass_threshold,
                         suite_id=e.suite_id,
+                        version=e.version,
                     )
                 )
         return eval_defs_by_node
@@ -1720,6 +1761,7 @@ class PipelineExecutor:
                                 run_id=run_id,
                                 node_id=node_uuid,
                                 eval_id=eval_def.id,
+                                eval_definition_version=eval_def.version,
                                 passed=eval_result.passed,
                                 score=eval_result.score,
                                 detail=eval_result.detail,
@@ -2255,6 +2297,7 @@ class PipelineExecutor:
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
             ),
             pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+            graph_struct_hash=compute_port_topology_hash(graph_json),
         )
 
         config = {"configurable": {"thread_id": thread_id}}
@@ -2360,6 +2403,40 @@ class PipelineExecutor:
             node_ids=node_ids,
         )
 
+    async def _record_eval_blocked_audit(
+        self,
+        *,
+        org_id: uuid.UUID,
+        run_id: uuid.UUID,
+        pipeline_id: uuid.UUID,
+        error_detail: str | None,
+    ) -> None:
+        """Record an ``eval.blocked`` audit event — failure-isolated.
+
+        Runs in its own session/transaction so a blocked-eval audit failure
+        never interrupts terminalization. The payload carries the sanitized
+        detail plus the run's pipeline id so the event links back to the graph.
+        """
+        async with self._session_factory() as session, session.begin():
+            await set_rls_org(session, org_id)
+            await set_rls_execution_context(session)
+            try:
+                await append_audit_event(
+                    session,
+                    org_id=org_id,
+                    event_type="eval.blocked",
+                    resource_type="run",
+                    resource_id=run_id,
+                    payload_json={
+                        "pipeline_id": str(pipeline_id),
+                        "error_detail": _sanitize_detail(error_detail, limit=5000),
+                    },
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _log.exception("audit.eval_blocked_failed", extra={"run_id": str(run_id)})
+
     async def _finalize_run_after_stream(
         self,
         *,
@@ -2382,23 +2459,14 @@ class PipelineExecutor:
         terminal/awaiting_human outcome of the stream.
         """
         # Record audit events for block failures on resume.
-        if final_status == "eval_failed" and error_code == "eval_blocked":
-            async with self._session_factory() as session, session.begin():
-                await set_rls_org(session, org_id)
-                await set_rls_execution_context(session)
-                try:
-                    await append_audit_event(
-                        session,
-                        org_id=org_id,
-                        event_type="eval.blocked",
-                        resource_type="run",
-                        resource_id=run_id,
-                        payload_json={"error_detail": _sanitize_detail(error_detail, limit=5000)},
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    _log.exception("audit.eval_blocked_failed", extra={"run_id": str(run_id)})
+        eval_blocked = final_status == "eval_failed" and error_code == "eval_blocked"
+        if eval_blocked:
+            await self._record_eval_blocked_audit(
+                org_id=org_id,
+                run_id=run_id,
+                pipeline_id=pipeline_id,
+                error_detail=error_detail,
+            )
 
         # Resume recomputes from LIVE components over the cumulative merged set
         # (two-state rule, §4.4); finalize_cost reads the stored cumulative set,
@@ -2444,7 +2512,7 @@ class PipelineExecutor:
         # guardrail-blocked now gets those side effects compensated. Best-effort
         # + failure-isolated (guard-the-guard): a compensation failure never
         # crashes terminalization. Uses its own fresh session + hub.
-        if final_status == "eval_failed" and error_code == "eval_blocked":
+        if eval_blocked:
             await self._compensate_blocked_run_best_effort(
                 org_id=org_id,
                 run_id=run_id,
@@ -2644,7 +2712,6 @@ class PipelineExecutor:
                 model_backend_hub=model_backend_hub,
                 connector_hub=connector_hub,
                 broker=broker,
-                completed_node_outputs=completed_node_outputs,
                 stall_requested=self._stall_requested,
             )
             gate_suppressed, final_status, error_code, error_detail = self._apply_transient_decision(
@@ -2752,7 +2819,6 @@ class PipelineExecutor:
         model_backend_hub: ModelBackendHub | None,
         connector_hub: Any | None,
         broker: RunEventBroker,
-        completed_node_outputs: dict[str, Any],
         stall_requested: asyncio.Event | None,
     ) -> dict[str, Any]:
         """Decide how a transient node-cancelled / sandbox-failed run recovers.
@@ -2818,7 +2884,7 @@ class PipelineExecutor:
         # A stale ``script_executing`` lease means a script may have run —
         # requeue is forbidden (exactly-once). Only when the probe proves no
         # live lease does the run stay eligible for the fenced reset below.
-        # NOTE: the probe is computed BEFORE the gate/retry chain below so
+        # The probe is computed BEFORE the gate/retry chain below so
         # the idempotency gate stays the FIRST branch (it must suppress the
         # pending-reset when a delivery marker is present), and so the
         # pending-reset branch remains reachable for BOTH script-mode and
@@ -3085,6 +3151,7 @@ class PipelineExecutor:
                 pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
             ),
             pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
+            graph_struct_hash=compute_port_topology_hash(graph_json),
         )
 
         initial_state = _seed_state(snapshot, input_payload, variant_config_snapshot)
@@ -3144,7 +3211,15 @@ class PipelineExecutor:
                 {"rid": str(run_id)},
             )
 
-        if self._checkpointer_conn_string:
+        # FAR-432 (item 4a): a checkpointer is ONLY attached when the pipeline
+        # is HITL/interactive. The decision is DERIVED from the graph at
+        # execution time (a HITL gate edge or a ``manual`` input node → resume
+        # must work → persist). Batch pipelines never pause, so their
+        # per-superstep checkpoints are pure overhead — derive persistence off.
+        # ``compiled`` is shared via the graph cache, so the checkpointer is
+        # explicitly cleared in the non-interactive branch to avoid leaking a
+        # previously-attached saver into a batch run of the same snapshot.
+        if self._checkpointer_conn_string and _graph_is_interactive(graph_json):
             from modulo.settings import get_settings
 
             _settings = get_settings()
@@ -3170,6 +3245,7 @@ class PipelineExecutor:
                     node_type_map=node_type_map,
                 )
         else:
+            compiled.checkpointer = None
             final_status, error_code, error_detail, node_token_usage = await self._stream_graph(
                 compiled,
                 initial_state,
@@ -3966,7 +4042,7 @@ class PipelineExecutor:
         # evaluated too. If a ``block`` eval fails, ``EvalBlockedError``
         # propagates and the existing ``except EvalBlockedError`` below
         # transitions the run to ``eval_failed`` with ``error_code="eval_blocked"``.
-        # NOTE: if this node ALSO feeds a HITL gate with eval-before-interrupt,
+        # If this node ALSO feeds a HITL gate with eval-before-interrupt,
         # the evals run twice (once here post-node, once in the gate) —
         # acceptable for now, the gate's eval is a separate node.
         if ctx.eval_definitions_by_node:
@@ -4053,6 +4129,7 @@ class PipelineExecutor:
         """
         broker = ctx.broker
         run_id = ctx.run_id
+        node_token_usage = state.node_token_usage or None
         if isinstance(exc, GraphInterrupt):
             interrupts = exc.args[0] if exc.args else []
             return await self._handle_graph_interrupt(interrupts, state, ctx)
@@ -4072,7 +4149,7 @@ class PipelineExecutor:
                 "eval_failed",
                 "eval_blocked",
                 _sanitize_detail(exc, limit=5000),
-                state.node_token_usage or None,
+                node_token_usage,
             )
         if isinstance(exc, OutputRejectedError):
             # C4: ``output_rejected`` violates the ``ck_runs_status`` CHECK
@@ -4082,12 +4159,12 @@ class PipelineExecutor:
                 "failed",
                 "output_rejected",
                 _sanitize_detail(exc, limit=5000),
-                state.node_token_usage or None,
+                node_token_usage,
             )
         if isinstance(exc, RunCancelledError):
             broker.publish("run_cancelled", {})
             self._log_accumulation_state(run_id, state.segments_completed, state.node_token_usage)
-            return "cancelled", None, None, state.node_token_usage or None
+            return "cancelled", None, None, node_token_usage
         if isinstance(exc, RunawayRunError):
             error_detail = _sanitize_detail(exc, limit=5000)
             _log.warning(
@@ -4099,14 +4176,14 @@ class PipelineExecutor:
                     "limit": exc.limit,
                 },
             )
-            return _terminal_failure(broker, "failed", "runaway", error_detail, state.node_token_usage or None)
+            return _terminal_failure(broker, "failed", "runaway", error_detail, node_token_usage)
         if isinstance(exc, TimeoutError):
             error_detail = _sanitize_detail(exc, limit=5000)
             _log.warning(
                 _ERROR_CODE_NODE_TIMEOUT,
                 extra={"run_id": str(run_id), "detail": error_detail},
             )
-            return _terminal_failure(broker, "failed", "node_timeout", error_detail, state.node_token_usage or None)
+            return _terminal_failure(broker, "failed", "node_timeout", error_detail, node_token_usage)
         if isinstance(exc, SupersededNodeError):
             # A6: the sandbox dispatch marker was denied — a superseded claim
             # or a run no longer running. Terminal ``superseded`` failure; the
@@ -4122,7 +4199,7 @@ class PipelineExecutor:
                 "failed",
                 "executor_superseded",
                 scrubbed,
-                state.node_token_usage or None,
+                node_token_usage,
             )
         if isinstance(exc, OutputSchemaValidationError):
             # Manual-node resume output (or agent output) failed validation
@@ -4138,7 +4215,7 @@ class PipelineExecutor:
                 "failed",
                 "schema_validation_failure",
                 scrubbed,
-                state.node_token_usage or None,
+                node_token_usage,
             )
         _tb = _traceback_detail(exc, limit=5000)
         return _terminal_failure(
