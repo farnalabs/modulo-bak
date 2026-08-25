@@ -48,7 +48,7 @@ async def _invoke_with_timeout(
         return await backend.invoke(messages)
 
 
-def _extract_content(response: object, *, context: str, error_cls: type[Exception]) -> str:
+def _extract_content(response: BaseMessage, *, context: str, error_cls: type[Exception]) -> str:
     try:
         content = response.content
     except AttributeError:
