@@ -4313,8 +4313,10 @@ def _mock_constructor_container_violations(tree: ast.AST) -> list[tuple[int, str
         for container in ast.walk(node.test):
             if not isinstance(container, (ast.List, ast.Dict, ast.Tuple, ast.Set)):
                 continue
-            elements = list(container.elts) if isinstance(container, (ast.List, ast.Tuple, ast.Set)) else (
-                list(container.keys) + list(container.values)
+            elements = (
+                list(container.elts)
+                if isinstance(container, (ast.List, ast.Tuple, ast.Set))
+                else (list(container.keys) + list(container.values))
             )
             if any(_is_mock_constructor_call(el) for el in elements):
                 found.append(
