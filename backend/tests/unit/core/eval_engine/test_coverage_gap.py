@@ -229,3 +229,91 @@ class TestEvaluateCoverageGap:
     def test_invalid_min_runs_rejected(self) -> None:
         with pytest.raises(ValueError):
             evaluate_coverage_gap([], [], min_runs=0)
+
+    def test_prove_the_fix_single_sample_eval_is_no_gap(self) -> None:
+        """An eval with a result on only ONE variant must never emit a gap (Major 1).
+
+        ``min_runs`` gates the TOTAL data-point run count, not per-eval samples.
+        An eval that saw a value on a single variant has no second sample to
+        compare against — its differentiation is meaningless, so it is marked
+        ``insufficient_data`` and never routes to ``improve_evals`` (a
+        data-coverage artifact, not an eval-quality deficiency). Without the fix
+        it returned differentiation ``0.0`` and falsely emitted ``has_gap=True``.
+        """
+        eval_id = uuid.uuid4()
+        single_id = uuid.uuid4()
+        runs = [
+            _run(uuid.uuid4(), variant_id="v-1", outputs={"answer": "alpha"}),
+            _run(uuid.uuid4(), variant_id="v-2", outputs={"answer": "bravo"}),
+            _run(uuid.uuid4(), variant_id="v-3", outputs={"answer": "charlie"}),
+        ]
+        evals = [
+            # ``eval_id`` present on all three runs -> run_count passes min_runs.
+            _eval(runs[0].id, eval_id, score=0.90),
+            _eval(runs[1].id, eval_id, score=0.90),
+            _eval(runs[2].id, eval_id, score=0.90),
+            # ``single_id`` present on only ONE run -> insufficient-data eval.
+            _eval(runs[0].id, single_id, score=0.90),
+        ]
+        summary = evaluate_coverage_gap(runs, evals, eval_names=_eval_defs(eval_id), min_runs=3)
+        assert summary.status == "complete"
+        gaps_by_eval = {str(g.eval_id): g for g in summary.evals}
+        single = gaps_by_eval[str(single_id)]
+        assert single.has_gap is False
+        assert single.recommended_action == "ok"
+        assert single.status == "insufficient_data"
+
+    def test_prove_the_fix_weighted_legacy_runs_participate(self) -> None:
+        """Weighted runs lacking a stable variant id still participate (Major 2).
+
+        The weighted single-shot path freezes ``variant_name`` even when the
+        variant carries no persisted ``id`` (legacy). ``_variant_key`` falls back
+        to ``variant_name`` so these runs are NOT silently skipped — otherwise a
+        weighted group reports ``no gap`` despite real divergence.
+        """
+        eval_id = uuid.uuid4()
+        runs = [
+            _run(uuid.uuid4(), variant_id=None, variant_name="variant-a", outputs={"answer": "alpha"}),
+            _run(uuid.uuid4(), variant_id=None, variant_name="variant-b", outputs={"answer": "bravo"}),
+            _run(uuid.uuid4(), variant_id=None, variant_name="variant-c", outputs={"answer": "charlie"}),
+        ]
+        evals = [_eval(r.id, eval_id, score=0.90) for r in runs]
+        summary = evaluate_coverage_gap(runs, evals, eval_names=_eval_defs(eval_id), min_runs=3)
+        assert summary.status == "complete"
+        assert summary.variant_divergence >= DEFAULT_DIVERGENCE_THRESHOLD
+        gap = summary.evals[0]
+        assert gap.has_gap is True
+        assert gap.recommended_action == "improve_evals"
+
+    def test_prove_the_fix_differentiation_uses_one_value_per_variant(self) -> None:
+        """Divergence and differentiation must measure the SAME population (Major 3).
+
+        When one variant has multiple terminal runs, its score must count ONCE in
+        the differentiation std (only that variant's representative run), not once
+        per run. Otherwise within-variant run variance is misread as the eval
+        having "differentiated" and clears a real gap. Pinned: variant ``v-1``
+        has two runs (0.90 / 0.10); per-variant values are ``[0.90, 0.90]`` ->
+        std 0 -> a gap fires. The old per-run behaviour used
+        ``[0.90, 0.10, 0.90]`` -> std ~0.38 -> falsely reported ``ok``.
+        """
+        eval_id = uuid.uuid4()
+        v1_rep = _run(uuid.uuid4(), variant_id="v-1", outputs={"answer": "alpha"})
+        v1_second = _run(uuid.uuid4(), variant_id="v-1", outputs={"answer": "alpha-2"})
+        v2 = _run(uuid.uuid4(), variant_id="v-2", outputs={"answer": "bravo"})
+        runs = [v1_rep, v1_second, v2]
+        evals = [
+            _eval(v1_rep.id, eval_id, score=0.90),
+            _eval(v1_second.id, eval_id, score=0.10),  # within-variant run variance
+            _eval(v2.id, eval_id, score=0.90),
+        ]
+        summary = evaluate_coverage_gap(runs, evals, eval_names=_eval_defs(eval_id), min_runs=3)
+        assert summary.status == "complete"
+        gap = summary.evals[0]
+        # ONE value per variant: [0.90 (v-1 rep), 0.90 (v-2)] => std 0 => gap.
+        # Asserted BEFORE ``status`` so a population-misalignment regression (the
+        # old per-run std ~0.38 reporting "ok") is caught by the signal that
+        # matters, not the new status field.
+        assert gap.has_gap is True
+        assert gap.recommended_action == "improve_evals"
+        assert gap.status == "complete"
+        assert summary.variant_divergence >= DEFAULT_DIVERGENCE_THRESHOLD

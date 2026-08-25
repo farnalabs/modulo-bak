@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -81,7 +82,15 @@ DEFAULT_DIFFERENTIATION_THRESHOLD = 0.05
 
 @dataclass
 class EvalCoverageGap:
-    """Coverage-gap verdict for a single eval definition within a batch."""
+    """Coverage-gap verdict for a single eval definition within a batch.
+
+    ``status`` reflects whether the eval had enough data to compute a
+    differentiation verdict: ``"complete"`` when at least two distinct variants
+    carried a value for this eval; ``"insufficient_data"`` when only one variant
+    (or none) did — in that case ``has_gap`` is always ``False`` and
+    ``recommended_action`` is always ``"ok"``, because a single-sample eval is a
+    data-coverage artifact, NOT an eval-quality deficiency.
+    """
 
     eval_id: UUID
     eval_name: str
@@ -90,6 +99,7 @@ class EvalCoverageGap:
     has_gap: bool
     reason: str
     recommended_action: Literal["improve_evals", "ok"]
+    status: Literal["insufficient_data", "complete"] = "complete"
 
 
 @dataclass
@@ -125,6 +135,7 @@ class CoverageGapSummary:
                     "has_gap": g.has_gap,
                     "reason": g.reason,
                     "recommended_action": g.recommended_action,
+                    "status": g.status,
                 }
                 for g in self.evals
             ],
@@ -185,7 +196,7 @@ def compute_eval_differentiation(values: Sequence[float]) -> float:
         return 0.0
     mean = sum(nums) / len(nums)
     variance = sum((v - mean) ** 2 for v in nums) / len(nums)
-    return round(variance**0.5, 4)
+    return round(float(math.sqrt(variance)), 4)
 
 
 def _eval_metric(result: object) -> float:
@@ -193,7 +204,7 @@ def _eval_metric(result: object) -> float:
     score = getattr(result, "score", None)
     if score is not None:
         return float(score)
-    return 1.0 if getattr(result, "passed", False) else 0.0
+    return 1.0 if bool(getattr(result, "passed", False)) else 0.0
 
 
 def _variant_key(run: object) -> str | None:
@@ -248,8 +259,9 @@ def evaluate_coverage_gap(
     results_by_run: dict[UUID, list[object]] = defaultdict(list)
     for result in eval_results:
         run_id = getattr(result, "run_id", None)
-        if run_id in terminal_run_ids:
-            results_by_run[run_id].append(result)
+        if run_id is None or run_id not in terminal_run_ids:
+            continue
+        results_by_run[run_id].append(result)
     data_point_run_ids = {run_id for run_id, results in results_by_run.items() if results}
     run_count = len(data_point_run_ids)
 
@@ -268,13 +280,18 @@ def evaluate_coverage_gap(
 
     # --- Variant divergence ----------------------------------------------
     # One representative terminal run per distinct variant (stable order).
+    # ``variant_key_by_run`` maps every data-point run to its variant key so the
+    # differentiation pass below can restrict itself to the SAME population.
     runs_by_variant: dict[str, object] = {}
+    variant_key_by_run: dict[UUID, str] = {}
     for run in runs:
-        if getattr(run, "id", None) not in data_point_run_ids:
+        run_id = getattr(run, "id", None)
+        if run_id not in data_point_run_ids:
             continue
         key = _variant_key(run)
         if key is None:
             continue  # a run without a variant identity cannot participate
+        variant_key_by_run[run_id] = key
         if key not in runs_by_variant:
             runs_by_variant[key] = run
 
@@ -282,20 +299,56 @@ def evaluate_coverage_gap(
     variant_outputs = [o for o in variant_outputs if o is not None]
     variant_divergence = compute_variant_divergence(variant_outputs)
 
-    # --- Eval differentiation (per eval_id) ------------------------------
-    results_by_eval: dict[UUID, list[object]] = defaultdict(list)
+    # --- Eval differentiation (per eval_id, ONE value per variant) -------
+    # Both sides of the has_gap AND must be computed on the SAME entities:
+    # divergence uses ``runs_by_variant`` (one representative run per distinct
+    # variant); differentiation must therefore also use one value per distinct
+    # variant, taken ONLY from that variant's representative run. Counting every
+    # run per variant would weight run-count rather than variants and bias
+    # differentiation down (inflating false-gap risk).
+    results_by_eval_variant: dict[UUID, dict[str, float]] = defaultdict(dict)
     for result in eval_results:
         run_id = getattr(result, "run_id", None)
-        if run_id in data_point_run_ids:
-            results_by_eval[getattr(result, "eval_id", None)].append(result)
-
-    evals: list[EvalCoverageGap] = []
-    for eval_id, results in results_by_eval.items():
+        if run_id not in data_point_run_ids:
+            continue
+        key = variant_key_by_run.get(run_id)
+        if key is None:
+            continue
+        representative = runs_by_variant.get(key)
+        if representative is None or getattr(representative, "id", None) != run_id:
+            continue  # only the variant's representative run contributes
+        eval_id = getattr(result, "eval_id", None)
         if eval_id is None:
             continue
-        values = [_eval_metric(r) for r in results if getattr(r, "run_id", None) in data_point_run_ids]
+        results_by_eval_variant[eval_id][key] = _eval_metric(result)
+
+    evals: list[EvalCoverageGap] = []
+    for eval_id, values_by_variant in results_by_eval_variant.items():
+        values = list(values_by_variant.values())
+        if len(values) < 2:
+            # Major 1 gate: an eval with a result on fewer than two distinct
+            # variants cannot differentiate anything — it is a data-coverage
+            # artifact, not an eval-quality deficiency. Never emit a gap for it.
+            evals.append(
+                EvalCoverageGap(
+                    eval_id=eval_id,
+                    eval_name=eval_names.get(eval_id, "unknown"),
+                    variant_divergence=variant_divergence,
+                    eval_score_spread=0.0,
+                    has_gap=False,
+                    reason=(
+                        "Only one distinct variant has data for this eval; a "
+                        "coverage-gap verdict needs at least two. Marked "
+                        "insufficient_data."
+                    ),
+                    recommended_action="ok",
+                    status="insufficient_data",
+                )
+            )
+            continue
+
         differentiation = compute_eval_differentiation(values)
-        spread = round(max(values) - min(values), 4) if values else 0.0
+        spread = round(max(values) - min(values), 4)
 
         has_gap = variant_divergence >= divergence_threshold and differentiation < differentiation_threshold
         if has_gap:
