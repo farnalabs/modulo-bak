@@ -97,7 +97,8 @@ class TestRetentionConditions:
             org_id=None, date_from=start, date_to=end, pipeline_id=None, status=None, statuses=None
         )
         text = "\n".join(str(c) for c in conds)
-        assert ">=" in text and "<=" in text
+        assert ">=" in text
+        assert "<=" in text
 
     def test_terminal_status_whitelist_limits_status_expression(self) -> None:
         conds = rr._retention_conditions(

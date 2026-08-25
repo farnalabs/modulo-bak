@@ -519,9 +519,9 @@ async def _delete_checkpoints(
         org_filter = " AND organisation_id = :org"
         params["org"] = str(org_id)
     for table, _size_expr in _CHECKPOINT_TABLES:
-        stmt = text(f"DELETE FROM {table} WHERE thread_id IN :tids{org_filter}").bindparams(  # nosec B608  # noqa: S608 -- table is a fixed whitelist constant
-            bindparam("tids", expanding=True)
-        )
+        stmt = text(
+            "DELETE FROM " + table + " WHERE thread_id IN :tids" + org_filter  # noqa: S608 -- table/org_filter are fixed whitelist constants, not user input  # nosec B608
+        ).bindparams(bindparam("tids", expanding=True))
         try:
             await session.execute(stmt, params)
         except Exception:
