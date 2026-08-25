@@ -1,7 +1,7 @@
 """REST connector profile table (FAR-412).
 
-Revision ID: 0142_rest_connector_profile
-Revises: 0141_pipeline_edge_ports
+Revision ID: 0143_rest_connector_profile
+Revises: 0142_merge_heads_add_fk_indexes
 Create Date: 2026-08-25
 
 FAR-412 gates the generic REST integration connector (FAR-408). The connector
@@ -45,8 +45,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0142_rest_connector_profile"
-down_revision: str | None = "0141_pipeline_edge_ports"
+revision: str = "0143_rest_connector_profile"
+down_revision: str | None = "0142_merge_heads_add_fk_indexes"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
