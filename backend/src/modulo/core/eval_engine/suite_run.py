@@ -587,7 +587,7 @@ def _leaderboard_stability(by_type: dict[str, dict[str, Any]]) -> float:
         return 1.0
     mean_rate = sum(rates) / len(rates)
     variance = sum((r - mean_rate) ** 2 for r in rates) / len(rates)
-    return round(max(0.0, 1.0 - variance**0.5), 4)
+    return float(round(max(0.0, 1.0 - variance**0.5), 4))
 
 
 def _normalise_day(value: Any) -> Any:
@@ -936,7 +936,7 @@ async def run_suite_comparison(
     )
     regressed = bool(alerts)
     run.regressed = regressed
-    run.baseline_run_id = baseline_run.id
+    run.baseline_run_id = baseline_runs[0].id
     comparison.update(
         {
             "alert_count": len(alerts),

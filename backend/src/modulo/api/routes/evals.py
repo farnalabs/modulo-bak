@@ -730,7 +730,6 @@ async def eval_timeseries(
 @router.put(
     "/evals/suites/{suite_id}/alerting",
     status_code=status.HTTP_200_OK,
-    dependencies=[Depends(deny_break_glass_mint)],
     responses={
         403: {"description": "Forbidden"},
         404: {"description": "Not Found"},
