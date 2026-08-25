@@ -368,6 +368,26 @@ def _decorator_name(dec: ast.AST) -> str | None:
     return None
 
 
+def _is_mark_decorator(dec: ast.AST) -> bool:
+    """Return True when ``dec`` is a ``@pytest.mark.*`` marker.
+
+    Unlike ``_decorator_name(d) == "mark"`` (which only matches a bare
+    ``@pytest.mark`` / ``@mark``), this walks the whole attribute chain so a
+    realistically-spelled marker such as ``@pytest.mark.asyncio`` is also
+    recognised — its terminal attribute is ``asyncio``, but the ``mark``
+    attribute sits further up the chain."""
+    if isinstance(dec, ast.Call):
+        dec = dec.func
+    node: ast.AST = dec
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return "mark" in parts
+
+
 def _iter_test_modules():
     for path in sorted(TESTS.rglob("*.py")):
         if any(part in EXCLUDED_PACKAGES for part in path.parts):
@@ -1637,7 +1657,7 @@ def test_no_noop_test_functions():
                 continue
             if any(_decorator_name(d) == "fixture" for d in node.decorator_list):
                 continue
-            if not (node.name.startswith("test_") or any(_decorator_name(d) == "mark" for d in node.decorator_list)):
+            if not (node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)):
                 continue
             if _noop_lens_verifies(node):
                 continue
@@ -2807,7 +2827,7 @@ def _async_test_without_async_behavior_violations(tree: ast.AST) -> list[tuple[i
             continue
         if any(_decorator_name(d) == "fixture" for d in node.decorator_list):
             continue
-        if not (node.name.startswith("test_") or any(_decorator_name(d) == "mark" for d in node.decorator_list)):
+        if not (node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)):
             continue
         if _function_is_async(node):
             continue
@@ -4974,12 +4994,6 @@ def _nested_test_functions(tree: ast.AST) -> list[tuple[int, str]]:
     """
     stack: list[tuple[str, ast.AST]] = []  # (kind, node) for enclosing defs/classes
 
-    def _mark_decorated(dec: ast.AST) -> bool:
-        if isinstance(dec, ast.Call):
-            dec = dec.func
-        name = dec.attr if isinstance(dec, ast.Attribute) else (dec.id if isinstance(dec, ast.Name) else None)
-        return name == "mark"
-
     def _is_fixture(decs: list[ast.AST]) -> bool:
         return any(_decorator_name(d) == "fixture" for d in decs)
 
@@ -4988,7 +5002,7 @@ def _nested_test_functions(tree: ast.AST) -> list[tuple[int, str]]:
     def _visit(node: ast.AST) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             inside_fn = any(kind == "fn" for kind, _ in stack)
-            is_here_a_test = node.name.startswith("test_") or any(_mark_decorated(d) for d in node.decorator_list)
+            is_here_a_test = node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)
             if inside_fn and is_here_a_test and not _is_fixture(node.decorator_list):
                 found.append((node.lineno, f"{node.name}() defined inside another function — pytest never collects it"))
             stack.append(("fn", node))
@@ -5047,6 +5061,9 @@ def test_nested_test_lens_flags_uncollected_tests():
         "def test_foo():\n    def helper():\n        def test_bar():\n            assert 1 == 1\n",
         "async def test_foo():\n    def test_bar():\n        assert 1 == 1\n",
         "def test_foo():\n    @pytest.mark.asyncio\n    def test_bar():\n        assert 1 == 1\n",
+        # Mark-detection branch exercised with a NON-``test_`` name: this only
+        # flags because ``@pytest.mark.asyncio`` is recognised as a marker.
+        "def test_foo():\n    @pytest.mark.asyncio\n    def _coro():\n        assert 1 == 1\n",
     ]
     for source in positive_sources:
         tree = ast.parse(source)
