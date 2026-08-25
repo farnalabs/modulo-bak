@@ -1,6 +1,7 @@
 import uuid
+from decimal import Decimal
 
-from sqlalchemy import JSON, CheckConstraint, ForeignKey, String, UniqueConstraint, Uuid
+from sqlalchemy import JSON, CheckConstraint, ForeignKey, Integer, Numeric, String, UniqueConstraint, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from modulo.db.models.base import OrgScoped
@@ -62,3 +63,21 @@ class EvalSuite(OrgScoped):
     # Original free-text suite tag (FAR-374 backfill). NULL for suites created
     # through the new UI.
     legacy_suite_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # ------------------------------------------------------------------ #
+    # Regression alerting config (FAR-379) — org-scoped via OrgScoped.   #
+    # ------------------------------------------------------------------ #
+    # Rolling N-run baseline window used when comparing a run against its
+    # baseline. ``None`` = disabled (the Alerting layer requires an explicit
+    # baseline to be resolved before any alert can fire, never a default).
+    baseline_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Pass-rate drop threshold (as a fraction, 0..1) the observed drop must
+    # exceed before an alert is dispatched. ``None`` = defer entirely to the
+    # Phase 3 ``regressed`` detection flag. Mirrors ``pass_threshold`` on
+    # ``EvalDefinition`` (Numeric(8,4), Decimal).
+    minimum_delta: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    # Silence window (minutes) between regression alerts for a suite — the
+    # per-suite rate limit so a single sustained regression does not spam the
+    # log on every run within the window. ``None`` = no time-based rate limit
+    # (idempotency on ``suite_run_id`` still applies).
+    cooldown: Mapped[int | None] = mapped_column(Integer, nullable=True)

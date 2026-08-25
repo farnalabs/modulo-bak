@@ -6,6 +6,7 @@ URLs:
     POST   /api/v1/evals/compare      — side-by-side comparison of two runs
     GET    /api/v1/evals/coverage     — eval coverage map for a pipeline
     POST   /api/v1/evals/from-run     — create eval definition from run data
+    PUT    /api/v1/evals/suites/{suite_id}/alerting — configure regression alerting (admin only)
 """
 
 import logging
@@ -28,6 +29,7 @@ from modulo.core.node_output_split import node_return
 from modulo.db.crud.eval_run import non_guardrail_eval_results_clause
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
+from modulo.db.models.eval_suite import EvalSuite
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.run import Run
 from modulo.db.rls import set_rls_org, set_rls_user_context
@@ -43,8 +45,10 @@ _CODE_EVALS_DELETE_EVAL_DEFINITION = "evals.delete_eval_definition"
 _CODE_EVALS_LIST_RUN_EVALS = "evals.list_run_evals"
 _CODE_EVALS_COMPARE_EVALS = "evals.compare_evals"
 _CODE_EVALS_CREATE_EVAL_RUN = "evals.create_eval_from_run"
+_CODE_EVALS_SUITE_ALERTING = "evals.suite_alerting"
 _EVAL_TYPE_PATTERN = r"^(llm_judge|regex|json_schema|custom_function|guardrail|human_set)$"
 _MSG_PIPELINE_NOT_FOUND = "Pipeline not found"
+_MSG_EVAL_SUITE_NOT_FOUND = "Eval suite not found"
 
 
 _log = logging.getLogger(__name__)
@@ -170,6 +174,27 @@ class EvalDefinitionListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class EvalSuiteAlertingRequest(BaseModel):
+    """Per-suite regression alerting configuration (FAR-379)."""
+
+    # Rolling N-run baseline window used when resolving the comparison baseline.
+    # NULL clears the config (alerting stays dormant until an explicit baseline).
+    baseline_window: int | None = Field(None, ge=1)
+    # Pass-rate drop threshold (fraction 0..1) the observed drop must exceed.
+    # NULL defers entirely to the Phase 3 ``regressed`` detection flag.
+    minimum_delta: float | None = Field(None, ge=0.0, le=1.0)
+    # Silence window (minutes) between regression alerts for a suite. NULL = no
+    # time-based rate limit (idempotency on suite_run_id still applies).
+    cooldown: int | None = Field(None, ge=0)
+
+
+class EvalSuiteAlertingResponse(BaseModel):
+    suite_id: uuid.UUID
+    baseline_window: int | None
+    minimum_delta: float | None
+    cooldown: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +492,97 @@ async def eval_coverage(
             "coverage_pct": pct,
         },
     }
+
+
+@router.put(
+    "/evals/suites/{suite_id}/alerting",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(deny_break_glass_mint)],
+    responses={
+        403: {"description": "Forbidden"},
+        404: {"description": "Not Found"},
+        409: {"description": "Conflict"},
+        500: {"description": "Internal Server Error"},
+        501: {"description": "Not Implemented"},
+        503: {"description": "Service Unavailable"},
+    },
+)
+@handle_db_errors(_CODE_EVALS_SUITE_ALERTING)
+async def update_suite_alerting(
+    suite_id: uuid.UUID,
+    req: EvalSuiteAlertingRequest,
+    session: AsyncSession = Depends(get_db_session),
+    principal: TenantPrincipal = require_permission("eval.definition.update"),
+) -> EvalSuiteAlertingResponse:
+    """Configure regression alerting for an eval suite (FAR-379).
+
+    Admin only. Sets the suite's ``baseline_window`` / ``minimum_delta`` /
+    ``cooldown`` so the Alerting layer knows WHEN and HOW OFTEN to page: a
+    regression must exceed ``minimum_delta``, and after it fires the suite is
+    silent for ``cooldown`` minutes. Additive/non-breaking — every field is
+    optional, and NULL clears that field (alerting requires an explicit
+    baseline before any alert fires, never a default).
+
+    The suite is looked up org-scoped (a cross-org suite can never be
+    configured). NULL values are persisted as NULL, wiping the config.
+    """
+    if principal.org_role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only admins can update eval suites")
+
+    try:
+        async with session.begin():
+            await set_rls_org(session, principal.organisation_id)
+            await set_rls_user_context(session, principal.account_id, principal.org_role)
+            suite = (
+                await session.execute(
+                    select(EvalSuite).where(
+                        EvalSuite.id == suite_id,
+                        EvalSuite.organisation_id == principal.organisation_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if suite is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_EVAL_SUITE_NOT_FOUND)
+
+            updates = req.model_dump(exclude_unset=True)
+            for key in ("baseline_window", "minimum_delta", "cooldown"):
+                if key in updates:
+                    setattr(suite, key, updates[key])
+            await session.flush()
+    except HTTPException:
+        raise
+    except IntegrityError:
+        _log.exception(_CODE_EVALS_SUITE_ALERTING)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Update would violate a constraint.",
+        ) from None
+    except ProgrammingError:
+        _log.exception(_CODE_EVALS_SUITE_ALERTING)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=MSG_FEATURE_NOT_AVAILABLE,
+        ) from None
+    except SQLAlchemyError:
+        _log.exception(_CODE_EVALS_SUITE_ALERTING)
+        _log.warning("evals.suite_alerting_db_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=MSG_DB_OPERATION_FAILED,
+        ) from None
+    except Exception:
+        _log.exception("evals.suite_alerting_error", extra={"org_id": str(principal.organisation_id)})
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred while updating eval suite alerting.",
+        ) from None
+
+    return EvalSuiteAlertingResponse(
+        suite_id=suite.id,
+        baseline_window=suite.baseline_window,
+        minimum_delta=float(suite.minimum_delta) if suite.minimum_delta is not None else None,
+        cooldown=suite.cooldown,
+    )
 
 
 @router.get("/evals/{eval_id}")

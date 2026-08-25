@@ -37,6 +37,7 @@ from modulo.core.eval_engine.suite_run import (
     pass_rate_by_eval_type,
     resolve_baseline_run,
     should_notify_regression,
+    suite_alert_metrics,
     suite_cumulative_exceeded,
 )
 from modulo.db.models import (
@@ -450,6 +451,31 @@ def test_rate_limit_and_idempotency() -> None:
     assert should_notify_regression(run, baseline) is False  # idempotent on suite_run_id
 
 
+def test_suite_alert_metrics_derives_worst_alert() -> None:
+    """The alert metrics summarise the worst (largest drop) alert already
+    recorded in ``comparison_json`` — never re-doing the detection."""
+    metrics = suite_alert_metrics(
+        {
+            "alerts": [
+                {"prev_pass_rate": 0.9, "current_pass_rate": 0.6, "drop_pct": 0.3},
+                {"prev_pass_rate": 0.8, "current_pass_rate": 0.3, "drop_pct": 0.5},
+            ]
+        }
+    )
+    assert metrics == {
+        "alert_count": 2,
+        "prev_pass_rate": 0.8,
+        "current_pass_rate": 0.3,
+        "drop_pct": 0.5,
+    }
+
+
+def test_suite_alert_metrics_none_when_no_alerts() -> None:
+    assert suite_alert_metrics(None) is None
+    assert suite_alert_metrics({}) is None
+    assert suite_alert_metrics({"alerts": [], "regressed": True}) is None
+
+
 def test_suite_rate_limit_window() -> None:
     assert is_suite_rate_limited(None, timedelta(hours=1)) is False
     assert is_suite_rate_limited(datetime.now(UTC), timedelta(hours=1)) is True
@@ -509,7 +535,8 @@ def test_single_migration_head() -> None:
     # migrations + main's status_check_constraints + rename_remy migrations:
     # 0131 -> 0132 -> 0133_run_evidence_rls -> 0134_dismissals_org_rls
     # -> 0135_status_check_constraints -> 0136_rename_remy_user_id_to_account_id
-    # -> 0137_eval_suite_run (renumbered to resolve the 0135 collision).
+    # -> 0137_eval_suite_run (renumbered to resolve the 0135 collision)
+    # -> 0140_eval_regression_alert (FAR-379 alerting config on eval_suites).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -522,9 +549,11 @@ def test_single_migration_head() -> None:
     assert [_basename(p) for p in chaining_off_0135] == ["0136_rename_remy_user_id_to_account_id.py"]
     chaining_off_0136 = [p for p in revisions if parents[p] == "0136_rename_remy_user_id_to_account_id"]
     assert [_basename(p) for p in chaining_off_0136] == ["0137_eval_suite_run.py"]
-    # Nothing chains off 0137 -> it is the single head.
     chaining_off_0137 = [p for p in revisions if parents[p] == "0137_eval_suite_run"]
-    assert chaining_off_0137 == []
+    assert [_basename(p) for p in chaining_off_0137] == ["0140_eval_regression_alert.py"]
+    # Nothing chains off 0140 -> it is the single head.
+    chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
+    assert chaining_off_0140 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
