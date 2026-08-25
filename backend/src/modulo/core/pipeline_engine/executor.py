@@ -1440,7 +1440,7 @@ class PipelineExecutor:
             decline_code, decline_detail = self._capacity_decline(
                 max_concurrent=max_concurrent,
                 active_count=active_count,
-                pipeline_capacity_ok=pipeline_capacity_ok,
+                _pipeline_capacity_ok=pipeline_capacity_ok,
                 org_sandbox_cap=org_sandbox_cap,
                 org_count=org_sandbox_count,
                 org_capacity_ok=org_sandbox_cap_ok,

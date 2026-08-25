@@ -925,7 +925,7 @@ async def _intercept_guardrails(
                     guardrail_blocking_eval_name,
                 ) = await _run_guardrail_interception_pass(
                     org_id=org_id,
-                    run_id=run_id,
+                    _run_id=run_id,
                     guardrail_defs=guardrail_defs,
                     payload=payload,
                     is_replay=is_replay,

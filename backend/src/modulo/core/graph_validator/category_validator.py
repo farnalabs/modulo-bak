@@ -37,7 +37,7 @@ async def validate_node_category(
     try:
         parsed = uuid.UUID(str(category_id))
     except (ValueError, TypeError):
-        result.exception(
+        result.error(
             "CATEGORY_INVALID_ID",
             f"Node '{node_id}' has invalid category_id '{category_id}'",
             node_id=node_id,

@@ -271,12 +271,12 @@ class LangGraphOtelBridge(BaseCallbackHandler):
     def on_chain_start(
         self,
         serialized: dict[str, Any],
-        _inputs: dict[str, Any],
+        inputs: dict[str, Any],
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
-        _metadata: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
         **_kwargs: Any,
     ) -> Any:
         name = self._serialized_name(serialized)
@@ -290,10 +290,10 @@ class LangGraphOtelBridge(BaseCallbackHandler):
 
     def on_chain_end(
         self,
-        _outputs: dict[str, Any],
+        outputs: dict[str, Any],
         *,
         run_id: UUID,
-        _parent_run_id: UUID | None = None,
+        parent_run_id: UUID | None = None,
         **_kwargs: Any,
     ) -> None:
         self._end_span(run_id)
@@ -438,13 +438,13 @@ class LangGraphOtelBridge(BaseCallbackHandler):
     def on_tool_start(
         self,
         serialized: dict[str, Any],
-        _input_str: str,
+        input_str: str,
         *,
         run_id: UUID,
         parent_run_id: UUID | None = None,
         tags: list[str] | None = None,
-        _metadata: dict[str, Any] | None = None,
-        _inputs: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
         **_kwargs: Any,
     ) -> Any:
         name = self._serialized_name(serialized)
@@ -458,10 +458,10 @@ class LangGraphOtelBridge(BaseCallbackHandler):
 
     def on_tool_end(
         self,
-        _output: Any,
+        output: Any,
         *,
         run_id: UUID,
-        _parent_run_id: UUID | None = None,
+        parent_run_id: UUID | None = None,
         **_kwargs: Any,
     ) -> None:
         self._end_span(run_id)

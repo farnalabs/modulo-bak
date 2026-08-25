@@ -379,7 +379,7 @@ def _add_node_to_graph(
     elif connector_binding and not (node_type == "agent" and node_def.get("agent_id")):
         node_fn = make_connector_fn(node_def, timeout=timeout)
     elif node_type == "manual":
-        node_fn = make_manual_node_fn(node_def, timeout=timeout)
+        node_fn = make_manual_node_fn(node_def, _timeout=timeout)
     else:
         # agent nodes (with or without a frozen agent_id) and connector nodes
         # without a binding default to the general agent node factory.
@@ -388,7 +388,7 @@ def _add_node_to_graph(
             role=role,
             timeout=timeout,
             max_input_length=max_input_length,
-            token_budget=token_budget,
+            _token_budget=token_budget,
         )
     graph.add_node(node_id, node_fn)
 

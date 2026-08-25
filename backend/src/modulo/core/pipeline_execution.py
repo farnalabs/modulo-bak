@@ -275,7 +275,7 @@ async def claim_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_claim_update(stale_seconds=window, claim_cap=cap, claim_token=claim_token),
+                build_claim_update(_stale_seconds=window, _claim_cap=cap, claim_token=claim_token),
                 _claim_params(run_id, org_id, window, cap, claim_token),
             )
             claimed = result.fetchone() is not None
@@ -1526,7 +1526,7 @@ async def claim_resume_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_resume_claim_update(stale_seconds=stale_seconds, claim_cap=cap, claim_token=claim_token),
+                build_resume_claim_update(_stale_seconds=stale_seconds, _claim_cap=cap, claim_token=claim_token),
                 _resume_claim_params(run_id, org_id, stale_seconds, cap, claim_token),
             )
             claimed = result.fetchone() is not None

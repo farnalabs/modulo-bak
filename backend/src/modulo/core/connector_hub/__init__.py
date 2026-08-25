@@ -448,10 +448,10 @@ class _TracedConnector(ConnectorBase):
 
     async def compensate(
         self,
-        operation: CompensationOperation,
+        _operation: CompensationOperation,
         *,
-        context: CompensationContext,
-        error: str,
+        _context: CompensationContext,
+        _error: str,
     ) -> CompensationResult:
         """Forward a compensating callback to the wrapped connector (FAR-213).
 
@@ -465,10 +465,10 @@ class _TracedConnector(ConnectorBase):
                 f"connector.{self._inner.connector_type}.compensate",
                 "compensate",
                 self._inner.compensate,
-                operation,
-                context=context,
-                error=error,
-                extra_attrs={_OTEL_ATTR_CONNECTOR_RESOURCE: operation.resource},
+                _operation,
+                context=_context,
+                error=_error,
+                extra_attrs={_OTEL_ATTR_CONNECTOR_RESOURCE: _operation.resource},
                 acl_operation=None,
             ),
         )

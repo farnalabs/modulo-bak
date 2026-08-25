@@ -3855,7 +3855,7 @@ async def _sandbox_agent_impl(
             claim_lease=claim_lease,
             org_id=org_id,
             run_id=run_id,
-            node_id=node_id,
+            _node_id=node_id,
             attempt_key=attempt_key,
         )
 
@@ -3876,7 +3876,7 @@ async def _sandbox_agent_impl(
             claim_lease=claim_lease,
             org_id=org_id,
             run_id=run_id,
-            node_id=node_id,
+            _node_id=node_id,
             attempt_key=attempt_key,
         )
 
@@ -3909,7 +3909,7 @@ async def _sandbox_agent_impl(
             claim_lease=claim_lease,
             org_id=org_id,
             run_id=run_id,
-            node_id=node_id,
+            _node_id=node_id,
         )
 
     try:

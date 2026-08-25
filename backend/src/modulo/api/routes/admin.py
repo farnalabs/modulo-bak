@@ -1949,7 +1949,7 @@ async def request_org_deletion(
                 result = await _request_deletion(
                     session,
                     org_id=current_user.organisation_id,
-                    actor_user_id=current_user.account_id,
+                    _actor_user_id=current_user.account_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -2148,7 +2148,7 @@ async def delete_org_immediate(
                 req = await _request_deletion(
                     session,
                     org_id=current_user.organisation_id,
-                    actor_user_id=current_user.account_id,
+                    _actor_user_id=current_user.account_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
