@@ -687,6 +687,71 @@ def test_transport_errors_are_typed() -> None:
         asyncio_run(c.query(ConnectorQuery(resource="default")))
 
 
+# ── Transport config wiring (timeout_seconds / verify_tls) ────────────────
+
+
+def test_timeout_seconds_in_config_overrides_default() -> None:
+    """config_json timeout_seconds must override the constructor default (FAR-412)."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "timeout_seconds": 12.0},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c._client().timeout == httpx.Timeout(12.0)
+    assert c._timeout == 12.0
+
+
+def test_default_timeout_is_30_seconds() -> None:
+    """Absent timeout_seconds keeps the default (30.0), not 0 or None (FAR-412)."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c._client().timeout == httpx.Timeout(30.0)
+    assert c._timeout == 30.0
+
+
+def test_verify_tls_false_passes_verify_to_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """config_json verify_tls: false must reach the AsyncClient as verify=False (FAR-412)."""
+    captured: dict[str, Any] = {}
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr("modulo.connectors.rest.httpx.AsyncClient", factory)
+    c = RestConnector(
+        {"base_url": "https://api.example.com", "path": "/items", "verify_tls": False},
+        {"auth_mode": "bearer", "token": "t"},
+        transport=httpx.MockTransport(_default_handler),
+        ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
+    )
+    c._client()
+    assert captured.get("verify") is False
+
+
+def test_verify_tls_defaults_to_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Absent verify_tls keeps the secure default (verify=True) (FAR-412)."""
+    captured: dict[str, Any] = {}
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr("modulo.connectors.rest.httpx.AsyncClient", factory)
+    c = RestConnector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+        transport=httpx.MockTransport(_default_handler),
+        ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
+    )
+    c._client()
+    assert captured.get("verify") is True
+
+
 def asyncio_run(coro: Any) -> Any:
     import asyncio
 

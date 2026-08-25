@@ -85,10 +85,14 @@ against it:
 - A top-level JSON array is treated as the record list.
 - A JSON object with no `records_path` is wrapped as a single record.
 - **Raw / passthrough** content-types (CSV, XML, plain text) yield a single
-  uniform record: `{body, content_type, status_code, headers}`. The connector
+  uniform record — `{body, content_type, status_code, headers}` — when **no
+  `records_path` is configured** (or when `passthrough` is set). The connector
   does **not** parse XML/CSV itself — the record body is the raw string, which a
-  downstream node (or Remy) can interpret. This keeps the shape contract stable:
-  the result is **never** a bare string that would break the JMESPath consumer.
+  downstream node (or Remy) can interpret. When a `records_path` IS configured
+  against a non-JSON body, extraction cannot run, so the connector returns an
+  empty records list rather than fabricating a record. This keeps the shape
+  contract stable: the result is **never** a bare string that would break the
+  JMESPath consumer.
 
 A non-2xx/3xx response raises a typed error rather than silently passing a
 redirect through — so a downstream node sees a failure, not an empty or

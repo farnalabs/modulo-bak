@@ -30,10 +30,24 @@ class ConnectorProfile(OrgScoped):
             "auth_in IS NULL OR auth_in IN ('header', 'query')",
             name="ck_connector_profiles_auth_in",
         ),
+        CheckConstraint(
+            "auth_in <> 'query' OR auth_query_param_name IS NOT NULL",
+            name="ck_connector_profiles_auth_query_param",
+        ),
+        CheckConstraint(
+            "auth_in <> 'header' OR auth_query_param_name IS NULL",
+            name="ck_connector_profiles_auth_header_inverse",
+        ),
     )
 
     connector_instance_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(), ForeignKey("connector_instances.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+        # ``unique=True`` alone yields the backing index; the separate plain index
+        # on this column was redundant (the UNIQUE constraint already indexes it),
+        # so it is dropped to avoid a duplicate index (FAR-412).
+        Uuid(),
+        ForeignKey("connector_instances.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
     )
     auth_mode: Mapped[str] = mapped_column(String(20), nullable=False)
     auth_in: Mapped[str | None] = mapped_column(String(10))

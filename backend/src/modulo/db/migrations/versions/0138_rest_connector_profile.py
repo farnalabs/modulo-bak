@@ -128,14 +128,25 @@ def upgrade() -> None:
             "auth_in IS NULL OR auth_in IN ('header', 'query')",
             name="ck_connector_profiles_auth_in",
         ),
+        sa.CheckConstraint(
+            "auth_in <> 'query' OR auth_query_param_name IS NOT NULL",
+            name="ck_connector_profiles_auth_query_param",
+        ),
+        sa.CheckConstraint(
+            "auth_in <> 'header' OR auth_query_param_name IS NULL",
+            name="ck_connector_profiles_auth_header_inverse",
+        ),
     )
 
     if pg and migrate_role:
         op.execute("RESET ROLE")
         _assert_owner_is_migrate(bind, _TABLE)
 
+    # Only org_id gets a plain index here; the connector_instance_id column is
+    # covered by the UNIQUE constraint above (its backing index is the single
+    # index on that column — a dual unique-constraint + explicit-index pair was
+    # redundant, FAR-412).
     op.create_index("ix_connector_profiles_organisation_id", _TABLE, ["organisation_id"])
-    op.create_index("ix_connector_profiles_connector_instance_id", _TABLE, ["connector_instance_id"])
 
     if pg:
         op.execute(f"ALTER TABLE {_TABLE} ENABLE ROW LEVEL SECURITY")
@@ -156,7 +167,6 @@ def downgrade() -> None:
         op.execute(f"DROP POLICY IF EXISTS rls_org_isolation ON {_TABLE}")
         op.execute(f"ALTER TABLE {_TABLE} DISABLE ROW LEVEL SECURITY")
 
-    op.drop_index("ix_connector_profiles_connector_instance_id", table_name=_TABLE)
     op.drop_index("ix_connector_profiles_organisation_id", table_name=_TABLE)
 
     op.drop_table(_TABLE)

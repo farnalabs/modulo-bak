@@ -50,16 +50,19 @@ write}`.
 JSON-serializable dicts**, so the downstream JMESPath consumer and the JSON API
 formatter stay contract-stable. Raw / passthrough content-types (CSV, XML, plain
 text) wrap the raw body in a single
-`{body, content_type, status_code, headers}` record rather than parsing it.
-This is the REST-specific conformance shape: the connector never returns a bare
-string or a list of scalars that would break the downstream evaluator.
+`{body, content_type, status_code, headers}` record when **no `records_path` is
+configured** (or when `passthrough` is set). When a `records_path` IS configured
+against a non-JSON body, extraction cannot run and the connector returns an empty
+records list. This is the REST-specific conformance shape: the connector never
+returns a bare string or a list of scalars that would break the downstream
+evaluator.
 
 ### Layered guards
 
 SSRF / output-injection guards live in `modulo.core` and are injected at the
 composition root (`connector_hub`) via a `SecurityGuard` port — the connector
 does not reach into `modulo.core` directly. The connector additionally:
-- rejects header/URL control characters (injection),
+- rejects header control characters (injection),
 - forbids rendered headers from overriding auth/transport headers,
 - enforces a scheme/host allowlist (`allowed_hosts`) + SSRF validation,
 - caps the response body at `max_response_size`,
@@ -90,6 +93,17 @@ does not reach into `modulo.core` directly. The connector additionally:
 ## Deferrals
 
 - **Request→response ingestion classification** — to FAR-404.
+- **DISTINCT classification layer** — a separate deduplicate/classify layer is
+  deferred to FAR-404 alongside the ingestion classification;
+  request→response ingestion runs as one opaque hop today.
+- **Per-tenant weighted concurrency semaphore** — a per-tenant (weighted,
+  per-credential) concurrency semaphore is deferred; today the connector shares
+  a single connection-pooled client and far-out fan-out relies on the pipeline's
+  global concurrency limits.
+- **Fan-out cardinality guard** — a connector-level guard on the number of
+  parallel requests a single fan-out may open is deferred (see the pipeline
+  concurrency references in the loop/parallel node docs); rely on pipeline-level
+  concurrency limits.
 - **OAuth 2.0** — the connector supports bearer / api_key (header+query) / basic
   only; registry/refresh flows are deferred.
 - **Async mode** — response-driven polling and async webhook-style triggers are

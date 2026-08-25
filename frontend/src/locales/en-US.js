@@ -3183,3 +3183,10 @@ export default {
     }
   }
 }
+
+// NOTE (FAR-412): the `connectors.rest.*` keys above are the structured-config
+// schema for a Generic REST connector. No view wires a label lookup to them yet —
+// the connector's config_json is authored as a bare JSON map. Kept as the i18n
+// surface for the upcoming structured-config form; remove only if the product
+// drops that plan. (Trailing comment — the manifest parser reads the object
+// literal and tolerates nothing inside it.)

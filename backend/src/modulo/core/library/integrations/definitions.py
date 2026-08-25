@@ -1,4 +1,4 @@
-"""25 canonical library integration primitives.
+"""24 canonical library integration primitives.
 
 Each dict provides the metadata, default configuration, credential
 field descriptions, and tool-group classification needed to register
