@@ -18,8 +18,10 @@ guard pattern used throughout 0110).
 
 Renumber note: this migration was originally ``0138_add_router_no_match_status``
 but collided with main's ``0138_eval_versioning``. It is renumbered to
-``0139`` and re-parented onto main's head ``0141_pipeline_edge_ports`` so the
-migration graph stays a single linear chain.
+``0139`` and re-parented onto main's head. It was first re-parented onto
+``0141_pipeline_edge_ports``; after main advanced to ``0143_rest_connector_profile``
+(FAR-412 REST connector profile) the down-revision is updated to ``0143`` so the
+migration graph stays a single linear chain with ``0139`` as the head.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0139_add_router_no_match_status"
-down_revision: str | None = "0141_pipeline_edge_ports"
+down_revision: str | None = "0143_rest_connector_profile"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

@@ -13007,7 +13007,7 @@ export interface components {
             hitl_config?: {
                 [key: string]: unknown;
             } | null;
-             * Inputs
+            /** Inputs
              * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.
              */
             inputs?: {
