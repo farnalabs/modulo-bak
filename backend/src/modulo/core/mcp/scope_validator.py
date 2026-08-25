@@ -11,6 +11,7 @@ The per-tool requirement map references the centralized permission registry
 registry is the single source of truth (ADR 017).
 """
 
+import contextvars
 import types
 from collections.abc import Sequence
 from logging import getLogger
@@ -25,12 +26,36 @@ from modulo.auth.team_rbac import ORG_ROLE_HIERARCHY
 
 _log = getLogger(__name__)
 
+# FAR-418: request-scoped node-level allowed_tools allow-list. The agent's MCP
+# tool calls arrive at the MCP server as independent HTTP requests; the calling
+# node's capability_scope.allowed_tools is forwarded by the agent runtime as the
+# ``X-Modulo-Allowed-Tools`` header and lifted into this ContextVar by
+# McpAuthMiddleware. ``check_tool_scope`` consults it as the default narrowing
+# filter so the production tool-dispatch chokepoint enforces it without every
+# handler call-site having to thread the value. Unset (None) = UNRESTRICTED.
+_ctx_allowed_tools: contextvars.ContextVar[Sequence[str] | None] = contextvars.ContextVar(
+    "scope_allowed_tools", default=None
+)
+
+
+def set_request_allowed_tools(allowed_tools: Sequence[str] | None) -> None:
+    """Set the request-scoped node allowed_tools allow-list (called by middleware)."""
+    _ctx_allowed_tools.set(allowed_tools)
+
+
+def get_request_allowed_tools() -> Sequence[str] | None:
+    """Return the request-scoped node allowed_tools allow-list, if any."""
+    return _ctx_allowed_tools.get()
+
+
 __all__ = [
     "READ_ONLY_TOOLS",
     "TOOL_SCOPE_REQUIREMENTS",
     "MCPAuthorizationError",
     "MCPConfigurationError",
     "check_tool_scope",
+    "get_request_allowed_tools",
+    "set_request_allowed_tools",
 ]
 
 
@@ -137,6 +162,14 @@ def check_tool_scope(
     action: str | None = None,
     allowed_tools: Sequence[str] | None = None,
 ) -> None:
+    # FAR-418: when no explicit allow-list is passed, fall back to the
+    # request-scoped node allowed_tools (set by McpAuthMiddleware from the
+    # agent-supplied ``X-Modulo-Allowed-Tools`` header). This is the production
+    # run-path wiring: an agent node's tool calls are narrowed here, and the
+    # UNRESTRICTED default (no header) leaves behaviour unchanged.
+    if allowed_tools is None:
+        allowed_tools = get_request_allowed_tools()
+
     if current_role is None:
         _log.warning("Scope check failed: no authentication context")
         raise MCPAuthorizationError("No authentication context: role not set")

@@ -268,6 +268,31 @@ def test_check_tool_scope_no_allowed_tools_means_no_narrowing():
         check_tool_scope("admin", "sell_land")
 
 
+def test_check_tool_scope_narrows_via_request_contextvar():
+    # FAR-418: the production run path (McpAuthMiddleware -> check_tool_scope)
+    # supplies allowed_tools via the request-scoped ContextVar, not the param.
+    from modulo.core.mcp.scope_validator import (
+        get_request_allowed_tools,
+        set_request_allowed_tools,
+    )
+
+    set_request_allowed_tools(["create_pipeline", "list_runs"])
+    try:
+        # In-scope tool + valid role -> passes.
+        check_tool_scope("admin", "create_pipeline")
+        # Out-of-scope tool despite valid role -> rejected (node-level scoping).
+        with pytest.raises(MCPAuthorizationError):
+            check_tool_scope("admin", "create_agent")
+    finally:
+        # Reset the ContextVar to the unrestricted default (None) so the test
+        # leaves no residue for other tests in the process.
+        set_request_allowed_tools(None)
+
+    # After the context is cleared, no narrowing is applied.
+    assert get_request_allowed_tools() is None
+    check_tool_scope("admin", "create_agent")
+
+
 # ---------------------------------------------------------------------------
 # context_scope allowlist
 # ---------------------------------------------------------------------------

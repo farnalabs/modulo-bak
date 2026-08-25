@@ -2398,15 +2398,11 @@ def make_connector_fn(
             record_scope_violation,
         )
 
-        connector, error_artifact = _resolve_binding_connector(binding, node_id)
-        if error_artifact is not None:
-            return error_artifact
-
-        resource, filters, data = _connector_inputs(binding, state)
-
-        # FAR-418: deny-by-default within the node's connector scope. A node that
-        # targets a connector excluded by its capability_scope fails FAST with a
-        # typed, logged, metric-emitting ScopeViolationError (never silently).
+        # FAR-418: deny-by-default within the node's connector scope. The gate
+        # fires BEFORE the connector is resolved from the hub, so a node that
+        # targets a connector excluded by its capability_scope never decrypts or
+        # touches the connection (fail-fast with a typed, logged, metric-emitting
+        # ScopeViolationError). The hub is only consulted for in-scope connectors.
         instance_id_str = binding.get("instance_id")
         if instance_id_str:
             import uuid as _uuid
@@ -2422,6 +2418,12 @@ def make_connector_fn(
                 record_scope_violation(node_id=node_id, target=target, kind="connector")
                 _log.error("scope.violation node=%s connector=%s", node_id, target)
                 return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
+        connector, error_artifact = _resolve_binding_connector(binding, node_id)
+        if error_artifact is not None:
+            return error_artifact
+
+        resource, filters, data = _connector_inputs(binding, state)
 
         try:
             if op == "write":
@@ -4252,6 +4254,18 @@ async def _sandbox_agent_impl(
                 org_id=org_id,
             ),
         )
+
+        # FAR-418: expose the node's capability_scope.allowed_tools to the sandbox
+        # agent runtime (FAR-402 P4 / FAR-418) so the agent's MCP client can
+        # forward it as the ``X-Modulo-Allowed-Tools`` header. The MCP server's
+        # McpAuthMiddleware lifts that header into the request-scoped allow-list
+        # consumed by check_tool_scope, enforcing node-level tool scoping in the
+        # production run path. Absent/empty (the UNRESTRICTED default) sets nothing,
+        # preserving pre-scope behaviour.
+        _node_scope = node_def.get("capability_scope") or {}
+        _allowed_tools = _node_scope.get("allowed_tools")
+        if _allowed_tools:
+            env_vars_extra["MODULO_ALLOWED_TOOLS"] = ",".join(str(t) for t in _allowed_tools)
 
         # FAR-212 PR B: apply the enforced sandbox policy AFTER the Modulo-owned
         # context files / prompt / input are written but BEFORE the agent/script
