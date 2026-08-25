@@ -859,8 +859,8 @@ class GitHubConnector(ConnectorBase):
         self,
         operation: CompensationOperation,
         *,
-        _context: CompensationContext,
-        _error: str,
+        context: CompensationContext,
+        error: str,
     ) -> CompensationResult:
         """Compensate a performed GitHub write (FAR-213): close a PR the run opened.
 

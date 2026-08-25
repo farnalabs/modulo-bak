@@ -105,7 +105,7 @@ def _sync_interval_to_cron(interval_seconds: int) -> str:
 
 
 # Web UI bind (F8): fly ssh only.
-_SYSTEM_WEB_HOST = "localhost"
+_SYSTEM_WEB_HOST = "127.0.0.1"
 _SYSTEM_WEB_PORT = 8081
 
 # Engine for run execution (SAQ path) — the shared per-process engine (D4).

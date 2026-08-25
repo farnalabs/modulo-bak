@@ -492,10 +492,10 @@ class ConnectorBase(ABC):
 
     async def compensate(
         self,
-        _operation: CompensationOperation,
+        operation: CompensationOperation,
         *,
-        _context: CompensationContext,
-        _error: str,
+        context: CompensationContext,
+        error: str,
     ) -> CompensationResult:
         """Best-effort inverse of a performed connector operation (FAR-213).
 

@@ -185,7 +185,7 @@ class ValidateResponse(BaseModel):
 @router.get("/parameter-schemas")
 @handle_db_errors("parameter_schemas.list")
 async def list_parameter_schemas_endpoint(
-    _page: int = Query(default=1, ge=1),
+    page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal = require_permission(_CODE_PARAMETER_SCHEMA_LIST),
