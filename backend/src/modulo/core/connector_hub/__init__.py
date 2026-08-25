@@ -204,7 +204,7 @@ class ConnectorHub:
             if self._initialised:
                 logger.warning("ConnectorHub already initialised — skipping")
                 return
-            fetch_scope: set[str] = set(allowed_connectors) if allowed_connectors is not None else None
+            fetch_scope: set[str] | None = set(allowed_connectors) if allowed_connectors is not None else None
             for ci in instances:
                 if fetch_scope is not None and not _in_fetch_scope(ci, fetch_scope):
                     continue
