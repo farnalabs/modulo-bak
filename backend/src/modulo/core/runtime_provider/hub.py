@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import select
 
@@ -99,7 +99,7 @@ class RuntimeProviderHub:
     ) -> RuntimeProvider | None:
         raw_provider_type: Any = getattr(profile, "provider_type", None)
         if not isinstance(raw_provider_type, str) or not raw_provider_type.strip():
-            return _TYPE_UNSET
+            return cast("RuntimeProvider | None", _TYPE_UNSET)
         provider_type = raw_provider_type.strip().lower()
 
         direct_match = providers.get(provider_type)
