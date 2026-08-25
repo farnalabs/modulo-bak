@@ -408,7 +408,7 @@ class TestDiffSnapshotsSemantic:
         # reach the source and its full downstream (b, c).
         assert semantic["impacted_nodes"] == ["a", "b", "c"]
         # out1 -> out2 with equal schema_ref is not breaking on its own.
-        assert semantic["breaking_changes"] == []
+        assert not semantic["breaking_changes"]
 
     async def test_diff_edge_source_port_repoint_to_missing_port_is_breaking(self):
         # Repointing an edge at a port the new graph does not declare must be
