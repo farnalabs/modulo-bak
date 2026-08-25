@@ -20,6 +20,7 @@ that call into here with injected child-execution and event hooks.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Any, Literal
@@ -257,7 +258,7 @@ def emit_scatter_event(event: str, **attrs: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def run_scatter_node(
+async def run_scatter_node(
     node_def: dict[str, Any],
     *,
     items: list[Any],
@@ -269,6 +270,12 @@ def run_scatter_node(
     Produces N child branch executions (each with a unique correlation id used as
     the audit/claim/feedback key) via ``execute_child`` and returns a state
     fragment carrying each child's output keyed by its child node id.
+
+    ``execute_child`` may be sync OR async (returning a coroutine) — the latter is
+    the LangGraph runtime path where each child is a real async node function.
+    Either way the child's result is resolved before ``results`` is populated, so
+    fan-out branches actually execute (a sync-only call would store un-awaited
+    coroutines and never run the children).
 
     An empty ``items`` iterator succeeds vacuously with no child calls (design
     §4 B).
@@ -290,6 +297,8 @@ def run_scatter_node(
     for child in children:
         child_id = str(child["id"])
         output = execute_child(child)
+        if asyncio.iscoroutine(output):
+            output = await output
         results[child_id] = output
         # Idempotent teardown dedupe key (design §4 B): ties child teardown to
         # run cancellation AND join completion AND scatter-level failure.
@@ -371,6 +380,6 @@ def validate_scatter_join_node(node_def: dict[str, Any]) -> None:
             FanOutConfig.model_validate(fan_out)
         except ValidationError as exc:
             raise JoinConfigurationError(f"invalid fan_out config: {exc}") from exc
-        allowed = node_def.get("node_type") in ("agent", "sandbox_agent", "composite")
+        allowed = node_def.get("node_type") in ("agent", "sandbox_agent")
         if not allowed:
-            raise JoinConfigurationError("fan_out is only allowed on agent / sandbox_agent / composite nodes.")
+            raise JoinConfigurationError("fan_out is only allowed on agent / sandbox_agent nodes.")

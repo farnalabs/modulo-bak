@@ -690,9 +690,8 @@ class PipelineGraphNode(BaseModel):
         if self.fan_out is not None and self.node_type not in (
             "agent",
             "sandbox_agent",
-            "composite",
         ):
-            raise ValueError("fan_out is only allowed on agent / sandbox_agent / composite nodes")
+            raise ValueError("fan_out is only allowed on agent / sandbox_agent nodes")
         # FAR-212 PR B: read_only / git_credentials are sandbox_agent-only fields.
         # A non-sandbox node that sets them is rejected ÔÇö the enforcement surface
         # (read-only workspace, git-credential scope) only exists for sandbox

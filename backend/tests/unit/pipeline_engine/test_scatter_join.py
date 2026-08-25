@@ -70,14 +70,14 @@ def test_scatter_default_cap_is_1000():
         expand_scatter_nodes(node, list(range(1001)))
 
 
-def test_scatter_empty_iterator_vacuous_success():
+async def test_scatter_empty_iterator_vacuous_success():
     calls: list[int] = []
 
-    def execute_child(child_def):
+    async def execute_child(child_def):
         calls.append(child_def["scatter_index"])
         return {"ok": True}
 
-    result = run_scatter_node(
+    result = await run_scatter_node(
         {"id": "parent", "node_type": "agent", "fan_out": {"split": "items"}},
         items=[],
         execute_child=execute_child,
@@ -86,14 +86,14 @@ def test_scatter_empty_iterator_vacuous_success():
     assert calls == []  # no child executed
 
 
-def test_scatter_runs_each_branch_and_isolates_audit_keys():
+async def test_scatter_runs_each_branch_and_isolates_audit_keys():
     executed: list[str] = []
 
-    def execute_child(child_def):
+    async def execute_child(child_def):
         executed.append(child_def["id"])  # unique audit/claim/feedback key
         return {"out": child_def["scatter_item"] * 2}
 
-    result = run_scatter_node(
+    result = await run_scatter_node(
         {"id": "parent", "node_type": "agent", "fan_out": {"split": "items"}},
         items=[1, 2],
         execute_child=execute_child,
@@ -195,13 +195,13 @@ def test_child_teardown_dedup_key_is_run_node_index_scoped():
     assert a != c
 
 
-def test_scatter_events_emitted():
+async def test_scatter_events_emitted():
     events: list[str] = []
 
     def emit(event, **attrs):
         events.append(event)
 
-    run_scatter_node(
+    await run_scatter_node(
         {"id": "parent", "node_type": "agent", "fan_out": {"split": "items"}},
         items=[1, 2],
         execute_child=lambda c: "x",

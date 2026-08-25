@@ -413,26 +413,52 @@ def make_scatter_node_fn(
     fan_out = node_def["fan_out"]
     split = fan_out.get("split") if isinstance(fan_out, dict) else fan_out.split
 
-    def _fn(state: dict[str, Any]) -> dict[str, Any]:
+    async def _fn(state: dict[str, Any]) -> dict[str, Any]:
         items = state.get(split) or [] if split is not None else []
-        manifest: list[str] = []
+        status_map: dict[str, str] = {}
 
-        def execute_child(child_def: dict[str, Any]) -> Any:
+        async def execute_child(child_def: dict[str, Any]) -> Any:
             child_fn = _make_node_fn(
                 child_def,
                 timeout=timeout,
                 session_factory=session_factory,
                 single_sandbox_node=single_sandbox_node,
             )
+            child_id = str(child_def["id"])
+            item = child_def.get("scatter_item")
+            # Deliver the per-item payload to the child so each branch processes
+            # its OWN item rather than an identical copy of the parent state.
+            # The item is injected as the child's run_context input (the
+            # conventional agent input channel, rendered into the prompt as
+            # ``{{ input }}``) and mirrored under ``__scatter_item__`` for direct
+            # template reference (``{{ state.__scatter_item__ }}``).
             child_state = dict(state)
-            child_state["__scatter_item__"] = child_def.get("scatter_item")
-            return child_fn(child_state)
+            run_ctx = dict(child_state.get("run_context") or {})
+            run_ctx["input"] = item
+            child_state["run_context"] = run_ctx
+            child_state["__scatter_item__"] = item
+            try:
+                out = await child_fn(child_state)
+                status_map[child_id] = "succeeded"
+                return out
+            except Exception as exc:  # record per-branch failure
+                # A child failure must NOT abort the whole scatter: record the
+                # failed branch so a downstream join can apply its partial-failure
+                # policy (``join_partial_policy="fail"`` raises; the default
+                # ``collect_and_proceed`` aggregates the partial result). This is
+                # what makes ``__scatter_read`` statuses real at runtime (FAR-402
+                # §4 B).
+                status_map[child_id] = "failed"
+                return {"error": str(exc), "_scatter_child_failed": True}
 
-        results = run_scatter_node(node_def, items=list(items), execute_child=execute_child)
+        results = await run_scatter_node(node_def, items=list(items), execute_child=execute_child)
         manifest = [str(k) for k in results]
+        update: dict[str, Any] = dict(results)
         if manifest:
-            return {**results, "__scatter_manifest__": {parent_id: manifest}}
-        return results
+            update["__scatter_manifest__"] = {parent_id: manifest}
+        if status_map:
+            update["__scatter_status__"] = status_map
+        return update
 
     return _fn
 
@@ -494,10 +520,21 @@ def _add_node_to_graph(
         graph.add_node(node_id, make_join_node_fn(node_def))
         return
 
-    if node_type == "agent" and node_def.get("fan_out") is not None:
+    if node_def.get("fan_out") is not None and node_type in ("agent", "sandbox_agent"):
         # FAR-402 P3 / FAR-417: a scatter node expands its split source into N
         # parallel child branches at runtime, each with a unique correlation id.
-        graph.add_node(node_id, make_scatter_node_fn(node_def, timeout=timeout))
+        # Both agent and sandbox_agent nodes are executable as children, so
+        # fan_out is honored for both (composite is rejected at validation
+        # because it has no runtime child factory).
+        graph.add_node(
+            node_id,
+            make_scatter_node_fn(
+                node_def,
+                timeout=timeout,
+                session_factory=session_factory,
+                single_sandbox_node=single_sandbox_node,
+            ),
+        )
         return
 
     graph.add_node(
