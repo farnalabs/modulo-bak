@@ -5632,8 +5632,7 @@ def test_no_unconditional_body_skip():
         f"Found {len(violations)} unconditional skip/xfail statement(s) in test bodies.\n"
         "A skip/xfail placed directly on the test body always executes, so the test is\n"
         "permanently deselected while still reporting green. Gate it behind an explicit\n"
-        "condition, or drop the call so the test either runs or is removed.\n"
-        + "\n".join(violations)
+        "condition, or drop the call so the test either runs or is removed.\n" + "\n".join(violations)
     )
 
 
