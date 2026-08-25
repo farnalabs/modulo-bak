@@ -71,6 +71,40 @@ _CHECKPOINT_TABLES: tuple[tuple[str, str], ...] = (
     ("checkpoint_writes", "octet_length(blob)"),
 )
 
+# Hard-coded per-table SQL templates (NO f-string, NO string interpolation — the
+# table name and size expression are baked into each literal). A table name is
+# only ever used after membership validation against _CHECKPOINT_TABLES (the
+# allowlist) / these dict keys, so an arbitrary `table` value can never reach the
+# SQL string. thread_ids and organisation_id are always bound parameters
+# (:tids via an expanding bind, :org via a plain bind) — never concatenated —
+# so there is no SQL-injection surface. Pure string literals also mean the
+# bandit `# nosec B608` suppression is no longer required.
+_CHECKPOINT_SIZE_SQL: dict[str, str] = {
+    "checkpoints": (
+        "SELECT thread_id, COALESCE(SUM(octet_length(checkpoint::text) + "
+        "octet_length(metadata::text)), 0) AS bytes, COUNT(*) AS cnt "
+        "FROM checkpoints WHERE thread_id IN :tids GROUP BY thread_id"
+    ),
+    "checkpoint_blobs": (
+        "SELECT thread_id, COALESCE(SUM(octet_length(blob)), 0) AS bytes, "
+        "COUNT(*) AS cnt FROM checkpoint_blobs WHERE thread_id IN :tids "
+        "GROUP BY thread_id"
+    ),
+    "checkpoint_writes": (
+        "SELECT thread_id, COALESCE(SUM(octet_length(blob)), 0) AS bytes, "
+        "COUNT(*) AS cnt FROM checkpoint_writes WHERE thread_id IN :tids "
+        "GROUP BY thread_id"
+    ),
+}
+_CHECKPOINT_DELETE_SQL: dict[str, str] = {
+    "checkpoints": "DELETE FROM checkpoints WHERE thread_id IN :tids",
+    "checkpoint_blobs": "DELETE FROM checkpoint_blobs WHERE thread_id IN :tids",
+    "checkpoint_writes": "DELETE FROM checkpoint_writes WHERE thread_id IN :tids",
+}
+# Appended to a template ONLY when org_id is in scope; the org value is a bound
+# parameter (:org), never string-interpolated.
+_ORG_CLAUSE = " AND organisation_id = :org"
+
 
 def _json_bytes(value: Any) -> int:
     """Approximate byte size of a JSON-serialisable column value."""
@@ -186,18 +220,19 @@ async def _checkpoint_detail(
     bytes_by_thread: dict[str, int] = {}
     count_by_thread: dict[str, int] = {}
     params: dict[str, Any] = {"tids": thread_ids}
-    org_filter = ""
+    org_clause = ""
     if org_id is not None:
-        org_filter = " AND organisation_id = :org"
+        org_clause = _ORG_CLAUSE
         params["org"] = str(org_id)
-    for table, size_expr in _CHECKPOINT_TABLES:
+    for table, _ in _CHECKPOINT_TABLES:
+        base_sql = _CHECKPOINT_SIZE_SQL.get(table)
+        if base_sql is None:
+            # Not in the hard-coded allowlist — never interpolate an unknown
+            # table name into SQL; skip this table for the size estimate.
+            _log.warning("run_retention.checkpoint_size_unavailable", extra={"table": table})
+            continue
         try:
-            stmt = (
-                text(
-                    f"SELECT thread_id, COALESCE(SUM({size_expr}), 0) AS bytes, COUNT(*) AS cnt "  # nosec B608  # noqa: S608 -- size_expr/table come from the fixed _CHECKPOINT_TABLES constant
-                    f"FROM {table} WHERE thread_id IN :tids{org_filter} GROUP BY thread_id"  # nosec B608
-                )
-            ).bindparams(bindparam("tids", expanding=True))
+            stmt = text(base_sql + org_clause).bindparams(bindparam("tids", expanding=True))
             result = await session.execute(stmt, params)
         except Exception:
             # The `langgraph.*` tables may not exist yet (pre-checkpointer) or
@@ -514,14 +549,21 @@ async def _delete_checkpoints(
     if not thread_ids:
         return
     params: dict[str, Any] = {"tids": thread_ids}
-    org_filter = ""
+    org_clause = ""
     if org_id is not None:
-        org_filter = " AND organisation_id = :org"
+        org_clause = _ORG_CLAUSE
         params["org"] = str(org_id)
-    for table, _size_expr in _CHECKPOINT_TABLES:
-        stmt = text(f"DELETE FROM {table} WHERE thread_id IN :tids{org_filter}").bindparams(  # nosec B608  # noqa: S608 -- table is a fixed whitelist constant
-            bindparam("tids", expanding=True)
-        )
+    for table, _ in _CHECKPOINT_TABLES:
+        base_sql = _CHECKPOINT_DELETE_SQL.get(table)
+        if base_sql is None:
+            # Not in the hard-coded allowlist — never interpolate an unknown
+            # table name into SQL.
+            _log.warning(
+                "run_retention.checkpoint_delete_unavailable",
+                extra={"table": table, "org_id": str(org_id) if org_id else None},
+            )
+            continue
+        stmt = text(base_sql + org_clause).bindparams(bindparam("tids", expanding=True))
         try:
             await session.execute(stmt, params)
         except Exception:

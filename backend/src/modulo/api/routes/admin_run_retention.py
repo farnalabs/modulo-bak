@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi import status as http_status
+from fastapi import status as http_status  # nosemgrep: loopvar-shadows-import
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
