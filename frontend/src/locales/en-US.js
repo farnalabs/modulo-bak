@@ -1238,7 +1238,24 @@ export default {
       "total_runs": "Total Runs",
       "status_categories": "Status Categories",
       "estimated_storage_saved": "Estimated Storage Saved",
-      "runs_by_status": "Runs by Status"
+      "runs_by_status": "Runs by Status",
+      "filters_title": "Filters",
+      "filters_subtitle": "Narrow the candidate runs by date, pipeline, or status.",
+      "from_label": "From",
+      "pipeline_label": "Pipeline",
+      "status_label": "Status",
+      "summary_title": "Summary",
+      "summary_subtitle": "Checkpoint data dominates the estimated reclaimable size.",
+      "matching_runs": "Matching runs",
+      "estimated_reclaimable": "Estimated reclaimable",
+      "terminal_purgeable": "Terminal (purge-able)",
+      "candidates_title": "Candidates",
+      "col_status": "Status",
+      "col_created": "Created",
+      "col_pipeline": "Pipeline",
+      "col_estimated_size": "Estimated size",
+      "col_run_id": "Run id",
+      "confirm_clear_down": "Confirm clear-down"
     },
     "AdminSandboxConcurrencyView": {
       "max_concurrent_sandbox_runs": "Max concurrent sandbox runs",
@@ -1803,25 +1820,6 @@ export default {
       "schema_saved_new_version": "Schema saved as new version.",
       "delete_referenced_error": "Cannot delete: schema is referenced by agents or parameter sets.",
       "cloned_set_name": "{name} (clone)"
-    },
-    "AdminRunRetentionView": {
-      "filters_title": "Filters",
-      "filters_subtitle": "Narrow the candidate runs by date, pipeline, or status.",
-      "from_label": "From",
-      "pipeline_label": "Pipeline",
-      "status_label": "Status",
-      "summary_title": "Summary",
-      "summary_subtitle": "Checkpoint data dominates the estimated reclaimable size.",
-      "matching_runs": "Matching runs",
-      "estimated_reclaimable": "Estimated reclaimable",
-      "terminal_purgeable": "Terminal (purge-able)",
-      "candidates_title": "Candidates",
-      "col_status": "Status",
-      "col_created": "Created",
-      "col_pipeline": "Pipeline",
-      "col_estimated_size": "Estimated size",
-      "col_run_id": "Run id",
-      "confirm_clear_down": "Confirm clear-down"
     },
   "pipeline": {
     "hide_ports": "Hide Ports"
