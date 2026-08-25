@@ -703,8 +703,12 @@ class TestURLSyntaxValidation:
         with pytest.raises(ValueError, match="valid hostname"):
             ssrf.validate_outbound_url("http:///path")
 
-    def test_public_ip_with_userinfo_accepted_without_dns(self) -> None:
-        assert ssrf.validate_outbound_url("http://user:pass@8.8.8.8/path") is None
+    def test_public_ip_with_userinfo_rejected(self) -> None:
+        # Userinfo credentials are rejected uniformly by _parse_url_target before
+        # any DNS lookup, whether the host is a hostname or a literal public IP.
+        # This matches test_validate_outbound_url_rejects_userinfo.
+        with pytest.raises(ValueError, match="userinfo"):
+            ssrf.validate_outbound_url("http://user:pass@8.8.8.8/path")
 
 
 # ---------------------------------------------------------------------------
@@ -778,10 +782,15 @@ class TestHostnameResolution:
         ):
             ssrf.validate_outbound_url("http://ipv6.internal.example/")
 
-    def test_hostname_resolving_to_nothing_accepted(self) -> None:
-        # A hostname with no resolved records is treated as external.
-        with patch.object(ssrf, "_resolve_all_sync", lambda host: []):
-            assert ssrf.validate_outbound_url("http://empty.example/") is None
+    def test_hostname_resolving_to_nothing_fails_closed(self) -> None:
+        # A hostname with no resolved records fails CLOSED: it cannot be
+        # verified as non-internal, so it must not connect. This matches the
+        # fail-closed behaviour asserted by test_empty_resolution_sync_fails_closed.
+        with (
+            patch.object(ssrf, "_resolve_all_sync", lambda host: []),
+            pytest.raises(ValueError, match="resolved to no addresses"),
+        ):
+            ssrf.validate_outbound_url("http://empty.example/")
 
     def test_hostname_normalized_before_resolution(self) -> None:
         """Trailing dots and ports must be stripped before the resolver is consulted."""
