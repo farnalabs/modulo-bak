@@ -1,10 +1,61 @@
 # Modulo
 
-Product-specific agent guidance for the `farnalabs/modulo` repository.
+Product-specific agent guidance for the `farnalabs/modulo` repository. This is a
+thin pointer - the canonical developer guidance (build/test/lint commands, key
+implementation constraints, Semgrep rules, and lessons-learned) is maintained in
+`Repos/devtools/guidance/AGENTS.md` (moved out of this file in FAR-287).
 
-## Lessons Learned
+## What this repo is
 
-### Failed deploys must self-heal and outages must be detected (2026-08-23)
-A single failed prod deploy (Fly control-plane blip during health-check polling, NOT a code regression) left app.modulo.run down for ~7h with no alert. Hardening (see FAR-400): `fly deploy` in `.github/workflows/deploy.yml` MUST use `--auto-rollback`; add a post-deploy `/healthz/ready` gate that runs `fly releases rollback` if the app isn't serving; and a scheduled `.github/workflows/uptime-monitor.yml` MUST probe `app.modulo.run/healthz/ready` every 10 min and alert (fail the run + open a Linear ticket) on outage. Never rely on a failed deploy to merely fail the job — it must revert to the last good release so prod stays up.
+Self-hosted agent governance for agentic SDLC pipelines. Backend: Python 3.12
+FastAPI. Frontend: Vue 3 + Vite SPA. Runs on Postgres + Redis. Product
+requirements and behaviour spec live in `docs/` and the product map
+`frontend/src/manifest.yaml` (ADR 008). The PRD is retired.
 
-## Known Issues
+## Repository structure
+
+```
+modulo/
+  backend/                   # Python 3.12, uv, FastAPI
+    src/modulo/
+      api/                   # FastAPI routes, WebSocket, MCP server
+      core/                  # pipeline_engine, schema_registry, trigger_engine, hitl_manager, ...
+      db/                    # SQLAlchemy models, Alembic migrations, rls.py, models/
+      connectors/            # ConnectorType ABC + connectors/{filesystem,github}
+      model_backends/        # BaseChatModel ABC + {anthropic,openai,stub}
+      auth/                  # JWT, Basic Auth, API key validation
+      otel_bridge/           # LangGraph -> OTel callback handler
+    tests/unit/              # No DB, StubModelBackend, fast
+    tests/integration/       # Testcontainers Postgres, real migrations
+    tests/bdd/               # pytest-bdd steps + Gherkin features
+  frontend/                  # Vue 3 (Composition API), Vite, Pinia, pnpm
+    src/{stores,components,views,composables}
+    src/manifest.yaml        # product map (ADR 008)
+    tests/e2e/               # Playwright
+  docs/                      # architecture.md, core-principles.md, adr/, security/
+  scripts/                   # dev helper scripts
+  deploy/                    # Fly/Caddy/nginx/supervisor configs
+  configs/                   # grafana dashboards, otel-collector config
+  .semgrep/                  # custom lint rules (rls, credentials, jinja2, yaml, asyncdb)
+  .github/workflows/         # CI, Deploy, merge-queue (autonomous PR lifecycle)
+```
+
+## Where to look first
+
+- **Product requirements / behaviour:** `docs/architecture.md`, `docs/core-principles.md`
+- **Architecture decisions:** `docs/adr/`
+- **Key implementation constraints, Semgrep rules, testing strategy, lessons-learned:** `Repos/devtools/guidance/AGENTS.md`
+- **Test-suite inventory and run commands:** `Repos/devtools/guidance/AGENTS.md` (Testing Strategy section)
+
+## Working-directory rules (non-negotiable)
+
+- **All Python tooling** (`uv run pytest` / `mypy` / `ruff`) runs from `backend/` - never the repo root.
+- **All Node tooling** (`pnpm run lint` / `test:unit` / `vue-tsc`) runs from `frontend/` - never the repo root.
+- Reproduce the exact command and working directory CI uses when diagnosing a failure - do not add or drop flags.
+
+## Lessons-learned routing
+
+This repo deliberately carries no lessons-learned section. Internal/SDLC lessons
+(deploy, CI, merge queue, harness, branch-fixer) and product-code lessons (DB/RLS,
+i18n, a11y, error handling) are all codified in `Repos/devtools/guidance/AGENTS.md`
+under `## Lessons Learned` via the `lessons-learned` skill.
