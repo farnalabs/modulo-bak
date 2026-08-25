@@ -29,8 +29,10 @@ from typing import Any
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from modulo.core.notifier import EVENT_EVAL_REGRESSION
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
+from modulo.db.models.eval_suite import EvalSuite
 from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
 from modulo.db.models.notification_endpoint import NotificationEndpoint
 
@@ -746,6 +748,132 @@ def should_notify_regression(run: SuiteRun, baseline_run: SuiteRun | None) -> bo
     return run.notified_at is None
 
 
+async def resolve_suite_last_alert_at(session: AsyncSession, run: SuiteRun) -> datetime | None:
+    """Return the most recent ``notified_at`` of any prior run of the same suite.
+
+    This is the per-suite rate-limit marker (FAR-379): a persistent regression
+    must not alert on every run within the suite's ``cooldown`` window. Only
+    the same organisation is queried, and the current run is excluded so its own
+    ``notified_at`` (idempotency marker) cannot rate-limit itself. Returns
+    ``None`` when no prior run of the suite ever alerted.
+    """
+    stmt = (
+        select(SuiteRun.notified_at)
+        .where(
+            SuiteRun.organisation_id == run.organisation_id,
+            SuiteRun.suite_id == run.suite_id,
+            SuiteRun.notified_at.is_not(None),
+            SuiteRun.id != run.id,
+        )
+        .order_by(SuiteRun.notified_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+def suite_alert_metrics(comparison_json: dict[str, Any] | None) -> dict[str, float | int] | None:
+    """Derive the alert payload metrics from a ``comparison_json`` snapshot.
+
+    Phase 3 already produced ``comparison_json`` (the persisted output of the
+    grouped regression detection). This is a pure read — it never re-runs the
+    detection, it only summarises the ``alerts`` already recorded. Returns
+    ``None`` when there are no alert records; otherwise the metrics of the worst
+    (largest ``drop_pct``) alert, which is the suite-level regression signal.
+    """
+    if not comparison_json:
+        return None
+    alerts = comparison_json.get("alerts") or []
+    if not alerts:
+        return None
+    worst = max(alerts, key=lambda a: float(a.get("drop_pct") or 0.0))
+    return {
+        "alert_count": len(alerts),
+        "prev_pass_rate": float(worst.get("prev_pass_rate") or 0.0),
+        "current_pass_rate": float(worst.get("current_pass_rate") or 0.0),
+        "drop_pct": float(worst.get("drop_pct") or 0.0),
+    }
+
+
+async def maybe_alert_eval_regression(
+    session: AsyncSession,
+    run: SuiteRun,
+    suite: EvalSuite,
+    baseline_run: SuiteRun | None,
+    notifier: Any,
+) -> str:
+    """Alert on a detected regression — the ALERTING layer (FAR-379).
+
+    Detection is Phase 3's job (``run.regressed`` / ``comparison_json``); this
+    function decides WHEN and HOW OFTEN to alert, never whether a regression
+    happened. Every guard returns a distinct outcome string for observability
+    (logged by the caller):
+
+    * ``skipped_no_baseline`` — no baseline resolved (first run) or the run has
+      no regression flag. An explicit baseline is REQUIRED before any alert.
+    * ``skipped_not_regressed`` — the comparison ran but found no regression.
+    * ``skipped_partial_run`` — a ``partial`` run never alerts (its outcome is
+      incomplete); only ``completed`` runs page.
+    * ``skipped_already_notified`` — idempotent on ``suite_run_id``: an alert
+      for this run was already sent.
+    * ``skipped_below_minimum_delta`` — the observed drop is below the suite's
+      configured ``minimum_delta``.
+    * ``skipped_rate_limited`` — the suite alerted within its ``cooldown``
+      window (a sustained regression does not spam every run).
+    * ``dispatched`` — the alert was dispatched through ``notifier`` and
+      ``run.notified_at`` stamped.
+
+    Guards, in order: baseline -> regressed -> partial -> idempotency ->
+    minimum_delta -> rate limit -> isolation -> dispatch. The isolation guard
+    (``assert_eval_notification_isolated``) FAILS LOUDLY — it raises
+    ``SuiteRunError`` when the eval channel has no eval-scoped subscribers or
+    leaks to a production error forwarder, never silently dropping the alert.
+    """
+    if baseline_run is None or run.regressed is None:
+        return "skipped_no_baseline"
+    if run.regressed is False:
+        return "skipped_not_regressed"
+    if run.state != SuiteRunState.COMPLETED.value:
+        return "skipped_partial_run"
+    if run.notified_at is not None:
+        return "skipped_already_notified"
+
+    metrics = suite_alert_metrics(run.comparison_json)
+    suite_min_delta = suite.minimum_delta
+    if suite_min_delta is not None and (metrics is None or metrics["drop_pct"] < float(suite_min_delta)):
+        return "skipped_below_minimum_delta"
+
+    suite_cooldown = suite.cooldown
+    if suite_cooldown is not None:
+        last_alert_at = await resolve_suite_last_alert_at(session, run)
+        if is_suite_rate_limited(last_alert_at, timedelta(minutes=suite_cooldown)):
+            return "skipped_rate_limited"
+
+    # Fail loudly before attempting to send: the eval channel must actually have
+    # a reachable, non-error-forwarding subscriber — never a silent drop.
+    subscribers = await load_eval_subscriber_events(session, run.organisation_id)
+    assert_eval_notification_isolated(subscribers)
+
+    metrics = metrics or {}
+    payload = {
+        "suite_id": str(suite.id),
+        "suite_name": suite.name,
+        "run_id": str(run.id),
+        "baseline_run_id": str(baseline_run.id),
+        "alert_count": metrics.get("alert_count", 0),
+        "prev_pass_rate": metrics.get("prev_pass_rate", 0.0),
+        "current_pass_rate": metrics.get("current_pass_rate", 0.0),
+        "drop_pct": metrics.get("drop_pct", 0.0),
+        # The eval notification templates are keyed on the actor being evaluated
+        # (``agent_name``); for a suite we surface the suite as that actor so the
+        # existing title/body render without a mapper change.
+        "agent_name": suite.name,
+    }
+    await notifier.dispatch_event(run.organisation_id, EVENT_EVAL_REGRESSION, payload, run_id=run.id)
+    run.notified_at = datetime.now(UTC)
+    await session.flush()
+    return "dispatched"
+
+
 # --------------------------------------------------------------------------- #
 # High-level orchestration                                                    #
 # --------------------------------------------------------------------------- #
@@ -830,12 +958,15 @@ __all__ = [
     "daily_spend_exceeded",
     "is_suite_rate_limited",
     "load_eval_subscriber_events",
+    "maybe_alert_eval_regression",
     "pass_rate_by_eval_type",
     "record_completion",
     "resolve_baseline_run",
     "resolve_eval_definition_version",
+    "resolve_suite_last_alert_at",
     "run_suite_comparison",
     "should_notify_regression",
+    "suite_alert_metrics",
     "suite_cumulative_exceeded",
     "suite_pass_rate",
     "summarise_eval_timeseries",

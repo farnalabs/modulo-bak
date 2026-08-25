@@ -249,7 +249,7 @@ with `group_by="suite_id"` plus an explicit `baseline` scope. **The default
   `excluded_case_count`) and does not raise a regression alert unless explicitly
   configured.
 
-### Regression notification
+### Regression notification — the Alerting layer (FAR-379)
 
 Regression postings route through the existing `Notifier` (`eval_regression`
 event) — no parallel "sink". Eval notification endpoints share **zero**
@@ -257,6 +257,27 @@ subscribers with production error forwarders (a runtime guard asserts this);
 posting is idempotent on `suite_run_id`, rate-limited per suite, requires a
 baseline before any alert fires, and alerts if the eval channel has no
 subscribers (never a silent drop).
+
+Detection is Phase 3's job. The **alerting** layer (FAR-379) owns *when* and
+*how often* it pages, and is configured per suite via
+`PUT /api/v1/evals/suites/{suite_id}/alerting`:
+
+| Field | Meaning |
+|---|---|
+| `baseline_window` | Rolling N-run baseline window used when resolving the comparison baseline. `NULL` = alerting dormant until an explicit baseline exists. |
+| `minimum_delta` | Minimum pass-rate drop (fraction 0..1) the observed drop must exceed before an alert fires. `NULL` = defer entirely to the Phase 3 `regressed` flag. |
+| `cooldown` | Silence window (minutes) between regression alerts for a suite — a single sustained regression does not page on every run. `NULL` = no time-based rate limit (idempotency on `suite_run_id` still applies). |
+
+The decision function is `maybe_alert_eval_regression` in
+`core/eval_engine/suite_run.py`. Its guards fire in order: an **explicit
+baseline is required** (a first run never alerts — `regressed` is `None`), a
+non-regressed run is skipped, a `partial` run never alerts, an alert for a
+given run is sent at most once (idempotent on `suite_run_id` via `notified_at`),
+the drop must meet `minimum_delta`, and the suite's `cooldown` window rate-limits
+a persistent regression. Only then does the runtime isolation guard run — it
+*fails loudly* (raises) if the eval channel has no eval-scoped subscribers or
+leaks to a production error forwarder, never a silent drop. All config is
+org-scoped and overwritten-able (`NULL` clears a field).
 
 ### Spend & tenancy
 
