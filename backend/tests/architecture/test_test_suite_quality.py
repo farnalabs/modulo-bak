@@ -312,6 +312,17 @@ regression that silently weakens the suite:
   literal that *contains* ``ANY`` (``[a, ANY]``) makes ``in`` always PASS and
   ``not in`` always FAIL, because the element match short-circuits on
   ``x == ANY``
+- ``test_*`` functions *nested inside another function* — pytest only
+  collects module/class-level ``test_*`` functions, so a ``def test_*``
+  defined inside a test (or helper) body is never collected and silently
+  drops whatever regression coverage it carries without any warning. It is
+  almost always an accidental indentation or a helper miscast as a test, and
+  nothing in the normal run reports it — the suite just runs a few tests
+  fewer than a reader believes. Hoist the nested test to module scope, or
+  rename a helper that only happens to start with ``test_``. ``@pytest.mark``-
+  decorated functions are covered too (same non-collection), while nested
+  ``def``/``class``/``@pytest.fixture`` helpers are left alone — those are the
+  legitimate local-helper spellings
 
 Every lens is written so it reports actionable file:line violations instead
 of a bare "assert not violations", mirroring the sibling architecture tests.
@@ -4931,3 +4942,109 @@ def test_any_equality_lens_flags_fixed_outcomes():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _any_equality_tautologies(tree), f"lens should NOT flag:\n{source}"
+
+
+def _nested_test_functions(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``test_*`` (or
+    ``@pytest.mark``-decorated) function defined inside another function.
+
+    pytest only collects ``test_*`` functions at module and class scope, so a
+    test defined inside a function body is never collected and never runs —
+    silently dropping its coverage with no warning. ``@pytest.fixture`` and
+    other local helpers are deliberately excluded: those are the legitimate
+    nested-helper spellings and pytest asyncio/plugins may reference them.
+    ``@pytest.mark``-decorated nested functions are included, because the
+    decorator marks intent to be a test that pytest still will not collect.
+    """
+    stack: list[tuple[str, ast.AST]] = []  # (kind, node) for enclosing defs/classes
+
+    def _mark_decorated(dec: ast.AST) -> bool:
+        if isinstance(dec, ast.Call):
+            dec = dec.func
+        name = dec.attr if isinstance(dec, ast.Attribute) else (dec.id if isinstance(dec, ast.Name) else None)
+        return name == "mark"
+
+    def _is_fixture(decs: list[ast.AST]) -> bool:
+        return any(_decorator_name(d) == "fixture" for d in decs)
+
+    found: list[tuple[int, str]] = []
+
+    def _visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inside_fn = any(kind == "fn" for kind, _ in stack)
+            is_here_a_test = node.name.startswith("test_") or any(_mark_decorated(d) for d in node.decorator_list)
+            if inside_fn and is_here_a_test and not _is_fixture(node.decorator_list):
+                found.append((node.lineno, f"{node.name}() defined inside another function — pytest never collects it"))
+            stack.append(("fn", node))
+            for child in node.body:
+                _visit(child)
+            stack.pop()
+            return
+        if isinstance(node, ast.ClassDef):
+            stack.append(("cls", node))
+            for child in node.body:
+                _visit(child)
+            stack.pop()
+            return
+        for child in ast.iter_child_nodes(node):
+            _visit(child)
+
+    _visit(tree)
+    return found
+
+
+def test_no_nested_test_functions():
+    """A ``test_*`` function (or ``@pytest.mark``-decorated function) defined
+    *inside another function* is never collected by pytest, so the coverage it
+    carries silently drops from every run with no warning. pytest only
+    collects ``test_*`` at module and class scope; a test nested inside a test
+    or helper body is dead code that a reader — and a mutation-testing run —
+    believes is running. These are almost always an indentation accident or a
+    helper miscast as a ``test_``. Hoist a real test to module scope, or
+    rename a helper that merely happens to start with ``test_``. Nested
+    ``@pytest.fixture`` helpers and non-test local defs/classes are
+    deliberately left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _nested_test_functions(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} test function(s) nested inside another function.\n"
+        "pytest only collects test_* at module/class scope, so a nested test never runs —\n"
+        "its coverage silently drops from every run. Hoist it to module scope, or rename a\n"
+        "helper that only happens to start with 'test_'.\n" + "\n".join(violations)
+    )
+
+
+def test_nested_test_lens_flags_uncollected_tests():
+    """Synthetic positive/negative control for the nested-test lens: must flag
+    a ``test_*`` (or ``@pytest.mark``-decorated) function nested inside any
+    function (sync, async, or another test), and ignore nested fixtures,
+    non-``test_`` local helpers, and module/class-scope tests (which pytest
+    does collect)."""
+    positive_sources = [
+        "def test_foo():\n    def test_bar():\n        assert 1 == 1\n",
+        "def test_foo():\n    def helper():\n        def test_bar():\n            assert 1 == 1\n",
+        "async def test_foo():\n    def test_bar():\n        assert 1 == 1\n",
+        "def test_foo():\n    @pytest.mark.asyncio\n    def test_bar():\n        assert 1 == 1\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _nested_test_functions(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert 1 == 1\n",
+        "def test_foo():\n    def helper():\n        return 1\n    assert helper() == 1\n",
+        "def test_foo():\n    @pytest.fixture\n    def fxt():\n        return 1\n",
+        "def test_bar():\n    assert 1 == 1\n",
+        "class TestSuite:\n    def test_bar(self):\n        assert 1 == 1\n",
+        "def test_bar():\n    assert 1 == 1\n",
+        "@pytest.mark.parametrize('x', [1])\ndef test_bar(x):\n    assert x == 1\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _nested_test_functions(tree), f"lens should NOT flag:\n{source}"
