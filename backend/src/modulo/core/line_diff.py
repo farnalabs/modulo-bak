@@ -7,7 +7,7 @@ so each endpoint only maps the generic rows onto its own response model.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from difflib import SequenceMatcher
 from typing import Literal
 
@@ -18,6 +18,8 @@ LineDiffKind = Literal["unchanged", "removed", "added"]
 # other listing.
 LineDiffT = tuple[LineDiffKind, str, int | None, int | None]
 
+LineDiffRow = tuple[LineDiffKind, str, int | None, int | None]
+
 
 def _yield_common_or_removed(
     op: str,
@@ -26,8 +28,11 @@ def _yield_common_or_removed(
     lines_a: Sequence[str],
     line_a: int,
     line_b: int,
-) -> Iterator[tuple[LineDiffKind, str, int | None, int | None]]:
-    """Yield the ``unchanged`` (equal) or ``removed`` (delete) rows for one opcode."""
+) -> Generator[LineDiffRow, None, tuple[int, int]]:
+    """Yield the ``unchanged`` (equal) or ``removed`` (delete) rows for one opcode.
+
+    Returns the updated ``(line_a, line_b)`` counters to the ``yield from`` caller.
+    """
     kind: LineDiffKind = "unchanged" if op == "equal" else "removed"
     for idx in range(i1, i2):
         n_b = line_b if kind == "unchanged" else None
@@ -48,8 +53,11 @@ def _yield_replaced_and_added(
     lines_b: Sequence[str],
     line_a: int,
     line_b: int,
-) -> Iterator[tuple[LineDiffKind, str, int | None, int | None]]:
-    """Yield the ``removed`` (replace) and ``added`` rows for one opcode."""
+) -> Generator[LineDiffRow, None, tuple[int, int]]:
+    """Yield the ``removed`` (replace) and ``added`` rows for one opcode.
+
+    Returns the updated ``(line_a, line_b)`` counters to the ``yield from`` caller.
+    """
     if op == "replace":
         for idx in range(i1, i2):
             yield "removed", lines_a[idx].rstrip("\n"), line_a, None
