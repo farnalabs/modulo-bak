@@ -1,9 +1,6 @@
 # Modulo
 
-Product-specific agent guidance for the `farnalabs/modulo` repository. This is a
-thin pointer - the canonical developer guidance (build/test/lint commands, key
-implementation constraints, Semgrep rules, and lessons-learned) is maintained in
-`Repos/devtools/guidance/AGENTS.md` (moved out of this file in FAR-287).
+Product-specific agent guidance for the `farnalabs/modulo` repository.
 
 ## What this repo is
 
@@ -44,18 +41,10 @@ modulo/
 
 - **Product requirements / behaviour:** `docs/architecture.md`, `docs/core-principles.md`
 - **Architecture decisions:** `docs/adr/`
-- **Key implementation constraints, Semgrep rules, testing strategy, lessons-learned:** `Repos/devtools/guidance/AGENTS.md`
-- **Test-suite inventory and run commands:** `Repos/devtools/guidance/AGENTS.md` (Testing Strategy section)
+- **Product map:** `frontend/src/manifest.yaml`
 
 ## Working-directory rules (non-negotiable)
 
 - **All Python tooling** (`uv run pytest` / `mypy` / `ruff`) runs from `backend/` - never the repo root.
 - **All Node tooling** (`pnpm run lint` / `test:unit` / `vue-tsc`) runs from `frontend/` - never the repo root.
 - Reproduce the exact command and working directory CI uses when diagnosing a failure - do not add or drop flags.
-
-## Lessons-learned routing
-
-This repo deliberately carries no lessons-learned section. Internal/SDLC lessons
-(deploy, CI, merge queue, harness, branch-fixer) and product-code lessons (DB/RLS,
-i18n, a11y, error handling) are all codified in `Repos/devtools/guidance/AGENTS.md`
-under `## Lessons Learned` via the `lessons-learned` skill.
