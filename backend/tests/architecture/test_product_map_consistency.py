@@ -217,8 +217,7 @@ def test_route_parent_hierarchy_is_acyclic_and_resolves():
             next_entry = routes[cursor]
             cursor = next_entry.get("parent") if isinstance(next_entry, dict) else None
     assert not invalid, (
-        "dangling or circular parent references break breadcrumbs and Remy's page hierarchy:\n"
-        + "\n".join(invalid)
+        "dangling or circular parent references break breadcrumbs and Remy's page hierarchy:\n" + "\n".join(invalid)
     )
 
 
