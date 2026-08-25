@@ -255,6 +255,381 @@ def suite_pass_rate(results: Sequence[EvalResult], excluded_case_count: int = 0)
 
 
 # --------------------------------------------------------------------------- #
+# Eval read-model — leaderboard / timeseries aggregation (FAR-378)            #
+# --------------------------------------------------------------------------- #
+#
+# A pure read-model over the now-structured ``SuiteRun``/``eval_results`` data.
+# It is deliberately LIVE aggregation over the existing tables — no parallel
+# materialised view, no new "scores over time" store. The isolation invariant
+# mirrors ``core/analytics``: ``modulo_app`` is BYPASSRLS, so the explicit
+# ``organisation_id = :org`` predicate injected into EVERY statement is the ONLY
+# isolation control (``set_rls_org`` stays defense-in-depth, never the control).
+#
+# Pass-rate discipline (the non-circular rule): pass-rates are computed from
+# the ``passed`` BOOLEAN only, NEVER from the raw ``score`` column. Scores are
+# not comparable across differing ``eval_type`` (an ``llm_judge`` 0.8 and a
+# ``regex`` 0.6 measure different things), so every aggregation partitions by
+# ``eval_type`` and rolls up by counting passes, never by averaging scores. A
+# mixed-``eval_type`` axis never ranks by raw score.
+EVAL_LEADERBOARD_AXES: tuple[str, ...] = ("pipeline", "node", "agent")
+
+EVAL_LEADERBOARD_DEFAULT_DAYS = 30
+EVAL_LEADERBOARD_MAX_DAYS = 365
+
+# Suite-run outcomes count toward a leaderboard only when the run is terminal
+# (``completed``/``partial``) — a ``running`` suite's per-case results are still
+# in flight, so including them would make the read-model non-deterministic across
+# two calls. Legacy pipeline-path rows (``suite_run_id`` NULL) carry no run
+# state and are always included.
+_SUITE_RUN_TERMINAL_STATES = frozenset({SuiteRunState.COMPLETED.value, SuiteRunState.PARTIAL.value})
+
+
+def validate_leaderboard_axis(group_by: str) -> str:
+    """Validate a leaderboard ``group_by`` against the fixed axis allowlist.
+
+    The axis label/column expression is derived from this allowlist (see
+    ``_leaderboard_axis_columns``) and never from user input, so there is no
+    SQL-injection surface on the ``GROUP BY``/``SELECT`` axis.
+    """
+    if group_by not in EVAL_LEADERBOARD_AXES:
+        raise ValueError(f"group_by must be one of {EVAL_LEADERBOARD_AXES}, got {group_by!r}")
+    return group_by
+
+
+def _leaderboard_axis_columns(group_by: str) -> tuple[str, str, str]:
+    """Return ``(key_sql, label_sql, joins_sql)`` for a validated *group_by*.
+
+    ``key_sql`` is the axis column; ``label_sql`` is a display expression (an
+    aggregate ``MAX`` so the raw group key stays the only non-aggregate in
+    ``GROUP BY``); ``joins_sql`` is the extra join needed for the label. Node
+    leaderboards label by the node id because eval definitions carry no node
+    name snapshot of their own.
+    """
+    if group_by == "pipeline":
+        return "ed.pipeline_id", "MAX(p.name)", "LEFT JOIN pipelines p ON p.id = ed.pipeline_id"
+    if group_by == "node":
+        return "ed.node_id", "ed.node_id", ""
+    if group_by == "agent":
+        return "sr.model_backend_id", "MAX(mb.name)", "LEFT JOIN model_backends mb ON mb.id = sr.model_backend_id"
+    raise ValueError(f"unknown leaderboard axis {group_by!r}")  # pragma: no cover - validated upstream
+
+
+def _common_eval_read_conditions(
+    *,
+    org_id: uuid.UUID,
+    since: datetime,
+    eval_id: uuid.UUID | None,
+    pipeline_id: uuid.UUID | None,
+    node_id: uuid.UUID | None,
+    model_backend_id: uuid.UUID | None,
+) -> tuple[list[str], dict[str, Any]]:
+    """The org-scoped WHERE fragments + params shared by leaderboard/timeseries.
+
+    The org predicate is unconditional — the ONLY isolation control. Guardrail
+    rows are excluded (``eval_type != 'guardrail'``, matching the suite-run
+    consumer contract) and suite-run outcomes are restricted to terminal runs so
+    the read-model is deterministic across calls.
+    """
+    terminal_state_list = ", ".join(f"'{s}'" for s in sorted(_SUITE_RUN_TERMINAL_STATES))
+    conditions: list[str] = [
+        "er.organisation_id = :org_id",
+        "ed.organisation_id = :org_id",
+        "ed.eval_type != 'guardrail'",
+        "er.evaluated_at >= :since",
+        f"(er.suite_run_id IS NULL OR sr.state IN ({terminal_state_list}))",
+    ]
+    params: dict[str, Any] = {"org_id": org_id, "since": since}
+    if eval_id is not None:
+        conditions.append("er.eval_id = :eval_id")
+        params["eval_id"] = eval_id
+    if pipeline_id is not None:
+        conditions.append("ed.pipeline_id = :pipeline_id")
+        params["pipeline_id"] = pipeline_id
+    if node_id is not None:
+        conditions.append("ed.node_id = :node_id")
+        params["node_id"] = node_id
+    if model_backend_id is not None:
+        conditions.append("sr.model_backend_id = :model_backend_id")
+        params["model_backend_id"] = model_backend_id
+    return conditions, params
+
+
+def build_eval_leaderboard_query(
+    *,
+    org_id: uuid.UUID,
+    group_by: str,
+    days: int = EVAL_LEADERBOARD_DEFAULT_DAYS,
+    eval_id: uuid.UUID | None = None,
+    pipeline_id: uuid.UUID | None = None,
+    node_id: uuid.UUID | None = None,
+    model_backend_id: uuid.UUID | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the org-scoped leaderboard aggregation statement + bind params.
+
+    Aggregates per ``(axis, eval_type)``: the axis is one of ``pipeline`` /
+    ``node`` / ``agent``. Pass-rates are computed from the ``passed`` boolean;
+    ``run_count`` counts distinct runs (both suite-run and legacy pipeline-path
+    outcomes). Returns ``(statement, params)`` — the statement is fully
+    parameterised (no string interpolation of user input; the axis expression is
+    the only interpolated fragment and comes from the fixed allowlist).
+    """
+    validate_leaderboard_axis(group_by)
+    key_sql, label_sql, axis_joins = _leaderboard_axis_columns(group_by)
+    since = datetime.now(UTC) - timedelta(days=days)
+    conditions, params = _common_eval_read_conditions(
+        org_id=org_id,
+        since=since,
+        eval_id=eval_id,
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+        model_backend_id=model_backend_id,
+    )
+    # Node/agent axes carry no meaningful entry for a NULL axis key — drop them.
+    if group_by == "node":
+        conditions.append("ed.node_id IS NOT NULL")
+    if group_by == "agent":
+        conditions.append("sr.model_backend_id IS NOT NULL")
+
+    # S608/B608: the ONLY fragments interpolated here (``__AXIS_KEY__`` /
+    # ``__AXIS_LABEL__`` / ``__AXIS_JOINS__``) come from the fixed
+    # ``_leaderboard_axis_columns`` allowlist and the ``conditions`` predicates are
+    # pre-composed bound-param strings. User inputs are always named binds. The
+    # template is a static literal (implicit concatenation) + ``.replace()`` — no
+    # f-string/format operator reaches the SQL.
+    statement = (
+        (
+            "SELECT "  # nosec B608 - allowlist-controlled fragments; user inputs are bound
+            "__AXIS_KEY__ AS axis_key, "
+            "__AXIS_LABEL__ AS axis_label, "
+            "ed.eval_type AS eval_type, "
+            "COUNT(*) FILTER (WHERE er.passed) AS passed_count, "
+            "COUNT(*) AS total_count, "
+            "COUNT(DISTINCT COALESCE(er.suite_run_id, er.run_id)) AS run_count "
+            "FROM eval_results er "
+            "JOIN eval_definitions ed ON ed.id = er.eval_id "
+            "__AXIS_JOINS__ "
+            "LEFT JOIN suite_runs sr ON sr.id = er.suite_run_id "
+            "WHERE __CONDITIONS__ "
+            "GROUP BY __AXIS_KEY__, ed.eval_type "
+            "ORDER BY __AXIS_KEY__, ed.eval_type"
+        )
+        .replace("__AXIS_KEY__", key_sql)
+        .replace("__AXIS_LABEL__", label_sql)
+        .replace("__AXIS_JOINS__", axis_joins)
+        .replace("__CONDITIONS__", " AND ".join(conditions))
+    )
+    return statement, params
+
+
+def build_eval_timeseries_query(
+    *,
+    org_id: uuid.UUID,
+    eval_id: uuid.UUID,
+    days: int = EVAL_LEADERBOARD_DEFAULT_DAYS,
+    pipeline_id: uuid.UUID | None = None,
+    node_id: uuid.UUID | None = None,
+    model_backend_id: uuid.UUID | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the day-bucketed pass-rate time-series statement for one eval.
+
+    Buckets ``eval_results`` by UTC day (``DATE_TRUNC``), partitioning by
+    ``eval_type`` so a mixed partition is never rolled into a single raw
+    average. Pass-rate is derived from ``passed`` only.
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+    conditions, params = _common_eval_read_conditions(
+        org_id=org_id,
+        since=since,
+        eval_id=eval_id,
+        pipeline_id=pipeline_id,
+        node_id=node_id,
+        model_backend_id=model_backend_id,
+    )
+    statement = (
+        "SELECT "  # nosec B608 - allowlist-controlled fragments; user inputs are bound
+        "DATE_TRUNC('day', er.evaluated_at) AS bucket, "
+        "ed.eval_type AS eval_type, "
+        "COUNT(*) FILTER (WHERE er.passed) AS passed_count, "
+        "COUNT(*) AS total_count, "
+        "COUNT(DISTINCT COALESCE(er.suite_run_id, er.run_id)) AS run_count "
+        "FROM eval_results er "
+        "JOIN eval_definitions ed ON ed.id = er.eval_id "
+        "LEFT JOIN suite_runs sr ON sr.id = er.suite_run_id "
+        "WHERE __CONDITIONS__ "
+        "GROUP BY bucket, ed.eval_type "
+        "ORDER BY bucket"
+    ).replace("__CONDITIONS__", " AND ".join(conditions))
+    return statement, params
+
+
+def build_eval_pipelines_query(
+    *,
+    org_id: uuid.UUID,
+    eval_id: uuid.UUID,
+    days: int = EVAL_LEADERBOARD_DEFAULT_DAYS,
+    node_id: uuid.UUID | None = None,
+    model_backend_id: uuid.UUID | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Build the cross-pipeline rollup statement for one eval.
+
+    Lists every pipeline whose outcomes contributed to the eval within the
+    window — the "eval reused across pipelines" rollup. Rows carry
+    ``pipeline_id`` + ``pipeline_name`` (snapshot label via ``MAX``).
+    """
+    since = datetime.now(UTC) - timedelta(days=days)
+    conditions, params = _common_eval_read_conditions(
+        org_id=org_id,
+        since=since,
+        eval_id=eval_id,
+        pipeline_id=None,
+        node_id=node_id,
+        model_backend_id=model_backend_id,
+    )
+    statement = (
+        "SELECT "  # nosec B608 - allowlist-controlled fragments; user inputs are bound
+        "ed.pipeline_id AS pipeline_id, MAX(p.name) AS pipeline_name "
+        "FROM eval_results er "
+        "JOIN eval_definitions ed ON ed.id = er.eval_id "
+        "LEFT JOIN pipelines p ON p.id = ed.pipeline_id "
+        "LEFT JOIN suite_runs sr ON sr.id = er.suite_run_id "
+        "WHERE __CONDITIONS__ "
+        "GROUP BY ed.pipeline_id "
+        "ORDER BY ed.pipeline_id"
+    ).replace("__CONDITIONS__", " AND ".join(conditions))
+    return statement, params
+
+
+def aggregate_eval_leaderboard(rows: Sequence[Any], *, group_by: str) -> list[dict[str, Any]]:
+    """Roll the per-``(axis, eval_type)`` rows into per-axis leaderboard entries.
+
+    Each entry carries the axis-key rollup (``pass_rate``/``passed``/``total``)
+    computed by COUNTING passes across ``eval_type`` partitions — never by
+    averaging raw scores — plus a per-``eval_type`` ``by_type`` breakdown and a
+    ``stability`` score (``1 - cross-type pass-rate dispersion``). Entries are
+    sorted by aggregate pass-rate descending; entries with no data sort last.
+    """
+    validate_leaderboard_axis(group_by)
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = getattr(row, "axis_key", None)
+        if key is None:
+            continue
+        entry = grouped.setdefault(
+            str(key),
+            {
+                "key": str(key),
+                "label": getattr(row, "axis_label", None) or str(key),
+                "by_type": {},
+                "passed": 0,
+                "total": 0,
+            },
+        )
+        eval_type = getattr(row, "eval_type", None) or "unknown"
+        passed = int(getattr(row, "passed_count", 0) or 0)
+        total = int(getattr(row, "total_count", 0) or 0)
+        run_count = int(getattr(row, "run_count", 0) or 0)
+        by_type = entry["by_type"].setdefault(eval_type, {"passed": 0, "total": 0, "run_count": 0})
+        by_type["passed"] += passed
+        by_type["total"] += total
+        by_type["run_count"] += run_count
+        entry["passed"] += passed
+        entry["total"] += total
+
+    entries: list[dict[str, Any]] = []
+    for entry in grouped.values():
+        total = entry["total"]
+        entry["pass_rate"] = round(entry["passed"] / total, 4) if total else None
+        entry["by_type"] = {
+            eval_type: {
+                **by_type,
+                "pass_rate": round(by_type["passed"] / by_type["total"], 4) if by_type["total"] else None,
+            }
+            for eval_type, by_type in entry["by_type"].items()
+        }
+        entry["stability"] = _leaderboard_stability(entry["by_type"])
+        entries.append(entry)
+
+    # Sort by aggregate pass-rate descending; rate-less entries sink to bottom.
+    entries.sort(
+        key=lambda e: (e["pass_rate"] is not None, e["pass_rate"] if e["pass_rate"] is not None else 0.0), reverse=True
+    )
+    return entries
+
+
+def _leaderboard_stability(by_type: dict[str, dict[str, Any]]) -> float:
+    """Cross-type pass-rate consistency: ``1 - stddev(per-type pass_rate)``.
+
+    ``1.0`` when a single eval type drives the axis (no dispersion to measure)
+    or when every type agrees; lower when the axis's types disagree. This is a
+    *cross-type dispersion* measure — the suite-run path already guarantees a
+    per-``eval_type`` partition on the raw data, so it is computed over those
+    partitions only.
+    """
+    rates = [bt["pass_rate"] for bt in by_type.values() if bt["pass_rate"] is not None]
+    if len(rates) <= 1:
+        return 1.0
+    mean_rate = sum(rates) / len(rates)
+    variance = sum((r - mean_rate) ** 2 for r in rates) / len(rates)
+    return round(max(0.0, 1.0 - variance**0.5), 4)
+
+
+def _normalise_day(value: Any) -> Any:
+    """Collapse a SQL ``DATE_TRUNC`` timestamp/date result to a ``datetime.date``."""
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def bucket_eval_timeseries(rows: Sequence[Any], *, since: datetime) -> list[dict[str, Any]]:
+    """Bucket day-level rows into a zero-filled pass-rate series.
+
+    Zero-fills the day grid from ``since`` through today so the series is
+    continuous. A day with no outcomes is emitted with ``total=0`` and
+    ``pass_rate=None`` (never ``0.0`` — an absent day is not a failed day).
+    """
+    per_day: dict[Any, dict[str, int]] = {}
+    for row in rows:
+        day = _normalise_day(getattr(row, "bucket", None))
+        if day is None:
+            continue
+        bucket = per_day.setdefault(day, {"passed": 0, "total": 0, "run_count": 0})
+        bucket["passed"] += int(getattr(row, "passed_count", 0) or 0)
+        bucket["total"] += int(getattr(row, "total_count", 0) or 0)
+        bucket["run_count"] += int(getattr(row, "run_count", 0) or 0)
+
+    today = datetime.now(UTC).date()
+    start = since.date() if hasattr(since, "date") else since
+    out: list[dict[str, Any]] = []
+    day = start
+    while day <= today:
+        bucket = per_day.get(day, {"passed": 0, "total": 0, "run_count": 0})
+        total = bucket["total"]
+        out.append(
+            {
+                "date": day.isoformat(),
+                "passed": bucket["passed"],
+                "total": total,
+                "pass_rate": round(bucket["passed"] / total, 4) if total else None,
+                "run_count": bucket["run_count"],
+            }
+        )
+        day += timedelta(days=1)
+    return out
+
+
+def summarise_eval_timeseries(buckets: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate a time-series bucket list into a window summary."""
+    passed = sum(b["passed"] for b in buckets)
+    total = sum(b["total"] for b in buckets)
+    return {
+        "passed": passed,
+        "total": total,
+        "pass_rate": round(passed / total, 4) if total else None,
+        "run_count": sum(b["run_count"] for b in buckets),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Spend — two INDEPENDENT counters (daily + per-suite cumulative)             #
 # --------------------------------------------------------------------------- #
 def daily_spend_exceeded(current_daily_used: Decimal, daily_limit: Decimal | None) -> bool:
@@ -437,12 +812,20 @@ async def record_completion(session: AsyncSession, run: SuiteRun, entity_thresho
 
 
 __all__ = [
+    "EVAL_LEADERBOARD_AXES",
+    "EVAL_LEADERBOARD_DEFAULT_DAYS",
+    "EVAL_LEADERBOARD_MAX_DAYS",
     "BaselineAmbiguityError",
     "SpendLimitExceededError",
     "SuiteRunError",
     "acquire_org_advisory_lock",
+    "aggregate_eval_leaderboard",
     "assert_eval_notification_isolated",
+    "bucket_eval_timeseries",
     "build_baseline_tuple",
+    "build_eval_leaderboard_query",
+    "build_eval_pipelines_query",
+    "build_eval_timeseries_query",
     "claim_suite_run_cost",
     "daily_spend_exceeded",
     "is_suite_rate_limited",
@@ -455,5 +838,7 @@ __all__ = [
     "should_notify_regression",
     "suite_cumulative_exceeded",
     "suite_pass_rate",
+    "summarise_eval_timeseries",
     "tuple_is_matching",
+    "validate_leaderboard_axis",
 ]
