@@ -1,8 +1,14 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0138_trigger_run_kind_suite
-Revises: 0137_eval_suite_run
+Revision ID: 0143_suite_run_trigger_kind
+Revises: 0142_merge_heads_add_fk_indexes
 Create Date: 2026-08-25
+
+Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
+collision with main's merged ``0138_eval_versioning`` (FAR-382, PR 1947). The
+branch's former ``eval_results.eval_definition_version`` stamp was dropped here
+because ``0138_eval_versioning`` (now the ancestor) already owns that column;
+this migration adds only the FAR-377 trigger columns.
 
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
@@ -33,8 +39,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0138_trigger_run_kind_suite"
-down_revision: str | None = "0137_eval_suite_run"
+revision: str = "0143_suite_run_trigger_kind"
+down_revision: str | None = "0142_merge_heads_add_fk_indexes"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -62,12 +68,6 @@ def upgrade() -> None:
         "run_kind IN ('run', 'suite_run')",
     )
 
-    # FAR-382 version stamp on the per-case outcome (nullable — legacy
-    # pipeline-path rows keep it NULL). ``eval_results`` is owned by
-    # ``modulo_app`` (migration 0003), so this ALTER runs as the migration
-    # CALLER (never under SET ROLE modulo_migrate).
-    op.add_column("eval_results", sa.Column("eval_definition_version", sa.Integer(), nullable=True))
-
 
 def downgrade() -> None:
     bind = op.get_bind()
@@ -75,7 +75,6 @@ def downgrade() -> None:
     if is_pg:
         op.execute("SET search_path TO public")
 
-    op.drop_column("eval_results", "eval_definition_version")
     op.drop_constraint("ck_triggers_run_kind", "triggers", type_="check")
     op.drop_index("ix_triggers_eval_suite_id", table_name="triggers")
     op.drop_constraint("fk_triggers_eval_suite_id", "triggers", type_="foreignkey")
