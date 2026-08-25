@@ -197,6 +197,17 @@ regression that silently weakens the suite:
   (after ``ast.literal_eval``), so ``1`` and ``True`` are deliberately treated
   as distinct and only byte-identical values are flagged — an unambiguous
   duplicate
+- ``@pytest.mark.parametrize`` with a *large* literal case list (``>= 8``
+  cases) and no way to name the cases — no ``ids=`` keyword and not every
+  element carries a per-case ``pytest.param(..., id=...)``. pytest renders
+  each item's nodeid as ``test_x[arr0]``..``test_x[arrN-1]``, so a failure
+  report (and a ``.quarantine.yml`` entry, which records exactly those
+  nodeids) forces the reader to count from the top of the case list to learn
+  which input failed. ``ids=`` naming every case — or per-case
+  ``pytest.param(id=...)`` on the elements that matter — restores
+  self-documenting nodeids; small matrices, non-literal case lists, and
+  matrices where every element already carries ``pytest.param(id=...)`` are
+  left alone
 - ``@pytest.mark.skipif``/``@pytest.mark.xfail`` whose *condition* is a
   statically-foldable literal (``True``, ``0``, ``[]``, a string, ...) — the
   skip outcome is decided at source time. ``skipif(True, ...)`` permanently
@@ -312,6 +323,17 @@ regression that silently weakens the suite:
   literal that *contains* ``ANY`` (``[a, ANY]``) makes ``in`` always PASS and
   ``not in`` always FAIL, because the element match short-circuits on
   ``x == ANY``
+- ``test_*`` functions *nested inside another function* — pytest only
+  collects module/class-level ``test_*`` functions, so a ``def test_*``
+  defined inside a test (or helper) body is never collected and silently
+  drops whatever regression coverage it carries without any warning. It is
+  almost always an accidental indentation or a helper miscast as a test, and
+  nothing in the normal run reports it — the suite just runs a few tests
+  fewer than a reader believes. Hoist the nested test to module scope, or
+  rename a helper that only happens to start with ``test_``. ``@pytest.mark``-
+  decorated functions are covered too (same non-collection), while nested
+  ``def``/``class``/``@pytest.fixture`` helpers are left alone — those are the
+  legitimate local-helper spellings
 - a freshly-constructed Mock nested *inside* a container literal in an
   ``assert`` — ``assert result == {'status': MagicMock()}``,
   ``assert result != [AsyncMock()]``, ``assert {'k': Mock()} in x``. A fresh
@@ -357,12 +379,23 @@ regression that silently weakens the suite:
   working directory (``os.getcwd()``, ``Path.cwd()``) are left alone, as are
   directory *creation* calls (``os.makedirs``/``os.mkdir``/``Path.mkdir``)
   that never change the process CWD
+- an *unconditional* ``pytest.skip(reason)``/``pytest.xfail(reason)``
+  (or the bare imported ``skip(...)``/``xfail(...)``) placed as a direct
+  statement of the test body. The call always executes, so whatever follows
+  never runs and the test never verifies anything — it is indistinguishable in
+  source from a runtime gate yet not gated (no surrounding ``if``/loop, no
+  marker), so the coverage loss is identical to deleting the test but reported
+  green. The marker and reason-less twins are owned by the
+  ``skip-without-reason`` and ``constant-condition-skip`` lenses; this lens
+  owns the statement form that carries a reason and slips past both. A skip
+  nested under an explicit ``if``/loop (a real runtime gate) is left alone
 
 Every lens is written so it reports actionable file:line violations instead
 of a bare "assert not violations", mirroring the sibling architecture tests.
 """
 
 import ast
+import functools
 import operator
 import re
 from fractions import Fraction
@@ -386,13 +419,34 @@ def _decorator_name(dec: ast.AST) -> str | None:
     return None
 
 
+def _is_mark_decorator(dec: ast.AST) -> bool:
+    """Return True when ``dec`` is a ``@pytest.mark.*`` marker.
+
+    Unlike ``_decorator_name(d) == "mark"`` (which only matches a bare
+    ``@pytest.mark`` / ``@mark``), this walks the whole attribute chain so a
+    realistically-spelled marker such as ``@pytest.mark.asyncio`` is also
+    recognised — its terminal attribute is ``asyncio``, but the ``mark``
+    attribute sits further up the chain."""
+    if isinstance(dec, ast.Call):
+        dec = dec.func
+    node: ast.AST = dec
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    return "mark" in parts
+
+
+@functools.lru_cache(maxsize=1)
 def _iter_test_modules():
-    for path in sorted(TESTS.rglob("*.py")):
-        if any(part in EXCLUDED_PACKAGES for part in path.parts):
-            continue
-        yield path
+    return tuple(
+        path for path in sorted(TESTS.rglob("*.py")) if not any(part in EXCLUDED_PACKAGES for part in path.parts)
+    )
 
 
+@functools.cache
 def _parse(path: Path):
     try:
         return ast.parse(path.read_text(encoding="utf-8"))
@@ -1655,7 +1709,7 @@ def test_no_noop_test_functions():
                 continue
             if any(_decorator_name(d) == "fixture" for d in node.decorator_list):
                 continue
-            if not (node.name.startswith("test_") or any(_decorator_name(d) == "mark" for d in node.decorator_list)):
+            if not (node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)):
                 continue
             if _noop_lens_verifies(node):
                 continue
@@ -2139,15 +2193,15 @@ def test_empty_container_membership_lens_flags_impossible_membership():
         assert not _empty_container_membership_tautologies(tree), f"lens should NOT flag:\n{source}"
 
 
-def _parametrize_argvalue_lists(tree: ast.AST) -> list[tuple[int, list[ast.expr]]]:
-    """Return ``(lineno, argvalues.elts)`` for every ``@...parametrize``
-    decorator whose ``argvalues`` is a statically-known ``list``/``tuple``
-    literal. Only decorator applications are considered — a bare
-    ``parametrize(...)`` call inside a body is not pytest parametrization and
-    belongs to a different lens. The parametrize-adjacent lenses derive their
-    signal from ``len(elts)`` (``== 0``, ``== 1``, ...) or from the elements
-    themselves (duplicate detection), so a new lens never re-copies the
-    decorator walk."""
+def _parametrize_argvalue_lists(tree: ast.AST) -> list[tuple[int, list[ast.expr], ast.Call]]:
+    """Return ``(lineno, argvalues.elts, decorator_call)`` for every
+    ``@...parametrize`` decorator whose ``argvalues`` is a statically-known
+    ``list``/``tuple`` literal. Only decorator applications are considered — a
+    bare ``parametrize(...)`` call inside a body is not pytest parametrization
+    and belongs to a different lens. The parametrize-adjacent lenses derive
+    their signal from the decorator call (its ``ids=`` keyword), from
+    ``len(elts)`` (``== 0``, ``== 1``, ...) or from the elements themselves
+    (duplicate detection), so a new lens never re-copies the decorator walk."""
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -2163,7 +2217,7 @@ def _parametrize_argvalue_lists(tree: ast.AST) -> list[tuple[int, list[ast.expr]
                 argvalues = next((kw.value for kw in dec.keywords if kw.arg == "argvalues"), None)
             if not isinstance(argvalues, (ast.List, ast.Tuple)):
                 continue
-            found.append((dec.lineno, argvalues.elts))
+            found.append((dec.lineno, argvalues.elts, dec))
     return found
 
 
@@ -2174,7 +2228,7 @@ def _single_case_parametrize_violations(tree: ast.AST) -> list[tuple[int, str]]:
     body is not pytest parametrization and belongs to a different lens."""
     return [
         (lineno, "parametrize with a single case in argvalues — collapse to a plain test")
-        for lineno, elts in _parametrize_argvalue_lists(tree)
+        for lineno, elts, _dec in _parametrize_argvalue_lists(tree)
         if len(elts) == 1
     ]
 
@@ -2239,7 +2293,7 @@ def _empty_parametrize_violations(tree: ast.AST) -> list[tuple[int, str]]:
     pytest parametrization and belongs to a different lens."""
     return [
         (lineno, "parametrize with an empty argvalues — the test is collected as zero items and never runs")
-        for lineno, elts in _parametrize_argvalue_lists(tree)
+        for lineno, elts, _dec in _parametrize_argvalue_lists(tree)
         if len(elts) == 0
     ]
 
@@ -2825,7 +2879,7 @@ def _async_test_without_async_behavior_violations(tree: ast.AST) -> list[tuple[i
             continue
         if any(_decorator_name(d) == "fixture" for d in node.decorator_list):
             continue
-        if not (node.name.startswith("test_") or any(_decorator_name(d) == "mark" for d in node.decorator_list)):
+        if not (node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)):
             continue
         if _function_is_async(node):
             continue
@@ -3631,7 +3685,7 @@ def _duplicate_parametrize_case_violations(tree: ast.AST) -> list[tuple[int, str
     are flagged.
     """
     found = []
-    for lineno, elts in _parametrize_argvalue_lists(tree):
+    for lineno, elts, _dec in _parametrize_argvalue_lists(tree):
         keys: list[str] = []
         for element in elts:
             try:
@@ -3733,6 +3787,132 @@ def test_duplicate_parametrize_lens_flags_repeated_cases():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _duplicate_parametrize_case_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+#: Parametrize case-list sizes at/above which a missing ``ids=`` is flagged.
+#: Below this threshold a handful of auto-indexed ids (``arr[0]``..``arr[3]``)
+#: are still tractable to map by hand; past it, counting from the top of the
+#: case list to identify a failed input is exactly the chore ``ids=`` exists
+#: to remove. A reader (or a ``.quarantine.yml`` entry, which records these
+#: nodeids verbatim) cannot distinguish the cases of an anonymous matrix.
+_PARAMETRIZE_IDS_MIN_CASES = 8
+
+
+def _parametrize_without_ids_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``@...parametrize`` whose
+    literal ``argvalues`` holds ``>= _PARAMETRIZE_IDS_MIN_CASES`` cases and
+    that never names them: no ``ids=`` keyword and not every element carries a
+    per-case ``pytest.param(..., id=...)``. A large matrix without case names
+    reports failures as ``test_x[arr0]``..``test_x[arrN-1]`` — a triage must
+    count from the top of the case list to learn which input failed, and if
+    the matrix is later quarantined the recorded nodeid identifies nothing.
+    ``ids=`` naming every case, or per-case ``pytest.param(id=...)`` on the
+    elements that matter, restores self-documenting nodeids. Parametrizes with
+    a non-literal case list are left alone (the count is not statically
+    known); small matrices are left alone; a matrix where EVERY element is a
+    ``pytest.param(..., id=...)`` is already self-documented."""
+    violations = []
+    for _lineno, elts, dec in _parametrize_argvalue_lists(tree):
+        if any(kw.arg == "ids" for kw in dec.keywords):
+            continue
+        if len(elts) < _PARAMETRIZE_IDS_MIN_CASES:
+            continue
+        per_case_ids = sum(
+            1
+            for el in elts
+            if isinstance(el, ast.Call) and _decorator_name(el) == "param" and any(kw.arg == "id" for kw in el.keywords)
+        )
+        if per_case_ids == len(elts):
+            continue
+        violations.append(
+            (
+                dec.lineno,
+                f"parametrize with {len(elts)} cases and no ids= — failure nodeids are "
+                f"auto-indexed (arr[0]..arr[{len(elts) - 1}]), so triage must count "
+                "cases by hand",
+            )
+        )
+    return violations
+
+
+def test_no_large_parametrize_without_ids():
+    """A ``@pytest.mark.parametrize`` whose literal ``argvalues`` holds a large
+    case matrix (``>= 8`` cases) and that never names its cases leaves failure
+    reporting opaque: pytest renders each item as ``test_x[arr0]``,
+    ``test_x[arr1]``, ... and the reader must count from the top of the case
+    list to learn which input failed. That opacity is not merely cosmetic:
+    the auto-indexed nodeid is the identifier that surfaces in CI logs and the
+    exact string a ``.quarantine.yml`` entry would record, so an anonymous
+    matrix is indistinguishable from one whose ``ids=`` were never written.
+    ``ids=`` naming every case (or per-case ``pytest.param(..., id=...)`` when
+    only a few elements need names) restores self-describing nodeids. Small
+    matrices, non-literal case lists, and parametrizes where every element
+    already carries ``pytest.param(id=...)`` are left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _parametrize_without_ids_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} parametrize decorator(s) with a large case list and no ids.\n"
+        "A large unlabelled matrix reports failures as test_x[arr0]..test_x[arrN-1] — readers "
+        "and quarantine entries cannot tell the cases apart. Add ids= naming every case "
+        "(or per-case pytest.param(id=...) when only some need names).\n" + "\n".join(violations)
+    )
+
+
+def test_parametrize_without_ids_lens_flags_large_matrices():
+    """Synthetic positive/negative control for the parametrize-without-ids
+    lens: must flag a large (>= 8 case) literal matrix with neither ``ids=``
+    nor per-case ``pytest.param(id=...)`` on every element, and ignore small
+    matrices, matrices with ``ids=``, fully self-documented matrices, non-
+    literal case lists, and a bare ``parametrize(...)`` body call."""
+    positive_sources = [
+        (
+            "def test_foo():\n"
+            "    @pytest.mark.parametrize('x', [1,2,3,4,5,6,7,8])\n"
+            "    def test_bar(x):\n        assert x\n"
+        ),
+        (
+            "def test_foo():\n"
+            "    @pytest.mark.parametrize('a,b', [(1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9)])\n"
+            "    def test_bar(a, b):\n        assert a == b\n"
+        ),
+        (
+            "def test_foo():\n"
+            "    @pytest.mark.parametrize('x', argvalues=['a','b','c','d','e','f','g','h','i','j'])\n"
+            "    def test_bar(x):\n        assert x\n"
+        ),
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _parametrize_without_ids_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    @pytest.mark.parametrize('x', [1,2,3])\n    def test_bar(x):\n        assert x\n",
+        (
+            "def test_foo():\n"
+            "    @pytest.mark.parametrize('x', [1,2,3,4,5,6,7,8],\n"
+            "        ids=['a','b','c','d','e','f','g','h'])\n"
+            "    def test_bar(x):\n        assert x\n"
+        ),
+        (
+            "def test_foo():\n"
+            "    @pytest.mark.parametrize('x', [pytest.param(1, id='a'), pytest.param(2, id='b'), \n"
+            "        pytest.param(3, id='c'), pytest.param(4, id='d'), pytest.param(5, id='e'), \n"
+            "        pytest.param(6, id='f'), pytest.param(7, id='g'), pytest.param(8, id='h'), \n"
+            "        pytest.param(9, id='i')])\n"
+            "    def test_bar(x):\n        assert x\n"
+        ),
+        "def test_foo():\n    @pytest.mark.parametrize('x', CASES)\n    def test_bar(x):\n        assert x\n",
+        "def test_foo():\n    parametrize('x', [1,2,3,4,5,6,7,8])\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _parametrize_without_ids_violations(tree), f"lens should NOT flag:\n{source}"
 
 
 def _skip_condition_truthiness(node: ast.AST) -> bool | None:
@@ -5094,6 +5274,109 @@ def test_any_equality_lens_flags_fixed_outcomes():
         assert not _any_equality_tautologies(tree), f"lens should NOT flag:\n{source}"
 
 
+def _nested_test_functions(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``test_*`` (or
+    ``@pytest.mark``-decorated) function defined inside another function.
+
+    pytest only collects ``test_*`` functions at module and class scope, so a
+    test defined inside a function body is never collected and never runs —
+    silently dropping its coverage with no warning. ``@pytest.fixture`` and
+    other local helpers are deliberately excluded: those are the legitimate
+    nested-helper spellings and pytest asyncio/plugins may reference them.
+    ``@pytest.mark``-decorated nested functions are included, because the
+    decorator marks intent to be a test that pytest still will not collect.
+    """
+    stack: list[tuple[str, ast.AST]] = []  # (kind, node) for enclosing defs/classes
+
+    def _is_fixture(decs: list[ast.AST]) -> bool:
+        return any(_decorator_name(d) == "fixture" for d in decs)
+
+    found: list[tuple[int, str]] = []
+
+    def _visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inside_fn = any(kind == "fn" for kind, _ in stack)
+            is_here_a_test = node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)
+            if inside_fn and is_here_a_test and not _is_fixture(node.decorator_list):
+                found.append((node.lineno, f"{node.name}() defined inside another function — pytest never collects it"))
+            stack.append(("fn", node))
+            for child in node.body:
+                _visit(child)
+            stack.pop()
+            return
+        if isinstance(node, ast.ClassDef):
+            stack.append(("cls", node))
+            for child in node.body:
+                _visit(child)
+            stack.pop()
+            return
+        for child in ast.iter_child_nodes(node):
+            _visit(child)
+
+    _visit(tree)
+    return found
+
+
+def test_no_nested_test_functions():
+    """A ``test_*`` function (or ``@pytest.mark``-decorated function) defined
+    *inside another function* is never collected by pytest, so the coverage it
+    carries silently drops from every run with no warning. pytest only
+    collects ``test_*`` at module and class scope; a test nested inside a test
+    or helper body is dead code that a reader — and a mutation-testing run —
+    believes is running. These are almost always an indentation accident or a
+    helper miscast as a ``test_``. Hoist a real test to module scope, or
+    rename a helper that merely happens to start with ``test_``. Nested
+    ``@pytest.fixture`` helpers and non-test local defs/classes are
+    deliberately left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _nested_test_functions(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} test function(s) nested inside another function.\n"
+        "pytest only collects test_* at module/class scope, so a nested test never runs —\n"
+        "its coverage silently drops from every run. Hoist it to module scope, or rename a\n"
+        "helper that only happens to start with 'test_'.\n" + "\n".join(violations)
+    )
+
+
+def test_nested_test_lens_flags_uncollected_tests():
+    """Synthetic positive/negative control for the nested-test lens: must flag
+    a ``test_*`` (or ``@pytest.mark``-decorated) function nested inside any
+    function (sync, async, or another test), and ignore nested fixtures,
+    non-``test_`` local helpers, and module/class-scope tests (which pytest
+    does collect)."""
+    positive_sources = [
+        "def test_foo():\n    def test_bar():\n        assert 1 == 1\n",
+        "def test_foo():\n    def helper():\n        def test_bar():\n            assert 1 == 1\n",
+        "async def test_foo():\n    def test_bar():\n        assert 1 == 1\n",
+        "def test_foo():\n    @pytest.mark.asyncio\n    def test_bar():\n        assert 1 == 1\n",
+        # Mark-detection branch exercised with a NON-``test_`` name: this only
+        # flags because ``@pytest.mark.asyncio`` is recognised as a marker.
+        "def test_foo():\n    @pytest.mark.asyncio\n    def _coro():\n        assert 1 == 1\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _nested_test_functions(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert 1 == 1\n",
+        "def test_foo():\n    def helper():\n        return 1\n    assert helper() == 1\n",
+        "def test_foo():\n    @pytest.fixture\n    def fxt():\n        return 1\n",
+        "def test_bar():\n    assert 1 == 1\n",
+        "class TestSuite:\n    def test_bar(self):\n        assert 1 == 1\n",
+        "def test_bar():\n    assert 1 == 1\n",
+        "@pytest.mark.parametrize('x', [1])\ndef test_bar(x):\n    assert x == 1\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _nested_test_functions(tree), f"lens should NOT flag:\n{source}"
+
+
 _MUTATING_ENVIRON_METHODS = frozenset({"pop", "update", "setdefault", "clear", "__setitem__", "__delitem__"})
 # Method names on ``os.environ`` that mutate the mapping in place. The
 # ``__setitem__``/``__delitem__`` twins cover the pydantic-spelled
@@ -5389,3 +5672,145 @@ def test_cwd_mutation_lens_flags_unguarded_mutations():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _cwd_mutation_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+_SKIP_XFAIL_NAMES = {"skip", "xfail"}
+
+
+def _skip_xfail_call(call: ast.Call) -> str | None:
+    """Return ``"skip"``/``"xfail"`` when ``call`` is a skip/xfail invocation in
+    either spelling — ``pytest.skip(...)``/``pytest.xfail(...)`` (attribute) or
+    the bare imported ``skip(...)``/``xfail(...)`` name. ``skipif`` is
+    deliberately excluded: it is inherently conditional (it takes a condition
+    argument), whereas ``skip``/``xfail`` deselect unconditionally when called
+    unconditionally."""
+    func = call.func
+    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    return name if name in _SKIP_XFAIL_NAMES else None
+
+
+def _unconditional_body_skip_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every unconditional skip/xfail in a
+    test body.
+
+    ``pytest.skip(reason)``/``pytest.xfail(reason)`` (or the bare imported
+    ``skip(...)``/``xfail(...)``) placed as a *direct statement of the test body*
+    permanently deselects the test from every run: the call always executes, so
+    whatever follows never runs and the test never verifies anything. It is
+    indistinguishable in source from a runtime gate, yet it is not gated — there
+    is no surrounding ``if``/loop to make the deselection conditional, and no
+    marker on the function to make it reviewable. A reader — and a
+    mutation-testing run — believes the test participates when it silently does
+    not: the coverage loss is identical to deleting the test, but reported green.
+
+    The marker twins are owned elsewhere — ``test_no_skip_without_reason``
+    catches ``@skip``/``@xfail``/``@skipif`` and body ``skip()`` calls that carry
+    *no* reason, and ``test_no_constant_condition_skips`` catches statically
+    foldable ``@skipif(True, ...)`` conditions. A body skip that *does* carry a
+    reason slips past both, which makes this the sneaky statement form: it reads
+    like real logic but is unconditional. A skip nested under an explicit
+    ``if``/loop ``try``/``with`` block is a genuine runtime gate and is left
+    alone — only the direct, unconditional top-level statement is flagged.
+    """
+    found = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if any(_decorator_name(d) == "fixture" for d in fn.decorator_list):
+            continue
+        if not (fn.name.startswith("test_") or any(_is_mark_decorator(d) for d in fn.decorator_list)):
+            continue
+        for stmt in fn.body:
+            if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+                continue
+            name = _skip_xfail_call(stmt.value)
+            if name is None:
+                continue
+            if stmt.value.args:
+                reason = ast.unparse(stmt.value.args[0])
+                found.append(
+                    (
+                        stmt.lineno,
+                        f"{name}() called unconditionally on the test body ('{reason}') — "
+                        f"the test ALWAYS {name}s, so the rest of the body never runs",
+                    )
+                )
+            else:
+                found.append(
+                    (
+                        stmt.lineno,
+                        f"{name}() called unconditionally on the test body — "
+                        f"the test ALWAYS {name}s, so the rest of the body never runs",
+                    )
+                )
+    return found
+
+
+def test_no_unconditional_body_skip():
+    """A ``pytest.skip(reason)``/``pytest.xfail(reason)`` (or bare
+    ``skip(...)``/``xfail(...)``) placed as a *direct statement* of the test
+    body permanently deselects the test from every run — the call always
+    executes, so whatever follows never runs and the test never verifies
+    anything. It reads like a runtime gate but is not gated: there is no
+    surrounding ``if``/loop, so the deselection is unconditional and
+    unreviewable — the coverage loss is identical to deleting the test, but the
+    suite still reports green. ``test_no_skip_without_reason`` and
+    ``test_no_constant_condition_skips`` own the marker and reason-less forms;
+    this lens owns the *statement* form that carries a reason and therefore
+    slips past both. A skip nested under an explicit ``if``/loop (a real runtime
+    gate) is left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _unconditional_body_skip_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} unconditional skip/xfail statement(s) in test bodies.\n"
+        "A skip/xfail placed directly on the test body always executes, so the test is\n"
+        "permanently deselected while still reporting green. Gate it behind an explicit\n"
+        "condition, or drop the call so the test either runs or is removed.\n" + "\n".join(violations)
+    )
+
+
+def test_unconditional_body_skip_lens_flags_permanent_deselection():
+    """Synthetic positive/negative control for the unconditional-body-skip lens:
+    it must flag every direct top-level ``skip``/``xfail`` statement (in the
+    attribute and bare-name spellings, sync and async, mid-body as well as
+    single-statement), and ignore skips nested under an explicit ``if``/loop,
+    ``skipif`` (inherently conditional), ``self.skipTest``, and unrelated
+    calls."""
+    positive_sources = [
+        "def test_foo():\n    pytest.skip('not yet')\n",
+        "def test_foo():\n    pytest.xfail('flaky')\n",
+        "def test_foo():\n    skip('no')\n",
+        "def test_foo():\n    from pytest import skip\n    skip('no')\n",
+        "def test_foo():\n    x = do_work()\n    pytest.skip('abandoned')\n",
+        "async def test_foo():\n    pytest.skip('no')\n",
+        "def test_foo():\n    pytest.skip()\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _unconditional_body_skip_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    if not pkg:\n        pytest.skip('missing')\n",
+        "def test_foo():\n    if sys.version_info < (3, 12):\n        pytest.xfail('old')\n",
+        "def test_foo():\n    for x in items:\n        pytest.skip('x')\n",
+        "def test_foo():\n    def inner():\n        pytest.skip('nested helper')\n    inner()\n",
+        "def test_foo():\n    pytest.skipif(True, reason='always')\n",
+        "def test_foo():\n    self.skipTest('x')\n",
+        (
+            "def test_foo():\n"
+            "    try:\n"
+            "        do_work()\n"
+            "    except NotImplementedError:\n"
+            "        pytest.xfail('not there')\n"
+        ),
+        "def test_foo():\n    skip_service.run()\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _unconditional_body_skip_violations(tree), f"lens should NOT flag:\n{source}"

@@ -18,6 +18,7 @@
       :style="remyDockedStyle"
     >
       <div class="relative z-10 space-y-2">
+        <DbCapacityBanner />
         <OnboardingBanner />
         <div class="px-6">
           <ProductAnalyticsConsentPrompt />
@@ -34,7 +35,7 @@
     <div v-if="planStore.devMode && remyStore.isExecutingUi" class="remy-execution-overlay">
       <div class="remy-execution-banner">
         <span>{{ $t('components.AppLayout.remy_performing_actions') }}</span>
-        <button class="remy-stop-btn" @click="abortUiCommands">{{ $t('components.AppLayout.remy_stop') }}</button>
+        <button type="button" class="remy-stop-btn" @click="abortUiCommands">{{ $t('components.AppLayout.remy_stop') }}</button>
       </div>
     </div>
 
@@ -58,6 +59,7 @@ import { useOnboardingStore } from "../composables/useOnboarding";
 import { abortUiCommands } from "../composables/useUiCommandExecutor";
 import { applyPrimeVueTokenBridge } from "../lib/primevue-theme";
 import OnboardingBanner from "./onboarding/OnboardingBanner.vue";
+import DbCapacityBanner from "./DbCapacityBanner.vue";
 import CommandPalette from "./CommandPalette.vue";
 import SpotlightOverlay from "./onboarding/SpotlightOverlay.vue";
 import ProductAnalyticsConsentPrompt from "./product-analytics/ProductAnalyticsConsentPrompt.vue";
