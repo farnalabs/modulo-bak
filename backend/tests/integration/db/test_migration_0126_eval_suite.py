@@ -19,6 +19,7 @@ restores the head state in ``finally`` so the shared session schema is
 undisturbed for later tests.
 """
 
+import os
 import types
 import uuid
 from collections.abc import AsyncIterator
@@ -157,7 +158,25 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
         await conn.commit()
     await eng.dispose()
 
-    command.upgrade(_alembic_config(iso_url), PREV_REV)
+    # ``env.py`` overrides the connection URL with ``DATABASE_URL`` (or
+    # ``DATABASE_ADMIN_URL``), so the ``sqlalchemy.url`` set inside
+    # ``_alembic_config`` is ignored. Point ``DATABASE_URL`` at the isolated
+    # database here; otherwise the upgrade runs against the shared session DB.
+    # The shared DB is left at a mid-chain version by other migration tests
+    # (e.g. ``test_migration_0120_org_fk`` resets it to 0119 and only restores
+    # it to 0120), so re-running the 0120->0129 span there collides on
+    # already-existing tables such as ``library_sync_state`` (migration 0122),
+    # surfacing as ``relation "library_sync_state" already exists``. Restoring
+    # the previous value keeps the shared session env untouched for other tests.
+    prev_db_url = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = iso_url
+    try:
+        command.upgrade(_alembic_config(iso_url), PREV_REV)
+    finally:
+        if prev_db_url is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = prev_db_url
 
     try:
         yield iso_url
