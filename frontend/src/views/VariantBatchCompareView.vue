@@ -93,7 +93,7 @@
                   <span v-else class="text-muted-foreground">&mdash;</span>
                 </td>
                 <td class="px-4 py-3 text-right">
-                  <button
+                  <button type="button"
                     class="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                     :aria-label="$t(expandedRunIds.has(run.run_id) ? 'views.variantBatch.collapseDetail' : 'views.variantBatch.expandDetail', { label: run.variant_name })"
                     :aria-expanded="expandedRunIds.has(run.run_id)"
@@ -190,7 +190,7 @@
               </td>
               <td class="px-4 py-3 tabular-nums text-muted-foreground">{{ cmp.run_count }}</td>
               <td class="px-4 py-3 text-right">
-                <button
+                <button type="button"
                   class="text-xs text-destructive hover:underline disabled:opacity-50"
                   :disabled="deletingId === cmp.batch_id"
                   :data-testid="`variant-batch-delete-${cmp.batch_id}`"

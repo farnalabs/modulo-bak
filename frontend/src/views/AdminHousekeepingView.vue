@@ -196,7 +196,7 @@ const cleaningUp = ref(false)
 
 function formatDate(iso: string): string {
   const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
+  if (Number.isNaN(d.getTime())) return iso
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 

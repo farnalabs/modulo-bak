@@ -39,7 +39,7 @@
                 >
                   <td class="table-cell">
                     <div>
-                      <button
+                      <button type="button"
                         class="font-medium text-left hover:text-primary transition-colors"
                         @click="toggleExpand(plugin.PLUGIN_ID)"
                       >
@@ -88,7 +88,7 @@
                           class="peer h-5 w-9 rounded-full bg-muted-foreground/30 after:absolute after:start-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:bg-background after:transition-all peer-checked:bg-primary peer-checked:after:translate-x-full"
                         />
                       </label>
-                      <button
+                      <button type="button"
                         class="rounded p-1 text-muted-foreground hover:bg-accent"
                         data-testid="admin-plugins-expand"
                         :aria-label="$t('views.AdminPluginsView.expand_plugin_details')"
@@ -212,7 +212,7 @@ function toggleExpand(id: string) {
 }
 
 async function togglePlugin(id: string) {
-  const newState = activeStates[id] !== false ? false : true
+  const newState = activeStates[id] === false
   activeStates[id] = newState
   try {
     const { error: err } = await (api as any).PUT(`/api/v1/plugins/${id}/toggle`, {

@@ -80,7 +80,7 @@
             Cancel
           </button>
           <Button :disabled="saving || !form.name.trim()" type="submit" data-testid="remy-skills-form-submit">
-            {{ saving ? "Saving..." : editingId ? "Update" : "Create" }}
+            {{ submitLabel }}
           </Button>
         </div>
       </form>
@@ -155,6 +155,11 @@ const deletingName = ref("");
 const saving = ref(false);
 const deleting = ref(false);
 const saveError = ref<string | null>(null);
+
+const submitLabel = computed(() => {
+  if (saving.value) return "Saving...";
+  return editingId.value ? "Update" : "Create";
+});
 
 const form = reactive({
   name: "",

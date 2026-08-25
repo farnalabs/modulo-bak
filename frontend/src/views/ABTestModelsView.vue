@@ -179,7 +179,7 @@
                     </Select>
                   </td>
                   <td class="py-2 text-right whitespace-nowrap">
-                    <button
+                    <button type="button"
                       :data-testid="`variant-builder-duplicate-${i}`"
                       :disabled="variants.length >= MAX_VARIANTS"
                       class="mr-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
@@ -188,7 +188,7 @@
                     >
                       {{ $t('views.variantCreator.duplicate') }}
                     </button>
-                    <button
+                    <button type="button"
                       :data-testid="`variant-builder-remove-${i}`"
                       class="text-xs text-destructive hover:underline"
                       :aria-label="$t('views.variantCreator.remove')"

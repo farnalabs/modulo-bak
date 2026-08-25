@@ -59,7 +59,7 @@
 
         <div v-else-if="exportStatus === 'error'" class="flex items-center gap-3">
           <span class="text-sm text-destructive">Export failed: {{ exportError }}</span>
-          <button
+          <button type="button"
             class="text-sm font-medium text-primary underline underline-offset-2 hover:no-underline"
             @click="startExport"
           >
@@ -72,13 +72,13 @@
           <span class="text-sm text-muted-foreground">
             Exported at {{ formatDate(exportData.exportedAt) }}
           </span>
-          <button
+          <button type="button"
             class="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-input bg-background px-2.5 text-sm font-medium hover:bg-muted transition-all"
             @click="downloadExport"
           >
             Download
           </button>
-          <button
+          <button type="button"
             class="text-sm font-medium text-primary underline underline-offset-2 hover:no-underline"
             @click="resetExport"
           >
