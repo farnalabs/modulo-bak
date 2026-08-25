@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Uuid, func
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from modulo.db.models.base import OrgScoped
@@ -35,10 +35,14 @@ class EvalResult(OrgScoped):
     )
     node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(), nullable=True)
     eval_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(),
-        ForeignKey("eval_definitions.id", ondelete="CASCADE"),
-        nullable=False,
+        Uuid(), ForeignKey("eval_definitions.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    # Eval-definition version snapshot (FAR-382): the integer ``version`` of the
+    # eval definition that scored this result, captured at write time so a later
+    # version bump (rubric change) never makes an old result look like a
+    # regression. NULL for legacy rows written before versioning was cut over —
+    # such rows should be resolved to the definition's current (latest) version.
+    eval_definition_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     detail: Mapped[str | None] = mapped_column(String(2000))

@@ -1342,7 +1342,7 @@ function onParamSetChange() {
     return
   }
   const set = paramSets.value.find((ps: any) => ps.id === selectedNodeParamSetId.value)
-  selectedNodeOverrides.value = { ...(set?.values ?? {}) }
+  selectedNodeOverrides.value = { ...set?.values }
   // Also update the backend node data
   if (selectedNodeData.value) {
     selectedNodeData.value.parameter_set_id = selectedNodeParamSetId.value
@@ -1490,7 +1490,7 @@ function onNodeClick(event: any) {
   // Populate parameter set + overrides
   if (backendNode?.parameter_set_id) {
     selectedNodeParamSetId.value = backendNode.parameter_set_id
-    selectedNodeOverrides.value = { ...(backendNode.parameter_overrides ?? {}) }
+    selectedNodeOverrides.value = { ...backendNode.parameter_overrides }
     loadParamSets()
   } else {
     selectedNodeParamSetId.value = undefined
@@ -1584,6 +1584,8 @@ async function saveEdgeConfig() {
         max_iterations: edgeForm.edge_type === 'loop' ? (edgeForm.max_iterations || 0) : undefined,
         routing_label: edgeForm.edge_type === 'llm' ? (edgeForm.routing_label || undefined) : undefined,
         hitl_gate_config: buildHitlGateConfig(),
+        source_port: e.source_port || 'out',
+        target_port: e.target_port || 'in',
       }
     }
     return {
@@ -1593,6 +1595,8 @@ async function saveEdgeConfig() {
       edge_type: e.edge_type || 'normal',
       condition_expression: e.condition_expression || null,
       hitl_gate_config: e.hitl_gate_config || null,
+      source_port: e.source_port || 'out',
+      target_port: e.target_port || 'in',
     }
   })
 
@@ -1614,7 +1618,7 @@ async function saveEdgeConfig() {
           idempotent: n.idempotent !== false,
           timeout_seconds: n.timeout_seconds || null,
           stall_timeout_seconds: n.stall_timeout_seconds || null,
-          enable_heartbeat: n.enable_heartbeat === false ? false : true,
+          enable_heartbeat: n.enable_heartbeat !== false,
           watch_log_path: n.watch_log_path || null,
           stdout_percentage_delta: n.stdout_percentage_delta ?? null,
           watch_globs: Array.isArray(n.watch_globs) ? n.watch_globs : [],
@@ -1892,7 +1896,7 @@ async function saveGraph() {
           idempotent: n.idempotent !== false,
           timeout_seconds: n.timeout_seconds || null,
           stall_timeout_seconds: n.stall_timeout_seconds || null,
-          enable_heartbeat: n.enable_heartbeat === false ? false : true,
+          enable_heartbeat: n.enable_heartbeat !== false,
           watch_log_path: n.watch_log_path || null,
           stdout_percentage_delta: n.stdout_percentage_delta ?? null,
           watch_globs: Array.isArray(n.watch_globs) ? n.watch_globs : [],
@@ -1911,6 +1915,8 @@ async function saveGraph() {
           max_iterations: e.edge_type === 'loop' ? (e.max_iterations || 0) : undefined,
           routing_label: e.edge_type === 'llm' ? (e.routing_label || undefined) : undefined,
           hitl_gate_config: e.hitl_gate_config || null,
+          source_port: e.source_port || 'out',
+          target_port: e.target_port || 'in',
         })),
       },
       signal,

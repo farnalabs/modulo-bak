@@ -1,7 +1,7 @@
 """Broaden ck_notification_delivery_log_status to allow 'in_app'.
 
-Revision ID: 0138_broaden_notification_status_in_app
-Revises: 0137_eval_suite_run
+Revision ID: 0144_broaden_notification_status_in_app
+Revises: 0143_rest_connector_profile
 Create Date: 2026-08-25
 
 The error-tracking alert dispatcher (``modulo.core.error_tracking.alert_dispatcher``)
@@ -21,8 +21,8 @@ Postgres-only, matching the repo's existing CHECK-constraint migrations.
 from alembic import op
 from sqlalchemy import text
 
-revision = "0138_broaden_notification_status_in_app"
-down_revision = "0137_eval_suite_run"
+revision = "0144_broaden_notification_status_in_app"
+down_revision = "0143_rest_connector_profile"
 branch_labels = None
 depends_on = None
 
