@@ -104,7 +104,7 @@ class TestLengthCapping:
         assert len(sanitise_log_value("x" * DEFAULT_LOG_LIMIT)) == DEFAULT_LOG_LIMIT
 
     def test_zero_limit_yields_empty(self) -> None:
-        assert sanitise_log_value("abc", limit=0) == ""
+        assert not sanitise_log_value("abc", limit=0)
 
     def test_padding_newlines_do_not_bypass_cap(self) -> None:
         """Escaped CR/LF count toward the cap like any other character."""
