@@ -52,7 +52,7 @@ class _RetrySignalError(Exception):
 
 def _retry_delay(attempt: int) -> float:
     """Exponential backoff capped at ``_MAX_DELAY``."""
-    return min(_BASE_DELAY * (2**attempt), _MAX_DELAY)
+    return float(min(_BASE_DELAY * (2**attempt), _MAX_DELAY))
 
 
 class LinearConnector(TicketTrackerBase):
@@ -121,7 +121,8 @@ class LinearConnector(TicketTrackerBase):
                 raise _RetrySignalError(exc) from exc
             detail = exc.response.text[:200]
             raise ValueError(f"Linear API HTTP {exc.response.status_code}: {detail}") from exc
-        return r.json()
+        body: dict[str, Any] = r.json()
+        return body
 
     def _extract_data(self, body: dict[str, Any]) -> dict[str, Any]:
         """Validate a GraphQL response body and return its ``data`` payload.
