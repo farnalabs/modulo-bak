@@ -1,7 +1,7 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0143_suite_run_trigger_kind
-Revises: 0142_merge_heads_add_fk_indexes
+Revision ID: 0144_suite_run_trigger_kind
+Revises: 0143_rest_connector_profile
 Create Date: 2026-08-25
 
 Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
@@ -9,6 +9,11 @@ collision with main's merged ``0138_eval_versioning`` (FAR-382, PR 1947). The
 branch's former ``eval_results.eval_definition_version`` stamp was dropped here
 because ``0138_eval_versioning`` (now the ancestor) already owns that column;
 this migration adds only the FAR-377 trigger columns.
+
+Renumbered a second time from ``0143_suite_run_trigger_kind`` to
+``0144_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0143_rest_connector_profile`` (FAR-412, PR 2009's merge base). It now chains
+off the real main head ``0143_rest_connector_profile``.
 
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
@@ -39,8 +44,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0143_suite_run_trigger_kind"
-down_revision: str | None = "0142_merge_heads_add_fk_indexes"
+revision: str = "0144_suite_run_trigger_kind"
+down_revision: str | None = "0143_rest_connector_profile"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
