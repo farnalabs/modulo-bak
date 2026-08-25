@@ -1,41 +1,30 @@
 """Add missing foreign-key lookup indexes (improve-database FK-index pass).
 
 Revision ID: 0141_merge_heads_add_fk_indexes
-Revises: 0119_analytics_batch_id, 0123_relax_registry_signature_check, 0129_runs_json_to_jsonb, 0134_dismissals_org_rls, 0140_eval_regression_alert
+Revises: 0140_eval_regression_alert
 Create Date: 2026-08-25
 
-This migration merges the current alembic heads into a single lineage and
-adds the missing B-tree indexes on foreign-key columns that are used as
-lookup / join / owner-scoping keys but were never indexed. Postgres does not
-create an index for a foreign key automatically, so queries that filter or
-join on these columns performed full table scans.
+This migration adds the missing B-tree indexes on foreign-key columns that
+are used as lookup / join / owner-scoping keys but were never indexed.
+Postgres does not create an index for a foreign key automatically, so queries
+that filter or join on these columns performed full table scans. It is a
+linear child of the single current head ``0140_eval_regression_alert``.
 
 Every index is created with IF NOT EXISTS and dropped with IF EXISTS so the
 migration is safe to re-run. The corresponding ORM models now declare
 ``index=True`` on each column so a future ``alembic revision --autogenerate``
 sees them as in-sync and will not propose dropping them.
-
-This migration also reconciles the five pre-existing branch heads into one
-linear history (tuple down_revision).
 """
 
 from __future__ import annotations
-
-from collections.abc import Sequence
 
 from alembic import op
 from sqlalchemy import text
 
 revision: str = "0141_merge_heads_add_fk_indexes"
-down_revision: str | Sequence[str] | None = (
-    "0119_analytics_batch_id",
-    "0123_relax_registry_signature_check",
-    "0129_runs_json_to_jsonb",
-    "0134_dismissals_org_rls",
-    "0140_eval_regression_alert",
-)
-branch_labels: str | Sequence[str] | None = None
-depends_on: str | Sequence[str] | None = None
+down_revision: str | None = "0140_eval_regression_alert"
+branch_labels: str | None = None
+depends_on: str | None = None
 
 
 def upgrade() -> None:
@@ -77,7 +66,6 @@ def upgrade() -> None:
         text("CREATE INDEX IF NOT EXISTS ix_environment_profiles_owner_team_id ON environment_profiles (owner_team_id)")
     )
     op.execute(text("CREATE INDEX IF NOT EXISTS ix_error_groups_sample_event_id ON error_groups (sample_event_id)"))
-    op.execute(text("CREATE INDEX IF NOT EXISTS ix_error_groups_sample_event ON error_groups (sample_event)"))
     op.execute(text("CREATE INDEX IF NOT EXISTS ix_error_groups_assigned_to ON error_groups (assigned_to)"))
     op.execute(text("CREATE INDEX IF NOT EXISTS ix_eval_definitions_account_id ON eval_definitions (account_id)"))
     op.execute(text("CREATE INDEX IF NOT EXISTS ix_eval_results_eval_id ON eval_results (eval_id)"))
@@ -192,7 +180,6 @@ def downgrade() -> None:
     op.execute(text("DROP INDEX IF EXISTS ix_environment_profiles_account_id"))
     op.execute(text("DROP INDEX IF EXISTS ix_environment_profiles_owner_team_id"))
     op.execute(text("DROP INDEX IF EXISTS ix_error_groups_sample_event_id"))
-    op.execute(text("DROP INDEX IF EXISTS ix_error_groups_sample_event"))
     op.execute(text("DROP INDEX IF EXISTS ix_error_groups_assigned_to"))
     op.execute(text("DROP INDEX IF EXISTS ix_eval_definitions_account_id"))
     op.execute(text("DROP INDEX IF EXISTS ix_eval_results_eval_id"))

@@ -578,9 +578,12 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0138 except 0140 (the FAR-379 alerting migration).
     chaining_off_0138 = [p for p in revisions if parents[p] == "0138_eval_versioning"]
     assert [_basename(p) for p in chaining_off_0138] == ["0140_eval_regression_alert.py"]
-    # Nothing chains off 0140 -> it is the single head.
+    # Nothing chains off 0140 except 0141 (the FK-index migration).
     chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
-    assert chaining_off_0140 == []
+    assert [_basename(p) for p in chaining_off_0140] == ["0141_merge_heads_add_fk_indexes.py"]
+    # Nothing chains off 0141 -> it is the single head.
+    chaining_off_0141 = [p for p in revisions if parents[p] == "0141_merge_heads_add_fk_indexes"]
+    assert chaining_off_0141 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
