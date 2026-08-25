@@ -1,7 +1,7 @@
 """runs — add ``router_no_match`` to the ``ck_runs_status`` CHECK constraint.
 
-Revision ID: 0138_add_router_no_match_status
-Revises: 0137_eval_suite_run
+Revision ID: 0139_add_router_no_match_status
+Revises: 0141_pipeline_edge_ports
 Create Date: 2026-08-24
 
 FAR-402 P1 (FAR-415) introduces the ``router_no_match`` terminal run status
@@ -15,14 +15,19 @@ this migration lands the backend may emit it.
 The constraint is recreated idempotently: only drop + recreate when the
 current definition does not already include ``router_no_match`` (mirrors the
 guard pattern used throughout 0110).
+
+Renumber note: this migration was originally ``0138_add_router_no_match_status``
+but collided with main's ``0138_eval_versioning``. It is renumbered to
+``0139`` and re-parented onto main's head ``0141_pipeline_edge_ports`` so the
+migration graph stays a single linear chain.
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0138_add_router_no_match_status"
-down_revision: str | None = "0137_eval_suite_run"
+revision: str = "0139_add_router_no_match_status"
+down_revision: str | None = "0141_pipeline_edge_ports"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
