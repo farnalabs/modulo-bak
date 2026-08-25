@@ -192,22 +192,26 @@ class RedisTokenBucket:
     async def consume(self, key: str, tokens: float = 1.0, now: float | None = None) -> bool:
         """Consume ``tokens`` from the shared bucket at ``key``; False when low.
 
-        ``now`` is passed for the test seam and for callers that want a
-        deterministic refill base, but the production Lua script reads the refill
-        base from ``redis.call('TIME')`` server-side, so worker clock skew never
-        corrupts a shared bucket. Redis errors and an unchargeable (corrupt)
-        stored value propagate to the caller, which FAILS CLOSED rather than
-        minting a token from an uncounted per-process budget.
+        ``now`` is retained for backward compatibility with callers and as a
+        historical test seam, but it is deliberately NOT forwarded to the Redis
+        script: the production Lua reads the refill base from
+        ``redis.call('TIME')`` server-side, so worker clock skew never corrupts a
+        shared bucket. Redis errors and an unchargeable (corrupt) stored value
+        propagate to the caller, which FAILS CLOSED rather than minting a token
+        from an uncounted per-process budget.
         """
         if tokens <= 0:
             raise ValueError("tokens must be > 0")
-        now = float(now) if now is not None else time.time()
         # TTL must comfortably outlive a burst-worth of refill so the bucket is
         # reclaimed only when truly idle (never mid-window).
         ttl_ms = int(max(60.0, (self.burst / self.rate if self.rate > 0 else 60.0) * 2) * 1000)
         key_ = self._key(key)
         keys = [key_]
-        args = [self.rate, self.burst, tokens, now, ttl_ms]
+        # ARGV is exactly [rate, burst, cost, ttl_ms] as the Lua reads it. The
+        # worker's ``now`` is intentionally NOT sent: a stale/epoch ``now``
+        # (≈1.75e9) was previously misread as ARGV[4] (ttl_ms) by PEXPIRE, giving
+        # every Redis key a ~20-day expiry instead of the intended reclaim TTL.
+        args = [self.rate, self.burst, tokens, ttl_ms]
         result = await self._script(keys=keys, args=args)
         if result is None or result < 0:
             _log.warning(

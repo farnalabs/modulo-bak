@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -462,11 +463,19 @@ class _FakeRedis:
     Lua semantics atomically under a lock. ``store`` is shared by every client, so
     multiple limiter instances pointing at the same store simulate a fleet of
     workers hitting one Redis.
+
+    ``clock`` mirrors the Lua's server-side ``redis.call('TIME')`` refill base;
+    pass a controllable clock (or a fixed ``lambda``) to make refill determinism
+    testable. ``pexpire_ttl`` records the PEXPIRE TTL the script was told to use
+    (ARGV[4]), so a test can assert it receives the computed reclaim TTL rather
+    than a stale worker ``now`` value.
     """
 
-    def __init__(self, store: dict[str, dict[str, float]] | None = None) -> None:
+    def __init__(self, store: dict[str, dict[str, float]] | None = None, clock: Any = time.time) -> None:
         self._store: dict[str, dict[str, float]] = store if store is not None else {}
         self._lock = asyncio.Lock()
+        self._clock = clock
+        self.pexpire_ttl: float | None = None
 
     def register_script(self, script: str) -> Any:
         of_self = self
@@ -476,7 +485,9 @@ class _FakeRedis:
             rate = float(args[0])
             burst = float(args[1])
             cost = float(args[2])
-            now = float(args[3])
+            ttl_ms = float(args[3])
+            of_self.pexpire_ttl = ttl_ms
+            now = of_self._clock()
             async with of_self._lock:
                 st = of_self._store.get(key)
                 if st is None:
@@ -532,25 +543,35 @@ async def test_redis_token_bucket_no_lost_token_race_under_concurrency() -> None
     succeed ÔÇö never more ÔÇö proving the token check-and-decrement is not racy.
     """
     store: dict[str, dict[str, float]] = {}
-    redis = _FakeRedis(store)
+    redis = _FakeRedis(store, clock=lambda: 1000.0)
     bucket = RedisTokenBucket(redis, rate=0.0001, burst=5, key_prefix="rl:")
 
-    grant_count = sum(await asyncio.gather(*[bucket.consume("k", tokens=1.0, now=1000.0) for _ in range(50)]))
+    grant_count = sum(await asyncio.gather(*[bucket.consume("k", tokens=1.0) for _ in range(50)]))
     assert grant_count == 5
     assert store["rl:k"]["tokens"] >= 0
 
 
 async def test_redis_token_bucket_refills_over_wall_clock() -> None:
-    """A shared bucket refills continuously, so a later call re-acquires."""
+    """A shared bucket refills continuously, so a later call re-acquires.
+
+    The refill base is driven by the fake's clock (mirroring the Lua's server-side
+    ``redis.call('TIME')``) rather than an injected worker ``now``. It also asserts
+    that PEXPIRE receives the computed reclaim TTL — NOT a stale worker ``now``
+    (~1.75e9), which would give every key a ~20-day expiry instead of ~60s.
+    """
     store: dict[str, dict[str, float]] = {}
-    redis = _FakeRedis(store)
+    now = [1000.0]
+    redis = _FakeRedis(store, clock=lambda: now[0])
     bucket = RedisTokenBucket(redis, rate=2.0, burst=1, key_prefix="rl:")
 
-    assert await bucket.consume("k", tokens=1.0, now=1000.0) is True
+    assert await bucket.consume("k", tokens=1.0) is True
     # Immediately after spend, no refill -> denied.
-    assert await bucket.consume("k", tokens=1.0, now=1000.0) is False
+    assert await bucket.consume("k", tokens=1.0) is False
     # One second later the 2/s rate refilled a token.
-    assert await bucket.consume("k", tokens=1.0, now=1001.0) is True
+    now[0] += 1.0
+    assert await bucket.consume("k", tokens=1.0) is True
+    # ttl = max(60, (burst/rate)*2)*1000 = max(60, (1/2)*2)*1000 = 60000 ms.
+    assert redis.pexpire_ttl == 60000
 
 
 # ÔöÇÔöÇ PerDestinationRateLimiter: shared budget across simulated workers ÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇÔöÇ

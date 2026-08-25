@@ -199,6 +199,13 @@ class ConnectorHub:
         a configured Redis to ``None``, because returning ``None`` would make the
         REST connector fall back to its per-process local bucket, silently
         reconstructing the fleet-wide ``N x burst`` fail-open that FAR-439 removed.
+        The same fail-closed principle applies to a failure to READ settings: on
+        the executor path (``org_id`` present) a ``get_settings()`` failure
+        propagates :class:`SharedBudgetUnavailableError` rather than returning
+        ``None`` — an executor hub that cannot read its own settings cannot safely
+        conclude there is no shared budget. Only the genuinely-not-configured
+        (``redis_url`` empty / SQLite) and non-executor (``org_id`` absent) paths
+        return ``None``.
         """
         if self._redis_error is not None:
             raise SharedBudgetUnavailableError(
@@ -213,11 +220,23 @@ class ConnectorHub:
             settings = get_settings()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             # Settings could not be read to determine whether a shared Redis is
-            # configured — treat as not configured (local bucket). This is NOT a
-            # "configured Redis failed to build" case, so fail-closed does not
-            # apply.
+            # configured. On the EXECUTOR path (hub has an ``org_id``) this must
+            # FAIL CLOSED: returning ``None`` would make the REST connector fall
+            # back to its per-process local bucket, silently reconstructing the
+            # fleet-wide ``N x burst`` fail-open that FAR-439 removed. Non-executor
+            # hubs (health-check / schema-inference probes, which carry no
+            # ``org_id``) genuinely have no shared budget to multiply, so there
+            # the connector-local bucket is still correct.
+            if self._org_id is not None:
+                logger.error(
+                    "Settings could not be read on the executor path — fail-closed (no local-bucket fallback)",
+                    exc_info=True,
+                )
+                raise SharedBudgetUnavailableError(
+                    f"settings could not be read to wire the shared rate-limit budget: {exc}"
+                ) from exc
             logger.warning(
                 "Unable to read settings for the shared Redis rate limiter — using the local bucket",
                 exc_info=True,
