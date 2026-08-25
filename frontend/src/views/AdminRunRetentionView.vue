@@ -57,12 +57,12 @@
       </div>
 
       <Card>
-        <template #title>Filters</template>
-        <template #subtitle>Narrow the candidate runs by date, pipeline, or status.</template>
+        <template #title>{{ $t('views.AdminRunRetentionView.filters_title') }}</template>
+        <template #subtitle>{{ $t('views.AdminRunRetentionView.filters_subtitle') }}</template>
         <template #content>
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <div>
-              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-from">From</label>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-date-from">{{ $t('views.AdminRunRetentionView.from_label') }}</label>
               <input
                 id="rr-date-from"
                 v-model="dateFrom"
@@ -82,7 +82,7 @@
               />
             </div>
             <div>
-              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-pipeline">Pipeline</label>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-pipeline">{{ $t('views.AdminRunRetentionView.pipeline_label') }}</label>
               <Select
                 id="rr-pipeline"
                 v-model="selectedPipelineId"
@@ -95,7 +95,7 @@
               />
             </div>
             <div>
-              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-status">Status</label>
+              <label class="mb-1.5 block text-xs font-medium text-muted-foreground" for="rr-status">{{ $t('views.AdminRunRetentionView.status_label') }}</label>
               <Select
                 id="rr-status"
                 v-model="selectedStatus"
@@ -125,8 +125,8 @@
       </Card>
 
       <Card>
-        <template #title>Summary</template>
-        <template #subtitle>Checkpoint data dominates the estimated reclaimable size.</template>
+        <template #title>{{ $t('views.AdminRunRetentionView.summary_title') }}</template>
+        <template #subtitle>{{ $t('views.AdminRunRetentionView.summary_subtitle') }}</template>
         <template #content>
           <div v-if="loading" class="flex justify-center py-6">
             <LoadingSpinner />
@@ -137,15 +137,15 @@
           <div v-else class="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div class="rounded-lg border bg-muted p-4 text-center">
               <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-runs">{{ totalCount }}</p>
-              <p class="text-xs text-muted-foreground">Matching runs</p>
+              <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.matching_runs') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
               <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(totalEstimatedBytes) }}</p>
-              <p class="text-xs text-muted-foreground">Estimated reclaimable</p>
+              <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
               <p class="text-2xl font-semibold" data-testid="admin-run-retention-terminal-runs">{{ terminalCandidates.length }}</p>
-              <p class="text-xs text-muted-foreground">Terminal (purge-able)</p>
+              <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.terminal_purgeable') }}</p>
             </div>
           </div>
         </template>
@@ -158,7 +158,7 @@
       </div>
 
       <Card>
-        <template #title>Candidates</template>
+        <template #title>{{ $t('views.AdminRunRetentionView.candidates_title') }}</template>
         <template #subtitle>Up to 500 matching runs with an estimated per-run size.</template>
         <template #content>
           <div v-if="loading" class="flex justify-center py-6">
@@ -174,11 +174,11 @@
             <table class="w-full">
               <thead>
                 <tr>
-                  <th class="table-header">Status</th>
-                  <th class="table-header">Created</th>
-                  <th class="table-header">Pipeline</th>
-                  <th class="table-header">Estimated size</th>
-                  <th class="table-header">Run id</th>
+                  <th class="table-header">{{ $t('views.AdminRunRetentionView.col_status') }}</th>
+                  <th class="table-header">{{ $t('views.AdminRunRetentionView.col_created') }}</th>
+                  <th class="table-header">{{ $t('views.AdminRunRetentionView.col_pipeline') }}</th>
+                  <th class="table-header">{{ $t('views.AdminRunRetentionView.col_estimated_size') }}</th>
+                  <th class="table-header">{{ $t('views.AdminRunRetentionView.col_run_id') }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y">
@@ -206,7 +206,7 @@
       >
         <template #header>
           <div>
-            <div class="text-lg font-semibold">Confirm clear-down</div>
+            <div class="text-lg font-semibold">{{ $t('views.AdminRunRetentionView.confirm_clear_down') }}</div>
             <div class="mt-0.5 text-sm text-muted-foreground">
               This permanently deletes data and cannot be undone.
             </div>
