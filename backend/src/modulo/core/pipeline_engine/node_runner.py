@@ -2412,13 +2412,11 @@ def make_connector_fn(
             record_scope_violation,
         )
 
-        connector, error_artifact = _resolve_binding_connector(binding, node_id)
-        if error_artifact is not None:
-            return error_artifact
-
         # FAR-418: deny-by-default within the node's connector scope. A node that
         # targets a connector excluded by its capability_scope fails FAST with a
         # typed, logged, metric-emitting ScopeViolationError (never silently).
+        # The gate fires BEFORE the hub is consulted (fail-fast: an out-of-scope
+        # connector is never resolved, so secrets are never decrypted for it).
         instance_id_str = binding.get("instance_id")
         instance_uuid = _parse_uuid_opt(instance_id_str)
         if instance_uuid is not None and not is_connector_allowed(
@@ -2431,6 +2429,10 @@ def make_connector_fn(
             record_scope_violation(node_id=node_id, target=target, kind="connector")
             _log.error("scope.violation node=%s connector=%s", node_id, target)
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
+        connector, error_artifact = _resolve_binding_connector(binding, node_id)
+        if error_artifact is not None:
+            return error_artifact
 
         resource, filters, data = _connector_inputs(binding, state)
 
