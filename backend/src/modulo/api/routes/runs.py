@@ -52,6 +52,7 @@ from modulo.core.pipeline_engine.recovery import (
 )
 from modulo.core.rate_limiter import TokenBucketRegistry
 from modulo.core.trigger_engine import TriggerEngine
+from modulo.db.capacity import StorageExhaustedError
 from modulo.db.crud.node_observation import observe_node
 from modulo.db.crud.observability import get_otel_config
 from modulo.db.crud.pipeline import get_pipeline
@@ -986,6 +987,8 @@ async def trigger_run(
             detail=f"Cannot create run: organisation {exc.org_id} not found",
         ) from None
 
+    except StorageExhaustedError:
+        raise
     except HTTPException:
         raise
     except Exception:
