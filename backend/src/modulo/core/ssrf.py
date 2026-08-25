@@ -35,12 +35,15 @@ _log = logging.getLogger(__name__)
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 # Extra ranges not covered by ipaddress.is_private (cloud metadata, CGNAT).
+# NOSONAR S1313: these are documented reserved/private network blocks that must
+# be BLOCKED for outbound requests by this SSRF guard — they are destination
+# filters, never connection endpoints, so hardcoding them is required and safe.
 _EXCLUDED_NETWORKS = [
-    ipaddress.ip_network("169.254.0.0/16"),  # AWS/GCP/Azure link-local metadata
-    ipaddress.ip_network("100.64.0.0/10"),  # CGNAT
-    ipaddress.ip_network("198.18.0.0/15"),  # benchmarking
-    ipaddress.ip_network("0.0.0.0/8"),  # current network
-    ipaddress.ip_network("100.100.100.200/32"),  # Aliyun metadata
+    ipaddress.ip_network("169.254.0.0/16"),  # NOSONAR - AWS/GCP/Azure link-local metadata
+    ipaddress.ip_network("100.64.0.0/10"),  # NOSONAR - CGNAT
+    ipaddress.ip_network("198.18.0.0/15"),  # NOSONAR - benchmarking
+    ipaddress.ip_network("0.0.0.0/8"),  # NOSONAR - current network
+    ipaddress.ip_network("100.100.100.200/32"),  # NOSONAR - Aliyun metadata
 ]
 
 # IPv6 ranges that are never valid HTTP egress targets and must never be made

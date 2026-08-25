@@ -38,6 +38,7 @@ from modulo.core.feedback_manager import (
 )
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.feedback_record import FeedbackRecord
+from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import Run
 from modulo.db.rls import set_rls_org, set_rls_user_context
@@ -360,6 +361,26 @@ async def list_feedback_inbox(
     }
 
 
+async def _build_node_name_map(session: AsyncSession, items: list[Any]) -> dict[str, str]:
+    """Build a graph node id -> display-name map for a set of feedback records."""
+    node_name_map: dict[str, str] = {}
+    run_ids = [r.run_id for r in items if r.run_id]
+    if not run_ids:
+        return node_name_map
+    run_rows = await session.execute(select(Run.id, Run.snapshot_id).where(Run.id.in_(run_ids)))
+    snapshot_ids = [r.snapshot_id for r in run_rows.all() if r.snapshot_id]
+    if not snapshot_ids:
+        return node_name_map
+    snap_rows = await session.execute(
+        select(PipelineSnapshot.id, PipelineSnapshot.graph_json).where(PipelineSnapshot.id.in_(snapshot_ids))
+    )
+    for _, graph_json in snap_rows.all():
+        if graph_json:
+            for node in graph_json.get("nodes", []):
+                node_name_map[str(node.get("id"))] = node.get("name") or node.get("label", "")
+    return node_name_map
+
+
 @router.get("/feedback/proposals", status_code=status.HTTP_200_OK)
 @handle_db_errors(_CODE_FEEDBACK_LIST_EVAL_PROPOSALS)
 async def list_eval_proposals(
@@ -373,25 +394,8 @@ async def list_eval_proposals(
             await set_rls_org(session, principal.organisation_id)
             mgr = FeedbackManager(session, principal.organisation_id)
             result = await mgr.get_eval_proposals(page=page, page_size=page_size)
-
             items = result["items"]
-            node_name_map: dict[str, str] = {}
-            run_ids = [r.run_id for r in items if r.run_id]
-            if run_ids:
-                run_rows = await session.execute(select(Run.id, Run.snapshot_id).where(Run.id.in_(run_ids)))
-                rows = run_rows.all()
-                snapshot_ids = [r.snapshot_id for r in rows if r.snapshot_id]
-                if snapshot_ids:
-                    snap_rows = await session.execute(
-                        select(PipelineSnapshot.id, PipelineSnapshot.graph_json).where(
-                            PipelineSnapshot.id.in_(snapshot_ids)
-                        )
-                    )
-                    snap_rows_result = snap_rows.all()
-                    for _, graph_json in snap_rows_result:
-                        if graph_json:
-                            for node in graph_json.get("nodes", []):
-                                node_name_map[str(node.get("id"))] = node.get("name") or node.get("label", "")
+            node_name_map = await _build_node_name_map(session, items)
     except IntegrityError as exc:
         logger.exception(_CODE_FEEDBACK_LIST_EVAL_PROPOSALS)
         raise HTTPException(
@@ -462,6 +466,47 @@ async def _resolve_producing_node_uuid(
     return None
 
 
+async def _resolve_publish_context(
+    mgr: FeedbackManager,
+    session: AsyncSession,
+    record_id: uuid.UUID,
+    node_id: uuid.UUID | None,
+) -> tuple[Run, uuid.UUID]:
+    """Validate that ``record_id`` can be published and resolve its target node."""
+    record = await mgr.get_feedback_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback record not found")
+    if record.eval_gap is not True:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Only eval-gap feedback records can be published as eval proposals",
+        )
+    if record.feedback_status not in ("pending", "routing"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Proposal in status '{record.feedback_status}' cannot be published",
+        )
+    if record.run_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Feedback record has no associated run — cannot resolve the pipeline",
+        )
+    run = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+    if node_id is None:
+        node_id = await _resolve_producing_node_uuid(session, record, run)
+    if node_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Could not resolve producing_node_id to a pipeline node. "
+                "Supply an explicit node_id so the published eval is scoped to a run-time node."
+            ),
+        )
+    return run, node_id
+
+
 @router.post("/feedback/proposals/{record_id}/publish", status_code=status.HTTP_201_CREATED)
 @handle_db_errors(_CODE_FEEDBACK_PUBLISH_EVAL_PROPOSAL)
 async def publish_eval_proposal(
@@ -484,39 +529,7 @@ async def publish_eval_proposal(
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             mgr = FeedbackManager(session, principal.organisation_id)
-            record = await mgr.get_feedback_record(record_id)
-            if record is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback record not found")
-            if record.eval_gap is not True:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Only eval-gap feedback records can be published as eval proposals",
-                )
-            if record.feedback_status not in ("pending", "routing"):
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Proposal in status '{record.feedback_status}' cannot be published",
-                )
-            if record.run_id is None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Feedback record has no associated run — cannot resolve the pipeline",
-                )
-            run = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
-            if run is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-
-            node_id = req.node_id
-            if node_id is None:
-                node_id = await _resolve_producing_node_uuid(session, record, run)
-            if node_id is None:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail=(
-                        "Could not resolve producing_node_id to a pipeline node. "
-                        "Supply an explicit node_id so the published eval is scoped to a run-time node."
-                    ),
-                )
+            run, node_id = await _resolve_publish_context(mgr, session, record_id, req.node_id)
 
             eval_def = EvalDefinition(
                 organisation_id=principal.organisation_id,
@@ -657,6 +670,20 @@ async def update_feedback_status(
             detail=f"Invalid status. Must be one of: {', '.join(sorted(valid_statuses))}",
         )
 
+    record, old_status = await _update_feedback_status_transaction(session, principal, record_id, req.status)
+
+    await _append_feedback_status_audit(session, principal, record, record_id, old_status)
+
+    return {
+        "id": str(record.id),
+        "feedback_status": record.feedback_status,
+    }
+
+
+async def _update_feedback_status_transaction(
+    session: AsyncSession, principal: TenantPrincipal, record_id: uuid.UUID, new_status: str
+) -> tuple[FeedbackRecord, str]:
+    """Update the feedback status within a transaction, raising 404 if missing."""
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
@@ -665,7 +692,9 @@ async def update_feedback_status(
             if record is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
             old_status = record.feedback_status
-            record = await mgr.update_status(record_id, req.status)
+            record = await mgr.update_status(record_id, new_status)
+            if record is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
     except IntegrityError as exc:
         logger.exception(_CODE_FEEDBACK_UPDATE_FEEDBACK_STATUS)
         raise HTTPException(
@@ -692,10 +721,17 @@ async def update_feedback_status(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_UNEXPECTED_ERROR_OCCURRED_PLEASE,
         ) from None
+    return record, old_status
 
-    if record is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
 
+async def _append_feedback_status_audit(
+    session: AsyncSession,
+    principal: TenantPrincipal,
+    record: FeedbackRecord,
+    record_id: uuid.UUID,
+    old_status: str,
+) -> None:
+    """Append a feedback status-changed audit event."""
     await append_audit_event_isolated(
         session,
         principal,
@@ -712,10 +748,20 @@ async def update_feedback_status(
         log_key=_CODE_FEEDBACK_AUDIT_APPEND_FAILED,
     )
 
-    return {
-        "id": str(record.id),
-        "feedback_status": record.feedback_status,
-    }
+
+async def _load_eval_suite(session: AsyncSession, record: Any, org_id: uuid.UUID) -> list[EvalDefinitionDTO]:
+    """Load the eval definitions for the pipeline associated with a run."""
+    if not record.run_id:
+        return []
+    run = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
+    if run is None:
+        return []
+    eval_rows = (
+        (await session.execute(select(EvalDefinition).where(EvalDefinition.pipeline_id == run.pipeline_id)))
+        .scalars()
+        .all()
+    )
+    return [_eval_def_to_dto(row, org_id) for row in eval_rows]
 
 
 @router.post("/feedback/{record_id}/detect-gap", status_code=status.HTTP_200_OK)
@@ -734,20 +780,7 @@ async def detect_eval_gap(
             if record is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
 
-            eval_suite: list[EvalDefinitionDTO] = []
-            if record.run_id:
-                run = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
-                if run is not None:
-                    eval_rows = (
-                        (
-                            await session.execute(
-                                select(EvalDefinition).where(EvalDefinition.pipeline_id == run.pipeline_id)
-                            )
-                        )
-                        .scalars()
-                        .all()
-                    )
-                    eval_suite = [_eval_def_to_dto(row, principal.organisation_id) for row in eval_rows]
+            eval_suite = await _load_eval_suite(session, record, principal.organisation_id)
 
             is_gap = await mgr.detect_eval_gap(record, eval_suite=eval_suite)
     except IntegrityError as exc:
@@ -783,6 +816,17 @@ async def detect_eval_gap(
     }
 
 
+async def _resolve_pipeline_name(session: AsyncSession, record: Any) -> str | None:
+    """Resolve the display name of the pipeline a feedback record's run belongs to."""
+    if record is None or not record.run_id:
+        return None
+    run_row = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
+    if run_row is None:
+        return None
+    pipeline = await session.get(Pipeline, run_row.pipeline_id)
+    return pipeline.name if pipeline is not None else None
+
+
 @router.get("/feedback/inbox/{record_id}", status_code=status.HTTP_200_OK)
 @handle_db_errors(_CODE_FEEDBACK_GET_INBOX_ITEM)
 async def get_inbox_item(
@@ -790,22 +834,13 @@ async def get_inbox_item(
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal = require_permission(_CODE_FEEDBACK_LIST),
 ) -> dict[str, Any]:
-    pipeline_name: str | None = None
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             mgr = FeedbackManager(session, principal.organisation_id)
             record = await mgr.get_feedback_record(record_id)
-
-            if record is not None and record.run_id:
-                run_row = (await session.execute(select(Run).where(Run.id == record.run_id))).scalar_one_or_none()
-                if run_row:
-                    from modulo.db.models.pipeline import Pipeline
-
-                    pipeline = await session.get(Pipeline, run_row.pipeline_id)
-                    if pipeline:
-                        pipeline_name = pipeline.name
+            pipeline_name = await _resolve_pipeline_name(session, record)
     except IntegrityError as exc:
         logger.exception(_CODE_FEEDBACK_GET_INBOX_ITEM)
         raise HTTPException(
@@ -839,6 +874,67 @@ async def get_inbox_item(
     return _serialise_record(record, pipeline_name=pipeline_name)
 
 
+async def _apply_review_action(
+    mgr: FeedbackManager,
+    session: AsyncSession,
+    principal: TenantPrincipal,
+    record_id: uuid.UUID,
+    req: ReviewFeedbackRequest,
+) -> tuple[FeedbackRecord, str, str | None, str | None]:
+    """Apply a review action, returning (record, old_status, transition, correction_run_id)."""
+    transitioned_to: str | None = None
+    correction_run_id: str | None = None
+    record = await mgr.get_feedback_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
+    old_status = record.feedback_status
+
+    if req.action == "mark_reviewed":
+        record = await mgr.update_status(record_id, "resolved")
+        transitioned_to = "resolved"
+    elif req.action == "dismiss":
+        record = await mgr.update_status(record_id, "dismissed")
+        transitioned_to = "dismissed"
+    elif req.action == "create_correction_run":
+        if not record.run_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Feedback has no associated run — cannot create correction run",
+            )
+
+        try:
+            new_run_id = await mgr.spawn_correction_run(record_id)
+        except FeedbackRecordNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except FeedbackRecordRunNotFoundError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            ) from exc
+        except (InvalidTransitionError, ConcurrentModificationError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+
+        correction_run_id = str(new_run_id)
+        transitioned_to = "correcting"
+
+    if req.annotation is not None:
+        await session.execute(
+            sa_update(FeedbackRecord)
+            .where(
+                FeedbackRecord.id == record_id,
+                FeedbackRecord.organisation_id == principal.organisation_id,
+            )
+            .values(annotation=req.annotation)
+        )
+    return record, old_status, transitioned_to, correction_run_id
+
+
 @router.post("/feedback/inbox/{record_id}/review", status_code=status.HTTP_200_OK)
 @handle_db_errors(_CODE_FEEDBACK_REVIEW_FEEDBACK)
 async def review_feedback(
@@ -854,64 +950,18 @@ async def review_feedback(
             detail=f"Invalid action. Must be one of: {', '.join(sorted(valid_actions))}",
         )
 
-    correction_run_id: str | None = None
+    old_status: str | None = None
     transitioned_to: str | None = None
+    correction_run_id: str | None = None
+    record: FeedbackRecord | None = None
 
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             mgr = FeedbackManager(session, principal.organisation_id)
-            record = await mgr.get_feedback_record(record_id)
-
-            if record is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_FEEDBACK_RECORD_NOT_FOUND)
-
-            old_status = record.feedback_status
-
-            if req.action == "mark_reviewed":
-                record = await mgr.update_status(record_id, "resolved")
-                transitioned_to = "resolved"
-            elif req.action == "dismiss":
-                record = await mgr.update_status(record_id, "dismissed")
-                transitioned_to = "dismissed"
-
-            elif req.action == "create_correction_run":
-                if not record.run_id:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="Feedback has no associated run — cannot create correction run",
-                    )
-
-                try:
-                    new_run_id = await mgr.spawn_correction_run(record_id)
-                except FeedbackRecordNotFoundError as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=str(exc),
-                    ) from exc
-                except FeedbackRecordRunNotFoundError as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=str(exc),
-                    ) from exc
-                except (InvalidTransitionError, ConcurrentModificationError) as exc:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=str(exc),
-                    ) from exc
-
-                correction_run_id = str(new_run_id)
-                transitioned_to = "correcting"
-
-            if req.annotation is not None:
-                await session.execute(
-                    sa_update(FeedbackRecord)
-                    .where(
-                        FeedbackRecord.id == record_id,
-                        FeedbackRecord.organisation_id == principal.organisation_id,
-                    )
-                    .values(annotation=req.annotation)
-                )
+            record, old_status, transitioned_to, correction_run_id = await _apply_review_action(
+                mgr, session, principal, record_id, req
+            )
 
     except IntegrityError:
         logger.exception(_CODE_FEEDBACK_REVIEW_FEEDBACK)
@@ -954,6 +1004,8 @@ async def review_feedback(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_UNEXPECTED_ERROR_OCCURRED_PLEASE,
         ) from None
+
+    assert record is not None
 
     if transitioned_to is not None:
         await append_audit_event_isolated(

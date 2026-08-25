@@ -5,6 +5,7 @@ from modulo.db.models.audit_event import AuditChainHead, AuditEvent
 from modulo.db.models.base import Base, OrgScoped, TimestampMixin
 from modulo.db.models.composite_template import CompositeTemplate
 from modulo.db.models.connector_instance import ConnectorInstance
+from modulo.db.models.connector_profile import ConnectorProfile
 from modulo.db.models.cost_component import CostComponent, CostComponentKind
 from modulo.db.models.daily_run_count import OrgDailyRunCount
 from modulo.db.models.environment_profile import EnvironmentProfile
@@ -22,6 +23,18 @@ from modulo.db.models.eval_dataset import (
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
 from modulo.db.models.eval_suite import EvalSuite
+from modulo.db.models.eval_suite_run import (
+    IllegalStateTransitionError,
+    OptimisticLockError,
+    SuiteRun,
+    SuiteRunState,
+    can_transition,
+    canonical_hash,
+    compute_definition_checksum,
+    compute_scenario_signature,
+    is_terminal,
+    transition_state,
+)
 from modulo.db.models.feedback_record import FeedbackRecord
 from modulo.db.models.hitl_claim import HitlClaim
 from modulo.db.models.journey import Journey
@@ -88,6 +101,7 @@ __all__ = [
     "ChatSession",
     "CompositeTemplate",
     "ConnectorInstance",
+    "ConnectorProfile",
     "CostComponent",
     "CostComponentKind",
     "DeletedDefault",
@@ -105,6 +119,7 @@ __all__ = [
     "FeatureFlagCatalog",
     "FeedbackRecord",
     "HitlClaim",
+    "IllegalStateTransitionError",
     "Journey",
     "JourneyFact",
     "LibraryPrimitive",
@@ -125,6 +140,7 @@ __all__ = [
     "OAuthClient",
     "OAuthTokenFamily",
     "OnboardingProgress",
+    "OptimisticLockError",
     "OrgApiKey",
     "OrgDailyRunCount",
     "OrgMembership",
@@ -153,6 +169,8 @@ __all__ = [
     "SnapshotSchemaPin",
     "SpendAnomaly",
     "SsoProvider",
+    "SuiteRun",
+    "SuiteRunState",
     "SystemConfig",
     "Team",
     "TeamMembership",
@@ -166,7 +184,13 @@ __all__ = [
     "WebhookDedupHash",
     "WebhookPayload",
     "WorkspaceLease",
+    "can_transition",
+    "canonical_hash",
+    "compute_definition_checksum",
     "compute_input_hash",
+    "compute_scenario_signature",
+    "is_terminal",
     "purge_soft_deleted_eval_cases",
+    "transition_state",
     "validate_dataset_has_cases",
 ]
