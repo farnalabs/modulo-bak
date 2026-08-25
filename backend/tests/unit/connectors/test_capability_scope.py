@@ -502,8 +502,10 @@ def test_validate_capability_scopes_accepts_narrow_subset():
 
     agent_id = uuid.uuid4()
     node = _scope_node(agent_id, ["github"])
-    # Must not raise.
-    _validate_capability_scopes([node], {agent_id: _FakeAgent(["github", "linear"])})
+    # A strict subset of the Agent's grants is accepted: the check returns
+    # normally (None) and does not raise.
+    result = _validate_capability_scopes([node], {agent_id: _FakeAgent(["github", "linear"])})
+    assert result is None
 
 
 def test_validate_capability_scopes_unrestricted_node_is_skipped():
@@ -513,7 +515,9 @@ def test_validate_capability_scopes_unrestricted_node_is_skipped():
 
     agent_id = uuid.uuid4()
     node = _scope_node(agent_id, None)
-    _validate_capability_scopes([node], {agent_id: _FakeAgent(["github"])})
+    # No scope → skipped by the widen check; the call returns normally (None).
+    result = _validate_capability_scopes([node], {agent_id: _FakeAgent(["github"])})
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
