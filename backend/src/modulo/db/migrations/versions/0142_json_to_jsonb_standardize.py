@@ -1,7 +1,7 @@
 """Promote remaining ``json`` columns to ``jsonb`` (dist db-jsonb-standardize).
 
-Revision ID: 0138_json_to_jsonb_standardize
-Revises: 0137_eval_suite_run
+Revision ID: 0142_json_to_jsonb_standardize
+Revises: 0141_pipeline_edge_ports
 Create Date: 2026-08-24
 
 The codebase adopted ``jsonb`` as its JSON standard (see 0129_runs_json_to_jsonb
@@ -27,8 +27,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0138_json_to_jsonb_standardize"
-down_revision: str | None = "0137_eval_suite_run"
+revision: str = "0142_json_to_jsonb_standardize"
+down_revision: str | None = "0141_pipeline_edge_ports"
 branch_labels: str | None = None
 depends_on: str | None = None
 
