@@ -3149,5 +3149,37 @@ export default {
     },
     "eval": { "blocked": "Eval blocked", "failed": "Eval failed" },
     "config": { "error": "Configuration error", "invalid": "Invalid configuration" }
+  },
+  "connectors": {
+    "rest": {
+      "name": "Generic REST",
+      "base_url": "Base URL",
+      "method": "Method",
+      "path": "Path",
+      "headers": "Headers",
+      "params": "Query params",
+      "body": "Body",
+      "records_path": "Records path (JMESPath)",
+      "next_cursor_path": "Next cursor path (JMESPath)",
+      "passthrough": "Wrap raw body as a single record",
+      "max_response_size": "Max response bytes",
+      "idempotency_header": "Idempotency header",
+      "allowed_hosts": "Allowed hosts",
+      "timeout_seconds": "Timeout (seconds)",
+      "verify_tls": "Verify TLS",
+      "auth_mode": "Auth mode",
+      "auth_mode_bearer": "Bearer token",
+      "auth_mode_api_key": "API key",
+      "auth_mode_basic": "Basic auth",
+      "auth_in_header": "Send as header",
+      "auth_in_query": "Send as query parameter",
+      "header_name": "Header name",
+      "query_param_name": "Query parameter name",
+      "token": "Bearer token",
+      "api_key": "API key",
+      "username": "Username",
+      "password": "Password",
+      "operations": "Named resources (operations)"
+    }
   }
 }
