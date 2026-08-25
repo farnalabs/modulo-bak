@@ -2441,6 +2441,12 @@ def make_connector_fn(
         # FAR-418: secret hygiene — connector/secret OBJECTS are never valid port
         # payload types; only opaque connector IDs may enter state. Guard the
         # output before it is written into the run's state/ports.
+        from modulo.core.capability_scope import (
+            ScopeViolationError,
+            assert_no_secret_objects,
+            record_scope_violation,
+        )
+
         try:
             assert_no_secret_objects(result, node_id=node_id)
         except ScopeViolationError as scope_err:
@@ -3845,9 +3851,15 @@ async def _sandbox_agent_impl(
     else:
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
+        # FAR-436: context_scope — the sandbox agent's run_context VIEW (the keys
+        # fed to the prompt + agent_command templates) is allowlist-gated to the
+        # node's need-to-know set. Internal control keys are always preserved by
+        # filter_run_context_scope (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
         template_vars: dict[str, Any] = {
             "state": state,
-            "run_context": run_context,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         resolved = node_def.get("_resolved_parameters")
