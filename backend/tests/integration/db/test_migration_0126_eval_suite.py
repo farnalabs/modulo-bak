@@ -19,10 +19,12 @@ restores the head state in ``finally`` so the shared session schema is
 undisturbed for later tests.
 """
 
+import os
 import types
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -157,7 +159,17 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
         await conn.commit()
     await eng.dispose()
 
-    command.upgrade(_alembic_config(iso_url), PREV_REV)
+    # alembic env.py resolves the target DB from DATABASE_ADMIN_URL /
+    # DATABASE_URL (preferring DATABASE_ADMIN_URL), NOT from the Config URL. The
+    # CI "Start Postgres" step sets these to the shared service Postgres, so
+    # without overriding them here the upgrade would run against that DB (where
+    # library_sync_state already exists) and blow up with DuplicateTable. Pin
+    # both to the isolated database for the fixture's bootstrap upgrade.
+    with patch.dict(
+        os.environ,
+        {"DATABASE_URL": iso_url, "DATABASE_ADMIN_URL": iso_url},
+    ):
+        command.upgrade(_alembic_config(iso_url), PREV_REV)
 
     try:
         yield iso_url
@@ -274,7 +286,11 @@ async def _count_suites(engine, org: uuid.UUID | None = None) -> int:
 
 async def test_0126_eval_suite_backfill_rls_and_downgrade(isolated_db_url, monkeypatch) -> None:
     db_url = isolated_db_url
+    # env.py prefers DATABASE_ADMIN_URL over DATABASE_URL; pin both to the
+    # isolated database so every command.upgrade/downgrade in this test targets
+    # it (and not the shared CI service Postgres).
     monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("DATABASE_ADMIN_URL", db_url)
     config = _alembic_config(db_url)
     engine = create_async_engine(db_url, poolclass=NullPool)
 
