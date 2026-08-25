@@ -206,21 +206,24 @@ async def test_enforce_allows_below_threshold() -> None:
     settings = _fake_settings(mode="fixed")
     get_settings, db_status = _patch_capacity({"capacity_percent": 97.0}, settings)
     with get_settings, db_status:
-        await enforce_capacity_gate(engine=_fake_engine())  # must not raise
+        result = await enforce_capacity_gate(engine=_fake_engine())  # must not raise
+    assert result is None
 
 
 async def test_enforce_allows_elastic() -> None:
     settings = _fake_settings(mode="elastic")
     get_settings, db_status = _patch_capacity({"capacity_percent": 100.0}, settings)
     with get_settings, db_status:
-        await enforce_capacity_gate(engine=_fake_engine())
+        result = await enforce_capacity_gate(engine=_fake_engine())
+    assert result is None
 
 
 async def test_enforce_allows_bypass() -> None:
     settings = _fake_settings(mode="fixed", bypass=True)
     get_settings, db_status = _patch_capacity({"capacity_percent": 100.0}, settings)
     with get_settings, db_status:
-        await enforce_capacity_gate(engine=_fake_engine())
+        result = await enforce_capacity_gate(engine=_fake_engine())
+    assert result is None
 
 
 async def test_enforce_allows_on_measurement_failure() -> None:
@@ -231,7 +234,8 @@ async def test_enforce_allows_on_measurement_failure() -> None:
         new=AsyncMock(side_effect=RuntimeError("measurement broke")),
     )
     with get_settings, db_status:
-        await enforce_capacity_gate(engine=_fake_engine())  # fail-open: must not raise
+        result = await enforce_capacity_gate(engine=_fake_engine())  # fail-open: must not raise
+    assert result is None
 
 
 # --- create_run propagates StorageExhaustedError; API maps it to 503 -------
