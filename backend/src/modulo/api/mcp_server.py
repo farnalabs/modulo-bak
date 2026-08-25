@@ -125,13 +125,18 @@ from modulo.core.library_service import (
     get_primitive_by_slug,
     list_primitives,
 )
-from modulo.core.mcp.scope_validator import MCPAuthorizationError, check_tool_scope
+from modulo.core.mcp.scope_validator import (
+    MCPAuthorizationError,
+    check_tool_scope,
+    set_request_allowed_tools,
+)
 from modulo.core.pipeline_engine.error_codes import map_legacy_code, present_error
 from modulo.core.rate_limiter import TokenBucketRegistry
 from modulo.core.trigger_streak import (
     anchor_trigger_streak_epoch,
     clear_trigger_streak_after_reenable,
 )
+from modulo.db.capacity import StorageExhaustedError
 from modulo.db.crud.hitl_gate_guard import GuardrailBindingStripDenied, HitlGateWeakeningDenied
 from modulo.db.crud.model_backend import create_model_backend as db_create_model_backend
 from modulo.db.crud.pipeline import get_pipeline
@@ -1207,6 +1212,16 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
         unauth = await _dispatch_unauth_paths(request, call_next)
         if unauth is not None:
             return unauth
+
+        # FAR-418: lift the node-level allowed_tools allow-list (if the calling
+        # agent forwarded it) into the request-scoped ContextVar consumed by
+        # check_tool_scope. Absent/empty header = UNRESTRICTED, preserving the
+        # pre-scope behaviour for all non-node tool calls.
+        raw_allowed = request.headers.get("X-Modulo-Allowed-Tools")
+        if raw_allowed:
+            set_request_allowed_tools([t.strip() for t in raw_allowed.split(",") if t.strip()])
+        else:
+            set_request_allowed_tools(None)
 
         token, auth_err = _extract_bearer_token(request)
         if auth_err is not None:
@@ -2453,6 +2468,9 @@ async def trigger_pipeline(
         if exc.deleted:
             return {"error": "org_deleted", "detail": f"Organisation {exc.org_id} is deleted"}
         return {"error": "org_not_found", "detail": f"Organisation {exc.org_id} not found"}
+    except StorageExhaustedError as exc:
+        _log.warning("trigger_pipeline refused — storage exhausted (FAR-426)")
+        return {"error": "storage_exhausted", "detail": str(exc)}
     except ProgrammingError:
         _log.exception("trigger_pipeline failed")
         return {"error": "migration_required", "detail": _MSG_DB_MIGRATION_REQUIRED}
