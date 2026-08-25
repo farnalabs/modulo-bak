@@ -1,7 +1,7 @@
 """Add hard spend-ceiling columns to organisations (FAR-391, spec §5.1).
 
-Revision ID: 0142_spend_ceiling
-Revises: 0141_pipeline_edge_ports
+Revision ID: 0144_spend_ceiling
+Revises: 0143_rest_connector_profile
 Create Date: 2026-08-23
 
 Adds three integer-cents columns backing the per-run / per-org hard spend
@@ -24,8 +24,8 @@ Postgres-only concern: ``server_default=0`` is portable (integer literal).
 from alembic import op
 from sqlalchemy import Column, Integer
 
-revision = "0142_spend_ceiling"
-down_revision = "0141_pipeline_edge_ports"
+revision = "0144_spend_ceiling"
+down_revision = "0143_rest_connector_profile"
 branch_labels = None
 depends_on = None
 

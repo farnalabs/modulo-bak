@@ -525,7 +525,7 @@ def test_migration_is_reversible_single_head() -> None:
 
 
 def test_single_migration_head() -> None:
-    """Exactly one migration chains off each predecessor, and the head is 0137."""
+    """Exactly one migration chains off each predecessor, and the head is 0138."""
     import glob
     import re
 
@@ -561,10 +561,12 @@ def test_single_migration_head() -> None:
     # -> 0137_eval_suite_run
     # -> 0138_eval_versioning (FAR-382).
     # -> 0140_eval_regression_alert (FAR-379 alerting config on eval_suites).
-    # -> 0141_pipeline_edge_ports (FAR-416).
-    # -> 0142_spend_ceiling (FAR-391, renumbered from 0138 to chain off the
-    #    pipeline_edge_ports head).
-    # -> 0143_extend_runs_status_cost_ceiling (FAR-391, renumbered from 0139).
+    # -> 0142_merge_heads_add_fk_indexes (main FK-index migration).
+    # -> 0143_rest_connector_profile (FAR-412 REST connector profile, renumbered
+    #    from 0142 to avoid colliding with main's 0142_merge_heads_add_fk_indexes).
+    # -> 0144_spend_ceiling (FAR-391, renumbered from 0142 to chain off the
+    #    rest_connector_profile head and avoid colliding with main's 0142/0143).
+    # -> 0145_extend_runs_status_cost_ceiling (FAR-391, renumbered from 0143).
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -585,14 +587,21 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0140 except 0141 (the FAR-416 pipeline edge ports migration).
     chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
     assert [_basename(p) for p in chaining_off_0140] == ["0141_pipeline_edge_ports.py"]
-    # FAR-391 chains its spend-ceiling migrations off the pipeline_edge_ports head.
+    # Nothing chains off 0141 except 0142 (main's FK-index migration).
     chaining_off_0141 = [p for p in revisions if parents[p] == "0141_pipeline_edge_ports"]
-    assert [_basename(p) for p in chaining_off_0141] == ["0142_spend_ceiling.py"]
-    chaining_off_0142 = [p for p in revisions if parents[p] == "0142_spend_ceiling"]
-    assert [_basename(p) for p in chaining_off_0142] == ["0143_extend_runs_status_cost_ceiling.py"]
-    # Nothing chains off 0143 -> it is the single head.
-    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_extend_runs_status_cost_ceiling"]
-    assert chaining_off_0143 == []
+    assert [_basename(p) for p in chaining_off_0141] == ["0142_merge_heads_add_fk_indexes.py"]
+    # Nothing chains off 0142 except 0143 (the FAR-412 REST connector profile, renumbered).
+    chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
+    assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
+    # Nothing chains off 0143 except 0144 (FAR-391 spend ceiling, renumbered to avoid collision).
+    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_spend_ceiling.py"]
+    # Nothing chains off 0144 except 0145 (FAR-391 extend runs status cost ceiling).
+    chaining_off_0144 = [p for p in revisions if parents[p] == "0144_spend_ceiling"]
+    assert [_basename(p) for p in chaining_off_0144] == ["0145_extend_runs_status_cost_ceiling.py"]
+    # Nothing chains off 0145 -> it is the single head.
+    chaining_off_0145 = [p for p in revisions if parents[p] == "0145_extend_runs_status_cost_ceiling"]
+    assert chaining_off_0145 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
