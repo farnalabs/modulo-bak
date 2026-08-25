@@ -74,7 +74,6 @@ def org_skill_with_source_mode(name: str, mode: str, ctx) -> None:
     skill.triggers = None
     skill.organisation_id = ctx["org_id"]
     skill.user_id = None
-    skill.account_id = None
     ctx["org_skills"].append(skill)
 
 
