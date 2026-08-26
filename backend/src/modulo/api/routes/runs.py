@@ -1843,7 +1843,7 @@ async def observe_run_node(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
     except IntegrityError:
         _log.exception(_CODE_RUNS_OBSERVE_RUN_NODE)
         raise HTTPException(
