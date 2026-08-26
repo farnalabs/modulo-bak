@@ -429,6 +429,8 @@ async def update_agent_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             agent = await get_agent(session, agent_id)
+            if agent is None or agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     except ProgrammingError:
         _log.exception(_CODE_AGENTS_UPDATE_AGENT_ENDPOINT)
         raise HTTPException(
@@ -659,6 +661,9 @@ async def apply_optimized_prompt(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             agent = await add_prompt_version(
                 session,
                 agent_id,
@@ -795,6 +800,9 @@ async def rollback_prompt(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             agent = await rollback_prompt_version(session, agent_id, version)
     except IntegrityError:
         _log.exception("agents.rollback_prompt")
@@ -904,6 +912,9 @@ async def delete_agent_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             deleted = await delete_agent(session, agent_id)
     except IntegrityError:
         _log.exception("agents.delete_agent_endpoint")

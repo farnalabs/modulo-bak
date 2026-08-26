@@ -744,6 +744,9 @@ async def update_model_backend_endpoint(
                 # JSON column cannot serialize raw uuid.UUID objects; stringify
                 # before the write, mirroring the create path (line ~315).
                 updates["fallback_backend_ids"] = [str(fid) for fid in fallback_ids]
+            existing = await get_model_backend(session, backend_id)
+            if existing is None or existing.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             mb = await update_model_backend(session, backend_id, updates)
             if mb is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_MODEL_BACKEND_NOT_FOUND)
@@ -942,6 +945,8 @@ async def delete_model_backend_endpoint(
             # Capture the entity details BEFORE the delete so the audit event can
             # survive the row (a post-delete read would return nothing).
             existing = await get_model_backend(session, backend_id)
+            if existing is None or existing.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             if existing is not None:
                 audit_payload = {
                     "name": existing.name,
