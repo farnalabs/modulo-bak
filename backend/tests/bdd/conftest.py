@@ -1449,3 +1449,30 @@ def _mock_resp(status_code: int, body: dict[str, Any]) -> MagicMock:
     resp.json = lambda: body
     resp.text = str(body)
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Test-only shim: let BDD suites skip real DNS in SSRF checks.
+#
+# The SSRF guard (``modulo.core.ssrf``) performs real DNS resolution. In CI
+# sandboxes there is no network, and BDD tests mock the HTTP layer (respx or a
+# patched ``AsyncClient``) against ``example.com`` / ``localhost`` hosts. We make
+# any hostname validate as a public address so the guard no longer fails closed
+# on absent DNS. Literal private/loopback IPs are still enforced by a separate
+# code path that does NOT consult DNS, so this shim cannot weaken that control.
+# ---------------------------------------------------------------------------
+
+
+import pytest  # noqa: E402
+
+import modulo.core.ssrf as _ssrf  # noqa: E402  (appended shim)
+
+
+@pytest.fixture(autouse=True)
+def _allow_test_hostnames(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_ssrf, "_resolve_all_sync", lambda host: ["8.8.8.8"])
+
+    async def _fake_resolve(_host: str) -> list[str]:  # pragma: no cover - test shim
+        return ["8.8.8.8"]
+
+    monkeypatch.setattr(_ssrf, "_resolve_all_async", _fake_resolve)
