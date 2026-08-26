@@ -956,6 +956,9 @@ async def get_parameter_set_references_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
+            ps = await get_set(session, set_id)
+            if ps is None or ps.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SET_NOT_FOUND)
             refs = await get_set_references(session, set_id)
     except ProgrammingError:
         logger.exception(_CODE_PARAMETER_SETS_REFERENCES)

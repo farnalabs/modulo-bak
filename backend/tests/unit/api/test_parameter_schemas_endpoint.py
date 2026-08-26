@@ -146,3 +146,71 @@ def test_get_parameter_schema_references_cross_org_returns_404(client: TestClien
     ):
         resp = client.get(f"/api/v1/parameter-schemas/{_SCHEMA_ID}/references")
     assert resp.status_code == 404
+
+
+def test_get_parameter_set_references_cross_org_returns_404(client: TestClient) -> None:
+    """IDOR guard: references of a cross-org parameter set must not be enumerable.
+
+    Fails on the pre-fix code (returns 200 and leaks the referencing
+    pipeline-node/snapshot UUIDs of another org's set); passes once the
+    organisation_id ownership check is enforced on the set before returning
+    its references.
+    """
+    cross_org = _make_set()
+    cross_org.organisation_id = _CROSS_ORG_ID
+    assert cross_org.organisation_id != _ORG_ID
+    with (
+        patch(f"{_PREFIX}get_set", return_value=cross_org),
+        patch(f"{_PREFIX}set_rls_org"),
+        patch(f"{_PREFIX}set_rls_user_context"),
+    ):
+        resp = client.get(f"/api/v1/parameter-sets/{_SET_ID}/references")
+    assert resp.status_code == 404
+
+
+def test_diff_parameter_schema_cross_org_returns_404(client: TestClient) -> None:
+    """IDOR guard: a cross-org parameter schema's diff must not be readable."""
+    cross_org = _make_schema()
+    cross_org.organisation_id = _CROSS_ORG_ID
+    assert cross_org.organisation_id != _ORG_ID
+    with (
+        patch(f"{_PREFIX}get_schema", return_value=cross_org),
+        patch(f"{_PREFIX}set_rls_org"),
+        patch(f"{_PREFIX}set_rls_user_context"),
+    ):
+        resp = client.get(
+            f"/api/v1/parameter-schemas/{_SCHEMA_ID}/diff",
+            params={"from_version": 1, "to_version": 2},
+        )
+    assert resp.status_code == 404
+
+
+def test_validate_parameter_values_cross_org_returns_404(client: TestClient) -> None:
+    """IDOR guard: validating against a cross-org parameter schema must 404."""
+    cross_org = _make_schema()
+    cross_org.organisation_id = _CROSS_ORG_ID
+    assert cross_org.organisation_id != _ORG_ID
+    with (
+        patch(f"{_PREFIX}get_schema", return_value=cross_org),
+        patch(f"{_PREFIX}set_rls_org"),
+        patch(f"{_PREFIX}set_rls_user_context"),
+    ):
+        resp = client.post(
+            f"/api/v1/parameter-schemas/{_SCHEMA_ID}/validate",
+            json={"values": {}},
+        )
+    assert resp.status_code == 404
+
+
+def test_list_parameter_sets_cross_org_returns_404(client: TestClient) -> None:
+    """IDOR guard: listing sets of a cross-org parameter schema must 404."""
+    cross_org = _make_schema()
+    cross_org.organisation_id = _CROSS_ORG_ID
+    assert cross_org.organisation_id != _ORG_ID
+    with (
+        patch(f"{_PREFIX}get_schema", return_value=cross_org),
+        patch(f"{_PREFIX}set_rls_org"),
+        patch(f"{_PREFIX}set_rls_user_context"),
+    ):
+        resp = client.get(f"/api/v1/parameter-schemas/{_SCHEMA_ID}/sets")
+    assert resp.status_code == 404
