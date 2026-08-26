@@ -3198,8 +3198,11 @@ class PipelineExecutor:
                 org_id,
                 allowed_connectors=compute_run_fetch_scope(graph_json),
             )
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             # FAR-439: a configured-path connector-hub failure RAISES (fail closed).
+            # Catch the run-abort paths (Exception + asyncio.CancelledError) but not
+            # KeyboardInterrupt/SystemExit — those terminate the process and must not
+            # be swallowed into a teardown-and-reraise.
             # That raise propagates out of execute() BEFORE the post-stream
             # try/finally runs, so the resources acquired above (the model-backend
             # hub and its ContextVar, the run's cancellation-check / audit-hook

@@ -377,6 +377,17 @@ class ConnectorHub:
                         creds,
                         runtime_provider=self._runtime_provider,
                         runtime_provider_hub=self._runtime_provider_hub,
+                        # NOTE (FAR-439 trade-off): the shared Redis client is
+                        # constructed for EVERY connector row here, not only for
+                        # rate-limited REST connectors. A malformed ``redis_url``
+                        # therefore fail-closes runs whose connectors would never
+                        # touch the shared budget (GitHub / Linear / non-rate-limited
+                        # REST). This is accepted deliberately: a misconfigured
+                        # Redis URL is a fleet-wide configuration error and must fail
+                        # loud rather than silently per-process for some connectors
+                        # and shared for others. ``get_settings()`` is re-read here
+                        # after the executor already read it; the cache makes this a
+                        # cheap lookup, not a second DB round-trip.
                         redis_client=self._shared_redis_client(),
                         tenant_id=str(self._org_id) if self._org_id else None,
                     )

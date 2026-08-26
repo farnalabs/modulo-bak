@@ -769,8 +769,16 @@ class RestConnector(ConnectorBase):
         missing/disabled ``rate_limit`` config is a no-op. When a ``redis_client``
         is supplied the shared Redis bucket is authoritative (one budget across
         workers) and FAILS CLOSED on a Redis outage — it never mints from an
-        uncounted per-process budget; otherwise the per-process connector-local
+        uncounted per-process bucket; otherwise the per-process connector-local
         bucket is used.
+
+        Constraint (intentional fail-loud): ``requests_per_second`` must be ``> 0``
+        and ``burst`` must be ``>= 1``. A ``0``/negative rate or ``< 1`` burst is a
+        hard ``ValueError`` at request time — it deliberately replaces the previous
+        silent "disable the limiter" behaviour (an undocumented ``rate_limit:
+        requests_per_second: 0`` is not a supported way to turn limiting off; omit
+        the ``rate_limit`` block to disable it). Configure these at save time and
+        treat a ``ValueError`` here as a misconfiguration, not a runtime surprise.
         """
         rate = self._rate_limit_config.get("requests_per_second")
         if rate is None:
