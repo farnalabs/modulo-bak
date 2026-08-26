@@ -6994,8 +6994,7 @@ def test_no_selection_markers_on_fixtures():
         f"Found {len(violations)} selection marker(s) on @pytest.fixture function(s).\n"
         "pytest only honours skip/skipif/xfail on collected test items — a fixture is never one,\n"
         "so the marker is silently ignored and a skipif that should gate the tests never fires.\n"
-        "Hoist the gate into the fixture body (pytest.skip(...) behind the real condition).\n"
-        + "\n".join(violations)
+        "Hoist the gate into the fixture body (pytest.skip(...) behind the real condition).\n" + "\n".join(violations)
     )
 
 
