@@ -927,6 +927,20 @@ def build_graph_from_json(
     # Build a node-id-to-def lookup for quick access.
     nodes_by_id: dict[str, dict[str, Any]] = {str(n["id"]): n for n in nodes}
 
+    # Router nodes route via `router_config` (not outgoing edges), so their rule
+    # targets are never seen by the edge-driven `target_ids` population below.
+    # Register every router rule/default target here so the entry-point selection
+    # cannot pick a router's rule target as the pipeline entry node (FAR-415: a
+    # router whose rule target sorts first in `nodes` would otherwise become the
+    # entry, leaving the real entry + router dead).
+    for _n in nodes:
+        if (_n.get("node_type") or "agent") == "router":
+            _rc = _n.get("router_config") or {}
+            for _rule in _rc.get("rules", []) or []:
+                _tgt = _rule.get("target") or _rule.get("target_port")
+                if _tgt is not None:
+                    target_ids.add(str(_tgt))
+
     for source, src_edges in source_edges.items():
         source_node_def = nodes_by_id.get(source, {})
         routing_mode: str | None = source_node_def.get("routing_mode")

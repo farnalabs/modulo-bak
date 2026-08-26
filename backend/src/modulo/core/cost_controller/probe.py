@@ -96,7 +96,7 @@ _SAMPLE_QUERY_EXPLAIN_TEMPLATE = (
     "FROM runs "
     "WHERE organisation_id = :org_id "
     "AND status IN ('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', "
-    "'budget_exceeded', 'cost_ceiling_exceeded') "
+    "'budget_exceeded', 'cost_ceiling_exceeded', 'router_no_match') "
     "AND cost_breakdown IS NOT NULL "
     "ORDER BY started_at DESC "
     "LIMIT 50"

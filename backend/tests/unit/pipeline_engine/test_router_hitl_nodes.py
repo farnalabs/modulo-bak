@@ -230,6 +230,42 @@ def test_router_node_compiles():
     assert "B" in nodes
 
 
+def test_router_rule_targets_excluded_from_entry_point():
+    # Regression guard for the wrong-entry-node bug: a Router's rule targets
+    # must be registered as graph targets so the entry-point selection cannot
+    # pick one as the pipeline entry. Here the nodes array puts a rule target
+    # (A) first, the real entry (S) last, and the router (R) in between.
+    graph_json = {
+        "nodes": [
+            {"id": "A", "node_type": "agent"},
+            {"id": "B", "node_type": "agent"},
+            {"id": "S", "node_type": "agent"},
+            {
+                "id": "R",
+                "node_type": "router",
+                "router_config": {
+                    "rules": [
+                        {"guard": "state.x == `1`", "target": "A"},
+                        {"default": True, "target": "B"},
+                    ]
+                },
+            },
+        ],
+        "edges": [{"source": "S", "target": "R"}],
+    }
+    with (
+        patch("modulo.core.pipeline_engine.graph_cache.make_node_fn", MagicMock()),
+        patch("modulo.core.pipeline_engine.graph_cache.make_manual_node_fn", MagicMock()),
+        patch("modulo.core.pipeline_engine.graph_cache.make_hitl_gate_fn", MagicMock()),
+    ):
+        compiled = build_graph_from_json(graph_json)
+    graph = compiled.get_graph()
+    entry_nodes = [e.target for e in graph.edges if e.source == "__start__"]
+    # Without the fix the entry becomes "A" (a router rule target) and the real
+    # entry S + router R are dead.
+    assert entry_nodes == ["S"]
+
+
 # ---------------------------------------------------------------------------
 # Executor terminalization: RouterNoMatchError -> router_no_match (FAR-415)
 # ---------------------------------------------------------------------------

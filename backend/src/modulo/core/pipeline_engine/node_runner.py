@@ -261,6 +261,8 @@ class OutputSchemaValidationError(ValueError):
     """
 
 
+# Single source of truth for JMESPath guard truthiness — `bool(result)`.
+# Test-pinned in tests/unit/pipeline_engine/test_conditional_transitions.py.
 _is_truthy = bool
 
 # Cap for the stored artifact stdout/stderr blobs. 512KB keeps storage bounded

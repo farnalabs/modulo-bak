@@ -1841,6 +1841,8 @@ async function saveEdgeConfig() {
         nodes: rawNodes.value.map((n: any) => ({
           id: n.id,
           node_type: n.node_type || 'agent',
+          router_config: n.router_config ?? null,
+          hitl_config: n.hitl_config ?? null,
           mode: n.mode || 'llm',
           label: n.label || null,
           description: n.description || null,
@@ -1900,8 +1902,10 @@ function onPaneClick() {
 const newNodeType = ref<'agent' | 'router' | 'hitl'>('agent')
 const nodeTypeOptions = [
   { value: 'agent', label: t('views.PipelineEditorView.agent') },
-  { value: 'router', label: t('views.PipelineEditorView.node_router_label') },
-  { value: 'hitl', label: t('views.PipelineEditorView.node_hitl_label') },
+  // Router/HITL authoring is deferred: addNode cannot yet emit the mandatory
+  // router_config/hitl_config the backend requires, so exposing them here
+  // produces unsavable (422) nodes. Imported router/HITL graphs still render
+  // correctly via convertBackendNode. Re-add once a config editor lands.
 ]
 
 function addNode(nodeType: 'agent' | 'router' | 'hitl' = newNodeType.value) {
@@ -2136,6 +2140,8 @@ async function saveGraph() {
         nodes: rawNodes.value.map((n: any) => ({
           id: n.id,
           node_type: n.node_type || 'agent',
+          router_config: n.router_config ?? null,
+          hitl_config: n.hitl_config ?? null,
           mode: n.mode || 'llm',
           label: n.label || null,
           description: n.description || null,
