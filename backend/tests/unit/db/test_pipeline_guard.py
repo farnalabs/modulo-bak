@@ -1065,7 +1065,7 @@ async def test_replace_pipeline_graph_persists_condition_expression(
     assert persisted_edges[0].condition_expression == expr
 
 
-async def test_edge_to_plain_dict_preserves_condition_expression() -> None:
+def test_edge_to_plain_dict_preserves_condition_expression() -> None:
     """``_edge_to_plain_dict`` (clone snapshot + graph-replace read path) must
     carry a conditional edge's ``condition_expression`` onto the plain data so
     clones and snapshot reads don't silently drop it (FAR-455)."""
