@@ -1,7 +1,7 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0147_suite_run_trigger_kind
-Revises: 0146_extend_runs_status_cost_ceiling
+Revision ID: 0148_suite_run_trigger_kind
+Revises: 0147_json_to_jsonb_standardize
 Create Date: 2026-08-25
 
 Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
@@ -27,6 +27,12 @@ Renumbered a fourth time from ``0147_suite_run_trigger_kind`` to
 third merge base). It now chains off the real main head
 ``0146_extend_runs_status_cost_ceiling`` and is the single head of the merged
 tree.
+
+Renumbered a fifth time from ``0147_suite_run_trigger_kind`` to
+``0148_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0147_json_to_jsonb_standardize`` (PR 2009's fourth merge base). It now chains
+off the real main head ``0147_json_to_jsonb_standardize`` and is the single head
+of the merged tree.
 
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
@@ -57,8 +63,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0147_suite_run_trigger_kind"
-down_revision: str | None = "0146_extend_runs_status_cost_ceiling"
+revision: str = "0148_suite_run_trigger_kind"
+down_revision: str | None = "0147_json_to_jsonb_standardize"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
