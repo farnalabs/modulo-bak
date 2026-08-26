@@ -1,7 +1,7 @@
 """runs — add ``router_no_match`` to the ``ck_runs_status`` CHECK constraint.
 
-Revision ID: 0139_add_router_no_match_status
-Revises: 0147_json_to_jsonb_standardize
+Revision ID: 0150_add_router_no_match_status
+Revises: 0149_suite_run_trigger_kind
 Create Date: 2026-08-24
 
 FAR-402 P1 (FAR-415) introduces the ``router_no_match`` terminal run status
@@ -24,9 +24,10 @@ but collided with main's ``0138_eval_versioning``. It is renumbered to
 main advanced again to ``0144_broaden_notification_status_in_app`` (FAR-436) the
 down-revision was updated to ``0144`` and then to ``0147_json_to_jsonb_standardize``
 after main advanced through 0145/0146/0147 and then ``0148_pipeline_snapshot_versioning_far420``
-(FAR-402 P6) landed on main. The migration graph stays a single linear chain with
-``0139`` re-parented onto ``0148_pipeline_snapshot_versioning_far420`` (main's head) as
-the tip. The recreated
+(FAR-402 P6) landed on main. It was renumbered a second time to ``0150`` and
+re-parented onto ``0149_suite_run_trigger_kind`` (FAR-377, main's head) after
+``0149`` landed on main, so the graph stays a single linear chain with
+``0150`` chained off ``0149_suite_run_trigger_kind`` as the tip. The recreated
 constraint list MUST include ``cost_ceiling_exceeded`` (added by 0146) as well as
 ``router_no_match`` so this migration does not clobber main's status addition.
 """
@@ -35,8 +36,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0139_add_router_no_match_status"
-down_revision: str | None = "0148_pipeline_snapshot_versioning_far420"
+revision: str = "0150_add_router_no_match_status"
+down_revision: str | None = "0149_suite_run_trigger_kind"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
