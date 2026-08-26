@@ -6895,3 +6895,138 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _unconditional_skip_marker_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+_RAISES_CONTEXT_WITH_NAMES = frozenset({"raises", "warns"})
+"""The ``with`` context-manager names that indicate a ``pytest.raises`` /
+``pytest.warns`` block — matched on the final name of the attribute chain
+(``pytest.raises`` -> ``raises``, ``pytest.warns`` -> ``warns``) or on a bare
+imported ``raises(...)``/``warns(...)``. Helper aliases that rename the
+context manager to something else are deliberately not implicated."""
+
+
+def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``with pytest.raises(...):`` /
+    ``with pytest.warns(...):`` (or their ``async with`` twins, or a bare
+    imported ``raises``/``warns``) whose body contains no executable
+    statement — only ``pass``, ``...``, a docstring, or nothing at all.
+
+    A ``pytest.raises``/``pytest.warns`` context that never executes any code
+    inside its body is a silent false green: the ``with`` block claims to pin
+    down an expected exception or warning, but because no statement runs, the
+    context never observes anything and the test passes regardless of what the
+    code under test does. It is the empty-body twin of the unentered-raises
+    lens (where the context manager is never entered) and of the
+    no-op-test-body lens (which only governs whole ``test_*`` functions, not
+    individual ``with`` blocks).
+    """
+    found: list[tuple[int, str]] = []
+
+    def _context_manager_name(node: ast.AST) -> str | None:
+        if not isinstance(node, ast.Call):
+            return None
+        f = node.func
+        if isinstance(f, ast.Attribute):
+            return f"{f.attr}"
+        if isinstance(f, ast.Name):
+            return f.id
+        return None
+
+    def _body_is_empty(body: list[ast.stmt]) -> bool:
+        statements = [
+            s
+            for s in body
+            if not (
+                isinstance(s, ast.Pass)
+                or (
+                    isinstance(s, ast.Expr)
+                    and isinstance(s.value, ast.Constant)
+                    and (isinstance(s.value.value, str) or s.value.value is Ellipsis)
+                )
+            )
+        ]
+        return not statements
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)) or not node.items:
+            continue
+        with_item = node.items[0].context_expr
+        lineno = node.lineno
+        name = _context_manager_name(with_item)
+        if name not in _RAISES_CONTEXT_WITH_NAMES:
+            continue
+        if not _body_is_empty(node.body):
+            continue
+        found.append(
+            (
+                lineno,
+                f"{name}(...) with an empty body — no code runs inside the with block, so the "
+                "expected exception/warning is never actually exercised and the test passes "
+                "whether or not it occurs; put the code-under-test inside the 'with' body",
+            )
+        )
+    return found
+
+
+def test_no_empty_raises_context_bodies():
+    """A ``pytest.raises``/``pytest.warns`` context (``with ...:`` or
+    ``async with ...:``, attribute or bare-imported name) whose body contains
+    no executable statement — only ``pass``, ``...``, a docstring, or nothing —
+    is a silent false green. The ``with`` block claims to pin down an expected
+    exception or warning but never runs any code, so it passes whether the code
+    under test raises the expected error, raises the wrong error, or raises
+    nothing at all. Put the actual code-under-test inside the ``with`` body so
+    the expectation is genuinely checked."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _empty_raises_context_body_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} pytest.raises/pytest.warns context(s) with an empty body.\n"
+        "A with-block that never runs any statement cannot check an exception/warning — the "
+        "test passes whether or not the code under test raises it. Move the code-under-test "
+        "inside the 'with' body.\n" + "\n".join(violations)
+    )
+
+
+def test_empty_raises_context_body_lens_flags_silent_false_greens():
+    """Synthetic positive/negative control for the empty-raises-context-body
+    lens: it must flag ``with``/``async with`` ``pytest.raises``/``pytest.warns``
+    contexts (attribute and bare-imported name spellings) whose body is only
+    ``pass``/``...``/a docstring/empty, and ignore contexts whose body contains
+    a real executable statement."""
+    positive_sources = [
+        "def test_foo():\n    with pytest.raises(ValueError):\n        pass\n",
+        "def test_foo():\n    async with pytest.raises(ValueError):\n        pass\n",
+        "def test_foo():\n    with pytest.raises(ValueError, match='boom'):\n        ...\n",
+        "def test_foo():\n    with pytest.warns(UserWarning):\n        pass\n",
+        "import pytest\ndef test_foo():\n    with raises(ValueError):\n        pass\n",
+        "import pytest\ndef test_foo():\n    with warns(UserWarning):\n        pass\n",
+        (
+            "def test_foo():\n"
+            "    with pytest.raises(ValueError):\n"
+            "        \"\"\"docstring only\"\"\"\n"
+        ),
+        "def test_foo():\n    with pytest.raises(ValueError):\n        # comment only\n        pass\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _empty_raises_context_body_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    with pytest.raises(ValueError):\n        foo()\n",
+        "def test_foo():\n    with pytest.raises(ValueError) as exc_info:\n        foo()\n"
+        "        assert exc_info.value.args[0] == 'boom'\n",
+        "def test_foo():\n    async with pytest.raises(ValueError):\n        await foo()\n",
+        "def test_foo():\n    with pytest.warns(UserWarning):\n        foo()\n",
+        "def test_foo():\n    with pytest.raises(ValueError):\n        x = 1\n",
+        "def test_foo():\n    pytest.raises(ValueError)\n",
+        "def test_foo():\n    with my_custom_context():\n        pass\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _empty_raises_context_body_violations(tree), f"lens should NOT flag:\n{source}"
