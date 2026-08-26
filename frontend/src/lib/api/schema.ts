@@ -1553,6 +1553,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/costs/ceiling": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Spend Ceiling */
+        get: operations["get_spend_ceiling_api_v1_admin_costs_ceiling_get"];
+        /** Set Spend Ceiling */
+        put: operations["set_spend_ceiling_api_v1_admin_costs_ceiling_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/costs/circuit-breaker/{pipeline_id}/reset": {
         parameters: {
             query?: never;
@@ -5733,6 +5751,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/eval-coverage-gap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Eval Coverage Gap
+         * @description Return the eval coverage-gap signal for a batch or variant group (FAR-381).
+         *
+         *     A pure read-model over the ``VariantGroup -> Run -> EvalResult`` lineage.
+         *     Emits a per-eval verdict only once at least ``min_runs`` terminal runs carry
+         *     eval data (statistical significance — llm-judge scores are high-variance),
+         *     and only when variant outputs diverged past ``threshold`` while that eval
+         *     could not differentiate them. A gap routes to ``recommended_action =
+         *     "improve_evals"`` (the eval suite is the problem, not the variants); all
+         *     other cases are ``"ok"``. Org-scoped (explicit ``organisation_id`` predicate
+         *     on every query; ``set_rls_org`` remains defense-in-depth).
+         */
+        get: operations["eval_coverage_gap_api_v1_eval_coverage_gap_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/evals/suites/{suite_id}/alerting": {
         parameters: {
             query?: never;
@@ -9599,6 +9646,15 @@ export interface components {
             }[];
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
             /** Alert Thresholds */
             alert_thresholds?: number[];
             /**
@@ -14955,6 +15011,19 @@ export interface components {
              */
             account_id: string;
         };
+        /** SetSpendCeilingRequest */
+        SetSpendCeilingRequest: {
+            /**
+             * Max Run Cost
+             * @description Per-run hard ceiling in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            max_run_cost?: number | null;
+            /**
+             * Spend Ceiling
+             * @description Org lifetime budget in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            spend_ceiling?: number | null;
+        };
         /** SetSpendLimitRequest */
         SetSpendLimitRequest: {
             /** Daily Spend Limit */
@@ -15168,6 +15237,20 @@ export interface components {
             tag?: string | null;
             /** Notes */
             notes?: string | null;
+        };
+        /** SpendCeilingResponse */
+        SpendCeilingResponse: {
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
+            /** Remaining Budget Usd */
+            remaining_budget_usd?: number | null;
         };
         /** SpendLimitResponse */
         SpendLimitResponse: {
@@ -15708,6 +15791,10 @@ export interface components {
         UpdateCostControlsRequest: {
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
             /** Alert Thresholds */
             alert_thresholds?: number[] | null;
             /** Circuit Breaker Enabled */
@@ -20294,6 +20381,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CostControlsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_spend_ceiling_api_v1_admin_costs_ceiling_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_spend_ceiling_api_v1_admin_costs_ceiling_put: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSpendCeilingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
                 };
             };
             /** @description Validation Error */
@@ -30281,6 +30434,73 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    eval_coverage_gap_api_v1_eval_coverage_gap_get: {
+        parameters: {
+            query?: {
+                /** @description Scope to a variant group */
+                variant_group_id?: string | null;
+                /** @description Scope to a single fired batch */
+                batch_id?: string | null;
+                /** @description Minimum run count before a signal is emitted */
+                min_runs?: number;
+                /** @description Variant-divergence threshold above which variants count as genuinely differing */
+                threshold?: number;
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Internal Server Error */
             500: {
