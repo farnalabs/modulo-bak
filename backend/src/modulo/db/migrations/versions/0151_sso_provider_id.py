@@ -37,12 +37,27 @@ def upgrade() -> None:
     op.add_column("sso_providers", sa.Column("provider_id", sa.String(length=64), nullable=True))
 
     if is_pg:
+        op.execute("SET search_path TO public")
         op.execute(
-            "UPDATE sso_providers SET provider_id = lower(regexp_replace(name, '[^a-zA-Z0-9]+', '-', 'g')) "
-            "WHERE provider_id IS NULL"
+            """
+        DO $$
+        DECLARE r RECORD; base text; cand text; n int;
+        BEGIN
+          FOR r IN SELECT id, organisation_id, name FROM sso_providers WHERE provider_id IS NULL LOOP
+            base := lower(regexp_replace(r.name, '[^a-zA-Z0-9]+', '-', 'g'));
+            base := trim(both '-' from base);
+            IF base = '' THEN base := 'sso'; END IF;
+            cand := base; n := 2;
+            WHILE EXISTS (SELECT 1 FROM sso_providers WHERE provider_id = cand AND id <> r.id) LOOP
+              cand := base || '-' || n; n := n + 1;
+            END LOOP;
+            UPDATE sso_providers SET provider_id = cand WHERE id = r.id;
+          END LOOP;
+        END $$;
+        """
         )
     else:
-        op.execute("UPDATE sso_providers SET provider_id = lower(name) WHERE provider_id IS NULL")
+        op.execute("UPDATE sso_providers SET provider_id = COALESCE(lower(name), 'sso') WHERE provider_id IS NULL")
 
     if is_pg:
         op.execute(

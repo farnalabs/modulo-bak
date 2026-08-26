@@ -855,6 +855,7 @@ class TestSamlProcessResponse:
                 "Test User",
                 "saml",
                 "saml:https://idp.example.com:user@example.com",
+                default_org_id=None,
             )
             mock_tok.assert_awaited_once()
 
@@ -1159,6 +1160,7 @@ class TestOidcProcessCallbackDb:
             discovery_url="https://example.auth0.com/.well-known/openid-configuration",
             scopes=None,
             group_mappings=[],
+            organisation_id=uuid.uuid4(),
         )
         session = _mock_session(scalar=provider)
         signed = sign_state("auth0:raw-state", settings.secret_key)

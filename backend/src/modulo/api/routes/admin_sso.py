@@ -194,7 +194,13 @@ async def create_provider_endpoint(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except IntegrityError as exc:
-        _log.warning("SSO provider duplicate name on create: %s", exc, exc_info=True)
+        _log.warning("SSO provider create conflict: %s", exc, exc_info=True)
+        detail = str(exc).lower()
+        if "provider_id" in detail or "uq_sso_providers_org_provider_id" in detail:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="An SSO provider with this provider ID already exists.",
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="An SSO provider with this name already exists."
         ) from exc

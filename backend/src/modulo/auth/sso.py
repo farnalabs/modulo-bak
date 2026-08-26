@@ -17,6 +17,7 @@ from modulo.auth.jwt import create_access_token, create_refresh_token
 from modulo.auth.oidc_verify import OidcVerifyError, verify_id_token
 from modulo.auth.saml_handler import ModuloSamlAuth, SamlAuthError
 from modulo.auth.secret_storage import decode_stored_secret
+from modulo.core.ssrf import validate_outbound_url_async
 from modulo.db.crud.account import create_account, get_account_by_email, update_last_login
 from modulo.db.crud.org_membership import create_membership, get_membership_by_account_and_org
 from modulo.db.crud.sso_provider import get_enabled_saml_provider, get_provider_by_provider_id
@@ -25,6 +26,7 @@ from modulo.db.crud.token_family import create_family
 from modulo.db.models.account import Account
 from modulo.db.models.organisation import Organisation
 from modulo.db.models.sso_provider import SsoProvider
+from modulo.db.rls import set_rls_org
 from modulo.settings import Settings
 
 _log = logging.getLogger(__name__)
@@ -51,6 +53,21 @@ def verify_state(signed: str, secret_key: str) -> str | None:
     if not hmac.compare_digest(expected, sig):
         return None
     return state
+
+
+async def _set_default_rls_org(session: AsyncSession) -> None:
+    """Set RLS org context to the first Organisation so pre-auth SSO routes can read the sso_providers table.
+
+    The sso_providers table is OrgScoped, so Postgres RLS filters rows by
+    ``app.organisation_id``. Pre-auth routes (no user/org claim) would otherwise
+    get ZERO rows and silently fall through to the empty env fallback. We point
+    RLS at the first org (single-org self-hosted assumption) so the global,
+    org-unfiltered provider lookups resolve correctly.
+    """
+    result = await session.execute(select(Organisation).order_by(Organisation.created_at).limit(1))
+    org = result.scalar_one_or_none()
+    if org is not None:
+        await set_rls_org(session, org.id)
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +228,47 @@ async def issue_sso_tokens(
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_oidc_provider(
+    provider_id: str,
+    session: AsyncSession,
+    settings: Settings,
+) -> tuple[str | None, str | None, str | None, list[str] | str | None, SsoProvider | None]:
+    """Resolve OIDC IdP config, DB-first then env fallback.
+
+    Returns ``(client_id, client_secret, discovery_url, scopes, db_provider)``.
+    ``db_provider`` is the ``SsoProvider`` row when the config came from the DB
+    (used for JIT org placement and SSRF validation); ``None`` for the env path.
+    Returns all-``None`` when the provider is not configured at all.
+    """
+    db_provider = await get_provider_by_provider_id(session, provider_id)
+    if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
+        discovery_url = db_provider.discovery_url
+        if discovery_url:
+            try:
+                await validate_outbound_url_async(discovery_url)
+            except ValueError as exc:
+                raise ValueError(f"Rejected OIDC discovery_url for provider '{provider_id}': {exc}") from None
+        return (
+            db_provider.client_id,
+            decode_stored_secret(db_provider.client_secret, settings.fernet_key) if db_provider.client_secret else None,
+            discovery_url,
+            json.loads(db_provider.scopes) if db_provider.scopes else None,
+            db_provider,
+        )
+
+    providers = _parse_oidc_providers(settings)
+    provider = next((p for p in providers if p["provider_id"] == provider_id), None)
+    if not provider:
+        return None, None, None, None, None
+    return (
+        provider["client_id"],
+        provider["client_secret"],
+        provider["discovery_url"],
+        provider.get("scopes"),
+        None,
+    )
+
+
 async def oidc_get_authorize_url(
     provider_id: str,
     settings: Settings,
@@ -223,20 +281,12 @@ async def oidc_get_authorize_url(
     the admin UI writes there); falls back to env-var providers for backward
     compatibility.
     """
-    db_provider = await get_provider_by_provider_id(session, provider_id)
-    if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
-        client_id = db_provider.client_id
-        discovery_url = db_provider.discovery_url
-        scopes = json.loads(db_provider.scopes) if db_provider.scopes else None
-    else:
-        providers = _parse_oidc_providers(settings)
-        provider = next((p for p in providers if p["provider_id"] == provider_id), None)
-        if not provider:
-            raise ValueError(f"OIDC provider '{provider_id}' not configured")
-        client_id = provider["client_id"]
-        discovery_url = provider["discovery_url"]
-        scopes = provider.get("scopes")
+    client_id, _client_secret, discovery_url, scopes, _db_provider = await _resolve_oidc_provider(
+        provider_id, session, settings
+    )
 
+    if client_id is None:
+        raise ValueError(f"OIDC provider '{provider_id}' not configured")
     if not client_id or not discovery_url:
         raise ValueError(f"OIDC provider '{provider_id}' is missing client_id or discovery_url")
 
@@ -281,22 +331,12 @@ async def oidc_process_callback(
 
     provider_id = state_data.split(":", 1)[0] if ":" in state_data else state_data
 
-    db_provider = await get_provider_by_provider_id(session, provider_id)
-    if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
-        client_id = db_provider.client_id
-        client_secret = (
-            decode_stored_secret(db_provider.client_secret, settings.fernet_key) if db_provider.client_secret else None
-        )
-        discovery_url = db_provider.discovery_url
-    else:
-        providers = _parse_oidc_providers(settings)
-        provider = next((p for p in providers if p["provider_id"] == provider_id), None)
-        if not provider:
-            raise ValueError(f"OIDC provider '{provider_id}' not found")
-        client_id = provider["client_id"]
-        client_secret = provider["client_secret"]
-        discovery_url = provider["discovery_url"]
+    client_id, client_secret, discovery_url, _scopes, db_provider = await _resolve_oidc_provider(
+        provider_id, session, settings
+    )
 
+    if client_id is None:
+        raise ValueError(f"OIDC provider '{provider_id}' not found")
     if not client_id or not client_secret or not discovery_url:
         raise ValueError(f"OIDC provider '{provider_id}' is missing required configuration")
 
@@ -344,7 +384,15 @@ async def oidc_process_callback(
     sso_subject = f"{provider_id}:{claims.get('sub', email)}"
 
     try:
-        account, org_id, org_role = await jit_provision_user(session, settings, email, name, "oidc", sso_subject)
+        account, org_id, org_role = await jit_provision_user(
+            session,
+            settings,
+            email,
+            name,
+            "oidc",
+            sso_subject,
+            default_org_id=db_provider.organisation_id if db_provider is not None else None,
+        )
     except RuntimeError as exc:
         raise ValueError(str(exc)) from None
 
@@ -469,6 +517,63 @@ def _decode_id_token_claims(id_token: str) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_saml_config(
+    session: AsyncSession,
+    settings: Settings,
+) -> tuple[str, str, str | None, str | None, SsoProvider | None]:
+    """Resolve SAML IdP config, DB-first then env fallback.
+
+    Returns ``(idp_metadata_xml, entity_id, sp_private_key, sp_x509_cert,
+    db_provider)``. ``entity_id`` is ``db_saml.entity_id or
+    settings.modulo_saml_entity_id`` (used by the SP handler). ``db_provider`` is
+    the row when config came from the DB (used for JIT org placement); ``None``
+    for the env path.
+
+    Admin-configured ``metadata_url`` (DB path) is SSRF-validated and fetched
+    with explicit error handling; the env path is unchanged for backward
+    compatibility (unit tests use example.com).
+    """
+    db_saml = await get_enabled_saml_provider(session)
+    if db_saml is not None:
+        idp_metadata = db_saml.metadata_xml or None
+        if not idp_metadata and db_saml.metadata_url:
+            try:
+                await validate_outbound_url_async(db_saml.metadata_url)
+            except ValueError as exc:
+                raise ValueError(f"Rejected SAML metadata_url for provider: {exc}") from None
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
+                    resp.raise_for_status()
+                    idp_metadata = resp.text
+            except httpx.HTTPError as exc:
+                raise ValueError("Failed to fetch SAML IdP metadata from provider metadata_url") from exc
+        if not idp_metadata:
+            raise ValueError("SAML provider is missing IdP metadata (set metadata_xml or metadata_url)")
+        entity_id = db_saml.entity_id or settings.modulo_saml_entity_id or "modulo"
+        sp_key = settings.modulo_saml_sp_private_key or None
+        sp_cert = settings.modulo_saml_sp_x509_cert or None
+        return idp_metadata, entity_id, sp_key, sp_cert, db_saml
+
+    if not settings.modulo_saml_enabled:
+        raise ValueError("SAML is not enabled")
+    if not settings.modulo_license_key:
+        raise ValueError("SAML requires a license key (Team feature)")
+
+    try:
+        idp_metadata = await _saml_fetch_idp_metadata(settings)
+    except (httpx.HTTPError, ValueError) as exc:
+        raise ValueError(f"Failed to fetch IdP metadata: {exc}") from None
+
+    return (
+        idp_metadata,
+        settings.modulo_saml_entity_id,
+        settings.modulo_saml_sp_private_key or None,
+        settings.modulo_saml_sp_x509_cert or None,
+        None,
+    )
+
+
 async def saml_get_auth_url(
     settings: Settings,
     acs_url: str,
@@ -484,54 +589,18 @@ async def saml_get_auth_url(
     the admin UI writes there); falls back to env-var config for backward
     compatibility.
     """
-    db_saml = await get_enabled_saml_provider(session)
-    if db_saml is not None:
-        idp_metadata = db_saml.metadata_xml or None
-        if not idp_metadata and db_saml.metadata_url:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
-                resp.raise_for_status()
-                idp_metadata = resp.text
-        if not idp_metadata:
-            raise ValueError("SAML provider is missing IdP metadata (set metadata_xml or metadata_url)")
-        entity_id = db_saml.entity_id or settings.modulo_saml_entity_id
-        sp_key = settings.modulo_saml_sp_private_key or None
-        sp_cert = settings.modulo_saml_sp_x509_cert or None
-        handler = ModuloSamlAuth(
-            entity_id=entity_id,
-            acs_url=acs_url,
-            idp_metadata_xml=idp_metadata,
-            sp_private_key=sp_key,
-            sp_x509_cert=sp_cert,
-        )
-        try:
-            auth_url = handler.get_auth_url()
-        except Exception as exc:
-            raise ValueError(f"Failed to generate SAML AuthnRequest: {exc}") from None
-        return auth_url, ""
-
-    if not settings.modulo_saml_enabled:
-        raise ValueError("SAML is not enabled")
-    if not settings.modulo_license_key:
-        raise ValueError("SAML requires a license key (Team feature)")
-
-    try:
-        idp_metadata = await _saml_fetch_idp_metadata(settings)
-    except (httpx.HTTPError, ValueError) as exc:
-        raise ValueError(f"Failed to fetch IdP metadata: {exc}") from None
-
+    idp_metadata, entity_id, sp_key, sp_cert, _db_saml = await _resolve_saml_config(session, settings)
     handler = ModuloSamlAuth(
-        entity_id=settings.modulo_saml_entity_id,
+        entity_id=entity_id,
         acs_url=acs_url,
         idp_metadata_xml=idp_metadata,
-        sp_private_key=settings.modulo_saml_sp_private_key or None,
-        sp_x509_cert=settings.modulo_saml_sp_x509_cert or None,
+        sp_private_key=sp_key,
+        sp_x509_cert=sp_cert,
     )
     try:
         auth_url = handler.get_auth_url()
     except Exception as exc:
         raise ValueError(f"Failed to generate SAML AuthnRequest: {exc}") from None
-
     return auth_url, ""
 
 
@@ -591,45 +660,24 @@ async def saml_process_response(
     the admin UI writes there); falls back to env-var config for backward
     compatibility.
     """
-    idp_metadata: str | None = None
-    entity_id_override: str | None = None
-    db_saml = await get_enabled_saml_provider(session)
-    if db_saml is not None:
-        idp_metadata = db_saml.metadata_xml or None
-        if not idp_metadata and db_saml.metadata_url:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
-                resp.raise_for_status()
-                idp_metadata = resp.text
-        entity_id_override = db_saml.entity_id or None
-
-    if idp_metadata is None:
-        if not settings.modulo_saml_enabled:
-            raise ValueError("SAML is not enabled")
-        if not settings.modulo_license_key:
-            raise ValueError("SAML requires a license key (Team feature)")
-
-        try:
-            idp_metadata = await _saml_fetch_idp_metadata(settings)
-        except (httpx.HTTPError, ValueError) as exc:
-            raise ValueError(f"Failed to fetch IdP metadata: {exc}") from None
+    idp_metadata, entity_id, sp_key, sp_cert, db_saml = await _resolve_saml_config(session, settings)
 
     try:
         _, idp_entity_id = _saml_parse_idp_metadata(idp_metadata)
     except (ElementTree.ParseError, ValueError) as exc:
         raise ValueError(f"Failed to parse IdP metadata: {exc}") from None
 
-    if entity_id_override is not None:
-        idp_entity_id = entity_id_override
+    if db_saml is not None and db_saml.entity_id is not None:
+        idp_entity_id = db_saml.entity_id
 
     acs_url = f"{settings.modulo_public_url.rstrip('/')}/api/v1/auth/saml/acs"
     _validate_saml_response_destination(saml_response, acs_url)
     handler = ModuloSamlAuth(
-        entity_id=entity_id_override or settings.modulo_saml_entity_id,
+        entity_id=entity_id,
         acs_url=acs_url,
         idp_metadata_xml=idp_metadata,
-        sp_private_key=settings.modulo_saml_sp_private_key or None,
-        sp_x509_cert=settings.modulo_saml_sp_x509_cert or None,
+        sp_private_key=sp_key,
+        sp_x509_cert=sp_cert,
     )
     try:
         result = handler.process_response(saml_response)
@@ -654,7 +702,13 @@ async def saml_process_response(
 
     try:
         account, org_id, org_role = await jit_provision_user(
-            session, settings, email, display_name, "saml", sso_subject
+            session,
+            settings,
+            email,
+            display_name,
+            "saml",
+            sso_subject,
+            default_org_id=db_saml.organisation_id if db_saml is not None else None,
         )
     except RuntimeError as exc:
         raise ValueError(str(exc)) from None

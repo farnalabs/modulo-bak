@@ -72,7 +72,10 @@ async def get_provider_by_provider_id(session: AsyncSession, provider_id: str) -
 async def get_enabled_saml_provider(session: AsyncSession) -> SsoProvider | None:
     """Return any enabled SAML provider (global lookup — no org filter)."""
     result = await session.execute(
-        select(SsoProvider).where(SsoProvider.provider_type == "saml", SsoProvider.enabled).limit(1)
+        select(SsoProvider)
+        .where(SsoProvider.provider_type == "saml", SsoProvider.enabled)
+        .order_by(SsoProvider.created_at)
+        .limit(1)
     )
     return result.scalar_one_or_none()
 
