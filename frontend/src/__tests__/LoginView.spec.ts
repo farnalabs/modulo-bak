@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { flushPromises, mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 
 vi.mock('vue-router', () => ({
@@ -9,77 +9,86 @@ vi.mock('vue-router', () => ({
 
 import LoginView from '../views/LoginView.vue'
 
-beforeEach(() => {
-  vi.stubGlobal(
-    'location',
-    {
-      assign: vi.fn(),
-      href: '',
-      replace: vi.fn(),
-      reload: vi.fn(),
-    },
-  )
-})
+function okJson(data: unknown) {
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    json: async () => data,
+  } as unknown as Response
+}
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-  vi.restoreAllMocks()
-})
-
-function stubSsoProviders(response: unknown, ok = true) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    ok,
-    json: vi.fn().mockResolvedValue(response),
-  }))
+function notAvailable() {
+  return {
+    ok: false,
+    status: 402,
+    statusText: 'Payment Required',
+    json: async () => ({ detail: 'This feature is not available on your plan' }),
+  } as unknown as Response
 }
 
 describe('LoginView', () => {
-  it('renders the sign-in form without an SSO section when none is configured', async () => {
-    stubSsoProviders({ oidc: [], saml: false })
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn())
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('renders without crashing', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    fetchMock.mockResolvedValue(okJson({ oidc: [], saml: false }))
     const wrapper = mount(LoginView)
-    await flushPromises()
     await nextTick()
     expect(wrapper.exists()).toBe(true)
     expect(wrapper.text()).toContain('Modulo')
     expect(wrapper.text()).toContain('Sign in')
-    expect(wrapper.find('[data-testid="login-sso-saml"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid^="login-sso-oidc-"]').exists()).toBe(false)
   })
 
-  it('hides the SSO section when the providers endpoint is feature-gated', async () => {
-    stubSsoProviders({ detail: 'Feature not available' }, false)
+  it('renders an SSO section when the instance advertises configured providers', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    fetchMock.mockResolvedValue(
+      okJson({ oidc: [{ provider_id: 'google' }, { provider_id: 'okta' }], saml: true }),
+    )
     const wrapper = mount(LoginView)
     await flushPromises()
-    await nextTick()
-    expect(wrapper.find('[data-testid="login-sso-saml"]').exists()).toBe(false)
-    expect(wrapper.find('[data-testid^="login-sso-oidc-"]').exists()).toBe(false)
+
+    expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="login-sso-oidc-google"]').attributes('href')).toBe(
+      '/api/v1/auth/oidc/google/login',
+    )
+    expect(wrapper.get('[data-testid="login-sso-oidc-okta"]').attributes('href')).toBe(
+      '/api/v1/auth/oidc/okta/login',
+    )
+    expect(wrapper.get('[data-testid="login-sso-saml"]').attributes('href')).toBe('/api/v1/auth/saml/login')
   })
 
-  it('renders one button per configured OIDC provider and a SAML button', async () => {
-    stubSsoProviders({ oidc: [{ provider_id: 'google' }, { provider_id: 'okta' }], saml: true })
+  it('hides the SSO section when the sso feature is not available', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    fetchMock.mockResolvedValue(notAvailable())
     const wrapper = mount(LoginView)
     await flushPromises()
-    await nextTick()
-    expect(wrapper.find('[data-testid="login-sso-oidc-google"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="login-sso-oidc-okta"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="login-sso-saml"]').exists()).toBe(true)
+
+    expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(false)
   })
 
-  it('redirects to the OIDC login URL when a provider button is clicked', async () => {
-    stubSsoProviders({ oidc: [{ provider_id: 'okta' }], saml: false })
+  it('hides the SSO section when the instance advertises no providers', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    fetchMock.mockResolvedValue(okJson({ oidc: [], saml: false }))
     const wrapper = mount(LoginView)
     await flushPromises()
-    await nextTick()
-    await wrapper.find('[data-testid="login-sso-oidc-okta"]').trigger('click')
-    expect(window.location.assign).toHaveBeenCalledWith('/api/v1/auth/oidc/okta/login')
+
+    expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(false)
   })
 
-  it('redirects to the SAML login URL when the SAML button is clicked', async () => {
-    stubSsoProviders({ oidc: [], saml: true })
+  it('fails closed to password login when provider discovery errors', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    fetchMock.mockRejectedValue(new Error('network down'))
     const wrapper = mount(LoginView)
     await flushPromises()
-    await nextTick()
-    await wrapper.find('[data-testid="login-sso-saml"]').trigger('click')
-    expect(window.location.assign).toHaveBeenCalledWith('/api/v1/auth/saml/login')
+
+    expect(wrapper.find('[data-testid="login-sso-section"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="login-submit"]').exists()).toBe(true)
   })
 })

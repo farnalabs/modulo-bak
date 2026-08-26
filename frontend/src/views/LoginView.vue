@@ -56,34 +56,30 @@
         </Button>
       </form>
 
-      <div v-if="hasSsoProviders" class="space-y-3">
-        <div class="flex items-center gap-3">
+      <div v-if="ssoState === 'available'" class="space-y-3" data-testid="login-sso-section">
+        <div class="flex items-center gap-3 text-xs text-muted-foreground">
           <span class="h-px flex-1 bg-border" />
-          <span class="text-xs font-medium uppercase tracking-wide text-muted-foreground">{{ $t('views.LoginView.sso_divider') }}</span>
+          <span>{{ $t('views.LoginView.or_continue_with') }}</span>
           <span class="h-px flex-1 bg-border" />
         </div>
-        <div class="grid gap-2">
-          <Button
+        <div class="space-y-2">
+          <a
             v-for="provider in oidcProviders"
-            :key="provider"
-            type="button"
-            variant="outlined"
-            class="w-full border-input px-4 py-2.5"
-            :data-testid="`login-sso-oidc-${provider}`"
-            @click="beginSsoLogin(`/api/v1/auth/oidc/${provider}/login`)"
+            :key="provider.provider_id"
+            :href="`/api/v1/auth/oidc/${provider.provider_id}/login`"
+            class="flex w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            :data-testid="`login-sso-oidc-${provider.provider_id}`"
           >
-            {{ $t('views.LoginView.sso_continue_with', { provider: providerLabel(provider) }) }}
-          </Button>
-          <Button
+            {{ provider.provider_id }}
+          </a>
+          <a
             v-if="samlEnabled"
-            type="button"
-            variant="outlined"
-            class="w-full border-input px-4 py-2.5"
+            href="/api/v1/auth/saml/login"
+            class="flex w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
             data-testid="login-sso-saml"
-            @click="beginSsoLogin('/api/v1/auth/saml/login')"
           >
-            {{ $t('views.LoginView.sso_continue_with_saml') }}
-          </Button>
+            SAML
+          </a>
         </div>
       </div>
     </div>
@@ -91,51 +87,49 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Button from 'primevue/button'
 import { useMutation } from '../composables/useMutation'
 import { setAccessToken, setRefreshToken } from '../lib/api/client'
 
+interface SsoProviderInfo {
+  provider_id: string
+}
+
 interface SsoProvidersResponse {
-  oidc: Array<{ provider_id: string }>
+  oidc: SsoProviderInfo[]
   saml: boolean
 }
+
+// SSO is a licensed (team-tier) surface; the login page renders its provider
+// buttons only when the instance advertises configured providers. A 402 (feature
+// not available) or any fetch failure keeps the page on password login.
+const ssoState = ref<'unknown' | 'available' | 'unavailable'>('unknown')
+const oidcProviders = ref<SsoProviderInfo[]>([])
+const samlEnabled = ref(false)
+
+async function discoverSsoProviders() {
+  try {
+    const res = await fetch('/api/v1/auth/sso/providers')
+    if (!res.ok) {
+      ssoState.value = 'unavailable'
+      return
+    }
+    const data = (await res.json()) as SsoProvidersResponse
+    oidcProviders.value = data.oidc ?? []
+    samlEnabled.value = Boolean(data.saml)
+    ssoState.value = oidcProviders.value.length > 0 || samlEnabled.value ? 'available' : 'unavailable'
+  } catch {
+    ssoState.value = 'unavailable'
+  }
+}
+
+onMounted(discoverSsoProviders)
 
 const router = useRouter()
 const email = ref('')
 const password = ref('')
-const oidcProviders = ref<string[]>([])
-const samlEnabled = ref(false)
-const hasSsoProviders = computed(() => oidcProviders.value.length > 0 || samlEnabled.value)
-
-function providerLabel(provider: string): string {
-  return provider
-    .replace(/[-_]+/g, ' ')
-    .replace(/\b\w/g, (char) => char.toUpperCase())
-}
-
-function beginSsoLogin(path: string) {
-  window.location.assign(path)
-}
-
-async function loadSsoProviders() {
-  try {
-    const res = await fetch('/api/v1/auth/sso/providers', {
-      headers: { Accept: 'application/json' },
-    })
-    if (!res.ok) {
-      return
-    }
-    const data = (await res.json()) as SsoProvidersResponse
-    oidcProviders.value = (data.oidc ?? []).map((p) => p.provider_id)
-    samlEnabled.value = Boolean(data.saml)
-  } catch {
-    return
-  }
-}
-
-onMounted(loadSsoProviders)
 
 const { loading, error, mutate: login } = useMutation(async () => {
   const res = await fetch('/api/v1/auth/login', {
