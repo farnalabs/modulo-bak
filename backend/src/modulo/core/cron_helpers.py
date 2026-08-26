@@ -1955,6 +1955,7 @@ async def fire_suite_run_trigger(
     from sqlalchemy import func, update
 
     from modulo.core.eval_engine.execute_suite_run import (
+        _DEFAULT_COST_PER_LLM_CASE,
         SuiteRunEmptyDatasetError,
         SuiteRunExecutionError,
         build_suite_run,
@@ -2057,16 +2058,23 @@ async def fire_suite_run_trigger(
         # ``str(None)`` would render as the literal 'None' and crash ``Decimal``,
         # so a config key explicitly set to ``null`` falls back to the default.
         cost_raw = config.get("cost_per_llm_case")
-        cost_per_case = Decimal("0.001") if cost_raw is None else Decimal(str(cost_raw))
+        cost_per_case = _DEFAULT_COST_PER_LLM_CASE if cost_raw is None else Decimal(str(cost_raw))
+        suite_ceiling_raw = config.get("suite_ceiling")
         run.extra = {
             "trigger_id": str(trigger_id),
             "dataset_id": str(dataset_id),
             "model_backend_id": str(model_backend_id),
             "scenario_inputs": scenario_inputs,
             "entity_thresholds": config.get("entity_thresholds") or {},
-            "suite_ceiling": config.get("suite_ceiling"),
+            # ``extra`` is a plain ``JSON`` column with no ``default=str``
+            # serializer, so every value written here MUST be JSON-native.
+            # Store ``cost_per_llm_case`` and ``suite_ceiling`` as ``str`` — the
+            # SAQ job coerces them back to ``Decimal`` on read. Writing a raw
+            # ``Decimal`` here raises ``TypeError`` at flush (json.dumps), which
+            # kills every fire inside ``session.begin()``.
+            "suite_ceiling": str(suite_ceiling_raw) if suite_ceiling_raw is not None else None,
             "eval_definition_version": int(config.get("eval_definition_version", 1)),
-            "cost_per_llm_case": cost_per_case,
+            "cost_per_llm_case": str(cost_per_case),
         }
         await session.flush()
         await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))

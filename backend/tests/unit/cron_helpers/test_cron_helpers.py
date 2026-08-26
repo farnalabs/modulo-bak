@@ -21,6 +21,7 @@ import pytest
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 
 from modulo.core import cron_helpers as ch
+from modulo.db.models.eval_suite_run import SuiteRun
 
 ORG = uuid.uuid4()
 TRIGGER_A = uuid.uuid4()
@@ -2993,3 +2994,194 @@ class TestGetSystemEngine:
             assert "MODULO_SYSTEM_DATABASE_URL not set" in extra["reason"]
         finally:
             ch._SYSTEM_ENGINE = None
+
+
+class TestFireSuiteRunTriggerPersists:
+    """``fire_suite_run_trigger`` must persist a JSON-serialisable ``run.extra``.
+
+    The fire path previously wrote a raw ``decimal.Decimal`` into ``run.extra``
+    (a plain ``JSON`` column with no ``default=str`` serializer), which raises
+    ``TypeError`` at flush — every fire rolled back inside ``session.begin()``
+    and no ``SuiteRun`` was ever created. This class round-trips the real
+    function against a session double whose ``flush()`` mimics the Postgres JSON
+    bind (``json.dumps`` on ``run.extra``), proving the bug is fixed without a
+    live database.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fired_run_extra_is_json_serialisable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_env(monkeypatch)
+
+        org_id = ORG
+        trigger_id = TRIGGER_A
+        suite_id = uuid.uuid4()
+        dataset_id = uuid.uuid4()
+        model_backend_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+
+        trigger = MagicMock()
+        trigger.id = trigger_id
+        trigger.organisation_id = org_id
+        trigger.active = True
+        trigger.deleted_at = None
+        trigger.run_kind = "suite_run"
+        trigger.eval_suite_id = suite_id
+        trigger.max_concurrent_runs = 5
+        trigger.daily_spend_limit = None
+        trigger.config_json = {
+            "dataset_id": str(dataset_id),
+            "model_backend_id": str(model_backend_id),
+            "cost_per_llm_case": "0.005",
+            "suite_ceiling": "5.00",
+            "entity_thresholds": {"min_pass_rate": 0.8},
+            "scenario_inputs": {"temperature": 0.2},
+            "eval_definition_version": 1,
+        }
+
+        captured: list[SuiteRun] = []
+
+        def fake_build_suite_run(session: object, **kwargs: object) -> SuiteRun:
+            run = SuiteRun(
+                id=run_id,
+                organisation_id=org_id,
+                suite_id=suite_id,
+                dataset_id=dataset_id,
+                dataset_version=1,
+                definition_checksum="deadbeef",
+                model_backend_id=model_backend_id,
+                state="pending",
+                version=0,
+            )
+            captured.append(run)
+            return run
+
+        # Session double. ``execute`` pops canned results in call order:
+        # advisory lock -> trigger select -> active_count -> Trigger update.
+        # ``flush`` mimics the DB JSON bind so a non-serialisable extra fails here.
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = 0
+        update_res = MagicMock()
+
+        class _FireSession(_MockSession):
+            def __init__(self) -> None:
+                super().__init__([advisory, trigger_res, count_res, update_res])
+
+            async def flush(self) -> None:
+                # Mirror what the Postgres JSON bind does at flush time.
+                json.dumps(captured[0].extra)
+
+        session = _FireSession()
+        factory = MagicMock(return_value=session)
+
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.build_suite_run",
+                side_effect=fake_build_suite_run,
+            ),
+        ):
+            result = await ch.fire_suite_run_trigger(
+                org_id=org_id,
+                trigger_id=trigger_id,
+                pipeline_id=None,
+            )
+
+        assert result["status"] == "fired"
+        assert result["suite_run_id"] == str(run_id)
+        # The original bug: ``cost_per_llm_case`` was a ``Decimal`` -> not
+        # JSON-serialisable. It must now be stored as a JSON-native str.
+        assert isinstance(captured[0].extra["cost_per_llm_case"], str)
+        assert captured[0].extra["cost_per_llm_case"] == "0.005"
+        # ``suite_ceiling`` must round-trip as a JSON-native str too.
+        assert captured[0].extra["suite_ceiling"] == "5.00"
+        # And the whole extra must survive a JSON round-trip (flush simulated).
+        assert json.loads(json.dumps(captured[0].extra))["cost_per_llm_case"] == "0.005"
+
+    @pytest.mark.asyncio
+    async def test_default_cost_is_stored_when_config_omits_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When ``cost_per_llm_case`` is absent, the module default is used and
+        stored JSON-safely (regression guard for the hard-coded ``0.001``)."""
+        _patch_env(monkeypatch)
+
+        org_id = ORG
+        trigger_id = TRIGGER_B
+        suite_id = uuid.uuid4()
+        dataset_id = uuid.uuid4()
+        model_backend_id = uuid.uuid4()
+        run_id = uuid.uuid4()
+
+        trigger = MagicMock()
+        trigger.id = trigger_id
+        trigger.organisation_id = org_id
+        trigger.active = True
+        trigger.deleted_at = None
+        trigger.run_kind = "suite_run"
+        trigger.eval_suite_id = suite_id
+        trigger.max_concurrent_runs = 5
+        trigger.daily_spend_limit = None
+        # No ``cost_per_llm_case`` / ``suite_ceiling`` keys.
+        trigger.config_json = {
+            "dataset_id": str(dataset_id),
+            "model_backend_id": str(model_backend_id),
+        }
+
+        captured: list[SuiteRun] = []
+
+        def fake_build_suite_run(session: object, **kwargs: object) -> SuiteRun:
+            run = SuiteRun(
+                id=run_id,
+                organisation_id=org_id,
+                suite_id=suite_id,
+                dataset_id=dataset_id,
+                dataset_version=1,
+                definition_checksum="deadbeef",
+                model_backend_id=model_backend_id,
+                state="pending",
+                version=0,
+            )
+            captured.append(run)
+            return run
+
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = 0
+        update_res = MagicMock()
+
+        class _FireSession(_MockSession):
+            def __init__(self) -> None:
+                super().__init__([advisory, trigger_res, count_res, update_res])
+
+            async def flush(self) -> None:
+                json.dumps(captured[0].extra)
+
+        session = _FireSession()
+        factory = MagicMock(return_value=session)
+
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.build_suite_run",
+                side_effect=fake_build_suite_run,
+            ),
+        ):
+            result = await ch.fire_suite_run_trigger(
+                org_id=org_id,
+                trigger_id=trigger_id,
+                pipeline_id=None,
+            )
+
+        assert result["status"] == "fired"
+        # Defaults resolve to the module constant (0.001) and are stored as str.
+        assert captured[0].extra["cost_per_llm_case"] == "0.001"
+        assert captured[0].extra["suite_ceiling"] is None

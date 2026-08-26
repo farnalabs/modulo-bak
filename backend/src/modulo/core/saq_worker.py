@@ -733,9 +733,9 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
                 _log.warning("SAQ execute_suite_run: suite_run %s belongs to a different org", rid)
                 return {"status": "missing"}
             extra = run.extra or {}
+            suite_ceiling_raw = extra.get("suite_ceiling")
             run_kwargs: dict[str, Any] = {
                 "entity_thresholds": extra.get("entity_thresholds"),
-                "suite_ceiling": extra.get("suite_ceiling"),
                 "scenario_inputs": extra.get("scenario_inputs"),
                 "eval_definition_version": int(extra.get("eval_definition_version", 1)),
             }
@@ -747,6 +747,14 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
             cost_per = extra.get("cost_per_llm_case")
             if cost_per is not None:
                 run_kwargs["cost_per_llm_case"] = Decimal(str(cost_per))
+            # ``suite_ceiling`` is ALSO JSON-decoded (a str/int/float). The
+            # runner only coerces it when the kwarg is ``None`` (it falls back to
+            # ``run.extra``), so a raw str passed here would bypass that coercion
+            # and raise ``Decimal >= str`` mid-evaluation. Coerce it the same way
+            # as ``cost_per_llm_case``; when absent, omit it so the runner reads
+            # the (already-``None``) value from ``run.extra``.
+            if suite_ceiling_raw is not None:
+                run_kwargs["suite_ceiling"] = Decimal(str(suite_ceiling_raw))
             stats = await _run_exec(session, run, **run_kwargs)
             run.extra = {**extra, "execution": stats}
             await session.flush()
