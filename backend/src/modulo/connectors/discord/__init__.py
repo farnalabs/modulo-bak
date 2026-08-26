@@ -56,7 +56,7 @@ class DiscordConnector(ConnectorBase):
         value = q.filters.get(key, "")
         if not value:
             raise ValueError(message)
-        return value
+        return str(value)
 
     @staticmethod
     def _records_result(data: Any) -> ConnectorResult:
