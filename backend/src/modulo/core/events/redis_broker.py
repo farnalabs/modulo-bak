@@ -67,6 +67,30 @@ class RedisEventBroker:
             ),
         )
 
+    async def _close_clients(self, pub: aioredis.Redis | None, sub: aioredis.Redis | None) -> None:
+        """Best-effort close of one or both freshly created clients."""
+        if pub is not None:
+            await pub.close()
+        if sub is not None:
+            await sub.close()
+
+    async def _adopt_new_clients(self, pub: aioredis.Redis | None, sub: aioredis.Redis | None) -> bool:
+        """Store the freshly created clients, unless a concurrent connect beat us.
+
+        Returns ``True`` if the new clients were adopted (first connect to win the
+        lock), or ``False`` if both connections were already established by another
+        task (in which case the new clients are closed).
+        """
+        async with self._lock:
+            if self._pub is not None and self._sub is not None:
+                await self._close_clients(pub, sub)
+                return False
+            if pub is not None:
+                self._pub = pub
+            if sub is not None:
+                self._sub = sub
+            return True
+
     async def connect(self) -> None:
         """Open dedicated connections for publishing and subscribing."""
         async with self._lock:
@@ -85,23 +109,10 @@ class RedisEventBroker:
             raise
         except Exception:
             _log.exception("redis_broker.connect_failed", extra={"url": self._redact_url(self._redis_url)})
-            if pub is not None:
-                await pub.close()
-            if sub is not None:
-                await sub.close()
+            await self._close_clients(pub, sub)
             raise
-        async with self._lock:
-            if self._pub is not None and self._sub is not None:
-                if pub is not None:
-                    await pub.close()
-                if sub is not None:
-                    await sub.close()
-                return
-            if pub is not None:
-                self._pub = pub
-            if sub is not None:
-                self._sub = sub
-        _log.info("RedisEventBroker connected to %s", self._redact_url(self._redis_url))
+        if await self._adopt_new_clients(pub, sub):
+            _log.info("RedisEventBroker connected to %s", self._redact_url(self._redis_url))
 
     async def publish(self, channel: str, data: dict[str, Any]) -> None:
         """Serialize *data* as JSON and publish to the given *channel*."""
