@@ -6387,8 +6387,13 @@ export interface paths {
          * @description List runs matching the filter set, with an estimated per-run byte size.
          *
          *     Returns every matching run (including non-terminal ones — the UI shows
-         *     terminal-only as purge-able), the total match count, and an estimated total
-         *     reclaimable byte count across ALL matches.
+         *     terminal-only as purge-able), the total match count, an estimated total
+         *     reclaimable byte count across ALL matches, and — most importantly for the
+         *     purge confirm dialog — a terminal-only ``terminal_total`` and
+         *     ``terminal_estimated_bytes``. The purge deletes *every* matching terminal run
+         *     (unbounded), so the client must derive its confirm count and reclaimable
+         *     figure from these server-side terminal totals, never from the page-capped
+         *     candidate list it happens to hold.
          */
         get: operations["candidates_api_v1_admin_run_retention_candidates_get"];
         put?: never;
@@ -8914,6 +8919,16 @@ export interface components {
             total_count: number;
             /** Total Estimated Bytes */
             total_estimated_bytes: number;
+            /**
+             * Terminal Total
+             * @default 0
+             */
+            terminal_total: number;
+            /**
+             * Terminal Estimated Bytes
+             * @default 0
+             */
+            terminal_estimated_bytes: number;
         };
         /**
          * CapabilityScope
@@ -10610,6 +10625,27 @@ export interface components {
             /** Organisation Id */
             organisation_id?: string | null;
         };
+        /**
+         * FanOutConfig
+         * @description Declares a scatter (fan-out) on an agent / sandbox_agent node.
+         *
+         *     Only the ``split`` source and the ``max_items`` cardinality ceiling are
+         *     honoured by the runtime — there is no batching/parallelism in P3, so those
+         *     knobs are intentionally absent from the contract rather than accepted and
+         *     silently ignored.
+         */
+        FanOutConfig: {
+            /**
+             * Split
+             * @description Name of the source port / state key to split.
+             */
+            split: string;
+            /**
+             * Max Items
+             * @description Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.
+             */
+            max_items?: number | null;
+        };
         /** FeatureFlagInfo */
         FeatureFlagInfo: {
             /** Name */
@@ -11250,6 +11286,44 @@ export interface components {
         InstallRequest: {
             /** Target Team Id */
             target_team_id?: string | null;
+        };
+        /**
+         * JoinAggregateSpec
+         * @description Aggregation applied by a join node to its collected branches.
+         */
+        JoinAggregateSpec: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "concat" | "merge_by_key" | "map" | "custom_function";
+            /**
+             * Key
+             * @description Field name for merge_by_key (read from each collected item's output).
+             */
+            key?: string | null;
+            /**
+             * Map Expression
+             * @description JMESPath expression for map aggregation.
+             */
+            map_expression?: string | null;
+        };
+        /**
+         * JoinCollectSpec
+         * @description One upstream branch a join node collects from.
+         *
+         *     Only the parent ``node`` is read by the runtime (it locates the scatter
+         *     manifest and merges every child output of that parent). The ``port`` knob
+         *     was removed from the contract because no code path selected a specific
+         *     output port; collecting all child outputs of the parent is the supported
+         *     semantics.
+         */
+        JoinCollectSpec: {
+            /**
+             * Node
+             * @description Parent (scatter) node id this branch belongs to.
+             */
+            node: string;
         };
         /**
          * JourneyCurrentStage
@@ -12993,7 +13067,7 @@ export interface components {
              * @default agent
              * @enum {string}
              */
-            node_type: "agent" | "manual" | "composite" | "sandbox_agent";
+            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "join";
             /** Agent Id */
             agent_id?: string | null;
             position: components["schemas"]["GraphPosition"];
@@ -13118,6 +13192,16 @@ export interface components {
              * @description Filesystem detector: globs of sandbox paths whose change counts as activity.
              */
             watch_globs?: string[];
+            fan_out?: components["schemas"]["FanOutConfig"] | null;
+            /** Collect */
+            collect?: components["schemas"]["JoinCollectSpec"][] | null;
+            aggregate?: components["schemas"]["JoinAggregateSpec"] | null;
+            /**
+             * Join Partial Policy
+             * @default collect_and_proceed
+             * @enum {string}
+             */
+            join_partial_policy: "collect_and_proceed" | "fail";
             /**
              * Inputs
              * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.
