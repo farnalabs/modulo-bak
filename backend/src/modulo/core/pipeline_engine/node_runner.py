@@ -1497,9 +1497,15 @@ def _render_agent_prompt(
     """
     env = SandboxedEnvironment()
     template = env.from_string(prompt_template)
+    # FAR-418 / FAR-436: context_scope — the agent's run_context VIEW (the keys
+    # fed to the prompt template) is allowlist-gated to the node's need-to-know
+    # set. Internal control keys are always preserved by filter_run_context_scope
+    # (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy (full run_context view).
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
     template_vars: dict[str, Any] = {
         "state": state,
-        "run_context": run_context,
+        "run_context": scoped_run_context,
         "input": raw_input,
     }
     resolved = node_def.get("_resolved_parameters")
@@ -2313,13 +2319,25 @@ def make_manual_node_fn(
 def _resolve_binding_connector(
     binding: dict[str, Any],
     node_id: str,
+    *,
+    allowed_connectors: list[str] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve a bound connector instance for *node_id*.
 
     Returns ``(connector, None)`` on success, or ``(None, error_artifact)``
-    when the hub is unavailable, the instance id is missing, or the connector
-    cannot be resolved — the error artifact is already enveloped for return.
+    when the hub is unavailable, the instance id is missing, the connector
+    is outside the node's ``capability_scope.allowed_connectors``, or the
+    connector cannot be resolved — the error artifact is already enveloped.
+
+    FAR-418: when *allowed_connectors* is set, a bound connector excluded by
+    the scope fails FAST with a typed, logged, metric-emitting
+    ``ScopeViolationError`` (never silently). Absent = unrestricted.
     """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        is_connector_allowed,
+        record_scope_violation,
+    )
     from modulo.core.pipeline_engine.decorator import get_connector_hub
 
     hub = get_connector_hub()
@@ -2335,8 +2353,23 @@ def _resolve_binding_connector(
 
     import uuid as _uuid
 
+    instance_uuid = _uuid.UUID(str(instance_id_str))
+
+    # FAR-418: deny-by-default within the node's connector scope.
+    connector_type: str = binding.get("type", "")
+    if not is_connector_allowed(
+        connector_instance_id=instance_uuid,
+        connector_type=connector_type,
+        allowed_connectors=allowed_connectors,
+    ):
+        target = connector_type or str(instance_uuid)
+        scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+        record_scope_violation(node_id=node_id, target=target, kind="connector")
+        _log.error("scope.violation node=%s connector=%s", node_id, target)
+        return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
     try:
-        connector = hub.get(_uuid.UUID(str(instance_id_str)))
+        connector = hub.get(instance_uuid)
     except Exception as _conn_exc:
         return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": f"connector error: {_conn_exc}"}]}
     return connector, None
@@ -2362,6 +2395,84 @@ def _connector_inputs(binding: dict[str, Any], state: dict[str, Any]) -> tuple[s
     if "provider_ref" not in filters and "provider_ref" not in data:
         filters["provider_ref"] = "/"
     return resource, filters, data
+
+
+def _enforce_connector_scope(
+    binding: dict[str, Any],
+    node_id: str,
+    connector_type: str,
+    allowed_connectors: list[str] | None,
+) -> dict[str, Any] | None:
+    """FAR-418 deny-by-default scope gate for a connector node.
+
+    Fires BEFORE the connector is resolved from the hub, so a node that targets
+    a connector excluded by its ``capability_scope`` never decrypts or touches
+    the connection (fail-fast with a typed, logged, metric-emitting
+    ``ScopeViolationError``). The hub is only consulted for in-scope connectors.
+    Returns a failed-artifact dict on violation, else ``None``.
+    """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        is_connector_allowed,
+        record_scope_violation,
+    )
+
+    instance_id_str = binding.get("instance_id")
+    if not instance_id_str:
+        return None
+    import uuid as _uuid
+
+    instance_uuid = _uuid.UUID(str(instance_id_str))
+    if is_connector_allowed(
+        connector_instance_id=instance_uuid,
+        connector_type=connector_type,
+        allowed_connectors=allowed_connectors,
+    ):
+        return None
+    target = connector_type or str(instance_uuid)
+    scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+    record_scope_violation(node_id=node_id, target=target, kind="connector")
+    _log.error("scope.violation node=%s connector=%s", node_id, target)
+    return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
+
+async def _run_connector_action(
+    connector: Any,
+    op: str,
+    resource: str,
+    filters: dict[str, Any],
+    data: dict[str, Any],
+) -> Any:
+    """Execute a connector ``write``/``query`` action and return its result."""
+    from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+
+    if op == "write":
+        payload = ConnectorPayload(resource=resource, data=data)
+        return await connector.write(payload)
+    query = ConnectorQuery(resource=resource, filters=filters)
+    return await connector.query(query)
+
+
+def _guard_connector_secret_output(result: Any, node_id: str) -> dict[str, Any] | None:
+    """FAR-418 secret hygiene: connector/secret OBJECTS are never valid port
+    payload types — only opaque connector IDs may enter state.
+
+    Guards the output before it is written into the run's state/ports. Returns
+    a failed-artifact dict on violation, else ``None``.
+    """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        assert_no_secret_objects,
+        record_scope_violation,
+    )
+
+    try:
+        assert_no_secret_objects(result, node_id=node_id)
+    except ScopeViolationError as scope_err:
+        record_scope_violation(node_id=node_id, target=scope_err.target, kind="secret")
+        _log.error("scope.violation node=%s secret=%s", node_id, scope_err.target)
+        return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+    return None
 
 
 def make_connector_fn(
@@ -2401,60 +2512,28 @@ def make_connector_fn(
             connector_instance_ids=[instance_id] if instance_id is not None else [],
         )
 
-        from modulo.connectors.base import ConnectorPayload, ConnectorQuery
-        from modulo.core.capability_scope import (
-            ScopeViolationError,
-            assert_no_secret_objects,
-            is_connector_allowed,
-            record_scope_violation,
+        scope_block = _enforce_connector_scope(binding, node_id, connector_type, allowed_connectors)
+        if scope_block is not None:
+            return scope_block
+
+        connector, error_artifact = _resolve_binding_connector(
+            binding,
+            node_id,
+            allowed_connectors=allowed_connectors,
         )
-
-        # FAR-418: deny-by-default within the node's connector scope. The gate
-        # fires BEFORE the connector is resolved from the hub, so a node that
-        # targets a connector excluded by its capability_scope never decrypts or
-        # touches the connection (fail-fast with a typed, logged, metric-emitting
-        # ScopeViolationError). The hub is only consulted for in-scope connectors.
-        instance_id_str = binding.get("instance_id")
-        if instance_id_str:
-            import uuid as _uuid
-
-            instance_uuid = _uuid.UUID(str(instance_id_str))
-            if not is_connector_allowed(
-                connector_instance_id=instance_uuid,
-                connector_type=connector_type,
-                allowed_connectors=allowed_connectors,
-            ):
-                target = connector_type or str(instance_uuid)
-                scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
-                record_scope_violation(node_id=node_id, target=target, kind="connector")
-                _log.error("scope.violation node=%s connector=%s", node_id, target)
-                return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
-
-        connector, error_artifact = _resolve_binding_connector(binding, node_id)
         if error_artifact is not None:
             return error_artifact
 
         resource, filters, data = _connector_inputs(binding, state)
 
         try:
-            if op == "write":
-                payload = ConnectorPayload(resource=resource, data=data)
-                result = await connector.write(payload)
-            else:
-                query = ConnectorQuery(resource=resource, filters=filters)
-                result = await connector.query(query)
+            result = await _run_connector_action(connector, op, resource, filters, data)
         except Exception as exc:
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(exc)}]}
 
-        # FAR-418: secret hygiene — connector/secret OBJECTS are never valid port
-        # payload types; only opaque connector IDs may enter state. Guard the
-        # output before it is written into the run's state/ports.
-        try:
-            assert_no_secret_objects(result, node_id=node_id)
-        except ScopeViolationError as scope_err:
-            record_scope_violation(node_id=node_id, target=scope_err.target, kind="secret")
-            _log.error("scope.violation node=%s secret=%s", node_id, scope_err.target)
-            return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+        scope_block = _guard_connector_secret_output(result, node_id)
+        if scope_block is not None:
+            return scope_block
 
         return {
             "artifacts": [{"node_id": node_id, "status": "completed", "output": result}],
@@ -3852,9 +3931,15 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
     else:
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
+        # FAR-436: context_scope — the sandbox agent's run_context VIEW (the keys
+        # fed to the prompt + agent_command templates) is allowlist-gated to the
+        # node's need-to-know set. Internal control keys are always preserved by
+        # filter_run_context_scope (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
         template_vars: dict[str, Any] = {
             "state": state,
-            "run_context": run_context,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         resolved = node_def.get("_resolved_parameters")

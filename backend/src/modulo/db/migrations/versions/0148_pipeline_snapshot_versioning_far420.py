@@ -1,7 +1,7 @@
 """PipelineSnapshot live-edit history + release channels (FAR-402 P6).
 
-Revision ID: 0145_pipeline_snapshot_versioning_far420
-Revises: 0144_broaden_notification_status_in_app
+Revision ID: 0148_pipeline_snapshot_versioning_far420
+Revises: 0147_json_to_jsonb_standardize
 Create Date: 2026-08-25
 
 Adds four additive columns to ``pipeline_snapshots`` so the existing snapshot
@@ -39,8 +39,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0145_pipeline_snapshot_versioning_far420"
-down_revision: str | None = "0144_broaden_notification_status_in_app"
+revision: str = "0148_pipeline_snapshot_versioning_far420"
+down_revision: str | None = "0147_json_to_jsonb_standardize"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
