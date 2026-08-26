@@ -67,8 +67,10 @@ async def _assert_owns_parameter_schema(
 ) -> "ParameterSchema":
     """Load a parameter schema by id and assert the caller's org owns it.
 
-    The application session runs with BYPASSRLS, so tenant isolation must be
-    enforced explicitly. Raises 404 (not 403) to avoid leaking existence.
+    The application session is RLS-enforced (the app role is not BYPASSRLS), but
+    we assert ownership explicitly to give consistent 404s on non-Postgres
+    backends that rely on the ORM tenant filter. Raises 404 (not 403) to avoid
+    leaking existence.
     """
     schema = await get_schema(session, schema_id)
     if schema is None or schema.organisation_id != principal.organisation_id:
@@ -81,8 +83,10 @@ async def _assert_owns_parameter_set(
 ) -> "ParameterSet":
     """Load a parameter set by id and assert the caller's org owns it.
 
-    The application session runs with BYPASSRLS, so tenant isolation must be
-    enforced explicitly. Raises 404 (not 403) to avoid leaking existence.
+    The application session is RLS-enforced (the app role is not BYPASSRLS), but
+    we assert ownership explicitly to give consistent 404s on non-Postgres
+    backends that rely on the ORM tenant filter. Raises 404 (not 403) to avoid
+    leaking existence.
     """
     ps = await get_set(session, set_id)
     if ps is None or ps.organisation_id != principal.organisation_id:

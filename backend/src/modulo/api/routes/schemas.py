@@ -70,8 +70,10 @@ router = APIRouter(prefix="/api/v1/schemas", tags=["schemas"])
 async def _assert_owns_schema(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> "Schema":
     """Load a schema by id and assert the caller's org owns it.
 
-    The application session runs with BYPASSRLS, so tenant isolation must be
-    enforced explicitly. Raises 404 (not 403) to avoid leaking existence.
+    The application session is RLS-enforced (the app role is not BYPASSRLS), but
+    we assert ownership explicitly to give consistent 404s on non-Postgres
+    backends that rely on the ORM tenant filter. Raises 404 (not 403) to avoid
+    leaking existence.
     """
     schema = await get_schema(session, schema_id)
     if schema is None or schema.organisation_id != principal.organisation_id:
@@ -1174,11 +1176,14 @@ async def _load_migration_versions(
 ) -> tuple[Any, Any]:
     """Load the latest source and target schema versions within a transaction.
 
-    The application session runs with BYPASSRLS, so tenant isolation must be
-    enforced explicitly: assert the caller's org owns both the source and target
-    schema before touching any versions (avoiding a cross-org read).
+    The application session is RLS-enforced (the app role is not BYPASSRLS), so we
+    must set the org context before querying. We additionally assert explicitly
+    that the caller's org owns both the source and target schema before touching
+    any versions (avoiding a cross-org read, and giving consistent 404s on
+    non-Postgres backends that rely on the ORM tenant filter).
     """
     async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
         await _assert_owns_schema(session, req.from_schema_id, principal)
         from_sv = await _get_latest_version(session, req.from_schema_id)
         if from_sv is None:
