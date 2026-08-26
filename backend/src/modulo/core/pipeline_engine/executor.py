@@ -274,8 +274,9 @@ def _retry_after_policy(
     ``_stream_graph``, which reaches this decision. The **executor-level
     zombie-watchdog stall** (``execute_run`` watchdog terminal-fails the run and
     cancels ``execute()``; the ``CancelledError`` is re-raised at the top of the
-    stream block before this decision runs) is NOT retried. See ``docs/prd.md``
-    §8.9.
+    stream block before this decision runs) is NOT retried. See
+    ``docs/troubleshooting.md`` (``executor_stalled`` row) — the zombie watchdog's
+    terminal fail is documented as "never re-dispatched".
 
     An absent/malformed policy or a 0 budget yields None (no retry) — the
     current behaviour is unchanged for pipelines without a policy.
@@ -1507,7 +1508,7 @@ class PipelineExecutor:
             decline_code, decline_detail = self._capacity_decline(
                 max_concurrent=max_concurrent,
                 active_count=active_count,
-                pipeline_capacity_ok=pipeline_capacity_ok,
+                _pipeline_capacity_ok=pipeline_capacity_ok,
                 org_sandbox_cap=org_sandbox_cap,
                 org_count=org_sandbox_count,
                 org_capacity_ok=org_sandbox_cap_ok,
@@ -1673,7 +1674,7 @@ class PipelineExecutor:
         *,
         max_concurrent: int,
         active_count: int,
-        pipeline_capacity_ok: bool,
+        _pipeline_capacity_ok: bool,
         org_sandbox_cap: int | None,
         org_count: int,
         org_capacity_ok: bool,
@@ -1735,7 +1736,7 @@ class PipelineExecutor:
     def _build_eval_defs_by_node(
         eval_rows: list[EvalDefinition],
         org_id: uuid.UUID,
-        pipeline_id: uuid.UUID,
+        _pipeline_id: uuid.UUID,
     ) -> dict[str, list[EvalDefDTO]]:
         """Convert eval definition ORM rows to a dict keyed by node id."""
         eval_defs_by_node: dict[str, list[EvalDefDTO]] = {}
