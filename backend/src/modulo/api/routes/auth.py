@@ -315,6 +315,7 @@ def _mint_login_response(ctx: _LoginContext, settings: Settings) -> JSONResponse
         account_id=str(ctx.account.id),
         org_role=ctx.org_role or "",
         is_system_admin=ctx.account.is_system_admin,
+        ttl_minutes=settings.modulo_access_token_minutes,
     )
     refresh_token = create_refresh_token(
         ctx.account.email,
@@ -493,6 +494,7 @@ def _mint_refresh_response(
         organisation_id=claims.org_id,
         account_id=claims.account_id,
         org_role=str(minted_org_role),
+        ttl_minutes=settings.modulo_access_token_minutes,
     )
     new_refresh = create_refresh_token(
         claims.sub,
