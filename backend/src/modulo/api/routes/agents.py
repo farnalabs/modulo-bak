@@ -769,6 +769,8 @@ async def get_prompt_version_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error getting prompt version")
         raise HTTPException(

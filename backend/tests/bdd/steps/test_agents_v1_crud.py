@@ -8,6 +8,8 @@ from pytest_bdd import given, parsers, scenarios, then, when
 
 scenarios("../features/agents/crud.feature")
 
+ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
 _AGENT_ID: uuid.UUID | None = None
 _AGENT_BODY: dict = {
     "name": "code-review",
@@ -28,7 +30,7 @@ _AGENT_BODY: dict = {
 def _make_mock_agent(name: str = "test") -> MagicMock:
     a = MagicMock()
     a.id = uuid.uuid4()
-    a.organisation_id = uuid.uuid4()
+    a.organisation_id = ORG_ID
     a.name = name
     a.description = "Test agent description"
     a.is_executable = True
