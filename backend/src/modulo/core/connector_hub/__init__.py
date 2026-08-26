@@ -137,7 +137,8 @@ def resolve_shared_rate_limit_redis(org_id: str | None) -> Any | None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        return _handle_settings_read_failure(exc, org_id)
+        _handle_settings_read_failure(exc, org_id)
+        return None
 
     if _shared_redis_unconfigured(settings):
         # Redis is genuinely NOT configured — the connector-local bucket is correct
