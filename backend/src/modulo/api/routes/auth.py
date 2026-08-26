@@ -825,7 +825,7 @@ def _set_auth_cookies(response: Response, access_token: str, settings: Settings)
         httponly=True,
         samesite="strict",
         secure=secure,
-        max_age=900,
+        max_age=settings.modulo_access_token_minutes * 60,
         path="/",
     )
     csrf_token_value = secrets.token_hex(32)
@@ -839,7 +839,7 @@ def _set_csrf_cookie(response: Response, token: str, settings: Settings) -> None
         httponly=False,  # NOSONAR S3330 — JS-readable CSRF token; SameSite=strict + secure mitigate.
         samesite="strict",
         secure=not settings.debug,
-        max_age=900,
+        max_age=settings.modulo_access_token_minutes * 60,
         path="/",
     )
 
