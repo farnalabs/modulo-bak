@@ -33,6 +33,7 @@ from modulo.core.eval_engine.suite_run import (
     build_baseline_tuple,
     daily_spend_exceeded,
     is_suite_rate_limited,
+    load_eval_subscriber_events,
     pass_rate_by_eval_type,
     resolve_baseline_run,
     should_notify_regression,
@@ -622,3 +623,27 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0139 -> it is the single head.
     chaining_off_0139 = [p for p in revisions if parents[p] == "0139_add_router_no_match_status"]
     assert chaining_off_0139 == []
+
+
+async def test_load_eval_subscriber_events_normalises_json() -> None:
+    """The subscriber-event loader is exercised by the runtime guard."""
+    session = AsyncMock()
+
+    class Endpoint:
+        def __init__(self, events: Any) -> None:
+            self.events = events
+            self.auto_disabled = False
+
+    ep1 = Endpoint(["eval_regression"])
+    ep2 = Endpoint('["eval_blocked"]')
+
+    class FakeScalars:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    session.scalars.return_value = FakeScalars([ep1, ep2])
+    merged = await load_eval_subscriber_events(session, uuid.uuid4())
+    assert merged == ["eval_regression", "eval_blocked"]
