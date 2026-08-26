@@ -57,8 +57,8 @@
             {{ savingGraph ? $t('views.PipelineEditorView.saving_graph') : $t('views.PipelineEditorView.save') }}
           </Button>
           <span v-if="saveGraphError" class="ml-2 text-xs text-destructive" data-testid="pipeline-editor-save-error">{{ saveGraphError }}</span>
-          <Button size="small" class="text-xs" @click="showVersionTimeline = !showVersionTimeline" data-testid="pipeline-editor-version-timeline">
-            Versions
+          <Button v-if="planStore.featureEnabled('pipeline_diff_rollback')" size="small" class="text-xs" @click="showVersionTimeline = !showVersionTimeline" data-testid="pipeline-editor-version-timeline">
+            {{ $t('views.PipelineEditorView.versions') }}
           </Button>
           <Button size="small" class="text-xs border-indigo-300 bg-indigo-600 text-white hover:bg-indigo-500" :disabled="running || flowNodes.length === 0" :title="flowNodes.length === 0 ? $t('views.PipelineEditorView.no_nodes_to_run') : ''" @click="openRunDialog" data-testid="pipeline-editor-run">
             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" class="mr-1"><polygon points="5 3 19 12 5 21 5 3"/></svg>

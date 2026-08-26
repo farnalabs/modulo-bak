@@ -41,6 +41,7 @@ from modulo.core.capability_scope import (
     validate_allowed_connectors_subset,
 )
 from modulo.core.graph_validator import GraphValidator
+from modulo.core.release_channels import VALID_RELEASE_CHANNELS
 from modulo.core.reports.quality_report import (
     deliver_quality_report,
     generate_quality_report,
@@ -2264,13 +2265,19 @@ async def save_edit_snapshot_endpoint(
     ``draft`` save marks an in-progress editor auto-save; ``channel`` optionally
     tags the edit's release channel.
     """
+    channel = str(req.channel or "none").strip().lower()
+    if channel not in VALID_RELEASE_CHANNELS:
+        valid = ", ".join(sorted(VALID_RELEASE_CHANNELS))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid release channel: {req.channel!r}. Must be one of {valid}.",
+        )
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
             pipeline = await get_pipeline(session, pipeline_id)
             if pipeline is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
-            channel = str(req.channel or "none")
             snapshot = await create_snapshot_edit(
                 session,
                 pipeline_id=pipeline_id,

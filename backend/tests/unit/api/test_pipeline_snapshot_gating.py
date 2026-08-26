@@ -210,6 +210,35 @@ def test_save_edit_endpoint_round_trips_edit_body(team_client: TestClient) -> No
     assert body["channel"] == "canary"
 
 
+def test_save_edit_endpoint_rejects_invalid_channel(team_client: TestClient) -> None:
+    """An arbitrary (<=10-char) channel value must be rejected with 422 rather
+    than persisted; only VALID_RELEASE_CHANNELS are accepted (FAR-420 P6)."""
+    with (
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = team_client.post(
+            _save_edit_url(),
+            json={"draft": False, "channel": "foo"},
+        )
+    assert resp.status_code == 422, resp.text
+    assert "Invalid release channel" in resp.text
+
+
+def test_save_edit_endpoint_rejects_overlong_channel(team_client: TestClient) -> None:
+    """A >10-char channel value must be rejected with 422 rather than surfacing
+    a DB-level error (FAR-420 P6)."""
+    with (
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = team_client.post(
+            _save_edit_url(),
+            json={"draft": False, "channel": "x" * 12},
+        )
+    assert resp.status_code == 422, resp.text
+
+
 def test_snapshot_list_is_community_tier(community_client: TestClient) -> None:
     """Snapshot listing stays community tier — only diff/rollback are gated."""
     snapshot = MagicMock()

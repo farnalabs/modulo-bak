@@ -336,7 +336,6 @@ def _check_edge_repoint_breaking(
 
 
 def check_port_change_breaking(
-    graph_old: dict[str, Any],
     graph_new: dict[str, Any],
     changed_ports: Iterable[Any],
 ) -> list[dict[str, Any]]:

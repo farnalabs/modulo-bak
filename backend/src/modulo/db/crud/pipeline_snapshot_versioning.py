@@ -368,7 +368,6 @@ async def diff_snapshots(
     if a is None or b is None:
         return None
 
-    graph_a = a.graph_json
     nodes_a = {n["id"]: n for n in a.graph_json.get("nodes", [])}
     nodes_b = {n["id"]: n for n in b.graph_json.get("nodes", [])}
     ids_a = set(nodes_a)
@@ -492,7 +491,7 @@ async def diff_snapshots(
     breaking_changes: list[dict[str, Any]] = []
     if port_changes:
         impacted_nodes = compute_port_change_impact(graph_b_for_impact, port_changes)
-        breaking_changes = check_port_change_breaking(graph_a, graph_b_for_impact, port_changes)
+        breaking_changes = check_port_change_breaking(graph_b_for_impact, port_changes)
 
     return {
         "snapshot_a": {

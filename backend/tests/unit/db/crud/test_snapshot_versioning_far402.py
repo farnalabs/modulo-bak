@@ -144,58 +144,42 @@ class TestComputePortChangeImpact:
 
 class TestCheckPortChangeBreaking:
     def test_removed_output_port_blocks_consuming_edge(self):
-        graph_old = {
-            "nodes": [{"id": "a", "outputs": [{"name": "res", "schema_ref": "s"}]}],
-            "edges": [{"source": "a", "target": "b", "source_port": "res"}],
-        }
         graph_new = {
             "nodes": [{"id": "a", "outputs": []}],
             "edges": [{"source": "a", "target": "b", "source_port": "res"}],
         }
         findings = check_port_change_breaking(
-            graph_old, graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "removed"}]
+            graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "removed"}]
         )
         assert findings, "expected a block finding"
         assert findings[0]["severity"] == "block"
 
     def test_schema_ref_change_is_warning_when_edge_reads_port(self):
-        graph_old = {
-            "nodes": [{"id": "a", "outputs": [{"name": "res", "schema_ref": "s1"}]}],
-            "edges": [{"source": "a", "target": "b", "source_port": "res"}],
-        }
         graph_new = {
             "nodes": [{"id": "a", "outputs": [{"name": "res", "schema_ref": "s2"}]}],
             "edges": [{"source": "a", "target": "b", "source_port": "res"}],
         }
         findings = check_port_change_breaking(
-            graph_old, graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "modified"}]
+            graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "modified"}]
         )
         assert findings, "expected a warning finding"
         assert findings[0]["severity"] == "warning"
 
     def test_port_less_edge_still_breaks_when_default_output_removed(self):
-        graph_old = {
-            "nodes": [{"id": "a", "outputs": [{"name": "out", "schema_ref": "s"}]}],
-            "edges": [{"source": "a", "target": "b"}],
-        }
         graph_new = {"nodes": [{"id": "a", "outputs": []}], "edges": [{"source": "a", "target": "b"}]}
         findings = check_port_change_breaking(
-            graph_old, graph_new, [{"node_id": "a", "direction": "output", "port": "out", "change": "removed"}]
+            graph_new, [{"node_id": "a", "direction": "output", "port": "out", "change": "removed"}]
         )
         assert findings, "expected a block finding"
         assert findings[0]["severity"] == "block"
 
     def test_unrelated_edge_not_flagged(self):
-        graph_old = {
-            "nodes": [{"id": "a", "outputs": [{"name": "res", "schema_ref": "s"}]}],
-            "edges": [{"source": "a", "target": "b", "source_port": "other"}],
-        }
         graph_new = {
             "nodes": [{"id": "a", "outputs": []}],
             "edges": [{"source": "a", "target": "b", "source_port": "other"}],
         }
         findings = check_port_change_breaking(
-            graph_old, graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "removed"}]
+            graph_new, [{"node_id": "a", "direction": "output", "port": "res", "change": "removed"}]
         )
         assert findings == []
 

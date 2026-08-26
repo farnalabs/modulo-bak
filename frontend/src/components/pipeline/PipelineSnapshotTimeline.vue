@@ -5,7 +5,8 @@
       <button
         type="button"
         class="rounded p-1 hover:bg-accent"
-        aria-label="Close version timeline"
+        :aria-label="$t('components.PipelineSnapshotTimeline.close')"
+        data-testid="snapshot-timeline-close"
         @click="$emit('close')"
       >
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
@@ -23,6 +24,7 @@
           :key="s.id"
           role="button"
           tabindex="0"
+          :data-testid="`snapshot-timeline-row-${s.id}`"
           class="flex items-center justify-between gap-2 rounded-md border px-2 py-1.5"
           @click="selectA(s.id)"
           @keydown.enter="selectA(s.id)"
@@ -34,11 +36,11 @@
               class="rounded px-1.5 py-0.5 text-[10px] font-medium"
               :class="s.version_kind === 'edit' ? 'bg-primary/10 text-primary' : 'bg-muted/40 text-muted-foreground'"
             >
-              {{ s.version_kind === 'edit' ? 'edit' : 'run' }}
+              {{ s.version_kind === 'edit' ? $t('components.PipelineSnapshotTimeline.edit') : $t('components.PipelineSnapshotTimeline.run') }}
             </span>
             <span
               v-if="s.channel && s.channel !== 'none'"
-              class="rounded bg-canary/10 px-1.5 py-0.5 text-[10px] font-medium text-canary"
+              class="rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning"
             >
               {{ s.channel }}
             </span>
@@ -53,7 +55,7 @@
         <Select
           data-testid="snapshot-timeline-compare"
           aria-label="Base snapshot to compare"
-          placeholder="Select base snapshot"
+          :placeholder="$t('components.PipelineSnapshotTimeline.select_base_snapshot')"
           :options="compareOptions"
           v-model="compareB"
         />
@@ -64,14 +66,14 @@
           @click="runDiff"
           data-testid="snapshot-timeline-diff"
         >
-          Diff
+          {{ $t('components.PipelineSnapshotTimeline.diff') }}
         </Button>
       </div>
 
       <div v-if="diffResult" class="space-y-2" data-testid="snapshot-timeline-diff-result">
         <div class="text-xs">
           <span class="font-medium">{{ $t('components.PipelineSnapshotTimeline.impacted_nodes') }}</span>
-          <span class="text-muted-foreground">{{ impactedLabel }}</span>
+          <span class="text-muted-foreground">{{ impactedLabel ? impactedLabel : $t('components.PipelineSnapshotTimeline.none') }}</span>
         </div>
 
         <div v-if="diffResult.semantic?.breaking_changes?.length" class="space-y-1">
@@ -100,7 +102,7 @@
           @click="rollback"
           data-testid="snapshot-timeline-rollback"
         >
-          Rollback to selected
+          {{ $t('components.PipelineSnapshotTimeline.rollback_to_selected') }}
         </Button>
       </div>
       <p v-if="actionError" class="mt-1 text-[11px] text-destructive">{{ actionError }}</p>
@@ -144,7 +146,7 @@ const canDiff = computed(() => compareB.value != null && selectedSnapshotId.valu
 
 const impactedLabel = computed(() => {
   const ids = diffResult.value?.semantic?.impacted_nodes ?? []
-  if (!Array.isArray(ids) || ids.length === 0) return 'none'
+  if (!Array.isArray(ids) || ids.length === 0) return ''
   return ids.map((id: unknown) => String(id).slice(0, 8)).join(', ')
 })
 
