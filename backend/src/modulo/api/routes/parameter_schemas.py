@@ -315,7 +315,7 @@ async def get_parameter_schema_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if schema is None:
+    if schema is None or schema.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SCHEMA_NOT_FOUND)
     return SchemaResponse.model_validate(schema)
 
@@ -482,7 +482,7 @@ async def diff_parameter_schema_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if schema is None:
+    if schema is None or schema.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SCHEMA_NOT_FOUND)
 
     if from_version < 1 or to_version < 1:
@@ -568,7 +568,7 @@ async def validate_parameter_values_endpoint(
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             schema = await get_schema(session, schema_id)
-            if schema is None:
+            if schema is None or schema.organisation_id != principal.organisation_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SCHEMA_NOT_FOUND)
 
             params = schema.parameters if isinstance(schema.parameters, list) else []
@@ -650,7 +650,7 @@ async def list_parameter_sets_endpoint(
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             schema = await get_schema(session, schema_id)
-            if schema is None:
+            if schema is None or schema.organisation_id != principal.organisation_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SCHEMA_NOT_FOUND)
             sets = await list_sets(
                 session,
@@ -782,7 +782,7 @@ async def get_parameter_set_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if ps is None or ps.parameter_schema_id != schema_id:
+    if ps is None or ps.parameter_schema_id != schema_id or ps.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SET_NOT_FOUND)
     return SetResponse.model_validate(ps)
 
