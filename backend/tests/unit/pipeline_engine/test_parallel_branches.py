@@ -101,10 +101,10 @@ class TestFanOutExecution:
         """
         intervals: dict[str, list[float]] = {}
 
-        def _make_instrumented(node_id: str, delay: float) -> Any:
+        def _make_instrumented(node_id: str) -> Any:
             async def _fn(state: dict[str, Any]) -> dict[str, Any]:
                 intervals[node_id] = [time.monotonic(), 0.0]
-                await asyncio.sleep(delay)
+                await asyncio.sleep(0.1)
                 intervals[node_id][1] = time.monotonic()
                 return {"artifacts": [{"node_id": node_id, "status": "completed"}]}
 
@@ -113,9 +113,9 @@ class TestFanOutExecution:
 
         def _build() -> StateGraph:
             graph = StateGraph(_STATE_SCHEMA)
-            graph.add_node("entry", _make_instrumented("entry", 0.05))
-            graph.add_node("branch-a", _make_instrumented("branch-a", 0.5))
-            graph.add_node("branch-b", _make_instrumented("branch-b", 0.5))
+            graph.add_node("entry", _make_instrumented("entry"))
+            graph.add_node("branch-a", _make_instrumented("branch-a"))
+            graph.add_node("branch-b", _make_instrumented("branch-b"))
             graph.set_entry_point("entry")
             graph.add_edge("entry", "branch-a")
             graph.add_edge("entry", "branch-b")
