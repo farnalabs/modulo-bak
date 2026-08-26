@@ -228,6 +228,22 @@ class TestGetTeam:
             resp = client.get(f"/api/v1/teams/{uuid.uuid4()}")
         assert resp.status_code == 404
 
+    def test_cross_org_returns_404(self, client: TestClient) -> None:
+        """IDOR guard: a team belonging to another org must not be readable.
+
+        Fails on the pre-fix code (returns 200 and leaks the row); passes once
+        the organisation_id ownership check is enforced.
+        """
+        cross_org_team = _make_team(organisation_id=uuid.UUID("00000000-0000-0000-0000-000000000099"))
+        assert cross_org_team.organisation_id != _ORG_ID
+        with (
+            patch("modulo.api.routes.teams.get_team", return_value=cross_org_team),
+            patch("modulo.api.routes.teams.set_rls_org"),
+            patch("modulo.api.routes.teams.set_rls_user_context"),
+        ):
+            resp = client.get(f"/api/v1/teams/{_TEAM_ID}")
+        assert resp.status_code == 404
+
 
 class TestUpdateTeam:
     def test_returns_200(self, client: TestClient) -> None:
