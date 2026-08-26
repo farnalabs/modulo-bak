@@ -125,6 +125,8 @@ class TestDecisionTable:
             "cancelled-with-pr",
             "budget_exceeded-no-pr",
             "budget_exceeded-with-pr",
+            "router_no_match-no-pr",
+            "router_no_match-with-pr",
         ],
     )
     def test_terminal_status_matrix(
