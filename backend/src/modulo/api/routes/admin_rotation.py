@@ -9,15 +9,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError, ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.api.constants import MSG_INTERNAL_SERVER_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import (
     deny_break_glass_mint,
     get_db_session,
-    get_or_create_engine,
-    get_or_create_session_factory,
     require_system_permission,
 )
 from modulo.auth.jwt import TenantPrincipal
@@ -128,16 +126,11 @@ async def rotate_key(
 
         _rotation_in_progress = True
 
-        # Launch background rotation task.
-        # We use the global engine/session factory to avoid re-creating connections.
-        engine = get_or_create_engine(settings)
-        factory = get_or_create_session_factory(engine)
-
         import asyncio
 
+        # Launch background rotation task.
         task = asyncio.create_task(
             _run_rotation_background(
-                factory=factory,
                 new_key=req.new_fernet_key,
                 old_key=old_key,
                 org_id=current_user.organisation_id,
@@ -205,17 +198,29 @@ async def rotation_status(
 
 
 async def _run_rotation_background(
-    factory: async_sessionmaker[AsyncSession],
     new_key: str,
     old_key: str,
     org_id: uuid.UUID,
     actor_user_id: uuid.UUID,
 ) -> None:
-    """Run the full rotation in the background and store the result."""
+    """Run the full rotation in the background and store the result.
+
+    Rotation is inherently cross-org ("rotate all encrypted data"), so it runs on
+    the ``modulo_system`` cross-org session factory (BYPASSRLS). The app role
+    ``modulo_app`` is NOBYPASSRLS: on the org-scoped tables (``secrets``,
+    ``connector_instances``, ``model_backends``, ``notification_endpoints``) the
+    ``rls_org_isolation`` policy compares ``organisation_id`` against
+    ``app.organisation_id``, which is empty here — so the UPDATEs fail-closed to
+    ZERO rows and the rotation would silently no-op. The system factory bypasses
+    RLS and is the same cross-org mechanism used by the retention/system crons.
+    """
     global _rotation_in_progress, _last_rotation_result
 
+    # Lazy import keeps saq_worker's redis/saq import weight out of the route graph.
+    from modulo.core.saq_worker import _make_system_session_factory
+
     try:
-        async with factory() as session, session.begin():
+        async with _make_system_session_factory()() as session, session.begin():
             result = await rotate_all_encrypted_data(session, new_key, old_key)
 
             # Log completion inside the transaction so it gets committed

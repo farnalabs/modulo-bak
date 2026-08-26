@@ -132,11 +132,6 @@ def test_normal_admin_can_rotate_key(client: TestClient) -> None:
     )
     with (
         patch("modulo.api.routes.admin_rotation.append_audit_event", new=AsyncMock()),
-        patch("modulo.api.routes.admin_rotation.get_or_create_engine", return_value=MagicMock()),
-        patch(
-            "modulo.api.routes.admin_rotation.get_or_create_session_factory",
-            return_value=AsyncMock(),
-        ),
         patch("modulo.api.routes.admin_rotation._run_rotation_background", new=AsyncMock()),
     ):
         resp = client.post(_ROTATE_KEY_URL, json={"new_fernet_key": _VALID_32})
