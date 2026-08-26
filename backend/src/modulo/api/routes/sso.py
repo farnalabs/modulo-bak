@@ -13,6 +13,7 @@ from modulo.api.constants import MSG_FEATURE_NOT_AVAILABLE, MSG_UNEXPECTED_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature
 from modulo.auth.sso import (
+    _set_default_rls_org,
     oidc_get_authorize_url,
     oidc_process_callback,
     parse_oidc_providers,
@@ -68,25 +69,28 @@ async def sso_providers(
     configured (enabled + license + metadata).
     """
     try:
-        db_providers = await list_enabled_oidc_providers(session)
-        db_ids = {p.provider_id for p in db_providers}
-        oidc_list = [{"provider_id": p.provider_id} for p in db_providers if p.provider_id]
+        async with session.begin():
+            await _set_default_rls_org(session)
+            db_providers = await list_enabled_oidc_providers(session)
+            db_ids = {p.provider_id for p in db_providers}
+            oidc_list = [{"provider_id": p.provider_id} for p in db_providers if p.provider_id]
 
-        for env_provider in parse_oidc_providers(settings):
-            env_id = env_provider["provider_id"]
-            if env_id not in db_ids:
-                oidc_list.append({"provider_id": env_id})
+            for env_provider in parse_oidc_providers(settings):
+                env_id = env_provider["provider_id"]
+                if env_id not in db_ids:
+                    oidc_list.append({"provider_id": env_id})
 
-        db_saml = await get_enabled_saml_provider(session)
-        saml_enabled = db_saml is not None or (
-            settings.modulo_saml_enabled
-            and bool(settings.modulo_license_key)
-            and (bool(settings.modulo_saml_idp_metadata_url) or bool(settings.modulo_saml_idp_metadata_xml))
-        )
-        return SsoProvidersResponse(
-            oidc=[OidcProviderInfo(**p) for p in oidc_list],
-            saml=saml_enabled,
-        )
+            db_saml = await get_enabled_saml_provider(session)
+            db_saml_ok = db_saml is not None and bool(db_saml.metadata_xml or db_saml.metadata_url)
+            saml_enabled = db_saml_ok or (
+                settings.modulo_saml_enabled
+                and bool(settings.modulo_license_key)
+                and (bool(settings.modulo_saml_idp_metadata_url) or bool(settings.modulo_saml_idp_metadata_xml))
+            )
+            return SsoProvidersResponse(
+                oidc=[OidcProviderInfo(**p) for p in oidc_list],
+                saml=saml_enabled,
+            )
     except HTTPException:
         raise
     except Exception as e:
@@ -116,17 +120,13 @@ async def oidc_login(
     redirect_uri = f"{public_url}/api/v1/auth/oidc/{provider}/callback"
 
     try:
-        auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri, session)
+        async with session.begin():
+            await _set_default_rls_org(session)
+            auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except HTTPException:
         raise
-    except Exception as e:
-        _log.exception("sso.oidc_login.unexpected_error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=MSG_UNEXPECTED_ERROR_NO_PERIOD,
-        ) from e
 
     return Response(status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers={"Location": auth_url})
 
@@ -158,6 +158,7 @@ async def oidc_callback(
 
     try:
         async with session.begin():
+            await _set_default_rls_org(session)
             tokens = await oidc_process_callback(code, state, settings, session, redirect_uri)
     except ValueError as exc:
         _log.warning(
@@ -212,7 +213,9 @@ async def saml_login(
     acs_url = f"{public_url}/api/v1/auth/saml/acs"
 
     try:
-        auth_url, _ = await saml_get_auth_url(settings, acs_url, session)
+        async with session.begin():
+            await _set_default_rls_org(session)
+            auth_url, _ = await saml_get_auth_url(settings, acs_url, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except ProgrammingError as exc:
@@ -262,6 +265,7 @@ async def saml_acs(
 
     try:
         async with session.begin():
+            await _set_default_rls_org(session)
             tokens = await saml_process_response(raw_saml, settings, session)
     except ValueError as exc:
         _log.warning("SAML ACS failed: %s", exc, exc_info=True)
@@ -309,26 +313,28 @@ async def saml_metadata(
         )
 
     try:
-        db_saml = await get_enabled_saml_provider(session)
-        entity_id = (db_saml.entity_id if db_saml is not None else None) or settings.modulo_saml_entity_id
+        async with session.begin():
+            await _set_default_rls_org(session)
+            db_saml = await get_enabled_saml_provider(session)
+            entity_id = (db_saml.entity_id if db_saml is not None else None) or settings.modulo_saml_entity_id
 
-        public_url = settings.modulo_public_url.rstrip("/")
-        acs_url = f"{public_url}/api/v1/auth/saml/acs"
+            public_url = settings.modulo_public_url.rstrip("/")
+            acs_url = f"{public_url}/api/v1/auth/saml/acs"
 
-        return (
-            '<?xml version="1.0"?>'
-            "<md:EntityDescriptor"
-            ' xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"'
-            f' entityID="{entity_id}">'
-            "  <md:SPSSODescriptor"
-            '   protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
-            f"    <md:AssertionConsumerService"
-            f'     Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
-            f'     Location="{acs_url}"'
-            f'     index="1"/>'
-            "  </md:SPSSODescriptor>"
-            "</md:EntityDescriptor>"
-        )
+            return (
+                '<?xml version="1.0"?>'
+                "<md:EntityDescriptor"
+                ' xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"'
+                f' entityID="{entity_id}">'
+                "  <md:SPSSODescriptor"
+                '   protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">'
+                f"    <md:AssertionConsumerService"
+                f'     Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"'
+                f'     Location="{acs_url}"'
+                f'     index="1"/>'
+                "  </md:SPSSODescriptor>"
+                "</md:EntityDescriptor>"
+            )
     except HTTPException:
         raise
     except Exception as e:

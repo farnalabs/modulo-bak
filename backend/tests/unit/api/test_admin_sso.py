@@ -504,7 +504,9 @@ class TestEnvVarSeeding:
 
         settings = _make_settings()
         mock_session = _make_mock_session()
-        mock_session.execute.return_value = MagicMock(scalar_one_or_none=MagicMock(return_value=None))
+        # First execute (existing-provider check) -> None so seeding proceeds;
+        # second execute (organisation lookup) -> an org so organisation_id can be set.
+        mock_session.execute.return_value.scalar_one_or_none.side_effect = [None, MagicMock()]
 
         with (
             patch("modulo.api.dependencies.get_or_create_engine", return_value=MagicMock()),
