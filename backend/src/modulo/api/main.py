@@ -943,9 +943,7 @@ async def _run_boot_guards_and_seeds(settings: Settings) -> None:
     # MODULO_SEED_DEMO_ORGS is set; DEMO_ORGS is empty by default so nothing
     # seeds until follow-up tickets populate it. Non-fatal like the rest.
     if settings.modulo_seed_demo_orgs:
-        from modulo.core.seed_data.demo_data import seed_demo_orgs
-
-        await _boot_seed("demo_orgs", seed_demo_orgs(settings))
+        await _boot_seed("demo_orgs", _seed_demo_orgs(settings))
 
     # Initialise the LangGraph checkpointer schema (langgraph.* tables).
     try:
@@ -1079,6 +1077,15 @@ async def _seed_cost_components(settings: Settings) -> None:
     engine = get_or_create_engine(settings)
     factory = get_or_create_session_factory(engine)
     await seed_cost_components(factory)
+
+
+async def _seed_demo_orgs(settings: Settings) -> None:
+    from modulo.api.dependencies import get_or_create_engine, get_or_create_session_factory
+    from modulo.core.seed_data.demo_data import seed_demo_orgs
+
+    engine = get_or_create_engine(settings)
+    factory = get_or_create_session_factory(engine)
+    await seed_demo_orgs(factory)
 
 
 async def _seed_tier_catalog() -> None:

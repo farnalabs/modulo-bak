@@ -21,6 +21,7 @@ import pytest
 from modulo.core.license import parse_and_verify, set_public_key
 from modulo.core.license_signing import LicenseSigningError
 from modulo.core.registry.crypto import generate_keypair
+from modulo.core.seed_data import demo_data as demo_mod
 from modulo.core.seed_data.demo_data import DEMO_ORGS, seed_demo_org
 from modulo.db.models.account import Account
 from modulo.db.models.org_membership import OrgMembership
@@ -30,6 +31,13 @@ _KP = generate_keypair()
 _TEST_PRIV = _KP["private_key"]
 _TEST_PUB = _KP["public_key"]
 set_public_key(_TEST_PUB)
+
+
+@pytest.fixture(autouse=True)
+def _patch_get_settings(monkeypatch) -> None:
+    # seed_demo_org now resolves the signing key via get_settings(); point it at
+    # the test keypair so the real signing helpers run end-to-end.
+    monkeypatch.setattr(demo_mod, "get_settings", lambda: _settings())
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +131,6 @@ async def test_seed_demo_org_community_creates_entities_and_license() -> None:
     session = FakeAsyncSession()
     await seed_demo_org(
         session,
-        _settings(),
         slug="demo-community",
         tier="community",
         full=False,
@@ -158,7 +165,6 @@ async def test_seed_demo_org_team_license() -> None:
     session = FakeAsyncSession()
     await seed_demo_org(
         session,
-        _settings(),
         slug="demo-team",
         tier="team",
         full=True,
@@ -185,9 +191,9 @@ async def test_seed_demo_org_idempotent() -> None:
         "admin_email": "idem@demo.example",
         "admin_password": "secret123",
     }
-    await seed_demo_org(session, _settings(), **kwargs)
+    await seed_demo_org(session, **kwargs)
     org_id_after_first = session._store[Organisation][0].id
-    await seed_demo_org(session, _settings(), **kwargs)
+    await seed_demo_org(session, **kwargs)
 
     # No duplicates after a second call.
     assert _count(session._store, Organisation) == 1
@@ -197,12 +203,13 @@ async def test_seed_demo_org_idempotent() -> None:
     assert session._store[Organisation][0].id == org_id_after_first
 
 
-async def test_seed_demo_org_requires_private_key_for_team() -> None:
+async def test_seed_demo_org_requires_private_key_for_team(monkeypatch) -> None:
+    # Override the autouse fixture so the signing key is empty -> must fail closed.
+    monkeypatch.setattr(demo_mod, "get_settings", lambda: _settings(private_key=""))
     session = FakeAsyncSession()
     with pytest.raises(LicenseSigningError):
         await seed_demo_org(
             session,
-            _settings(private_key=""),
             slug="demo-np",
             tier="team",
             full=False,
@@ -228,7 +235,6 @@ async def test_resolve_plan_context_returns_per_org_tier(monkeypatch) -> None:
         session = FakeAsyncSession()
         await seed_demo_org(
             session,
-            _settings(),
             slug=f"rpc-{tier}",
             tier=tier,
             full=False,
@@ -245,3 +251,49 @@ def test_seed_demo_orgs_empty_by_default() -> None:
     # FAR-450 foundation: DEMO_ORGS ships empty so nothing seeds until a
     # follow-up ticket populates it.
     assert DEMO_ORGS == []
+
+
+async def test_seed_demo_org_email_collision_refuses_cross_tenant() -> None:
+    session = FakeAsyncSession()
+    # A pre-existing account shares the demo email but is NOT an admin member of
+    # this org. Seeding must refuse to attach it (cross-tenant escalation guard)
+    # and raise, leaving no demo entities committed.
+    preexisting = Account(email="admin@demo.example", display_name="real-admin")
+    session.add(preexisting)
+
+    with pytest.raises(ValueError):
+        await seed_demo_org(
+            session,
+            slug="collide",
+            tier="community",
+            full=False,
+            admin_email="admin@demo.example",
+            admin_password="secret123",
+        )
+
+    # The pre-existing account is NOT attached to the demo org: no membership
+    # links it, and no second account is created. (The in-memory fake session
+    # retains the uncommitted org row, but a real DB rolls the aborted
+    # transaction back — the cross-tenant guard is the membership absence.)
+    assert _count(session._store, Account) == 1  # only the pre-existing one
+    assert _count(session._store, OrgMembership) == 0
+    # And the pre-existing account is unchanged (not re-hashed / not a member).
+    assert session._store[Account][0] is preexisting
+
+
+async def test_seed_demo_org_email_reuse_is_idempotent() -> None:
+    # Re-running on an org whose admin account we already created (so it already
+    # exists AND is an admin member) must NOT raise — idempotency is preserved.
+    session = FakeAsyncSession()
+    kwargs = {
+        "slug": "idem-email",
+        "tier": "community",
+        "full": False,
+        "admin_email": "idem-email@demo.example",
+        "admin_password": "secret123",
+    }
+    await seed_demo_org(session, **kwargs)
+    await seed_demo_org(session, **kwargs)
+    assert _count(session._store, Organisation) == 1
+    assert _count(session._store, Account) == 1
+    assert _count(session._store, OrgMembership) == 1
