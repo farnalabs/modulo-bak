@@ -1973,11 +1973,12 @@ class PipelineExecutor:
         Returns the hub (or None if no connectors are configured).
 
         When *graph_json* is provided (the run-start path), the hub applies a
-        run-level fetch scope: the union of every node's
-        ``capability_scope.allowed_connectors`` and the referenced Agents'
-        ``connector_type_refs`` grants (FAR-435). The scope is cached on the
-        executor and reused by the compensation path (which has no graph) so
-        both apply the same deny-by-default fetch gate.
+        run-level fetch scope (deny-by-default, FAR-435 building on FAR-418): the
+        union of every node's ``capability_scope.allowed_connectors`` and the
+        referenced Agents' ``connector_type_refs`` grants. The hub decrypts ONLY
+        those connectors, so out-of-scope credentials are never disclosed. The scope
+        is cached on the executor and reused by the compensation path (which has no
+        graph) so both apply the same deny-by-default fetch gate.
         """
         hub: Any | None = None
         try:
@@ -3305,8 +3306,10 @@ class PipelineExecutor:
         # Load model backends for this run's org — provides LLM access to agent nodes.
         model_backend_hub = await self._init_model_backend_hub(org_id)
         # Load connector hub for this run's org — provides connector access to connector nodes.
-        # FAR-435: the hub is initialised with a run-level fetch scope (deny-by-default)
-        # derived from the graph's node capability_scope union Agent connector_type_refs grants.
+        # FAR-435 (building on FAR-418): the hub is initialised with a run-level
+        # fetch scope (deny-by-default) derived from the graph's node
+        # capability_scope union Agent connector_type_refs grants. The hub decrypts
+        # ONLY those connectors, so out-of-scope credentials are never disclosed.
         connector_hub = await self._init_connector_hub(org_id, graph_json=graph_json)
 
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
