@@ -39,12 +39,13 @@ def _make_settings() -> Settings:
     )
 
 
-def _make_principal(is_break_glass: bool = False) -> AuthenticatedPrincipal:
+def _make_principal(is_break_glass: bool = False, *, is_system_admin: bool = False) -> AuthenticatedPrincipal:
     return AuthenticatedPrincipal(
         username="breakglass-user" if is_break_glass else "testuser",
         organisation_id=_ORG_ID,
         account_id=_USER_ID,
         org_role="admin",
+        is_system_admin=is_system_admin,
     )
 
 
@@ -127,7 +128,7 @@ def test_normal_admin_can_rotate_key(client: TestClient) -> None:
     _configure_auth(
         app,
         session=_make_session(_make_account(is_break_glass=False)),
-        principal=_make_principal(is_break_glass=False),
+        principal=_make_principal(is_break_glass=False, is_system_admin=True),
     )
     with (
         patch("modulo.api.routes.admin_rotation.append_audit_event", new=AsyncMock()),
@@ -179,7 +180,7 @@ def test_normal_admin_can_rotate_identity_secret(client: TestClient) -> None:
     _configure_auth(
         app,
         session=_make_session(_make_account(is_break_glass=False)),
-        principal=_make_principal(is_break_glass=False),
+        principal=_make_principal(is_break_glass=False, is_system_admin=True),
     )
     with (
         patch(
