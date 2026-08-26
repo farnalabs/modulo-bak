@@ -8729,6 +8729,10 @@ export interface components {
             total_count: number;
             /** Total Estimated Bytes */
             total_estimated_bytes: number;
+            /** Terminal Total */
+            terminal_total: number;
+            /** Terminal Estimated Bytes */
+            terminal_estimated_bytes: number;
         };
         /** ChangeMemberRoleRequest */
         ChangeMemberRoleRequest: {

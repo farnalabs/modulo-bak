@@ -139,11 +139,11 @@
               <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.matching_runs') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
-              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(terminalEstimatedBytes) }}</p>
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-total-bytes">{{ formatBytes(displayTerminalBytes) }}</p>
               <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}</p>
             </div>
             <div class="rounded-lg border bg-muted p-4 text-center">
-              <p class="text-2xl font-semibold" data-testid="admin-run-retention-terminal-runs">{{ terminalCandidates.length }}</p>
+              <p class="text-2xl font-semibold" data-testid="admin-run-retention-terminal-runs">{{ displayTerminalCount }}</p>
               <p class="text-xs text-muted-foreground">{{ $t('views.AdminRunRetentionView.terminal_purgeable') }}</p>
             </div>
           </div>
@@ -211,9 +211,9 @@
         </template>
         <div class="space-y-3 text-sm">
           <p>
-            {{ $t('views.AdminRunRetentionView.confirm_purge_detail', { count: terminalCandidates.length }) }}
+            {{ $t('views.AdminRunRetentionView.confirm_purge_detail', { count: displayTerminalCount }) }}
           </p>
-           <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(terminalEstimatedBytes) }}.</p>
+           <p class="text-muted-foreground">{{ $t('views.AdminRunRetentionView.estimated_reclaimable') }}: {{ formatBytes(displayTerminalBytes) }}.</p>
         </div>
         <template #footer>
           <div class="flex justify-end gap-2">
@@ -272,7 +272,8 @@ const appliedFilters = ref<AppliedFilters | null>(null)
 
 const candidates = ref<RetentionCandidate[]>([])
 const totalCount = ref(0)
-const totalEstimatedBytes = ref(0)
+const terminalTotal = ref(0)
+const terminalEstimatedBytesResp = ref(0)
 const pipelines = ref<PipelineResponse[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -290,7 +291,16 @@ const pipelineOptions = computed(() => pipelines.value.map(p => ({ value: p.id, 
 const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({ value: s, label: s.replace(/_/g, ' ') })))
 
 const terminalCandidates = computed(() => candidates.value.filter(c => isTerminalStatus(c.status.toLowerCase())))
-const terminalEstimatedBytes = computed(() =>
+
+// The purge deletes EVERY matching terminal run (unbounded), so the confirm
+// count and reclaimable figure must come from the server-side terminal totals,
+// not the page-capped candidate list the client holds. Fall back to the loaded
+// page when the server response predates these fields.
+const displayTerminalCount = computed(() =>
+  terminalTotal.value || terminalCandidates.value.length,
+)
+const displayTerminalBytes = computed(() =>
+  terminalEstimatedBytesResp.value ||
   terminalCandidates.value.reduce((sum, c) => sum + (c.estimated_bytes ?? 0), 0),
 )
 
@@ -360,7 +370,8 @@ async function loadCandidates() {
     const data: CandidatesResponse | undefined = res.data as CandidatesResponse | undefined
     candidates.value = data?.runs ?? []
     totalCount.value = data?.total_count ?? 0
-    totalEstimatedBytes.value = data?.total_estimated_bytes ?? 0
+    terminalTotal.value = data?.terminal_total ?? 0
+    terminalEstimatedBytesResp.value = data?.terminal_estimated_bytes ?? 0
     appliedFilters.value = {
       dateFrom: dateFrom.value,
       dateTo: dateTo.value,

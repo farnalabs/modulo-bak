@@ -34,6 +34,8 @@ const mockCandidates = {
   ],
   total_count: 3,
   total_estimated_bytes: 62914560,
+  terminal_total: 2,
+  terminal_estimated_bytes: 52428800,
 }
 
 function setupDefaultMock() {
@@ -146,6 +148,8 @@ describe('AdminRunRetentionView', () => {
       ],
       total_count: 1,
       total_estimated_bytes: 26214400,
+      terminal_total: 0,
+      terminal_estimated_bytes: 0,
     }
     ;(api.GET as Mock).mockImplementation(async (url: string) => {
       if (url === '/api/v1/pipelines') return { data: mockPipelines, error: undefined }
@@ -259,5 +263,46 @@ describe('AdminRunRetentionView', () => {
 
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it('uses the server-side terminal total (not the page-capped count) in the confirm dialog', async () => {
+    // 500 candidates are returned (the client page cap), but 640 terminal runs
+    // actually match server-side — the purge is unbounded, so the confirm must
+    // reflect 640, never the truncated 500 shown in the table.
+    const manyRuns = Array.from({ length: 500 }, (_, i) => ({
+      id: `run-${i.toString().padStart(4, '0')}-aaaaaaaaaaaaaaaa`,
+      created_at: '2026-08-01T00:00:00Z',
+      status: 'complete',
+      pipeline_id: 'pipeline-1',
+      thread_id: `thread-${i}`,
+      estimated_bytes: 26214400,
+    }))
+    const many = {
+      runs: manyRuns,
+      total_count: 640,
+      total_estimated_bytes: 640 * 26214400,
+      terminal_total: 640,
+      terminal_estimated_bytes: 640 * 26214400,
+    }
+    ;(api.GET as Mock).mockImplementation(async (url: string) => {
+      if (url === '/api/v1/pipelines') return { data: mockPipelines, error: undefined }
+      if (url === '/api/v1/admin/run-retention/candidates') return { data: many, error: undefined }
+      return { data: null, error: undefined }
+    })
+
+    const wrapper = await mountView()
+    // The "Terminal (purge-able)" card shows the uncapped server total (640),
+    // not the 500-length page the table is rendering.
+    expect(wrapper.find('[data-testid="admin-run-retention-terminal-runs"]').text()).toBe('640')
+
+    await wrapper.find('[data-testid="admin-run-retention-purge"]').trigger('click')
+    await flushPromises()
+    await flushPromises()
+
+    const dialog = document.body.querySelector('[data-testid="admin-run-retention-confirm-dialog"]') as HTMLElement
+    expect(dialog).not.toBeNull()
+    // Confirm dialog must state 640 (all matching terminal runs), not 500.
+    expect(dialog.textContent).toContain('640')
+    expect(dialog.textContent).not.toContain('500')
   })
 })
