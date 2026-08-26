@@ -594,8 +594,8 @@ def _edge_to_plain_dict(e: PipelineEdge) -> dict[str, Any]:
         "source_node_id": e.source_node_id,
         "target_node_id": e.target_node_id,
         "edge_type": e.edge_type,
-        "source_port": e.source_port,
-        "target_port": e.target_port,
+        "source_port": e.source_port or "out",
+        "target_port": e.target_port or "in",
         "hitl_gate_config": copy.deepcopy(e.hitl_gate_config),
     }
 
@@ -852,8 +852,8 @@ async def replace_pipeline_graph(
             "target_node_id": str(e.target_node_id),
             "edge_type": e.edge_type,
             "hitl_gate_config": copy.deepcopy(e.hitl_gate_config),
-            "source_port": getattr(e, "source_port", "out"),
-            "target_port": getattr(e, "target_port", "in"),
+            "source_port": getattr(e, "source_port", None) or "out",
+            "target_port": getattr(e, "target_port", None) or "in",
         }
         for e in old_rows
     ]
