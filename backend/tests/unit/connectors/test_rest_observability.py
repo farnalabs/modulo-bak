@@ -591,7 +591,7 @@ async def test_shared_budget_enforced_across_simulated_workers() -> None:
 
     # 3-token budget shared by both workers -> 3 grants, 7 denies (no refill).
     assert results.count(True) == 3
-    assert len(worker_a.buckets) == 0  # never fell back to local
+    assert not worker_a.buckets  # never fell back to local
 
 
 async def test_per_tenant_weighting_separates_budgets() -> None:
@@ -647,7 +647,7 @@ async def test_redis_outage_fails_closed_when_configured(caplog: Any) -> None:
         with pytest.raises(SharedBudgetUnavailableError):
             await limiter.consume("dest")
 
-    assert limiter.buckets == {}  # never created a per-process fallback bucket
+    assert not limiter.buckets  # never created a per-process fallback bucket
     assert "rest.rate_limit.degraded" in [r.message for r in caplog.records]
     assert "rest.rate_limit.redis_error" in [r.message for r in caplog.records]
 
@@ -806,4 +806,4 @@ def test_rest_connector_redis_failure_fails_closed() -> None:
             c.write(ConnectorPayload(resource="default", data={"items": [{"name": f"n{i}"} for i in range(3)]}))
         )
     # With Redis configured, the connector must NOT fall back to a per-process bucket.
-    assert len(c._rate_buckets) == 0
+    assert not c._rate_buckets
