@@ -569,14 +569,42 @@ def test_single_migration_head() -> None:
     # -> 0146_extend_runs_status_cost_ceiling (FAR-391, renumbered from 0145).
     # -> 0147_json_to_jsonb_standardize (db-jsonb-standardize renumber from 0145
     #    to avoid colliding with main's 0145_spend_ceiling, chains off 0146).
-    # -> 0139_add_router_no_match_status (FAR-402 P1: router_no_match run status;
-    #    renumbered from 0138 to avoid colliding with eval_versioning; re-parented
-    #    onto 0147_json_to_jsonb_standardize so the graph stays a single linear
-    #    chain with 0139 as the head).
+    # -> 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147_json_to_jsonb_standardize.
+    chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
+    assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
+    chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
+    assert [_basename(p) for p in chaining_off_0132] == ["0133_run_evidence_rls.py"]
+    chaining_off_0133 = [p for p in revisions if parents[p] == "0133_run_evidence_rls"]
+    assert [_basename(p) for p in chaining_off_0133] == ["0134_dismissals_org_rls.py"]
+    chaining_off_0134 = [p for p in revisions if parents[p] == "0134_dismissals_org_rls"]
+    assert [_basename(p) for p in chaining_off_0134] == ["0135_status_check_constraints.py"]
+    chaining_off_0135 = [p for p in revisions if parents[p] == "0135_status_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0135] == ["0136_rename_remy_user_id_to_account_id.py"]
+    chaining_off_0136 = [p for p in revisions if parents[p] == "0136_rename_remy_user_id_to_account_id"]
+    assert [_basename(p) for p in chaining_off_0136] == ["0137_eval_suite_run.py"]
+    chaining_off_0137 = [p for p in revisions if parents[p] == "0137_eval_suite_run"]
+    assert [_basename(p) for p in chaining_off_0137] == ["0138_eval_versioning.py"]
+    # Nothing chains off 0138 except 0140 (the FAR-379 alerting migration).
+    chaining_off_0138 = [p for p in revisions if parents[p] == "0138_eval_versioning"]
+    assert [_basename(p) for p in chaining_off_0138] == ["0140_eval_regression_alert.py"]
+    # 0141_pipeline_edge_ports (FAR-416, main) chains off 0140,
+    # 0144_broaden_notification_status_in_app (main) chains off 0143, and
+    # 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147_json_to_jsonb_standardize.
+    chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
+    assert [_basename(p) for p in chaining_off_0140] == ["0141_pipeline_edge_ports.py"]
+    # 0142_merge_heads_add_fk_indexes (main, FK-index pass) chains off 0141.
+    chaining_off_0141 = [p for p in revisions if parents[p] == "0141_pipeline_edge_ports"]
+    assert [_basename(p) for p in chaining_off_0141] == ["0142_merge_heads_add_fk_indexes.py"]
+    # 0143_rest_connector_profile (FAR-412, main) chains off 0142.
+    chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
+    assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
     # Nothing chains off 0143 except 0144 (main's broaden notification status, in_app).
     # 0145_spend_ceiling (FAR-391) chains off 0144, 0146_extend_runs_status_cost_ceiling
-    # chains off 0145, and 0147_json_to_jsonb_standardize chains off 0146.
-    # 0139_add_router_no_match_status (this PR) chains off 0147 and is the single head.
+    # chains off 0145, and this branch's 0147_json_to_jsonb_standardize chains off
+    # 0146; 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147.
+    chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
+    assert [_basename(p) for p in chaining_off_0143] == ["0144_broaden_notification_status_in_app.py"]
+    # Nothing chains off 0144 except 0145 (FAR-391 spend ceiling, renumbered to chain off 0144).
     chaining_off_0144 = [p for p in revisions if parents[p] == "0144_broaden_notification_status_in_app"]
     assert [_basename(p) for p in chaining_off_0144] == ["0145_spend_ceiling.py"]
     # Nothing chains off 0145 except 0146 (FAR-391 extend runs status cost ceiling).
@@ -585,9 +613,12 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0146 except 0147 (this branch's json->jsonb cleanup).
     chaining_off_0146 = [p for p in revisions if parents[p] == "0146_extend_runs_status_cost_ceiling"]
     assert [_basename(p) for p in chaining_off_0146] == ["0147_json_to_jsonb_standardize.py"]
-    # Nothing chains off 0147 except 0139 (this PR's router_no_match status).
+    # 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147.
     chaining_off_0147 = [p for p in revisions if parents[p] == "0147_json_to_jsonb_standardize"]
-    assert [_basename(p) for p in chaining_off_0147] == ["0139_add_router_no_match_status.py"]
+    assert [_basename(p) for p in chaining_off_0147] == ["0148_pipeline_snapshot_versioning_far420.py"]
+    # 0139_add_router_no_match_status (this PR) chains off 0148 and is the single head.
+    chaining_off_0148 = [p for p in revisions if parents[p] == "0148_pipeline_snapshot_versioning_far420"]
+    assert [_basename(p) for p in chaining_off_0148] == ["0139_add_router_no_match_status.py"]
     # Nothing chains off 0139 -> it is the single head.
     chaining_off_0139 = [p for p in revisions if parents[p] == "0139_add_router_no_match_status"]
     assert chaining_off_0139 == []
