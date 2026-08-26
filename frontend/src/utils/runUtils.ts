@@ -8,6 +8,7 @@ export function runStatusBadgeClass(status: string): string {
     stalled: 'bg-destructive/10 text-destructive',
     budget_exceeded: 'bg-destructive/10 text-destructive',
     compensation_failed: 'bg-destructive/10 text-destructive',
+    router_no_match: 'bg-warning/10 text-warning',
     running: 'bg-primary/10 text-primary',
     pending: 'bg-muted text-muted-foreground',
     awaiting_human: 'bg-warning/10 text-warning',

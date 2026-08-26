@@ -117,6 +117,7 @@ export const RUN_STATUSES = [
   "stalled",
   "budget_exceeded",
   "cost_ceiling_exceeded",
+  "router_no_match",
   "compensation_failed",
 ] as const;
 

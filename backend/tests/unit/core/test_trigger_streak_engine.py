@@ -266,7 +266,7 @@ class TestDeactivateSQL:
         sql = ts._NO_DELIVERY_DEACTIVATE_SQL
         _terminal = (
             "'budget_exceeded','cancelled','compensation_failed','complete','cost_ceiling_exceeded',"
-            "'eval_failed','failed','stalled'"
+            "'eval_failed','failed','router_no_match','stalled'"
         )
         assert f"r.status IN ({_terminal})" in sql
         assert f"r3.status IN ({_terminal})" in sql
@@ -306,9 +306,9 @@ class TestMigrationBackfillGrace:
         assert 'ADD COLUMN IF NOT EXISTS "streak_epoch" timestamp with time zone DEFAULT CURRENT_TIMESTAMP' in source
         assert "ix_runs_unclassified_terminal" in source
         heads = ScriptDirectory(str(versions_dir.parent)).get_heads()
-        # FAR-419 (0150_pipeline_retry_compensation) is the current single head,
+        # FAR-419 (0151_pipeline_retry_compensation) is the current single head,
         # chained off FAR-377's 0149_suite_run_trigger_kind.
-        assert heads == ["0150_pipeline_retry_compensation"], f"expected a single head, got {heads}"
+        assert heads == ["0151_pipeline_retry_compensation"], f"expected a single head, got {heads}"
 
 
 # ---------------------------------------------------------------------------

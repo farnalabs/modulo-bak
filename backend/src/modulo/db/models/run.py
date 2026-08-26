@@ -46,6 +46,7 @@ TERMINAL_STATUSES: frozenset[str] = frozenset(
         "eval_failed",
         "stalled",
         "budget_exceeded",
+        "router_no_match",
         "cost_ceiling_exceeded",
         "compensation_failed",
     }
@@ -109,7 +110,7 @@ class Run(OrgScoped):
         CheckConstraint(
             "status IN ('pending', 'running', 'awaiting_human', 'claimed', 'unknown', "
             "'complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded', "
-            "'cost_ceiling_exceeded', 'compensation_failed')",
+            "'router_no_match', 'cost_ceiling_exceeded', 'compensation_failed')",
             name="ck_runs_status",
         ),
         UniqueConstraint("organisation_id", "run_number", name="uq_runs_org_run_number"),
