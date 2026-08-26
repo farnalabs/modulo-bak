@@ -49,7 +49,7 @@ _DROP_NEW = (
     "''awaiting_human''::charactervarying,''claimed''::charactervarying,''unknown''::charactervarying,"
     "''complete''::charactervarying,''failed''::charactervarying,''cancelled''::charactervarying,"
     "''eval_failed''::charactervarying,''stalled''::charactervarying,''budget_exceeded''::charactervarying,"
-    "''cost_ceiling_exceeded''::charactervarying,''compensation_failed''::charactervarying])::text[])))' "
+    "''cost_ceiling_exceeded''::charactervarying,''compensation_failed''::charactervarying])::text[])))') "
     "THEN ALTER TABLE public.runs DROP CONSTRAINT IF EXISTS ck_runs_status; END IF; END $$;"
 )
 # ADD (idempotent): re-add the constraint with the NEW list if it is now absent.
@@ -71,7 +71,7 @@ _DROP_OLD = (
     "''awaiting_human''::charactervarying,''claimed''::charactervarying,''complete''::charactervarying,"
     "''failed''::charactervarying,''cancelled''::charactervarying,''eval_failed''::charactervarying,"
     "''stalled''::charactervarying,''budget_exceeded''::charactervarying,"
-    "''cost_ceiling_exceeded''::charactervarying])::text[])))' "
+    "''cost_ceiling_exceeded''::charactervarying])::text[])))') "
     "THEN ALTER TABLE public.runs DROP CONSTRAINT IF EXISTS ck_runs_status; END IF; END $$;"
 )
 # ... and ADD the pre-0150 list if absent.
