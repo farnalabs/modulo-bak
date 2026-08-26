@@ -3854,6 +3854,18 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
     pipeline_id: str = str(state.get("_pipeline_id", ""))
     org_id: str = str(state.get("_org_id", ""))
 
+    # FAR-418: context_scope — the sandbox_agent node is the PRIMARY execution
+    # path, so the same need-to-know boundary that binds make_node_fn must also
+    # bind it. Without scoping here, a template can read gated keys via
+    # ``{{ run_context.<secret> }}`` or ``{{ state.run_context.<secret> }}`` and
+    # defeat the gate. The internal control keys still use the full run_context
+    # (seeded into the sandbox via _run_overrides machinery), but the keys fed to
+    # the prompt template are allowlist-gated to the node's context_scope.
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+    scoped_state = dict(state)
+    scoped_state["run_context"] = scoped_run_context
+
     # FAR-296 mode split: llm mode renders the prompt + agent_command through
     # the SandboxedEnvironment; script mode runs script_command VERBATIM —
     # no Jinja render of the command, no prompt, no template_vars.
@@ -3864,8 +3876,8 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
         template_vars: dict[str, Any] = {
-            "state": state,
-            "run_context": run_context,
+            "state": scoped_state,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         resolved = node_def.get("_resolved_parameters")

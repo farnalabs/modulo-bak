@@ -1921,3 +1921,45 @@ async def test_agent_command_tojson_on_undefined_skips():
     assert result["status"] == "skipped"
     assert "agent_command" in result["summary"]
     sandbox.commands.run.assert_not_called()
+
+
+async def test_context_scope_gates_sandbox_rendered_prompt(monkeypatch):
+    """FAR-418: the sandbox_agent node is the primary execution path, so the
+    ``context_scope`` need-to-know boundary must bind it too. A gated
+    ``run_context`` key must not reach the rendered prompt written to
+    ``/home/user/prompt.md`` — neither via ``{{ run_context.<key> }}`` nor via
+    ``{{ state.run_context.<key> }}``.
+
+    Mirrors test_context_scope_gates_state_run_context_view (make_node_fn).
+    """
+    import modulo.core.pipeline_engine.node_runner as nr
+
+    node_def = _base_node_def(
+        agent_prompt="tier={{ run_context.model_tier }}|leak={{ state.run_context.secret }}",
+        capability_scope={"context_scope": ["model_tier"]},
+    )
+    fn = make_sandbox_agent_fn(node_def)
+
+    monkeypatch.setattr(nr, "_run_conformance_gate", AsyncMock(return_value=False))
+    sandbox = _make_sandbox_mock()
+
+    state = {
+        "run_context": {"model_tier": "tier-2", "secret": "X", "input": {"task": "x"}},
+        "_run_id": "run-1",
+        "_pipeline_id": "pipe-1",
+        "_org_id": _ORG_ID,
+    }
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)):
+        result = await fn(state)
+
+    assert result["output"]["status"] == "completed"
+
+    # Locate the prompt.md write and assert the gated key did not leak.
+    prompt_writes = [
+        c.args[1] for c in sandbox.files.write.call_args_list if c.args and str(c.args[0]) == "/home/user/prompt.md"
+    ]
+    assert prompt_writes, "prompt.md was not written to the sandbox"
+    rendered = prompt_writes[0]
+    assert "tier=tier-2" in rendered
+    assert "leak=X" not in rendered

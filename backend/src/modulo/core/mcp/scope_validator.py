@@ -33,6 +33,18 @@ _log = getLogger(__name__)
 # McpAuthMiddleware. ``check_tool_scope`` consults it as the default narrowing
 # filter so the production tool-dispatch chokepoint enforces it without every
 # handler call-site having to thread the value. Unset (None) = UNRESTRICTED.
+#
+# SECURITY NOTE (FAR-418 review): this narrowing is AGENT-COOPERATIVE / ADVISORY,
+# not server-enforced. The MCP server trusts the ``X-Modulo-Allowed-Tools``
+# header exactly as forwarded by the agent runtime and does NOT cryptographically
+# bind it to the calling node/agent identity. A prompt-injected or compromised
+# agent that omits the header therefore receives UNRESTRICTED node-level tool
+# access — bounded ONLY by the hard role check, which is the real privilege
+# boundary. Treat allowed_tools as a self-imposed least-privilege hint for
+# well-behaved agents, not as a security control against a hostile agent. To make
+# it enforced, the server must bind the allow-list to the authenticated agent
+# server-side (e.g. look it up from the node's capability_scope by agent id)
+# rather than trusting the in-band header.
 _ctx_allowed_tools: contextvars.ContextVar[Sequence[str] | None] = contextvars.ContextVar(
     "scope_allowed_tools", default=None
 )
