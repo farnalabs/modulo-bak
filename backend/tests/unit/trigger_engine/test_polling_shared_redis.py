@@ -21,13 +21,16 @@ import asyncio
 import uuid
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from redis.exceptions import RedisError
 
-from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
-from modulo.core.trigger_engine.polling import _build_polling_connector
+from modulo.connectors._rate_bucket import RedisTokenBucket, SharedBudgetUnavailableError
+from modulo.connectors.base import ConnectorQuery
+from modulo.connectors.rest import RestConnector, RESTRateLimitTimeoutError, SecurityGuard
+from modulo.core.trigger_engine.polling import _build_polling_connector, _close_polling_resources
 
 
 def _rest_config() -> dict[str, Any]:
@@ -133,7 +136,7 @@ async def test_trigger_rest_connector_enforces_shared_redis_budget_across_worker
 async def test_trigger_rest_connector_per_tenant_isolation() -> None:
     """Different orgs get independent shared budgets for the same destination."""
     store: dict[str, dict[str, float]] = {}
-    redis = _FakeRedis(store)
+    redis = _FakeRedis(store, clock=lambda: 1000.0)
 
     org_a = _build_polling_connector("rest", _rest_config(), _REST_CREDS, redis_client=redis, tenant_id="org-A")
     org_b = _build_polling_connector("rest", _rest_config(), _REST_CREDS, redis_client=redis, tenant_id="org-B")
@@ -149,9 +152,13 @@ async def test_trigger_rest_connector_per_tenant_isolation() -> None:
     assert await limiter_b.consume("dest") is True
     assert await limiter_b.consume("dest") is False
 
-    assert limiter_a.key("dest") != limiter_b.key("dest")
-    assert "default" not in limiter_a.key("dest")
-    assert "default" not in limiter_b.key("dest")
+    # Assert the ACTUAL stored Redis keys (prefix + tenant composition), not the
+    # limiter's in-memory key helper. org-A and org-B must never collide, and
+    # there is no cross-tenant "default" bucket.
+    assert "rest_rate_limit:org-A:dest" in store
+    assert "rest_rate_limit:org-B:dest" in store
+    assert len(store) == 2
+    assert "default" not in store
 
 
 async def test_trigger_rest_connector_shared_limiter_without_tenant_raises() -> None:
@@ -315,7 +322,9 @@ def test_cron_build_polling_connector_wires_shared_redis_and_tenant() -> None:
             )
         )
 
-    assert result == "connector"
+    connector, redis_from_result = result
+    assert connector == "connector"
+    assert redis_from_result is shared_redis
     assert captured["type_id"] == "rest"
     assert captured["kwargs"]["redis_client"] is shared_redis
     assert captured["kwargs"]["tenant_id"] == str(ORG)
@@ -344,3 +353,131 @@ def test_cron_build_polling_connector_propagates_shared_budget_error() -> None:
                 uuid.uuid4(),
             )
         )
+
+
+# Real connector query path + real RedisTokenBucket semantics (FAR-442).
+
+
+class _SpyRedis(_FakeRedis):
+    """A fake that records the exact keys/args its Lua script was invoked with."""
+
+    def __init__(self, store: dict[str, dict[str, float]] | None = None, clock: Any = None) -> None:
+        super().__init__(store, clock)
+        self.script_args: tuple[list[str], list[Any]] | None = None
+
+    def register_script(self, script: str) -> Any:
+        run = super().register_script(script)
+        of_self = self
+
+        async def spy_run(keys: list[str], args: list[Any]) -> int:
+            of_self.script_args = (keys, list(args))
+            return await run(keys, args)
+
+        return spy_run
+
+
+def _noop_guard() -> SecurityGuard:
+    async def validate_url(url: str) -> None:
+        return None
+
+    def filter_strings(values: list[str], resource: str) -> None:
+        return None
+
+    return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
+
+
+def _make_rest_connector(
+    config: dict[str, Any],
+    *,
+    redis_client: Any = None,
+    tenant_id: str | None = None,
+    timeout_seconds: float = 30.0,
+) -> RestConnector:
+    return RestConnector(
+        config,
+        dict(_REST_CREDS),
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"dest": []})),
+        ssrf_validator=lambda url: None,
+        security_guard=_noop_guard(),
+        timeout=timeout_seconds,
+        redis_client=redis_client,
+        tenant_id=tenant_id,
+    )
+
+
+async def test_connector_query_enforces_shared_budget_third_call_denied() -> None:
+    """A REST connector's REAL ``query()`` enforces the shared Redis budget.
+
+    Routes through ``_acquire_rate_token`` (mock httpx transport, real
+    ``ConnectorQuery``) rather than the limiter primitive: with a 2-token shared
+    budget the third request is denied (rate-limit wait exceeded), proving the
+    connector enforces the budget end-to-end, not just the token bucket.
+    """
+    store: dict[str, dict[str, float]] = {}
+    redis = _FakeRedis(store, clock=lambda: 1000.0)
+    connector = _make_rest_connector(
+        {
+            "base_url": "https://api.example.com",
+            "path": "/widgets",
+            "rate_limit": {"requests_per_second": 1e-9, "burst": 2},
+        },
+        redis_client=redis,
+        tenant_id="org-1",
+        timeout_seconds=0.05,
+    )
+
+    with pytest.raises(RESTRateLimitTimeoutError):
+        for _ in range(3):
+            await connector.query(ConnectorQuery(resource="default"))
+
+    # The canonical per-tenant, per-destination key is what the connector charged.
+    assert "rest_rate_limit:org-1:https://api.example.com/widgets" in store
+
+
+def test_redis_token_bucket_real_key_format_and_lua_arg_order() -> None:
+    """The production ``RedisTokenBucket`` composes ``rest_rate_limit:{tenant}:{dest}``
+    and passes ARGV in the exact ``[rate, burst, cost, ttl_ms]`` order ``_CONSUME_LUA`` reads.
+
+    A regression in the key prefix or the Lua arg order would be hidden by the
+    hand-rolled fake (which only reads ARGV positionally); this asserts the real
+    composition so a key/Lua regression fails loudly.
+    """
+    store: dict[str, dict[str, float]] = {}
+    redis = _SpyRedis(store, clock=lambda: 1000.0)
+    bucket = RedisTokenBucket(redis, rate=0.5, burst=3)  # key_prefix defaults to "rest_rate_limit:"
+
+    assert asyncio.run(bucket.consume("org-1:https://api.example.com/widgets", tokens=1.0)) is True
+    keys, args = redis.script_args
+    expected_key = "rest_rate_limit:org-1:https://api.example.com/widgets"
+    assert keys == [expected_key]
+    assert expected_key in store
+    # ARGV order is exactly how _CONSUME_LUA reads it: [rate, burst, cost, ttl_ms].
+    assert args[0] == 0.5  # rate
+    assert args[1] == 3  # burst
+    assert args[2] == 1.0  # cost
+    assert args[3] > 0  # ttl_ms (>0, not a stale worker now ~1.75e9)
+
+
+async def test_close_polling_resources_closes_connector_and_redis() -> None:
+    """The shared teardown closes BOTH the polling connector and its Redis client
+    (FAR-442 client leak — a fresh ``Redis.from_url`` must not survive each fire)."""
+    connector = AsyncMock()
+    redis = AsyncMock()
+
+    await _close_polling_resources(connector, redis)
+
+    connector.close.assert_awaited_once()
+    redis.aclose.assert_awaited_once()
+
+
+async def test_close_polling_resources_tolerates_close_and_aclose_errors() -> None:
+    """A failing close()/aclose() is logged, never raised — teardown must not mask
+    the query outcome."""
+    from unittest.mock import AsyncMock as _AsyncMock
+
+    connector = _AsyncMock()
+    connector.close.side_effect = RuntimeError("close failed")
+    redis = _AsyncMock()
+    redis.aclose.side_effect = RuntimeError("aclose failed")
+
+    await _close_polling_resources(connector, redis)

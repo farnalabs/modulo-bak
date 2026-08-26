@@ -121,7 +121,9 @@ def resolve_shared_rate_limit_redis(org_id: str | None) -> Any | None:
     * Redis is not configured (no ``settings.redis_url`` or the DB is SQLite), or
     * no ``org_id`` is supplied (a non-tenant probe path, e.g. health-check /
       schema-inference). Wiring a shared budget without a tenant would bucket every
-      organisation under a single ``"default"`` key — a cross-tenant leak.
+      organisation under a single ``"default"`` key — a cross-tenant leak. The
+      guard is truthiness-based: an empty-string ``org_id`` is also treated as a
+      non-tenant probe (a non-empty tenant id is required to compose a Redis key).
 
     On a tenant path (``org_id`` present) where Redis IS configured the client is
     AUTHORITATIVE and FAIL-CLOSED: a settings-read failure or a client construction
@@ -137,7 +139,7 @@ def resolve_shared_rate_limit_redis(org_id: str | None) -> Any | None:
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        if org_id is not None:
+        if org_id:
             logger.error(
                 "Settings could not be read on the tenant path — fail-closed (no local-bucket fallback)",
                 exc_info=True,
@@ -154,11 +156,11 @@ def resolve_shared_rate_limit_redis(org_id: str | None) -> Any | None:
         # Redis is genuinely NOT configured — the connector-local bucket is correct
         # (no shared budget exists to multiply).
         return None
-    if org_id is None:
-        # Non-tenant probe path: never wire a shared budget — every org would
-        # otherwise land on the "default" tenant key and share one Redis budget
-        # across distinct orgs (cross-tenant leak). These short-lived probes stay on
-        # the connector-local bucket, which is correct.
+    if not org_id:
+        # Non-tenant probe path (None or an empty string): never wire a shared
+        # budget — every org would otherwise land on the "default" tenant key and
+        # share one Redis budget across distinct orgs (cross-tenant leak). These
+        # short-lived probes stay on the connector-local bucket, which is correct.
         return None
     try:
         from redis.asyncio import Redis
@@ -252,26 +254,27 @@ class ConnectorHub:
     def _shared_redis_client(self) -> Any | None:
         """Return the lazily-built shared Redis client, or None when NOT configured.
 
-                Thin caching wrapper over :func:
-        esolve_shared_rate_limit_redis — the shared
-                fail-closed composition root used by both the executor hub and the
-                trigger/polling path (FAR-442). The shared client is ONLY wired on a tenant
-                path — a `ConnectorHub` constructed with an `org_id`. Non-executor hubs
-                (health-check probes, schema-inference, determination scanning) carry no
-                `org_id`: wiring them to Redis would bucket every organisation's rate-limited
-                REST connector under a single `default` tenant key, sharing ONE budget across
-                distinct orgs (a cross-tenant leak). Those short-lived probes stay on the
-                connector-local per-process bucket, which is correct — there is no fleet-wide
-                budget to multiply.
+        Thin caching wrapper over :func:`resolve_shared_rate_limit_redis` — the
+        fail-closed composition root used by both the executor hub and the
+        trigger/polling path (FAR-442). The shared client is ONLY wired on a
+        tenant path — a ``ConnectorHub`` constructed with an ``org_id``.
+        Non-executor hubs (health-check probes, schema-inference, determination
+        scanning) carry no ``org_id``: wiring them to Redis would bucket every
+        organisation's rate-limited REST connector under a single ``default``
+        tenant key, sharing ONE budget across distinct orgs (a cross-tenant
+        leak). Those short-lived probes stay on the connector-local per-process
+        bucket, which is correct — there is no fleet-wide budget to multiply.
 
-                When Redis *is* wired (tenant path, `settings.redis_url` set and the DB is not
-                SQLite), the shared client is AUTHORITATIVE. Any settings-read or construction
-                failure FAILS CLOSED (raises :class:SharedBudgetUnavailableError) and is
-                recorded so every later call fails too; we NEVER degrade a configured Redis to
-                `None`, because returning `None` would make the REST connector fall back to
-                its per-process local bucket, silently reconstructing the fleet-wide `N x burst`
-                fail-open FAR-439 removed. Only the genuinely-not-configured / non-tenant paths
-                return `None` (correct, not a degrade).
+        When Redis *is* wired (tenant path, ``settings.redis_url`` set and the DB
+        is not SQLite), the shared client is AUTHORITATIVE. Any settings-read or
+        construction failure FAILS CLOSED (raises
+        :class:`SharedBudgetUnavailableError`) and is recorded so every later
+        call fails too; we NEVER degrade a configured Redis to ``None``, because
+        returning ``None`` would make the REST connector fall back to its
+        per-process local bucket, silently reconstructing the fleet-wide
+        ``N x burst`` fail-open FAR-439 removed. Only the genuinely
+        not-configured / non-tenant paths return ``None`` (correct, not a
+        degrade).
         """
         if self._redis_error is not None:
             raise SharedBudgetUnavailableError(
