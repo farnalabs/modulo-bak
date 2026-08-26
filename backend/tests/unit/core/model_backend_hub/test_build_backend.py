@@ -240,8 +240,7 @@ def test_build_backend_plugin_provider_build_failure_wrapped() -> None:
         _build_backend("my-plugin", "model", {"api_key": "k"}, {})
 
 
-@pytest.mark.anyio
-async def test_build_backend_plugin_provider_cancellation_propagates() -> None:
+def test_build_backend_plugin_provider_cancellation_propagates() -> None:
     registry = MagicMock()
     registry.has_model_backend.return_value = True
     registry.build_model_backend.side_effect = asyncio.CancelledError()

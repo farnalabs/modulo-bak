@@ -73,9 +73,9 @@ async def test_aexit_clears_all_backend_state(
     hub.register(bid, backend)
     hub._fallbacks[bid] = [uuid.uuid4()]
     await hub.__aexit__(None, None, None)
-    assert hub._backends == {}
-    assert hub._healthy == {}
-    assert hub._fallbacks == {}
+    assert not hub._backends
+    assert not hub._healthy
+    assert not hub._fallbacks
 
 
 @pytest.mark.anyio
@@ -89,16 +89,15 @@ async def test_aexit_with_exception_logs_and_clears(
         async with hub:
             hub.register(bid, backend)
             raise RuntimeError("boom")
-    assert hub._backends == {}
+    assert not hub._backends
     assert "ModelBackendHub exiting due to error" in caplog.text
 
 
-@pytest.mark.anyio
-async def test_register_overwrite_warns_and_replaces(
-    hub: ModelBackendHub,
+def test_register_overwrite_warns_and_replaces(
     backend: StubModelBackend,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    hub = ModelBackendHub()
     bid = uuid.uuid4()
     replacement = StubModelBackend()
     hub.register(bid, backend)
@@ -109,7 +108,7 @@ async def test_register_overwrite_warns_and_replaces(
 
 def test_backend_ids_property(hub: ModelBackendHub, backend: StubModelBackend) -> None:
     bid = uuid.uuid4()
-    assert hub.backend_ids == frozenset()
+    assert not hub.backend_ids
     hub.register(bid, backend)
     assert hub.backend_ids == frozenset({bid})
 

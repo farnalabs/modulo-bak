@@ -76,7 +76,7 @@ async def test_initialise_no_instances_registers_nothing(
     hub: ModelBackendHub, caplog: pytest.LogCaptureFixture
 ) -> None:
     await hub.initialise([], secrets_backend=_secrets(secret="{}"))
-    assert hub.backend_ids == frozenset()
+    assert not hub.backend_ids
     assert "No backends were registered" in caplog.text
 
 
@@ -185,7 +185,7 @@ async def test_initialise_non_iterable_fallback_ids_is_skipped(
 
 @pytest.mark.anyio
 async def test_initialise_invalid_fallback_id_string_is_skipped(
-    hub: ModelBackendHub, caplog: pytest.LogCaptureFixture
+    hub: ModelBackendHub,
 ) -> None:
     row = _row(fallback_backend_ids=["not-a-uuid"])
     await hub.initialise([row], secrets_backend=_secrets(secret="{}"))
@@ -238,4 +238,4 @@ def test_extract_fixture_map_coerces_keys_and_values() -> None:
 
 
 def test_extract_fixture_map_returns_empty_when_absent() -> None:
-    assert _extract_fixture_map({"api_key": "x"}, {"default_params": 1}) == {}
+    assert not _extract_fixture_map({"api_key": "x"}, {"default_params": 1})
