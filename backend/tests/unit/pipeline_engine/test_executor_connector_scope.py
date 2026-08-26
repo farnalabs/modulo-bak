@@ -139,14 +139,23 @@ class _FakeSessionCM:
 
 @pytest.mark.asyncio
 async def test_init_connector_hub_passes_scope_to_initialise():
-    """A run-level fetch scope forwarded as ``allowed_connectors`` applies the
-    deny-by-default fetch-time gate at run level."""
+    """A run-level fetch scope derived from graph node ``capability_scope`` is
+    forwarded as ``allowed_connectors`` so the deny-by-default fetch-time gate
+    applies at run level (FAR-435 building on FAR-418)."""
     fake_session = _FakeSession(conn_rows=[MagicMock()])
     executor = PipelineExecutor(MagicMock())
     executor._session_factory = lambda: _FakeSessionCM(fake_session)
 
     mock_hub = MagicMock()
     mock_hub.initialise = AsyncMock()
+    mock_hub.__aenter__ = AsyncMock(return_value=mock_hub)
+    mock_hub.__aexit__ = AsyncMock()
+    graph_json = {
+        "nodes": [
+            {"capability_scope": {"allowed_connectors": ["github"]}},
+            {"capability_scope": {"allowed_connectors": ["slack"]}},
+        ]
+    }
     with (
         patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
         patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
@@ -156,7 +165,7 @@ async def test_init_connector_hub_passes_scope_to_initialise():
         patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
         patch("modulo.settings.get_settings", return_value=MagicMock()),
     ):
-        hub = await executor._init_connector_hub(org_id=uuid.uuid4(), allowed_connectors=["github", "slack"])
+        hub = await executor._init_connector_hub(org_id=uuid.uuid4(), graph_json=graph_json)
 
     assert hub is mock_hub
     mock_hub.initialise.assert_awaited_once()
@@ -166,13 +175,17 @@ async def test_init_connector_hub_passes_scope_to_initialise():
 
 @pytest.mark.asyncio
 async def test_init_connector_hub_none_scope_is_unrestricted():
-    """``allowed_connectors=None`` yields the pre-scope (fetch everything) behaviour."""
+    """A graph with no connector fetch scope yields ``allowed_connectors=None``
+    (the pre-scope, fetch-everything behaviour)."""
     fake_session = _FakeSession(conn_rows=[MagicMock()])
     executor = PipelineExecutor(MagicMock())
     executor._session_factory = lambda: _FakeSessionCM(fake_session)
 
     mock_hub = MagicMock()
     mock_hub.initialise = AsyncMock()
+    mock_hub.__aenter__ = AsyncMock(return_value=mock_hub)
+    mock_hub.__aexit__ = AsyncMock()
+    graph_json = {"nodes": [{"node_type": "transform"}]}
     with (
         patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
         patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
@@ -182,7 +195,7 @@ async def test_init_connector_hub_none_scope_is_unrestricted():
         patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
         patch("modulo.settings.get_settings", return_value=MagicMock()),
     ):
-        hub = await executor._init_connector_hub(org_id=uuid.uuid4(), allowed_connectors=None)
+        hub = await executor._init_connector_hub(org_id=uuid.uuid4(), graph_json=graph_json)
 
     assert hub is mock_hub
     call = mock_hub.initialise.await_args
