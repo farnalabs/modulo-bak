@@ -55,20 +55,87 @@
           {{ loading ? $t('common.signing_in') : $t('common.sign_in') }}
         </Button>
       </form>
+
+      <div v-if="hasSsoProviders" class="space-y-3">
+        <div class="flex items-center gap-3">
+          <span class="h-px flex-1 bg-border" />
+          <span class="text-xs font-medium uppercase tracking-wide text-muted-foreground">{{ $t('views.LoginView.sso_divider') }}</span>
+          <span class="h-px flex-1 bg-border" />
+        </div>
+        <div class="grid gap-2">
+          <Button
+            v-for="provider in oidcProviders"
+            :key="provider"
+            type="button"
+            variant="outlined"
+            class="w-full border-input px-4 py-2.5"
+            :data-testid="`login-sso-oidc-${provider}`"
+            @click="beginSsoLogin(`/api/v1/auth/oidc/${provider}/login`)"
+          >
+            {{ $t('views.LoginView.sso_continue_with', { provider: providerLabel(provider) }) }}
+          </Button>
+          <Button
+            v-if="samlEnabled"
+            type="button"
+            variant="outlined"
+            class="w-full border-input px-4 py-2.5"
+            data-testid="login-sso-saml"
+            @click="beginSsoLogin('/api/v1/auth/saml/login')"
+          >
+            {{ $t('views.LoginView.sso_continue_with_saml') }}
+          </Button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Button from 'primevue/button'
 import { useMutation } from '../composables/useMutation'
 import { setAccessToken, setRefreshToken } from '../lib/api/client'
 
+interface SsoProvidersResponse {
+  oidc: Array<{ provider_id: string }>
+  saml: boolean
+}
+
 const router = useRouter()
 const email = ref('')
 const password = ref('')
+const oidcProviders = ref<string[]>([])
+const samlEnabled = ref(false)
+const hasSsoProviders = computed(() => oidcProviders.value.length > 0 || samlEnabled.value)
+
+function providerLabel(provider: string): string {
+  return provider
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function beginSsoLogin(path: string) {
+  window.location.assign(path)
+}
+
+async function loadSsoProviders() {
+  try {
+    const res = await fetch('/api/v1/auth/sso/providers', {
+      headers: { Accept: 'application/json' },
+    })
+    if (!res.ok) {
+      return
+    }
+    const data = (await res.json()) as SsoProvidersResponse
+    oidcProviders.value = (data.oidc ?? []).map((p) => p.provider_id)
+    samlEnabled.value = Boolean(data.saml)
+  } catch {
+    return
+  }
+}
+
+onMounted(loadSsoProviders)
 
 const { loading, error, mutate: login } = useMutation(async () => {
   const res = await fetch('/api/v1/auth/login', {

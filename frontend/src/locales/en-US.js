@@ -379,7 +379,10 @@ export default {
       "agent_governance_for_your_agentic_sdlc": "Agent governance for your agentic SDLC",
       "login_failed": "Login failed:",
       "enter_your_password": "Enter your password",
-      "modulo": "Modulo"
+      "modulo": "Modulo",
+      "sso_divider": "or continue with",
+      "sso_continue_with": "Continue with {provider}",
+      "sso_continue_with_saml": "Continue with SAML SSO"
     },
     "NotificationsPage": {
       "title": "Notifications",

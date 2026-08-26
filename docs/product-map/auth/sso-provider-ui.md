@@ -5,6 +5,7 @@ delivery-tasks: []
 code:
   - frontend/src/views/SettingsSsoView.vue
   - frontend/src/components/SsoProviderForm.vue
+  - frontend/src/views/LoginView.vue
   - frontend/src/router/index.ts
   - frontend/src/config/navigation.ts
   - backend/src/modulo/api/routes/admin_sso.py
@@ -17,6 +18,7 @@ unit-tests:
   - backend/tests/unit/api/test_sso_gating.py
   - backend/tests/unit/api/test_error_handling.py
   - backend/tests/unit/auth/test_sso.py
+  - frontend/src/__tests__/LoginView.spec.ts
 bdd:
   - backend/tests/bdd/features/auth/sso_oidc.feature
   - backend/tests/bdd/features/auth/sso_saml.feature
@@ -25,7 +27,7 @@ depends-on:
   - feat-core-oidc-integration
   - feat-core-saml-integration
   - feat-teams-org-entity
-status: partial
+status: covered
 ---
 
 # SSO Provider UI
@@ -56,14 +58,12 @@ incident-response playbook as the prevention control for IdP-initiated SSO valid
       JWT pair; SAML ACS parses `SAMLResponse`, validates the assertion, and issues JWTs
 - [x] JIT provisioning creates the user with the provider's default role; group
       mappings apply at provisioning time
-- [ ] Configured OIDC providers appear on the login page as buttons — `LoginView.vue`
-      has no SSO provider buttons; the `/api/v1/auth/oidc/{provider}/login` endpoint is
-      reachable directly (see Known Gaps)
+- [x] Configured OIDC providers appear on the login page as buttons that redirect to
+      `/api/v1/auth/oidc/{provider}/login`; a SAML button appears when SAML is enabled;
+      the section hides when SSO is feature-gated or no provider is configured
 
 ## Known Gaps
 
-- **No login-page provider buttons** — the SSO login endpoints exist but no buttons
-  surface them on `LoginView.vue`; login is still password/Basic Auth.
 - **Sidebar entry tier-gated but not SSO-skill-gated** — the nav entry hides for
   community (team tier required) but does not re-check the `sso` license key; the page
   renders a locked prompt via `FeatureGate show-disabled`.
@@ -74,9 +74,15 @@ incident-response playbook as the prevention control for IdP-initiated SSO valid
 
 ## QA History
 
+- 2026-08-26: **improve-architecture (product-map walk)** — closed the login-page provider
+  gap: `LoginView.vue` now fetches `/api/v1/auth/sso/providers` on mount and renders one
+  OIDC button per configured provider plus a SAML button when SAML is enabled, each
+  redirecting to the existing SSO login endpoints. Covered by `LoginView.spec.ts`
+  (per-provider buttons, SAML button, feature-gated/empty hide, OIDC + SAML redirects).
+  Status: covered.
 - 2026-08-25: **improve-architecture (product-map walk)** — restored this entry as part of
   rebuilding the `docs/product-map/` feature graph. The file is explicitly referenced by
   `docs/security/incident-response-playbook.md` as the SSO validation prevention control.
   Re-verified behaviours and file paths against the current tree (admin_sso.py model
-  fields, sso.py endpoints, manifest route gating). Status: partial — login-page provider
-  buttons remain the acknowledged gap.
+  fields, sso.py endpoints, manifest route gating). Status was partial — login-page provider
+  buttons were the acknowledged gap.
