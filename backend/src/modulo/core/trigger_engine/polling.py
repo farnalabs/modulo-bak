@@ -9,6 +9,7 @@ and tests keep importing ``polling.fire_polling_trigger``. The old duplicated
 removed in PR C of the Celery->SAQ migration.
 """
 
+import asyncio
 import datetime
 import hashlib
 import inspect
@@ -141,13 +142,25 @@ async def _build_polling_connector_from_instance(
     raw_creds = await secrets_backend.get_secret(str(connector_instance.id))
     creds: dict[str, Any] = json.loads(raw_creds)
     redis_client = resolve_shared_rate_limit_redis(str(org_id))
-    connector = _build_polling_connector(
-        connector_instance.connector_type_id,
-        connector_instance.config_json,
-        creds,
-        redis_client=redis_client,
-        tenant_id=str(org_id),
-    )
+    try:
+        connector = _build_polling_connector(
+            connector_instance.connector_type_id,
+            connector_instance.config_json,
+            creds,
+            redis_client=redis_client,
+            tenant_id=str(org_id),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # The connector build raised (bad config, missing file, KeyError on
+        # creds, unsupported type). ``redis_client`` was resolved before the
+        # build and never reaches the caller, so merely re-raising would
+        # ORPHAN the fresh ``Redis.from_url`` pool on every fire (FAR-442
+        # client leak). Close it here so a misconfigured connector leaks nothing.
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise
     return connector, redis_client
 
 

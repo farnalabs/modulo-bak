@@ -30,7 +30,11 @@ from redis.exceptions import RedisError
 from modulo.connectors._rate_bucket import RedisTokenBucket, SharedBudgetUnavailableError
 from modulo.connectors.base import ConnectorQuery
 from modulo.connectors.rest import RestConnector, RESTRateLimitTimeoutError, SecurityGuard
-from modulo.core.trigger_engine.polling import _build_polling_connector, _close_polling_resources
+from modulo.core.trigger_engine.polling import (
+    _build_polling_connector,
+    _build_polling_connector_from_instance,
+    _close_polling_resources,
+)
 
 
 def _rest_config() -> dict[str, Any]:
@@ -351,6 +355,67 @@ def test_cron_build_polling_connector_propagates_shared_budget_error() -> None:
                 SimpleNamespace(id=uuid.uuid4()),
                 ORG,
                 uuid.uuid4(),
+            )
+        )
+
+
+def test_from_instance_closes_resolved_redis_when_connector_build_fails() -> None:
+    """A connector build that raises must CLOSE the already-resolved Redis client.
+
+    ``_build_polling_connector_from_instance`` resolves the shared Redis client
+    BEFORE ``_build_polling_connector`` runs. If the build raises (bad config,
+    missing file, KeyError on creds, unsupported type), that fresh ``Redis.from_url``
+    pool never reaches the caller — whose ``finally`` only closes the locals it
+    still holds — so it is orphaned (FAR-442 client leak). The builder must
+    ``aclose()`` it on the failure path and re-raise.
+    """
+    resolved_redis = AsyncMock()
+    session = MagicMock()
+
+    def fake_resolver(_org: str) -> Any:
+        return resolved_redis
+
+    def fake_build_connector(_type_id: str, _config: dict[str, Any], _creds: dict[str, Any], **_kwargs: Any) -> Any:
+        raise KeyError("missing credential 'token'")
+
+    with (
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="b" * 44)),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=_FakeSecretsBackend()),
+        patch("modulo.core.connector_hub.resolve_shared_rate_limit_redis", side_effect=fake_resolver),
+        patch("modulo.core.trigger_engine.polling._build_polling_connector", side_effect=fake_build_connector),
+        pytest.raises(KeyError, match="missing credential"),
+    ):
+        asyncio.run(
+            _build_polling_connector_from_instance(
+                session,
+                SimpleNamespace(id=uuid.uuid4(), connector_type_id="rest", config_json={}),
+                ORG,
+            )
+        )
+
+    resolved_redis.aclose.assert_awaited_once()
+
+
+def test_from_instance_closes_nothing_when_no_redis_resolved_and_build_fails() -> None:
+    """When Redis is NOT configured (resolver returns None) and the build raises,
+    the builder must not attempt to close anything — no pool leak, no AttributeError."""
+    session = MagicMock()
+
+    def fake_build_connector(_type_id: str, _config: dict[str, Any], _creds: dict[str, Any], **_kwargs: Any) -> Any:
+        raise ValueError("bad config")
+
+    with (
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="b" * 44)),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=_FakeSecretsBackend()),
+        patch("modulo.core.connector_hub.resolve_shared_rate_limit_redis", return_value=None),
+        patch("modulo.core.trigger_engine.polling._build_polling_connector", side_effect=fake_build_connector),
+        pytest.raises(ValueError, match="bad config"),
+    ):
+        asyncio.run(
+            _build_polling_connector_from_instance(
+                session,
+                SimpleNamespace(id=uuid.uuid4(), connector_type_id="filesystem", config_json={}),
+                ORG,
             )
         )
 
