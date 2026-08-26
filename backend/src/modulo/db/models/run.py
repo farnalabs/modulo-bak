@@ -39,12 +39,25 @@ if TYPE_CHECKING:
 # across the codebase (crud/run, cron_helpers, analytics) import these instead
 # of re-declaring their own tuples.
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"complete", "failed", "cancelled", "eval_failed", "stalled", "budget_exceeded", "cost_ceiling_exceeded"}
+    {
+        "complete",
+        "failed",
+        "cancelled",
+        "eval_failed",
+        "stalled",
+        "budget_exceeded",
+        "cost_ceiling_exceeded",
+        "compensation_failed",
+    }
 )
 
 # Non-terminal (active) run statuses — a run that still holds a slot. A pending
 # run is active but does not hold capacity (see crud.run._active_run_statuses).
-ACTIVE_RUN_STATUSES: frozenset[str] = frozenset({"pending", "running", "awaiting_human", "claimed"})
+# ``unknown`` (adopted from FAR-410) is a NON-TERMINAL recovery status: the run's
+# outcome could not be determined (e.g. the sandbox was lost) but it is not
+# finalised; it holds a slot until an operator re-runs it with the SAME persisted
+# run-level ``idempotency_key``, reconciling it to a terminal outcome.
+ACTIVE_RUN_STATUSES: frozenset[str] = frozenset({"pending", "running", "awaiting_human", "claimed", "unknown"})
 
 # In-flight run statuses for the ``ongoing`` trigger type (FAR-158). An ongoing
 # trigger keeps its pipeline topped up to ``max_concurrent_runs`` runs whose
@@ -56,7 +69,8 @@ ACTIVE_RUN_STATUSES: frozenset[str] = frozenset({"pending", "running", "awaiting
 # ``awaiting_human`` run when a committed decision exists), so a run parked on a
 # human must not count against the target. This set is what separates the
 # ongoing top-up count (``cron_helpers._count_ongoing_runs``) from the general
-# ``_count_active_runs``.
+# ``_count_active_runs``. ``unknown`` is deliberately EXCLUDED: a stuck UNKNOWN
+# run must not trigger an ongoing top-up (it is not a fresh unit of work).
 ONGOING_ACTIVE_STATUSES: frozenset[str] = frozenset({"pending", "running", "claimed"})
 
 
@@ -93,9 +107,9 @@ class Run(OrgScoped):
             name="ck_runs_trigger_type",
         ),
         CheckConstraint(
-            "status IN ('pending', 'running', 'awaiting_human', 'claimed', "
+            "status IN ('pending', 'running', 'awaiting_human', 'claimed', 'unknown', "
             "'complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded', "
-            "'cost_ceiling_exceeded')",
+            "'cost_ceiling_exceeded', 'compensation_failed')",
             name="ck_runs_status",
         ),
         UniqueConstraint("organisation_id", "run_number", name="uq_runs_org_run_number"),
@@ -146,6 +160,13 @@ class Run(OrgScoped):
         Uuid(), ForeignKey("accounts.id", ondelete="SET NULL"), index=True
     )
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # FAR-410 / FAR-402 P5: the logical idempotency identity of the operator
+    # re-run, derived deterministically (``<pipeline_id>:<run_number>`` +
+    # node + index). An UNKNOWN run re-run by an operator reuses the SAME
+    # persisted key so a write that may have reached the upstream is not
+    # re-applied as a fresh operation. NULL for pre-P5 runs / runs never
+    # re-run; set at create_run when the pipeline carries idempotency config.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cancellation_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")

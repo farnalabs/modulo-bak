@@ -7,12 +7,14 @@ export function runStatusBadgeClass(status: string): string {
     failed: 'bg-destructive/10 text-destructive',
     stalled: 'bg-destructive/10 text-destructive',
     budget_exceeded: 'bg-destructive/10 text-destructive',
+    compensation_failed: 'bg-destructive/10 text-destructive',
     running: 'bg-primary/10 text-primary',
     pending: 'bg-muted text-muted-foreground',
     awaiting_human: 'bg-warning/10 text-warning',
     cancelled: 'bg-muted text-muted-foreground',
     eval_failed: 'bg-destructive/10 text-destructive',
     claimed: 'bg-warning/10 text-warning',
+    unknown: 'bg-muted text-muted-foreground',
   }
   return map[status] ?? 'bg-muted text-muted-foreground'
 }
