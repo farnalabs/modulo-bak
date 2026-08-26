@@ -21,6 +21,7 @@ from modulo.api.dependencies import (
 from modulo.auth.jwt import TenantPrincipal
 from modulo.core.audit_logger import append_audit_event
 from modulo.core.fernet_rotation import rotate_all_encrypted_data
+from modulo.core.saq_worker import _make_system_session_factory
 from modulo.settings import Settings, get_settings
 
 _CODE_ADMIN_ROTATION_ROTATE_KEY = "admin_rotation.rotate_key"
@@ -215,9 +216,6 @@ async def _run_rotation_background(
     RLS and is the same cross-org mechanism used by the retention/system crons.
     """
     global _rotation_in_progress, _last_rotation_result
-
-    # Lazy import keeps saq_worker's redis/saq import weight out of the route graph.
-    from modulo.core.saq_worker import _make_system_session_factory
 
     try:
         async with _make_system_session_factory()() as session, session.begin():
