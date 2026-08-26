@@ -625,12 +625,16 @@ def test_single_migration_head() -> None:
     # 0149_suite_run_trigger_kind (FAR-377, main) chains off 0148.
     chaining_off_0148 = [p for p in revisions if parents[p] == "0148_pipeline_snapshot_versioning_far420"]
     assert [_basename(p) for p in chaining_off_0148] == ["0149_suite_run_trigger_kind.py"]
-    # 0150_add_router_no_match_status (this PR) chains off 0149 and is the single head.
+    # 0150_add_router_no_match_status (this PR) chains off 0149,
+    # and 0151_stages_team_rls_org_gated (org-gated RLS for stages) chains off 0150.
     chaining_off_0149 = [p for p in revisions if parents[p] == "0149_suite_run_trigger_kind"]
     assert [_basename(p) for p in chaining_off_0149] == ["0150_add_router_no_match_status.py"]
-    # Nothing chains off 0150 -> it is the single head.
+    # Nothing chains off 0150 except 0151 (the stages org-gated team RLS policy).
     chaining_off_0150 = [p for p in revisions if parents[p] == "0150_add_router_no_match_status"]
-    assert chaining_off_0150 == []
+    assert [_basename(p) for p in chaining_off_0150] == ["0151_stages_team_rls_org_gated.py"]
+    # 0151 is the single head.
+    chaining_off_0151 = [p for p in revisions if parents[p] == "0151_stages_team_rls_org_gated"]
+    assert chaining_off_0151 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
