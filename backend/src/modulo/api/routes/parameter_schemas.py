@@ -528,6 +528,9 @@ async def get_parameter_schema_references_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
+            schema = await get_schema(session, schema_id)
+            if schema is None or schema.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PARAMETER_SCHEMA_NOT_FOUND)
             refs = await get_schema_references(session, schema_id)
     except ProgrammingError:
         logger.exception(_CODE_PARAMETER_SCHEMAS_REFERENCES)

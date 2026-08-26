@@ -127,3 +127,22 @@ def test_get_parameter_set_cross_org_returns_404(client: TestClient) -> None:
     ):
         resp = client.get(f"/api/v1/parameter-schemas/{_SCHEMA_ID}/sets/{_SET_ID}")
     assert resp.status_code == 404
+
+
+def test_get_parameter_schema_references_cross_org_returns_404(client: TestClient) -> None:
+    """IDOR guard: references of a cross-org parameter schema must not be enumerable.
+
+    Fails on the pre-fix code (returns 200 and leaks the referencing agent/set
+    UUIDs of another org's schema); passes once the organisation_id ownership
+    check is enforced on the schema before returning its references.
+    """
+    cross_org = _make_schema()
+    cross_org.organisation_id = _CROSS_ORG_ID
+    assert cross_org.organisation_id != _ORG_ID
+    with (
+        patch(f"{_PREFIX}get_schema", return_value=cross_org),
+        patch(f"{_PREFIX}set_rls_org"),
+        patch(f"{_PREFIX}set_rls_user_context"),
+    ):
+        resp = client.get(f"/api/v1/parameter-schemas/{_SCHEMA_ID}/references")
+    assert resp.status_code == 404
