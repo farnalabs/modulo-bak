@@ -499,6 +499,7 @@ class TestListMembers:
     def test_returns_200(self, client: TestClient) -> None:
         page_result = MagicMock(items=[_make_membership()], total=1, page=1, page_size=20)
         with (
+            patch("modulo.api.routes.teams.get_team", return_value=_make_team()),
             patch(
                 "modulo.api.routes.teams.list_team_members",
                 return_value=page_result,
@@ -515,6 +516,7 @@ class TestListMembers:
     def test_empty_members(self, client: TestClient) -> None:
         page_result = MagicMock(items=[], total=0, page=1, page_size=20)
         with (
+            patch("modulo.api.routes.teams.get_team", return_value=_make_team()),
             patch(
                 "modulo.api.routes.teams.list_team_members",
                 return_value=page_result,
