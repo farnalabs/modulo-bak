@@ -852,7 +852,7 @@ async def replace_pipeline_graph(
             "source_node_id": str(e.source_node_id),
             "target_node_id": str(e.target_node_id),
             "edge_type": e.edge_type,
-            "condition_expression": e.condition_expression,
+            "condition_expression": getattr(e, "condition_expression", None),
             "hitl_gate_config": copy.deepcopy(e.hitl_gate_config),
             "source_port": getattr(e, "source_port", None) or "out",
             "target_port": getattr(e, "target_port", None) or "in",
