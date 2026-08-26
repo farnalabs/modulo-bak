@@ -1,7 +1,7 @@
 """BitbucketConnector — async Bitbucket Cloud API connector."""
 
 import base64
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -115,7 +115,7 @@ class BitbucketConnector(ConnectorBase):
         value = q.filters.get(key)
         if not value:
             raise ValueError(f"Bitbucket {resource} query requires '{key}' filter")
-        return value
+        return cast(str, value)
 
     async def _query_repos(self, client: httpx.AsyncClient, q: ConnectorQuery) -> ConnectorResult:
         workspace = q.filters.get("workspace", "")
