@@ -1,8 +1,14 @@
 """Register ``compensation_failed``/``unknown`` run statuses + P5 columns (FAR-402 P5).
 
-Revision ID: 0150_pipeline_retry_compensation
-Revises: 0149_suite_run_trigger_kind
+Revision ID: 0151_pipeline_retry_compensation
+Revises: 0150_add_router_no_match_status
 Create Date: 2026-08-26
+
+Renumber note: this migration was authored as ``0150_pipeline_retry_compensation``
+but collided with main's ``0150_add_router_no_match_status`` (FAR-402 P1 / FAR-415),
+which also landed on main. It is renumbered to ``0151`` and re-parented onto
+``0150_add_router_no_match_status`` so the graph stays a single linear chain with
+``0151`` chained off main's head.
 
 Implements the FAR-402 P5 (FAR-419) failure/retry + compensation data-model
 deltas:
@@ -22,7 +28,11 @@ deltas:
 3. **``ck_runs_status``** — extend the CHECK constraint to admit the two new
    statuses. ``compensation_failed`` is a NEW TERMINAL status (a watched node AND
    its compensation path both failed); ``unknown`` is adopted from FAR-410 as a
-   NON-TERMINAL recovery status. The drop-if-differs / add-if-absent pattern
+   NON-TERMINAL recovery status. Because main's ``0150_add_router_no_match_status``
+   (FAR-415) also extends this same constraint (adding ``router_no_match``), the
+   recreated list here is the UNION of both migrations' status additions:
+   ``router_no_match`` (from main P1) plus ``unknown`` and ``compensation_failed``
+   (from this P5). The drop-if-differs / add-if-absent pattern
    (introduced in 0146, mirroring 0110) keeps the migration idempotent and
    rolling-deploy safe — the constraint is rebuilt with a backward-compatible
    SUPERSET so the overlap window where new app code emits a new status while the
@@ -32,8 +42,8 @@ deltas:
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0150_pipeline_retry_compensation"
-down_revision = "0149_suite_run_trigger_kind"
+revision = "0151_pipeline_retry_compensation"
+down_revision = "0150_add_router_no_match_status"
 branch_labels = None
 depends_on = None
 
@@ -42,6 +52,9 @@ depends_on = None
 # Postgres would emit for the NEW status set). String literals are hardcoded
 # (no f-string interpolation) so the raw-SQL injection detector does not fire —
 # these are immutable constants, mirroring migration 0146.
+#
+# The NEW target list is the UNION of main's 0150 (router_no_match) and this
+# migration's additions (unknown, compensation_failed) — 14 statuses total.
 _DROP_NEW = (
     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status' AND "
     "regexp_replace(pg_get_constraintdef(oid), '\\s+', '', 'g') <> "
@@ -49,7 +62,8 @@ _DROP_NEW = (
     "''awaiting_human''::charactervarying,''claimed''::charactervarying,''unknown''::charactervarying,"
     "''complete''::charactervarying,''failed''::charactervarying,''cancelled''::charactervarying,"
     "''eval_failed''::charactervarying,''stalled''::charactervarying,''budget_exceeded''::charactervarying,"
-    "''cost_ceiling_exceeded''::charactervarying,''compensation_failed''::charactervarying])::text[])))') "
+    "''cost_ceiling_exceeded''::charactervarying,''router_no_match''::charactervarying,"
+    "''compensation_failed''::charactervarying])::text[])))') "
     "THEN ALTER TABLE public.runs DROP CONSTRAINT IF EXISTS ck_runs_status; END IF; END $$;"
 )
 # ADD (idempotent): re-add the constraint with the NEW list if it is now absent.
@@ -60,10 +74,13 @@ _ADD_NEW = (
     "'claimed'::character varying, 'unknown'::character varying, 'complete'::character varying, "
     "'failed'::character varying, 'cancelled'::character varying, 'eval_failed'::character varying, "
     "'stalled'::character varying, 'budget_exceeded'::character varying, "
-    "'cost_ceiling_exceeded'::character varying, 'compensation_failed'::character varying])::text[]))); "
+    "'cost_ceiling_exceeded'::character varying, 'router_no_match'::character varying, "
+    "'compensation_failed'::character varying])::text[]))); "
     "END IF; END $$;"
 )
-# Revert: DROP if the def is not already the pre-0150 (post-0146) list ...
+# Revert: DROP if the def is not already the pre-0151 list ...
+# The pre-0151 list (main's 0150 state) already contains router_no_match but NOT
+# unknown / compensation_failed, so the OLD target list is that 12-status set.
 _DROP_OLD = (
     "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status' AND "
     "regexp_replace(pg_get_constraintdef(oid), '\\s+', '', 'g') <> "
@@ -71,17 +88,18 @@ _DROP_OLD = (
     "''awaiting_human''::charactervarying,''claimed''::charactervarying,''complete''::charactervarying,"
     "''failed''::charactervarying,''cancelled''::charactervarying,''eval_failed''::charactervarying,"
     "''stalled''::charactervarying,''budget_exceeded''::charactervarying,"
-    "''cost_ceiling_exceeded''::charactervarying])::text[])))') "
+    "''cost_ceiling_exceeded''::charactervarying,''router_no_match''::charactervarying])::text[])))') "
     "THEN ALTER TABLE public.runs DROP CONSTRAINT IF EXISTS ck_runs_status; END IF; END $$;"
 )
-# ... and ADD the pre-0150 list if absent.
+# ... and ADD the pre-0151 list if absent.
 _ADD_OLD = (
     "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_runs_status') "
     "THEN ALTER TABLE public.runs ADD CONSTRAINT ck_runs_status CHECK (((status)::text = ANY "
     "((ARRAY['pending'::character varying, 'running'::character varying, 'awaiting_human'::character varying, "
     "'claimed'::character varying, 'complete'::character varying, 'failed'::character varying, "
     "'cancelled'::character varying, 'eval_failed'::character varying, 'stalled'::character varying, "
-    "'budget_exceeded'::character varying, 'cost_ceiling_exceeded'::character varying])::text[]))); "
+    "'budget_exceeded'::character varying, 'cost_ceiling_exceeded'::character varying, "
+    "'router_no_match'::character varying])::text[]))); "
     "END IF; END $$;"
 )
 
