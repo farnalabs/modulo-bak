@@ -88,6 +88,17 @@ def _fake_engine(*, used_bytes: int | None = 42_000_000, raise_on_connect: bool 
         "full_boundary",
         "over_full",
     ],
+    ids=[
+        "none_ok",
+        "zero_ok",
+        "below_warn",
+        "at_warn",
+        "below_critical",
+        "at_critical",
+        "below_full",
+        "at_full",
+        "over_full",
+    ],
 )
 def test_alert_level_boundaries(percent: float | None, expected: str) -> None:
     assert _alert_level(percent) == expected
