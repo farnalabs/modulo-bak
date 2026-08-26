@@ -1,5 +1,6 @@
 """TrelloConnector — async Trello REST API v1 connector."""
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -73,7 +74,9 @@ class TrelloConnector(ConnectorBase):
                 raise ValueError(f"Unsupported Trello resource: {q.resource!r}")
             return await handler(client, q)
 
-    def _query_handlers(self) -> dict[str, Any]:
+    def _query_handlers(
+        self,
+    ) -> dict[str, Callable[[httpx.AsyncClient, ConnectorQuery], Awaitable[ConnectorResult]]]:
         return {
             "boards": self._query_boards,
             "lists": self._query_lists,
