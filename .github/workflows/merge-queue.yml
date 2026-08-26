@@ -18,6 +18,8 @@ jobs:
     name: Release freeze gate
     runs-on: ubicloud-standard-2
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       frozen: ${{ steps.check.outputs.frozen }}
     steps:
@@ -29,8 +31,17 @@ jobs:
         run: |
           # Alpha release process: while the 'release-freeze' tag exists,
           # main is frozen and the merge queue must not merge anything.
-          # Manual escape: delete the tag (or run Release -> release).
-          COUNT=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/release-freeze" --jq 'length' 2>/dev/null || echo "0")
+          # Manual escape: delete the 'release-freeze' tag. Do NOT use Release ->
+          # release as an escape - that promotes GA prematurely.
+          COUNT=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/release-freeze" --jq 'length' 2>/dev/null || true)
+          if [ -z "$COUNT" ]; then
+            # Fail CLOSED: an API error must never be read as "not frozen", or a
+            # transient gh failure would silently lift the freeze mid-release.
+            # Skipping this 15-min tick costs nothing; a wrongly-open gate costs the RC.
+            echo "::error::gh api failed querying release-freeze tag - failing CLOSED, skipping this merge-queue tick."
+            echo "frozen=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$COUNT" -gt 0 ]; then
             echo "frozen=true" >> "$GITHUB_OUTPUT"
             echo "::notice::Release freeze ACTIVE ('release-freeze' tag present) - merge queue paused."
@@ -540,6 +551,24 @@ jobs:
         shell: bash
         run: |
           echo "Frontend checks failed" >> /tmp/failure_description.txt
+
+      - name: Re-verify freeze before merging (TOCTOU guard)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # A queue tick can pass freeze-gate minutes before the RC is cut;
+          # re-check here so a just-started freeze stops this tick from merging.
+          COUNT=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/release-freeze" --jq 'length' 2>/dev/null || true)
+          if [ -z "$COUNT" ]; then
+            echo "::error::Could not query release-freeze tag - failing CLOSED, aborting this merge tick."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::Release freeze became ACTIVE after this tick passed the gate - aborting merge."
+            exit 1
+          fi
+          echo "Freeze re-check clean - proceeding to merge."
 
       # If CI passed -- merge source PRs
       - name: Merge source PRs via gh pr merge

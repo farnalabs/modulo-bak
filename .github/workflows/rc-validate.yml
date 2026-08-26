@@ -26,8 +26,11 @@ jobs:
     name: Schemathesis fuzz vs live RC
     runs-on: ubicloud-standard-2
     timeout-minutes: 60
+    permissions:
+      contents: write
     env:
       BASE_URL: https://app.modulo.run
+      RC_TAG: ${{ inputs.rc_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +39,6 @@ jobs:
       - name: Confirm RC tag exists
         shell: bash
         run: |
-          RC_TAG="${{ inputs.rc_tag }}"
           if ! git rev-parse -q --verify "refs/tags/${RC_TAG}" >/dev/null 2>&1; then
             echo "::error::Tag ${RC_TAG} not found."
             exit 1
@@ -61,7 +63,7 @@ jobs:
         run: |
           for i in $(seq 1 30); do
             CODE=$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/" || true)
-            if [ "$CODE" != "000" ]; then
+            if [ -n "$CODE" ] && [ "$CODE" -ge 200 ] && [ "$CODE" -lt 400 ]; then
               echo "${BASE_URL} reachable (HTTP ${CODE})"
               exit 0
             fi
@@ -70,7 +72,27 @@ jobs:
           echo "::error::${BASE_URL} unreachable after 5 minutes."
           exit 1
 
+      - name: Verify live deployment serves the RC commit
+        run: |
+          RC_SHA=$(git rev-parse "${RC_TAG}^{commit}")
+          INFO=$(curl -s -m 15 "${BASE_URL}/api/v1/deployment" || true)
+          DEPLOYED=$(echo "$INFO" | jq -r '.git_sha // empty' 2>/dev/null || true)
+          if [ -z "$DEPLOYED" ] || [ "$DEPLOYED" = "null" ]; then
+            echo "::error::Could not read git_sha from ${BASE_URL}/api/v1/deployment (got: ${INFO:-<empty>})."
+            exit 1
+          fi
+          if [ "${DEPLOYED:0:7}" != "${RC_SHA:0:7}" ]; then
+            echo "::error::Deployment SHA mismatch: ${BASE_URL} serves ${DEPLOYED:0:7} but RC ${RC_TAG} is ${RC_SHA:0:7}. Wait for the deploy pipeline to ship the RC before validating."
+            exit 1
+          fi
+          echo "Deployment SHA match: ${DEPLOYED:0:7} == ${RC_TAG}"
+
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+
+      - name: Configure git
+        run: |
+          git config user.name "modulo-release-bot"
+          git config user.email "bot@modulo.run"
 
       - name: Schemathesis fuzz against live RC
         env:
@@ -79,10 +101,18 @@ jobs:
         shell: bash
         timeout-minutes: 45
         run: |
-          uv tool install schemathesis
+          uv tool install "schemathesis==4.25.2"
           schemathesis run "${BASE_URL}/openapi.json" \
             --base-url "$BASE_URL" \
             --auth "$RC_USER:$RC_PASS" \
             --method GET \
             --checks all \
             --max-examples 50
+
+      - name: Record validation success (validated/<rc_tag> marker)
+        if: success()
+        run: |
+          VALIDATED_TAG="validated/${RC_TAG}"
+          git tag -f -a "$VALIDATED_TAG" -m "rc-validate SUCCESS for ${RC_TAG}"
+          git push origin "$VALIDATED_TAG" --force
+          echo "Validation marker pushed: $VALIDATED_TAG"

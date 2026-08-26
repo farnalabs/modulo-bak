@@ -6,7 +6,7 @@ name: "Release: Cut / Recut / Promote"
 #
 #   cut     - tag vX.Y.Z-rcN at main HEAD, push release-freeze, trigger rc-validate
 #   recut   - after a manually-merged fix on main: tag the NEXT RC, re-freeze
-#   release - promote vX.Y.Z GA at the validated RC commit and lift the freeze
+#   release - promote vX.Y.Z GA at the validated RC commit and lift the freeze (requires a successful rc-validate run recorded as validated/<rc>)
 
 on:
   workflow_dispatch:
@@ -50,8 +50,9 @@ jobs:
 
       - name: Validate version input
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
           if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::version must be semver X.Y.Z (e.g. 0.1.0); got '$VERSION'"
             exit 1
@@ -62,9 +63,10 @@ jobs:
         if: inputs.action == 'cut' || inputs.action == 'recut'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
-          BASE="v${{ inputs.version }}"
+          BASE="v${VERSION}"
 
           # Next free RC number for this version.
           N=1
@@ -83,8 +85,6 @@ jobs:
           git tag -f -a release-freeze -m "Release freeze active (for $RC_TAG)"
           git push origin release-freeze --force
 
-          echo "rc_tag=$RC_TAG" >> "$GITHUB_OUTPUT"
-
           # Kick off validation against the deployed RC (app.modulo.run).
           gh workflow run rc-validate.yml --ref main -f rc_tag="$RC_TAG"
           echo "Triggered rc-validate.yml for $RC_TAG."
@@ -93,9 +93,9 @@ jobs:
         if: inputs.action == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
         shell: bash
         run: |
-          VERSION="${{ inputs.version }}"
           GA_TAG="v${VERSION}"
 
           # Safety 1: only promote OUT of an active freeze.
@@ -121,6 +121,19 @@ jobs:
           HEAD_SHA=$(git rev-parse HEAD)
           if [ "$RC_SHA" != "$HEAD_SHA" ]; then
             echo "::error::main HEAD (${HEAD_SHA}) is not the latest RC ${LATEST_RC} (${RC_SHA}). Re-cut or investigate before promoting."
+            exit 1
+          fi
+
+          # Safety 4: GA may only be promoted from a VALIDATED RC. rc-validate.yml
+          # pushes validated/<rc_tag> on success; its commit must equal the RC.
+          VALIDATED_TAG="validated/${LATEST_RC}"
+          if ! git rev-parse -q --verify "refs/tags/${VALIDATED_TAG}" >/dev/null 2>&1; then
+            echo "::error::No validation marker ${VALIDATED_TAG} - rc-validate.yml has not recorded a successful validation for ${LATEST_RC}. Wait for (or re-run) validation before promoting."
+            exit 1
+          fi
+          VAL_SHA=$(git rev-parse "${VALIDATED_TAG}^{commit}")
+          if [ "$VAL_SHA" != "$RC_SHA" ]; then
+            echo "::error::Validation marker ${VALIDATED_TAG} points at ${VAL_SHA}, not the RC commit ${RC_SHA}. Re-run validation."
             exit 1
           fi
 
