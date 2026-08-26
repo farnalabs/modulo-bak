@@ -42,6 +42,7 @@ router = APIRouter(prefix="/api/v1/admin/sso", tags=["admin-sso"])
 class SsoProviderCreate(BaseModel):
     provider_type: str = Field(pattern=r"^(oidc|saml)$")
     name: str = Field(min_length=1, max_length=255)
+    provider_id: str | None = None
     client_id: str | None = None
     client_secret: str | None = None
     discovery_url: str | None = None
@@ -72,6 +73,7 @@ class SsoProviderResponse(BaseModel):
     id: uuid.UUID
     provider_type: str
     name: str
+    provider_id: str | None = None
     client_id: str | None = None
     client_secret: SensitiveValue | None = None
     discovery_url: str | None = None
@@ -174,6 +176,7 @@ async def create_provider_endpoint(
                 session,
                 provider_type=req.provider_type,
                 name=req.name,
+                provider_id=req.provider_id,
                 client_id=req.client_id,
                 client_secret=req.client_secret,
                 discovery_url=req.discovery_url,
