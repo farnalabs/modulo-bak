@@ -763,7 +763,7 @@ async def _fallback_write(
     error_detail: str | None,
     is_terminal: bool = False,
     claim_token: str | None = None,
-) -> None:
+) -> Decimal:
     """The LEGACY FALLBACK write (never-fail envelope, §1.5).
 
     Persists the UN-ENRICHED merged set (so the cumulative write-back invariant
