@@ -472,7 +472,7 @@ async def move_schema_to_folder_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await _assert_owns_schema(session, schema_id, principal)
-            schema = await move_schema_to_folder(session, schema_id, req.folder_id)
+            schema = await move_schema_to_folder(session, schema_id, req.folder_id, principal.organisation_id)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
