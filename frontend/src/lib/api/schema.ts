@@ -10557,6 +10557,11 @@ export interface components {
         /**
          * FanOutConfig
          * @description Declares a scatter (fan-out) on an agent / sandbox_agent node.
+         *
+         *     Only the ``split`` source and the ``max_items`` cardinality ceiling are
+         *     honoured by the runtime — there is no batching/parallelism in P3, so those
+         *     knobs are intentionally absent from the contract rather than accepted and
+         *     silently ignored.
          */
         FanOutConfig: {
             /**
@@ -11235,6 +11240,12 @@ export interface components {
         /**
          * JoinCollectSpec
          * @description One upstream branch a join node collects from.
+         *
+         *     Only the parent ``node`` is read by the runtime (it locates the scatter
+         *     manifest and merges every child output of that parent). The ``port`` knob
+         *     was removed from the contract because no code path selected a specific
+         *     output port; collecting all child outputs of the parent is the supported
+         *     semantics.
          */
         JoinCollectSpec: {
             /**
