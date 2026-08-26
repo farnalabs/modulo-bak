@@ -1172,19 +1172,19 @@ async def _load_migration_versions(
     principal: TenantPrincipal,
     req: SchemaMigrationRequest,
 ) -> tuple[Any, Any]:
-    """Load the latest source and target schema versions within a transaction."""
+    """Load the latest source and target schema versions within a transaction.
+
+    The application session runs with BYPASSRLS, so tenant isolation must be
+    enforced explicitly: assert the caller's org owns both the source and target
+    schema before touching any versions (avoiding a cross-org read).
+    """
     async with session.begin():
-        await set_rls_org(session, principal.organisation_id)
-        from_schema = await get_schema(session, req.from_schema_id)
-        if from_schema is None:
-            raise HTTPException(status_code=404, detail="Source schema not found")
+        await _assert_owns_schema(session, req.from_schema_id, principal)
         from_sv = await _get_latest_version(session, req.from_schema_id)
         if from_sv is None:
             raise HTTPException(status_code=404, detail="Source schema has no versions")
 
-        to_schema = await get_schema(session, req.to_schema_id)
-        if to_schema is None:
-            raise HTTPException(status_code=404, detail="Target schema not found")
+        await _assert_owns_schema(session, req.to_schema_id, principal)
         to_sv = await _get_latest_version(session, req.to_schema_id)
         if to_sv is None:
             raise HTTPException(status_code=404, detail="Target schema has no versions")

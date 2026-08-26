@@ -396,6 +396,53 @@ def test_migrate_data_source_schema_not_found_returns_404(client: TestClient) ->
     assert resp.status_code == 404
 
 
+def test_migrate_data_source_cross_org_schema_returns_404(client: TestClient) -> None:
+    # A schema belonging to a DIFFERENT organisation must be rejected with 404
+    # (not 403) and must never reach the version-loading CRUD path.
+    from_schema = _make_schema()
+    from_schema.organisation_id = uuid.UUID("99999999-9999-9999-9999-999999999999")
+    to_schema = _make_schema()
+    with (
+        patch("modulo.api.routes.schemas.get_schema", side_effect=[from_schema, to_schema]),
+        patch("modulo.api.routes.schemas.set_rls_org"),
+        patch("modulo.api.routes.schemas.list_schema_versions", new_callable=AsyncMock) as mock_list,
+    ):
+        resp = client.post(
+            "/api/v1/schemas/migrate",
+            json={
+                "from_schema_id": str(from_schema.id),
+                "to_schema_id": str(to_schema.id),
+                "data": {"name": "Alice"},
+            },
+        )
+    assert resp.status_code == 404
+    mock_list.assert_not_awaited()
+
+
+def test_migrate_data_target_cross_org_schema_returns_404(client: TestClient) -> None:
+    # The source is owned but the target belongs to another org: reject before
+    # any migration plan is computed.
+    from_schema = _make_schema()
+    to_schema = _make_schema()
+    to_schema.organisation_id = uuid.UUID("99999999-9999-9999-9999-999999999999")
+    from_sv = _make_schema_version(from_schema.id)
+    from_page = MagicMock(items=[from_sv], total=1, page=1, page_size=20)
+    with (
+        patch("modulo.api.routes.schemas.get_schema", side_effect=[from_schema, to_schema]),
+        patch("modulo.api.routes.schemas.list_schema_versions", side_effect=[from_page]),
+        patch("modulo.api.routes.schemas.set_rls_org"),
+    ):
+        resp = client.post(
+            "/api/v1/schemas/migrate",
+            json={
+                "from_schema_id": str(from_schema.id),
+                "to_schema_id": str(to_schema.id),
+                "data": {"name": "Alice"},
+            },
+        )
+    assert resp.status_code == 404
+
+
 def test_migrate_data_source_no_versions_returns_404(client: TestClient) -> None:
     from_schema = _make_schema()
     to_schema = _make_schema()
