@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, patch
 
 from pytest_bdd import given, parsers, scenarios, then, when
 
-scenarios("../features/agents/crud.feature")
+from tests.bdd.conftest import ORG_ID
 
-ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+scenarios("../features/agents/crud.feature")
 
 _AGENT_ID: uuid.UUID | None = None
 _AGENT_BODY: dict = {
