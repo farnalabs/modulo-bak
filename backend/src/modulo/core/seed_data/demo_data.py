@@ -105,8 +105,8 @@ async def seed_demo_org(
         )
 
     # 1. Organisation (idempotent by slug, with concurrency safety)
-    result = await session.execute(select(Organisation).where(Organisation.slug == slug))
-    org = result.scalar_one_or_none()
+    org_result = await session.execute(select(Organisation).where(Organisation.slug == slug))
+    org = org_result.scalar_one_or_none()
     if org is None:
         org = Organisation(name=slug, slug=slug, settings_json={})
         session.add(org)
@@ -116,8 +116,8 @@ async def seed_demo_org(
             # A concurrent boot already inserted this slug (unique violation).
             # Roll back the failed insert and use the row that won.
             await session.rollback()
-            result = await session.execute(select(Organisation).where(Organisation.slug == slug))
-            org = result.scalar_one_or_none()
+            org_result = await session.execute(select(Organisation).where(Organisation.slug == slug))
+            org = org_result.scalar_one_or_none()
             if org is None:
                 raise
             _log.info("demo_org.recovered_after_conflict", extra={"slug": slug})
@@ -127,8 +127,8 @@ async def seed_demo_org(
         _log.info("demo_org.exists", extra={"slug": slug})
 
     # 2. Admin account (idempotent by email, with collision guard)
-    result = await session.execute(select(Account).where(Account.email == admin_email))
-    account = result.scalar_one_or_none()
+    account_result = await session.execute(select(Account).where(Account.email == admin_email))
+    account = account_result.scalar_one_or_none()
     if account is None:
         from modulo.auth.passwords import hash_password
 
@@ -160,13 +160,13 @@ async def seed_demo_org(
         _log.info("demo_account.exists", extra={"email": admin_email})
 
     # 3. Membership (idempotent by account + org)
-    result = await session.execute(
+    mem_result = await session.execute(
         select(OrgMembership).where(
             OrgMembership.account_id == account.id,
             OrgMembership.organisation_id == org.id,
         )
     )
-    membership = result.scalar_one_or_none()
+    membership = mem_result.scalar_one_or_none()
     if membership is None:
         membership = OrgMembership(
             account_id=account.id,
@@ -230,6 +230,6 @@ async def seed_demo_orgs(factory: async_sessionmaker[AsyncSession]) -> None:
                     admin_email=spec["email"],
                     admin_password=spec["password"],
                 )
-        except Exception:
+        except (ValueError, LicenseSigningError, IntegrityError):
             _log.exception("demo_org.seed_failed", extra={"slug": spec.get("slug")})
             continue
