@@ -504,5 +504,5 @@ async def test_compile_path_wires_retry_wrapper_without_breaking_normal_exec() -
 
     # Both nodes produced a stub artifact (no model_backend_id → stub path), so
     # the run completed normally through the retry-wrapped callables.
-    assert result["run_context"]["input"] == {}
+    assert not result["run_context"]["input"]
     assert isinstance(result.get("artifacts"), list)
