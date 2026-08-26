@@ -1,0 +1,88 @@
+name: "RC Validation (pen test vs app.modulo.run)"
+
+# Runs during the alpha release freeze against the LIVE production soak
+# deployment - NOT an in-process app (that is schemathesis-nightly.yml).
+# Triggered automatically by release.yml on cut/recut; can also be
+# dispatched manually with an rc_tag.
+#
+# v1 scope: read-only (GET) fuzzing only. Destructive-method fuzzing against
+# the live soak would mutate real dogfood data and trigger real pipeline
+# runs/costs; it belongs against a disposable clone when that suite arrives.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "The RC tag being validated (e.g. v0.1.0-rc1)"
+        type: string
+        required: true
+
+concurrency:
+  group: rc-validate
+  cancel-in-progress: false
+
+jobs:
+  pen-test:
+    name: Schemathesis fuzz vs live RC
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 60
+    env:
+      BASE_URL: https://app.modulo.run
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm RC tag exists
+        shell: bash
+        run: |
+          RC_TAG="${{ inputs.rc_tag }}"
+          if ! git rev-parse -q --verify "refs/tags/${RC_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${RC_TAG} not found."
+            exit 1
+          fi
+          echo "Validating RC ${RC_TAG} ($(git rev-parse --short "${RC_TAG}^{commit}")) against ${BASE_URL}"
+
+      - name: Check pen-test credentials are configured
+        env:
+          RC_USER: ${{ secrets.RC_PENTEST_USERNAME }}
+          RC_PASS: ${{ secrets.RC_PENTEST_PASSWORD }}
+        shell: bash
+        run: |
+          if [ -z "$RC_USER" ] || [ -z "$RC_PASS" ]; then
+            echo "::error::Repo secrets RC_PENTEST_USERNAME / RC_PENTEST_PASSWORD are not set."
+            echo "        Configure an app.modulo.run account for the pen test before cutting an RC:"
+            echo "        gh secret set RC_PENTEST_USERNAME ; gh secret set RC_PENTEST_PASSWORD"
+            exit 1
+          fi
+
+      - name: Wait for app availability
+        shell: bash
+        run: |
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${BASE_URL}/" || true)
+            if [ "$CODE" != "000" ]; then
+              echo "${BASE_URL} reachable (HTTP ${CODE})"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::${BASE_URL} unreachable after 5 minutes."
+          exit 1
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+
+      - name: Schemathesis fuzz against live RC
+        env:
+          RC_USER: ${{ secrets.RC_PENTEST_USERNAME }}
+          RC_PASS: ${{ secrets.RC_PENTEST_PASSWORD }}
+        shell: bash
+        timeout-minutes: 45
+        run: |
+          uv tool install schemathesis
+          schemathesis run "${BASE_URL}/openapi.json" \
+            --base-url "$BASE_URL" \
+            --auth "$RC_USER:$RC_PASS" \
+            --method GET \
+            --checks all \
+            --max-examples 50
