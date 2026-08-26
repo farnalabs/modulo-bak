@@ -552,7 +552,13 @@ jobs:
         run: |
           echo "Frontend checks failed" >> /tmp/failure_description.txt
 
+      # Skips the merge (job stays GREEN) instead of failing: a failure here
+      # would trip this job's failure() plumbing - false "frontend failed"
+      # notes and a phantom ci-failure dispatch to the Branch Fixer during
+      # the exact window the freeze protects. The ::error:: annotations
+      # surface the abort in the run summary for the human overseer.
       - name: Re-verify freeze before merging (TOCTOU guard)
+        id: toctou
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -562,17 +568,19 @@ jobs:
           COUNT=$(gh api "repos/${{ github.repository }}/git/matching-refs/tags/release-freeze" --jq 'length' 2>/dev/null || true)
           if [ -z "$COUNT" ]; then
             echo "::error::Could not query release-freeze tag - failing CLOSED, aborting this merge tick."
-            exit 1
+            echo "aborted=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           if [ "$COUNT" -gt 0 ]; then
             echo "::error::Release freeze became ACTIVE after this tick passed the gate - aborting merge."
-            exit 1
+            echo "aborted=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "Freeze re-check clean - proceeding to merge."
 
       # If CI passed -- merge source PRs
       - name: Merge source PRs via gh pr merge
-        if: success() && steps.merge.outputs.merged_count != '0'
+        if: success() && steps.merge.outputs.merged_count != '0' && steps.toctou.outputs.aborted != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
