@@ -43,6 +43,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.dispatch import SAQ_RUN_TIMEOUT
 from modulo.core.exceptions import TriggersPausedError
 from modulo.core.pipeline_engine.error_codes import sanitize_error_text
@@ -833,9 +834,23 @@ async def _build_polling_connector(
     org_id: uuid.UUID,
     trigger_id: uuid.UUID,
 ) -> Any:
-    """Build the polling connector from stored creds; None on init failure."""
+    """Build the polling connector from stored creds; None on init failure.
+
+    FAR-442: REST connectors invoked via a polling trigger are wired to the SHARED
+    fleet-wide per-destination rate budget (same as run-executor connectors) by
+    resolving a shared Redis client keyed to ``tenant_id=str(org_id)``. Each org
+    gets its own budget (no cross-tenant ``"default"`` key). When Redis is NOT
+    configured the resolver returns ``None`` and the connector stays on the local
+    per-process bucket (correct: no shared budget exists to multiply). When Redis IS
+    configured but the shared budget cannot be resolved (settings-read failure or
+    client-construction failure) the resolver RAISES SharedBudgetUnavailableError,
+    which is deliberately NOT swallowed here — a trigger must fail closed rather than
+    silently fall back to the local bucket (which would reconstruct the fleet-wide
+    ``N x burst`` fail-open FAR-439 removed).
+    """
     import json
 
+    from modulo.core.connector_hub import resolve_shared_rate_limit_redis
     from modulo.core.secrets_backend import create_secrets_backend
     from modulo.core.trigger_engine.polling import _build_polling_connector as _build_connector
 
@@ -844,12 +859,20 @@ async def _build_polling_connector(
         secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
         raw_creds = await secrets_backend.get_secret(str(connector_instance.id))
         creds: dict[str, Any] = json.loads(raw_creds)
+        redis_client = resolve_shared_rate_limit_redis(str(org_id))
         return _build_connector(
             connector_instance.connector_type_id,
             connector_instance.config_json,
             creds,
+            redis_client=redis_client,
+            tenant_id=str(org_id),
         )
     except asyncio.CancelledError:
+        raise
+    except SharedBudgetUnavailableError:
+        # Fail-closed: a configured-but-unresolvable shared budget must NOT be
+        # downgraded to the per-process local bucket. Propagate so the fire job
+        # surfaces the outage rather than silently enforcing a per-worker cap.
         raise
     except Exception as exc:
         _log.warning("Failed to initialise connector for polling trigger %s: %s", trigger_id, str(exc)[:200])
@@ -892,6 +915,13 @@ async def _run_poll_query(
         )
         return None, {"status": "error", "reason": "query_timeout"}
     except asyncio.CancelledError:
+        raise
+    except SharedBudgetUnavailableError:
+        # Fail-closed (FAR-442): the shared Redis rate budget is configured but
+        # could not be charged during the poll query. Re-raise so the fire job
+        # surfaces the outage instead of degrading to a "query_failed" skip — the
+        # connector must never fall back to a per-process bucket under a shared
+        # budget. The request was never sent on an unaccountable budget.
         raise
     except Exception as exc:
         _log.warning("Poll query failed for trigger %s: %s", trigger_id, str(exc)[:200])

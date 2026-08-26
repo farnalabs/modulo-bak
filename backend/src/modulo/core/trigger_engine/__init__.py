@@ -708,6 +708,8 @@ class TriggerEngine:
         This is a sync-friendly evaluation meant for testing or manual one-off
         checks. For automatic scheduled evaluation use the SAQ fire job path.
         """
+        from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
+        from modulo.core.connector_hub import resolve_shared_rate_limit_redis
         from modulo.core.trigger_engine.polling import (
             _build_polling_connector,
         )
@@ -735,12 +737,19 @@ class TriggerEngine:
             secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
             raw_creds = await secrets_backend.get_secret(str(instance.id))
             creds: dict[str, Any] = json.loads(raw_creds)
+            redis_client = resolve_shared_rate_limit_redis(str(org_id))
             connector = _build_polling_connector(
                 instance.connector_type_id,
                 instance.config_json,
                 creds,
+                redis_client=redis_client,
+                tenant_id=str(org_id),
             )
         except asyncio.CancelledError:
+            raise
+        except SharedBudgetUnavailableError:
+            # Fail-closed (FAR-442): a configured-but-unresolvable shared rate
+            # budget must not be downgraded to the per-process local bucket.
             raise
         except Exception as exc:
             return {"status": "error", "error": f"Connector init failed: {str(exc)[:200]}"}
@@ -749,6 +758,11 @@ class TriggerEngine:
             query = ConnectorQuery(resource=poll_query)
             query_result = await connector.query(query)
         except asyncio.CancelledError:
+            raise
+        except SharedBudgetUnavailableError:
+            # Fail-closed (FAR-442): the shared Redis rate budget is configured but
+            # could not be charged during the query. Re-raise so the caller surfaces
+            # the outage rather than degrading to a "query failed" error.
             raise
         except Exception as exc:
             return {"status": "error", "error": f"Query failed: {str(exc)[:200]}"}

@@ -36,11 +36,26 @@ _ACTIVE_STATUSES = ACTIVE_RUN_STATUSES
 # ---------------------------------------------------------------------------
 
 
-def _build_polling_connector(type_id: str, config: dict[str, Any], creds: dict[str, Any]) -> ConnectorBase:
+def _build_polling_connector(
+    type_id: str,
+    config: dict[str, Any],
+    creds: dict[str, Any],
+    *,
+    redis_client: Any = None,
+    tenant_id: str | None = None,
+) -> ConnectorBase:
     """Build a one-shot connector for polling queries.
 
     Mirrors ``modulo.core.connector_hub._build_connector()`` but does not
     wrap in a ``_TracedConnector`` since polling runs outside a normal run context.
+
+    When ``redis_client`` and ``tenant_id`` (the organisation id) are supplied the
+    REST connector is wired to the SHARED fleet-wide per-destination rate budget
+    (FAR-442): trigger-invoked REST connectors enforce the SAME budget as
+    run-executor connectors, and each org gets its own budget (no cross-tenant
+    ``"default"`` key). Without them the connector stays on the per-process local
+    bucket (single-worker dev / no-fleet), which is correct when no shared budget
+    exists to multiply.
     """
     from modulo.connectors.filesystem import FilesystemConnector
     from modulo.connectors.github import GitHubConnector
@@ -83,6 +98,8 @@ def _build_polling_connector(type_id: str, config: dict[str, Any], creds: dict[s
                 config=config,
                 creds=creds,
                 security_guard=_core_security_guard(),
+                redis_client=redis_client,
+                tenant_id=tenant_id,
             )
         case _:
             raise ValueError(f"Unsupported connector type for polling: {type_id!r}")

@@ -626,6 +626,12 @@ class TestTriggerEngineEvaluateCondition:
     def polling_env(self):
         settings = MagicMock()
         settings.fernet_key = _VALID_32
+        # FAR-442: evaluate_condition now resolves a shared rate-limit Redis client.
+        # A truthy MagicMock redis_url would attempt a real Redis.from_url build (and
+        # fail on the MagicMock url); indicate Redis is NOT configured so the resolver
+        # short-circuits to None (the connector-local bucket is correct here).
+        settings.redis_url = ""
+        settings.modulo_db = "postgresql"
         with (
             patch("modulo.settings.get_settings", return_value=settings),
             patch("modulo.core.trigger_engine.create_secrets_backend") as mock_sb,
