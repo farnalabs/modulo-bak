@@ -1497,9 +1497,15 @@ def _render_agent_prompt(
     """
     env = SandboxedEnvironment()
     template = env.from_string(prompt_template)
+    # FAR-418 / FAR-436: context_scope — the agent's run_context VIEW (the keys
+    # fed to the prompt template) is allowlist-gated to the node's need-to-know
+    # set. Internal control keys are always preserved by filter_run_context_scope
+    # (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy (full run_context view).
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
     template_vars: dict[str, Any] = {
         "state": state,
-        "run_context": run_context,
+        "run_context": scoped_run_context,
         "input": raw_input,
     }
     resolved = node_def.get("_resolved_parameters")
@@ -1572,7 +1578,7 @@ def make_node_fn(
     role: str | None = None,
     timeout: float | None = None,
     max_input_length: int | None = None,
-    token_budget: int | None = None,
+    token_budget: int | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); budget enforced at executor level
 ) -> Any:
     """Return a decorated async node function for use in a StateGraph.
 
@@ -2252,7 +2258,7 @@ def make_hitl_gate_fn(
 def make_manual_node_fn(
     node_def: dict[str, Any],
     *,
-    timeout: float | None = None,
+    timeout: float | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); manual nodes never time out
 ) -> Any:
     """Return a node function for a manual-input node.
 
@@ -2321,13 +2327,25 @@ def make_manual_node_fn(
 def _resolve_binding_connector(
     binding: dict[str, Any],
     node_id: str,
+    *,
+    allowed_connectors: list[str] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve a bound connector instance for *node_id*.
 
     Returns ``(connector, None)`` on success, or ``(None, error_artifact)``
-    when the hub is unavailable, the instance id is missing, or the connector
-    cannot be resolved — the error artifact is already enveloped for return.
+    when the hub is unavailable, the instance id is missing, the connector
+    is outside the node's ``capability_scope.allowed_connectors``, or the
+    connector cannot be resolved — the error artifact is already enveloped.
+
+    FAR-418: when *allowed_connectors* is set, a bound connector excluded by
+    the scope fails FAST with a typed, logged, metric-emitting
+    ``ScopeViolationError`` (never silently). Absent = unrestricted.
     """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        is_connector_allowed,
+        record_scope_violation,
+    )
     from modulo.core.pipeline_engine.decorator import get_connector_hub
 
     hub = get_connector_hub()
@@ -2343,8 +2361,23 @@ def _resolve_binding_connector(
 
     import uuid as _uuid
 
+    instance_uuid = _uuid.UUID(str(instance_id_str))
+
+    # FAR-418: deny-by-default within the node's connector scope.
+    connector_type: str = binding.get("type", "")
+    if not is_connector_allowed(
+        connector_instance_id=instance_uuid,
+        connector_type=connector_type,
+        allowed_connectors=allowed_connectors,
+    ):
+        target = connector_type or str(instance_uuid)
+        scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+        record_scope_violation(node_id=node_id, target=target, kind="connector")
+        _log.error("scope.violation node=%s connector=%s", node_id, target)
+        return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
     try:
-        connector = hub.get(_uuid.UUID(str(instance_id_str)))
+        connector = hub.get(instance_uuid)
     except Exception as _conn_exc:
         return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": f"connector error: {_conn_exc}"}]}
     return connector, None
@@ -2438,7 +2471,11 @@ def make_connector_fn(
                 _log.error("scope.violation node=%s connector=%s", node_id, target)
                 return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
 
-        connector, error_artifact = _resolve_binding_connector(binding, node_id)
+        connector, error_artifact = _resolve_binding_connector(
+            binding,
+            node_id,
+            allowed_connectors=allowed_connectors,
+        )
         if error_artifact is not None:
             return error_artifact
 
@@ -3058,7 +3095,6 @@ class _SandboxWatchdog:
         sandbox_mode: str,
         stdout_percentage_delta: float | None,
         stream_broker: RunEventBroker | None,
-        stream_enabled: bool,
         drained_chunks: list[str],
         wallclock_budget_seconds: int | None,
         start_time: float,
@@ -3075,7 +3111,7 @@ class _SandboxWatchdog:
         self._sandbox_mode = sandbox_mode
         self._stdout_ratio = stdout_percentage_delta
         self._stream_broker = stream_broker
-        self._stream_enabled = stream_enabled
+        self._stream_enabled = isinstance(stream_broker, RunEventBroker)
         self._drained_chunks = drained_chunks
         self._activity: dict[str, Any] = {"last": time.monotonic()}
         self._stdout_prev: str | None = None
@@ -3791,7 +3827,7 @@ def _script_enforcement_requires_remote(
     )
 
 
-async def _sandbox_agent_impl(
+async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegates to extracted helpers (FAR-310)
     state: dict[str, Any],
     *,
     config: _SandboxNodeConfig,
@@ -3872,6 +3908,12 @@ async def _sandbox_agent_impl(
     else:
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
+        # FAR-436: context_scope — the sandbox agent's run_context VIEW (the keys
+        # fed to the prompt + agent_command templates) is allowlist-gated to the
+        # node's need-to-know set. Internal control keys are always preserved by
+        # filter_run_context_scope (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
         template_vars: dict[str, Any] = {
             "state": scoped_state,
             "run_context": scoped_run_context,
@@ -4368,7 +4410,6 @@ async def _sandbox_agent_impl(
                     _stream_broker = get_registry().get(uuid.UUID(run_id))
                 except (TypeError, ValueError):
                     _stream_broker = None
-            _stream_enabled = isinstance(_stream_broker, RunEventBroker)
 
             watchdog = _SandboxWatchdog(
                 sandbox=sandbox,
@@ -4381,7 +4422,6 @@ async def _sandbox_agent_impl(
                 sandbox_mode=sandbox_mode,
                 stdout_percentage_delta=stdout_percentage_delta,
                 stream_broker=_stream_broker,
-                stream_enabled=_stream_enabled,
                 drained_chunks=_drained_chunks,
                 wallclock_budget_seconds=wallclock_budget_seconds,
                 start_time=start_time,
