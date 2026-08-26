@@ -100,6 +100,8 @@ async def _run_health_check_on_save(
     try:
         creds: dict[str, Any] = {"api_key": api_key} if api_key else {}
         backend = _build_backend(provider, model_id, creds, default_params)
+    except HTTPException:
+        raise
     except Exception:
         # Provider cannot be constructed from API-supplied credentials — not a
         # health failure. Never persisted as last_health_check_error (the graph
@@ -111,6 +113,8 @@ async def _run_health_check_on_save(
             return "ok", None
         return "unhealthy", result.detail
     except asyncio.CancelledError:
+        raise
+    except HTTPException:
         raise
     except Exception as exc:
         return "unhealthy", str(exc)[:500]
@@ -174,6 +178,8 @@ async def _run_health_check_on_save_and_persist(
             user_id=user_id,
             org_role=org_role,
         )
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Failed to persist health check result for model backend %s", backend.id)
     return status_, detail
@@ -479,6 +485,8 @@ def _validate_provider(provider: str) -> None:
         registry = get_plugin_registry()
         if registry.has_model_backend(provider):
             return
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("model_backends._validate_provider")
         logger.warning("Plugin registry check failed for provider %r: %s", _sanitise_log_value(provider), exc)
@@ -860,6 +868,8 @@ async def recheck_model_backend_health_endpoint(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model backend not found")
         try:
             api_key = Fernet(settings.fernet_key.encode()).decrypt(mb.credentials_ciphertext).decode()
+        except HTTPException:
+            raise
         except Exception:
             logger.warning("Failed to decrypt credentials for model backend %s; health check skipped", backend_id)
             api_key = None

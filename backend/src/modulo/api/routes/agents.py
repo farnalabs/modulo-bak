@@ -299,6 +299,8 @@ async def list_agents_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error listing agents")
         raise HTTPException(
@@ -374,6 +376,8 @@ async def create_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error creating agent")
         raise HTTPException(
@@ -406,6 +410,8 @@ async def get_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error getting agent")
         raise HTTPException(
@@ -443,6 +449,8 @@ async def update_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error updating agent")
         raise HTTPException(
@@ -631,6 +639,8 @@ async def optimize_prompt(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Prompt optimization failed: LLM call failed after retries",
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error during prompt optimization")
         raise HTTPException(
@@ -691,6 +701,8 @@ async def apply_optimized_prompt(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error applying optimized prompt")
         raise HTTPException(
@@ -725,6 +737,8 @@ async def list_prompt_versions(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error listing prompt versions")
         raise HTTPException(
@@ -771,6 +785,8 @@ async def get_prompt_version_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error getting prompt version")
         raise HTTPException(
@@ -822,6 +838,8 @@ async def rollback_prompt(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error rolling back prompt")
         raise HTTPException(
@@ -863,6 +881,8 @@ async def diff_prompt_versions(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error diffing prompt versions")
         raise HTTPException(
@@ -934,6 +954,8 @@ async def delete_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error deleting agent")
         raise HTTPException(

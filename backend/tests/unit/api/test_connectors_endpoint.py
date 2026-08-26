@@ -38,6 +38,20 @@ def _make_settings() -> Settings:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_get_connector_instance() -> Generator[None, None, None]:
+    """The IDOR ownership check reads the connector via ``get_connector_instance``
+    before the write CRUD, but the write-path cases only mock
+    ``update_connector_instance`` / ``delete_connector_instance``. Supply a
+    same-org connector so the ownership check passes for the legitimate
+    (same-org) principal these tests use."""
+    with patch(
+        "modulo.api.routes.connectors.get_connector_instance",
+        return_value=_make_connector(),
+    ):
+        yield
+
+
 def _make_connector(credentials_ciphertext: bytes = b"encrypted", tier: str = "native") -> MagicMock:
     ci = MagicMock()
     ci.id = _CONNECTOR_ID

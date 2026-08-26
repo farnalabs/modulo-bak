@@ -32,6 +32,16 @@ def _make_settings() -> Settings:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_get_agent() -> Generator[None, None, None]:
+    """The IDOR ownership check reads the agent via ``get_agent`` before the
+    write CRUD, but the write-path cases only mock ``update_agent`` /
+    ``delete_agent``. Supply a same-org agent so the ownership check passes for
+    the legitimate (same-org) principal these tests use."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_make_agent()):
+        yield
+
+
 def _make_agent() -> MagicMock:
     a = MagicMock()
     a.id = _AGENT_ID

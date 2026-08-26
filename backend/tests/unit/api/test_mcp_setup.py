@@ -74,6 +74,7 @@ def _pending_backend() -> MagicMock:
     mb.id = _BACKEND_ID
     mb.name = "Test Backend"
     mb.status = "pending_setup"
+    mb.organisation_id = _ORG_ID
     return mb
 
 
