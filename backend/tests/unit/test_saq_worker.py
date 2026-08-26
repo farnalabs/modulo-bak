@@ -1790,8 +1790,14 @@ class TestFireSuiteRunTriggerEnqueueFailure:
         # Session double for the terminalise path (the run is found + failed).
         run = MagicMock()
         run.organisation_id = UUID(org_id)
-        term_session = AsyncMock()
-        term_session.get.return_value = run
+        term_session = MagicMock()
+        term_session.get = AsyncMock(return_value=run)
+        # ``session.begin()`` must return an async context manager (not a bare
+        # coroutine) for ``async with session.begin():`` to work under mock.
+        # ``MagicMock(return_value=...)`` (not ``AsyncMock``) so calling it
+        # returns the inner async-CM directly instead of wrapping it in a
+        # coroutine.
+        term_session.begin = MagicMock(return_value=AsyncMock())
         term_cm = AsyncMock()
         term_cm.__aenter__.return_value = term_session
         term_cm.__aexit__.return_value = False
