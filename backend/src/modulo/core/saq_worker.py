@@ -760,7 +760,7 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
     ``error_detail`` populated, never stranded ``pending``.
     """
     from modulo.core.eval_engine.execute_suite_run import execute_suite_run as _run_exec
-    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.models.eval_suite_run import SuiteRun, is_terminal
     from modulo.db.rls import set_rls_org
 
     rid = uuid.UUID(suite_run_id)
@@ -780,6 +780,18 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
             if run.organisation_id != oid:
                 _log.warning("SAQ execute_suite_run: suite_run %s belongs to a different org", rid)
                 return {"status": "missing"}
+            # Terminal short-circuit (FAR-377 reviewer minor): the enqueued job uses
+            # ``retries=2``, so a run that already reached a terminal state can be
+            # re-invoked on retry. Re-evaluating the whole dataset only to fail the
+            # illegal ``failed -> completed`` transition is wasted work + a noisy
+            # error path — close it cheaply instead.
+            if is_terminal(run.state):
+                _log.info(
+                    "SAQ execute_suite_run: suite_run %s already terminal (%s) - skipping re-execution",
+                    rid,
+                    run.state,
+                )
+                return {"status": "already_terminal", "state": run.state}
             extra = run.extra or {}
             suite_ceiling_raw = extra.get("suite_ceiling")
             run_kwargs: dict[str, Any] = {

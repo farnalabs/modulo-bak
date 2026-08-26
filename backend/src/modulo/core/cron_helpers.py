@@ -2160,6 +2160,7 @@ async def fire_suite_run_trigger(
         suite_ceiling_raw = config.get("suite_ceiling")
         run.extra = {
             "trigger_id": str(trigger_id),
+            "pipeline_id": str(pipeline_id),
             "dataset_id": str(dataset_id),
             "model_backend_id": str(model_backend_id),
             "scenario_inputs": scenario_inputs,

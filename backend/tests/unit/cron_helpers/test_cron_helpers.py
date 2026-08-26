@@ -3263,3 +3263,156 @@ class TestFireSuiteRunTriggerPersists:
         # The run must NOT be built — the fire is rejected before build.
         load_defs.assert_awaited_once()
         build_suite_run.assert_not_called()
+
+
+class TestFireSuiteRunTriggerSpendPool:
+    """``fire_suite_run_trigger`` enforces the daily spend pool PER TRIGGER.
+
+    FAR-377 reviewer (major): the suite-run ``daily_spend_limit`` must be enforced
+    against the trigger's OWN runs (extra->>'trigger_id'), not the org-wide
+    suite-run total. Two suite-run triggers in one org must be independently
+    rate-limited, and a spend/concurrency skip must record the attempt
+    (skip-not-defer) so it doesn't trip spurious missed-fire alerts.
+    """
+
+    def _trigger(self, trigger_id: uuid.UUID, *, daily_spend_limit: Any = None) -> MagicMock:
+        trigger = MagicMock()
+        trigger.id = trigger_id
+        trigger.organisation_id = ORG
+        trigger.active = True
+        trigger.deleted_at = None
+        trigger.run_kind = "suite_run"
+        trigger.eval_suite_id = uuid.uuid4()
+        trigger.max_concurrent_runs = 5
+        trigger.daily_spend_limit = daily_spend_limit
+        trigger.config_json = {
+            "dataset_id": str(uuid.uuid4()),
+            "model_backend_id": str(uuid.uuid4()),
+        }
+        return trigger
+
+    @pytest.mark.asyncio
+    async def test_fire_passes_trigger_id_to_spend_pool(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The per-trigger spend pool is fed ``trigger_id`` (not the org-wide pool)."""
+        _patch_env(monkeypatch)
+        from decimal import Decimal
+
+        org_id = ORG
+        trigger_id = TRIGGER_A
+        trigger = self._trigger(trigger_id, daily_spend_limit=Decimal("100.00"))
+
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = 0
+        update_res = MagicMock()
+        session = _MockSession([advisory, trigger_res, count_res, update_res])
+        factory = MagicMock(return_value=session)
+
+        spend = AsyncMock(return_value=Decimal("3.00"))
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.build_suite_run",
+                return_value=MagicMock(id=uuid.uuid4()),
+            ),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[],
+            ),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.suite_run_daily_spend_used_for_trigger",
+                spend,
+            ),
+        ):
+            result = await ch.fire_suite_run_trigger(org_id=org_id, trigger_id=trigger_id, pipeline_id=None)
+
+        # Under its own limit -> fires, and the pool was scoped to THIS trigger.
+        assert result["status"] == "fired"
+        spend.assert_awaited_once()
+        assert spend.call_args.args[1] == org_id
+        assert spend.call_args.args[2] == trigger_id
+
+    @pytest.mark.asyncio
+    async def test_spend_limit_skip_records_last_fired_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A spend-limited fire is skipped AND marks ``last_fired_at`` (skip-not-defer)."""
+        _patch_env(monkeypatch)
+        from decimal import Decimal
+
+        org_id = ORG
+        trigger_id = TRIGGER_B
+        trigger = self._trigger(trigger_id, daily_spend_limit=Decimal("5.00"))
+
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = 0
+        update_res = MagicMock()
+        session = _MockSession([advisory, trigger_res, count_res, update_res])
+        factory = MagicMock(return_value=session)
+
+        # Today's OWN spend already exceeds the limit -> skip, but record attempt.
+        spend = AsyncMock(return_value=Decimal("50.00"))
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[],
+            ),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.suite_run_daily_spend_used_for_trigger",
+                spend,
+            ),
+            patch.object(ch, "_log_event", new_callable=AsyncMock),
+        ):
+            result = await ch.fire_suite_run_trigger(org_id=org_id, trigger_id=trigger_id, pipeline_id=None)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "spend_limit"
+        # A Trigger UPDATE touching last_fired_at was issued (skip-not-defer).
+        assert any("last_fired_at" in str(stmt) for stmt, _ in session.executed)
+
+    @pytest.mark.asyncio
+    async def test_concurrency_limit_skip_records_last_fired_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A concurrency-limited fire is skipped AND marks ``last_fired_at``."""
+        _patch_env(monkeypatch)
+        from decimal import Decimal
+
+        org_id = ORG
+        trigger_id = TRIGGER_A
+        trigger = self._trigger(trigger_id, daily_spend_limit=Decimal("100.00"))
+
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        # active_count at the concurrency ceiling -> skip.
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = trigger.max_concurrent_runs
+        update_res = MagicMock()
+        session = _MockSession([advisory, trigger_res, count_res, update_res])
+        factory = MagicMock(return_value=session)
+
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[],
+            ),
+            patch.object(ch, "_log_event", new_callable=AsyncMock),
+        ):
+            result = await ch.fire_suite_run_trigger(org_id=org_id, trigger_id=trigger_id, pipeline_id=None)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "concurrency_limit"
+        assert any("last_fired_at" in str(stmt) for stmt, _ in session.executed)

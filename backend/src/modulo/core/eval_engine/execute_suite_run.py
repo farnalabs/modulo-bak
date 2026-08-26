@@ -681,6 +681,9 @@ async def build_suite_run(
         excluded_case_count=0,
         claimed_cost=Decimal(0),
     )
+    # Audit: stamp the owning pipeline id (the trigger's pipeline) so a scheduled
+    # SuiteRun is traceable to its pipeline even though it writes no production Run.
+    run.extra = {"pipeline_id": str(pipeline_id)} if pipeline_id is not None else None
     session.add(run)
     await session.flush()
     return run
