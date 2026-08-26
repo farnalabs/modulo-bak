@@ -35,6 +35,7 @@ from modulo.core.eval_engine.execute_suite_run import (
     is_eval_trigger,
     suite_run_daily_spend_exceeded,
     suite_run_daily_spend_used,
+    suite_run_daily_spend_used_for_trigger,
 )
 from modulo.db.models import Base
 from modulo.db.models.eval_dataset import EvalCase, EvalDataset
@@ -415,6 +416,54 @@ async def test_suite_run_daily_spend_used_ignores_production_runs(session) -> No
     # A second org never sees the first's suite-run spend (org isolation).
     other = await suite_run_daily_spend_used(session, uuid.uuid4())
     assert other == Decimal(0)
+
+
+async def test_suite_run_daily_spend_used_scoped_per_trigger(session) -> None:
+    """The suite-run daily spend pool is PER TRIGGER, not per org.
+
+    ``daily_spend_limit`` is a per-trigger knob. Two suite-run triggers in the
+    same org at different limits must gate independently: a spend-hungry trigger
+    must NOT consume a quieter trigger's pool. The owning trigger id is stamped
+    onto ``suite_runs.extra`` at fire time, so the per-trigger pool sums only
+    rows whose ``extra->>'trigger_id'`` matches (matching production's
+    ``_spend_limit_skip`` over ``runs.trigger_id``).
+
+    Prove-the-fix (FAR-377 reviewer major finding): the previous implementation
+    summed the whole org's ``suite_runs`` cost, so the smallest limit gated
+    every trigger and the configured per-trigger limits were meaningless.
+    """
+    org = await _org()
+    trigger_a = uuid.uuid4()
+    trigger_b = uuid.uuid4()
+    suite_run_a = SuiteRun(
+        organisation_id=org,
+        suite_id=uuid.uuid4(),
+        dataset_id=uuid.uuid4(),
+        definition_checksum="a" * 64,
+        model_backend_id=uuid.uuid4(),
+        state=SuiteRunState.COMPLETED.value,
+        total_cost_usd=Decimal("40.00"),
+        extra={"trigger_id": str(trigger_a)},
+    )
+    suite_run_b = SuiteRun(
+        organisation_id=org,
+        suite_id=uuid.uuid4(),
+        dataset_id=uuid.uuid4(),
+        definition_checksum="b" * 64,
+        model_backend_id=uuid.uuid4(),
+        state=SuiteRunState.COMPLETED.value,
+        total_cost_usd=Decimal("3.00"),
+        extra={"trigger_id": str(trigger_b)},
+    )
+    session.add_all([suite_run_a, suite_run_b])
+    await session.flush()
+
+    used_a = await suite_run_daily_spend_used_for_trigger(session, org, trigger_a)
+    used_b = await suite_run_daily_spend_used_for_trigger(session, org, trigger_b)
+    assert used_a == Decimal("40.00")
+    assert used_b == Decimal("3.00")
+    # A trigger at limit does NOT pull from a different trigger's pool.
+    assert used_a + used_b == Decimal("43.00")
 
 
 # --------------------------------------------------------------------------- #

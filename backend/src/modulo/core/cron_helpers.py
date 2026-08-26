@@ -2025,7 +2025,7 @@ async def fire_suite_run_trigger(
         build_suite_run,
         load_suite_definitions,
         suite_run_daily_spend_exceeded,
-        suite_run_daily_spend_used,
+        suite_run_daily_spend_used_for_trigger,
     )
     from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
     from modulo.db.models.trigger import Trigger
@@ -2083,16 +2083,28 @@ async def fire_suite_run_trigger(
             )
         ).scalar_one() or 0
         if int(active_count) >= int(trigger.max_concurrent_runs):
+            # Skip-not-defer (PR #982): stamp the attempt so a low-cadence
+            # trigger that is being serviced does not trip the hourly
+            # check_missed_fire_alerts on a stale last_fired_at.
+            await session.execute(
+                update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC))
+            )
             return {
                 "status": "skipped",
                 "reason": "concurrency_limit",
                 "active_suite_runs": int(active_count),
             }
 
-        # Separate daily spend pool: sum TODAY's suite_runs cost (never runs).
+        # Separate daily spend pool: sum TODAY's suite_runs cost for THIS
+        # trigger only (never the org, never runs). ``daily_spend_limit`` is a
+        # per-trigger knob, so the pool must be scoped to the trigger that owns
+        # the run (id stamped onto ``suite_runs.extra`` at fire time).
         if trigger.daily_spend_limit is not None:
-            used = await suite_run_daily_spend_used(session, org_id)
+            used = await suite_run_daily_spend_used_for_trigger(session, org_id, trigger_id)
             if suite_run_daily_spend_exceeded(used, trigger.daily_spend_limit):
+                await session.execute(
+                    update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC))
+                )
                 return {
                     "status": "skipped",
                     "reason": "spend_limit",

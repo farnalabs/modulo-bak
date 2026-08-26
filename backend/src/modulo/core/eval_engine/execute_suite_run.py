@@ -758,6 +758,33 @@ async def suite_run_daily_spend_used(session: AsyncSession, org_id: uuid.UUID) -
     return Decimal(str(value or 0))
 
 
+async def suite_run_daily_spend_used_for_trigger(
+    session: AsyncSession, org_id: uuid.UUID, trigger_id: uuid.UUID
+) -> Decimal:
+    """Sum today's ``suite_runs`` cost for one *trigger_id* (per-trigger pool).
+
+    ``daily_spend_limit`` is configured PER TRIGGER, so the daily suite-run
+    spend pool must be scoped to the trigger that owns the run, not summed over
+    the whole org. The owning trigger id is stamped onto ``suite_runs.extra`` at
+    fire time (see ``fire_suite_run_trigger``), so we sum ``total_cost_usd`` over
+    rows whose ``extra->>'trigger_id'`` matches — matching production's per-trigger
+    ``daily_spend_limit`` semantics on the ``runs`` table (``_spend_limit_skip``).
+    """
+    from modulo.core.cost_controller import created_at_day_start
+
+    today_start = created_at_day_start()
+    value = (
+        await session.execute(
+            select(func.coalesce(func.sum(SuiteRun.total_cost_usd), 0)).where(
+                SuiteRun.organisation_id == org_id,
+                SuiteRun.created_at >= today_start,
+                SuiteRun.extra.op("->>")("trigger_id") == str(trigger_id),
+            )
+        )
+    ).scalar_one()
+    return Decimal(str(value or 0))
+
+
 def suite_run_daily_spend_exceeded_for_org(current_daily_used: Decimal, daily_limit: Decimal | None) -> bool:
     """Alias kept for call-site clarity (separate pool, not production pool)."""
     return suite_run_daily_spend_exceeded(current_daily_used, daily_limit)
@@ -782,4 +809,5 @@ __all__ = [
     "suite_run_daily_spend_exceeded",
     "suite_run_daily_spend_exceeded_for_org",
     "suite_run_daily_spend_used",
+    "suite_run_daily_spend_used_for_trigger",
 ]
