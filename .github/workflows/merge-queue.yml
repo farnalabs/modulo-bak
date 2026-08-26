@@ -538,6 +538,18 @@ jobs:
               continue
             fi
 
+            # SHA-pin guard (FAR-455): the approving review must target the CURRENT PR
+            # head oid. A review approved against an OLDER commit_id must never grant
+            # merge for a newer head — otherwise a force-push/merge after the approval
+            # silently auto-merges unreviewed code (a TOCTOU on the approval itself).
+            HEAD_OID=$(gh pr view "$NUM" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
+            LATEST_APPROVE_COMMIT=$(gh api "repos/${{ github.repository }}/pulls/$NUM/reviews" 2>/dev/null \
+              | jq -r '[.[] | select(.state == "APPROVED")] | last | .commit_id // empty' 2>/dev/null || echo "")
+            if [ -z "$HEAD_OID" ] || [ -z "$LATEST_APPROVE_COMMIT" ] || [ "$HEAD_OID" != "$LATEST_APPROVE_COMMIT" ]; then
+              echo "  PR #$NUM approving review commit_id ($LATEST_APPROVE_COMMIT) != head oid ($HEAD_OID) -- skipping merge (treat as not-approved)"
+              continue
+            fi
+
             if gh pr merge --squash "$NUM" 2>&1; then
               echo "    PR #$NUM merged --"
               # Delete the PR's source branch right after a successful merge
