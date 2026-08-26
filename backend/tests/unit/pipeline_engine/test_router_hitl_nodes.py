@@ -90,7 +90,7 @@ def test_compile_jmespath_caches_compiled_expressions():
 def test_compile_jmespath_invalid_raises_with_expression():
     # The raised ValueError names the offending expression so the caller can
     # surface which guard is misconfigured.
-    with pytest.raises(ValueError, match="foo.++invalid"):
+    with pytest.raises(ValueError, match=r"Invalid JMESPath expression: foo\.\+\+invalid"):
         compile_jmespath("foo.++invalid")
 
 
