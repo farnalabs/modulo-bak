@@ -117,8 +117,12 @@ jobs:
             echo "::error::No ${GA_TAG}-rc* tags found - nothing to promote."
             exit 1
           fi
-          RC_SHA=$(git rev-parse "${LATEST_RC}^{commit}")
-          HEAD_SHA=$(git rev-parse HEAD)
+           RC_SHA=$(git rev-parse "${LATEST_RC}^{commit}")
+           # The checkout at workflow start reflects a possibly-stale local ref;
+           # fetch live main so HEAD_SHA reflects what is actually on main now
+           # (a commit could have landed between checkout and this step).
+           git fetch origin main
+           HEAD_SHA=$(git rev-parse origin/main)
           if [ "$RC_SHA" != "$HEAD_SHA" ]; then
             echo "::error::main HEAD (${HEAD_SHA}) is not the latest RC ${LATEST_RC} (${RC_SHA}). Re-cut or investigate before promoting."
             exit 1

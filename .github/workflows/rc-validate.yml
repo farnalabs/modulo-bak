@@ -75,17 +75,25 @@ jobs:
       - name: Verify live deployment serves the RC commit
         run: |
           RC_SHA=$(git rev-parse "${RC_TAG}^{commit}")
-          INFO=$(curl -s -m 15 "${BASE_URL}/api/v1/deployment" || true)
-          DEPLOYED=$(echo "$INFO" | jq -r '.git_sha // empty' 2>/dev/null || true)
-          if [ -z "$DEPLOYED" ] || [ "$DEPLOYED" = "null" ]; then
-            echo "::error::Could not read git_sha from ${BASE_URL}/api/v1/deployment (got: ${INFO:-<empty>})."
-            exit 1
-          fi
-          if [ "${DEPLOYED:0:7}" != "${RC_SHA:0:7}" ]; then
-            echo "::error::Deployment SHA mismatch: ${BASE_URL} serves ${DEPLOYED:0:7} but RC ${RC_TAG} is ${RC_SHA:0:7}. Wait for the deploy pipeline to ship the RC before validating."
-            exit 1
-          fi
-          echo "Deployment SHA match: ${DEPLOYED:0:7} == ${RC_TAG}"
+          # The deploy pipeline lags the RC tag, so a freshly-cut RC is not
+          # served immediately. Retry (reusing the wait pattern) for up to ~15
+          # minutes before failing closed, rather than hard-failing on the
+          # first attempt.
+          for attempt in $(seq 1 30); do
+            INFO=$(curl -s -m 15 "${BASE_URL}/api/v1/deployment" || true)
+            DEPLOYED=$(echo "$INFO" | jq -r '.git_sha // empty' 2>/dev/null || true)
+            if [ -z "$DEPLOYED" ] || [ "$DEPLOYED" = "null" ]; then
+              echo "Attempt $attempt: could not read git_sha from ${BASE_URL}/api/v1/deployment (got: ${INFO:-<empty>}). Retrying..."
+            elif [ "${DEPLOYED:0:7}" = "${RC_SHA:0:7}" ]; then
+              echo "Deployment SHA match: ${DEPLOYED:0:7} == ${RC_TAG}"
+              exit 0
+            else
+              echo "Attempt $attempt: deployment SHA mismatch: serves ${DEPLOYED:0:7}, RC is ${RC_SHA:0:7}. Retrying..."
+            fi
+            sleep 30
+          done
+          echo "::error::Deployment SHA for ${RC_TAG} (${RC_SHA:0:7}) never matched ${BASE_URL} after 15 minutes. Wait for the deploy pipeline to ship the RC before validating."
+          exit 1
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
 
@@ -94,17 +102,51 @@ jobs:
           git config user.name "modulo-release-bot"
           git config user.email "bot@modulo.run"
 
-      - name: Schemathesis fuzz against live RC
+      - name: Obtain Bearer JWT via login (fail-closed)
+        id: jwt
         env:
           RC_USER: ${{ secrets.RC_PENTEST_USERNAME }}
           RC_PASS: ${{ secrets.RC_PENTEST_PASSWORD }}
+        shell: bash
+        run: |
+          # The backend authenticates exclusively via Bearer JWT (HTTPBearer);
+          # HTTP Basic is not supported anywhere in backend/src, so the previous
+          # `--auth user:pass` (Basic) was silently ignored and every auth-gated
+          # GET failed conformance, deadlocking the validated/<rc> marker. We
+          # mint a JWT from the pen-test credentials and pass it as a Bearer
+          # header below. Fail closed if the token cannot be obtained.
+          # Keep credentials off the process list: use a netrc file and pass the
+          # login body via stdin (not argv).
+          NETRC_HOST=$(echo "$BASE_URL" | sed -E 's#^https?://##')
+          printf 'machine %s\nlogin %s\npassword %s\n' "$NETRC_HOST" "$RC_USER" "$RC_PASS" > "$HOME/.netrc"
+          chmod 600 "$HOME/.netrc"
+          RESP=$(curl -sS -m 30 --netrc "${BASE_URL}/api/v1/auth/login" \
+            -H 'Content-Type: application/json' \
+            --data-binary @- <<JSON
+          {"email":"$RC_USER","password":"$RC_PASS"}
+          JSON
+          ) || { echo "::error::Login request to ${BASE_URL}/api/v1/auth/login failed."; rm -f "$HOME/.netrc"; exit 1; }
+          rm -f "$HOME/.netrc"
+          TOKEN=$(echo "$RESP" | jq -r '.access_token // empty' 2>/dev/null || true)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::Could not obtain JWT from login (response: ${RESP:-<empty>}). Fail-closed."
+            exit 1
+          fi
+          # Mask the token so it cannot leak into logs.
+          echo "::add-mask::$TOKEN"
+          echo "RC_JWT=$TOKEN" >> "$GITHUB_ENV"
+          echo "Obtained Bearer JWT for pen-test user."
+
+      - name: Schemathesis fuzz against live RC
+        env:
+          RC_JWT: ${{ env.RC_JWT }}
         shell: bash
         timeout-minutes: 45
         run: |
           uv tool install "schemathesis==4.25.2"
           schemathesis run "${BASE_URL}/openapi.json" \
             --base-url "$BASE_URL" \
-            --auth "$RC_USER:$RC_PASS" \
+            --header "Authorization: Bearer ${RC_JWT}" \
             --method GET \
             --checks all \
             --max-examples 50
