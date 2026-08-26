@@ -16,8 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from modulo.auth.jwt import create_access_token, create_refresh_token
 from modulo.auth.oidc_verify import OidcVerifyError, verify_id_token
 from modulo.auth.saml_handler import ModuloSamlAuth, SamlAuthError
+from modulo.auth.secret_storage import decode_stored_secret
 from modulo.db.crud.account import create_account, get_account_by_email, update_last_login
 from modulo.db.crud.org_membership import create_membership, get_membership_by_account_and_org
+from modulo.db.crud.sso_provider import get_enabled_saml_provider, get_provider_by_provider_id
 from modulo.db.crud.team_membership import add_team_member, get_membership_by_team_and_account, update_member_role
 from modulo.db.crud.token_family import create_family
 from modulo.db.models.account import Account
@@ -213,15 +215,33 @@ async def oidc_get_authorize_url(
     provider_id: str,
     settings: Settings,
     redirect_uri: str,
+    session: AsyncSession,
 ) -> tuple[str, str]:
-    """Build the OIDC authorization URL and return (url, raw_state)."""
-    providers = _parse_oidc_providers(settings)
-    provider = next((p for p in providers if p["provider_id"] == provider_id), None)
-    if not provider:
-        raise ValueError(f"OIDC provider '{provider_id}' not configured")
+    """Build the OIDC authorization URL and return (url, raw_state).
+
+    Resolves IdP config from the sso_providers DB table first (preferred, since
+    the admin UI writes there); falls back to env-var providers for backward
+    compatibility.
+    """
+    db_provider = await get_provider_by_provider_id(session, provider_id)
+    if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
+        client_id = db_provider.client_id
+        discovery_url = db_provider.discovery_url
+        scopes = json.loads(db_provider.scopes) if db_provider.scopes else None
+    else:
+        providers = _parse_oidc_providers(settings)
+        provider = next((p for p in providers if p["provider_id"] == provider_id), None)
+        if not provider:
+            raise ValueError(f"OIDC provider '{provider_id}' not configured")
+        client_id = provider["client_id"]
+        discovery_url = provider["discovery_url"]
+        scopes = provider.get("scopes")
+
+    if not client_id or not discovery_url:
+        raise ValueError(f"OIDC provider '{provider_id}' is missing client_id or discovery_url")
 
     try:
-        disc = await _fetch_discovery(provider["discovery_url"])
+        disc = await _fetch_discovery(discovery_url)
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to fetch discovery document: {exc}") from None
     auth_endpoint = disc.get("authorization_endpoint")
@@ -231,11 +251,12 @@ async def oidc_get_authorize_url(
     raw_state = str(uuid.uuid4())
     signed = sign_state(f"{provider_id}:{raw_state}", settings.secret_key)
 
+    scope = " ".join(scopes) if scopes else "openid email profile"
     params = urllib.parse.urlencode(
         {
-            "client_id": provider["client_id"],
+            "client_id": client_id,
             "response_type": "code",
-            "scope": "openid email profile",
+            "scope": scope,
             "redirect_uri": redirect_uri,
             "state": signed,
         }
@@ -259,13 +280,28 @@ async def oidc_process_callback(
         raise ValueError("Invalid state parameter — possible CSRF")
 
     provider_id = state_data.split(":", 1)[0] if ":" in state_data else state_data
-    providers = _parse_oidc_providers(settings)
-    provider = next((p for p in providers if p["provider_id"] == provider_id), None)
-    if not provider:
-        raise ValueError(f"OIDC provider '{provider_id}' not found")
+
+    db_provider = await get_provider_by_provider_id(session, provider_id)
+    if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
+        client_id = db_provider.client_id
+        client_secret = (
+            decode_stored_secret(db_provider.client_secret, settings.fernet_key) if db_provider.client_secret else None
+        )
+        discovery_url = db_provider.discovery_url
+    else:
+        providers = _parse_oidc_providers(settings)
+        provider = next((p for p in providers if p["provider_id"] == provider_id), None)
+        if not provider:
+            raise ValueError(f"OIDC provider '{provider_id}' not found")
+        client_id = provider["client_id"]
+        client_secret = provider["client_secret"]
+        discovery_url = provider["discovery_url"]
+
+    if not client_id or not client_secret or not discovery_url:
+        raise ValueError(f"OIDC provider '{provider_id}' is missing required configuration")
 
     try:
-        disc = await _fetch_discovery(provider["discovery_url"])
+        disc = await _fetch_discovery(discovery_url)
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to fetch discovery document: {exc}") from None
 
@@ -276,8 +312,8 @@ async def oidc_process_callback(
     try:
         token_data = await _exchange_code(
             token_endpoint,
-            provider["client_id"],
-            provider["client_secret"],
+            client_id,
+            client_secret,
             code,
             redirect_uri,
         )
@@ -297,7 +333,7 @@ async def oidc_process_callback(
         )
 
     try:
-        claims = await verify_id_token(id_token, jwks_uri, provider["client_id"], issuer)
+        claims = await verify_id_token(id_token, jwks_uri, client_id, issuer)
     except OidcVerifyError as exc:
         raise ValueError(str(exc)) from None
 
@@ -317,9 +353,9 @@ async def oidc_process_callback(
         raw_groups = []
     idp_groups: list[str] = raw_groups
     if idp_groups:
-        db_provider = await _lookup_provider_by_client_id(session, provider["client_id"], org_id)
-        if db_provider is not None and db_provider.group_mappings:
-            await apply_group_mappings(session, account, org_id, idp_groups, db_provider.group_mappings)
+        db_provider_for_groups = await _lookup_provider_by_client_id(session, client_id, org_id)
+        if db_provider_for_groups is not None and db_provider_for_groups.group_mappings:
+            await apply_group_mappings(session, account, org_id, idp_groups, db_provider_for_groups.group_mappings)
 
     return await issue_sso_tokens(account, org_id, org_role, session, settings)
 
@@ -436,13 +472,44 @@ def _decode_id_token_claims(id_token: str) -> dict[str, object]:
 async def saml_get_auth_url(
     settings: Settings,
     acs_url: str,
+    session: AsyncSession,
 ) -> tuple[str, str]:
     """Generate a SAML AuthnRequest using python3-saml and return (IdP redirect URL, _).
 
     python3-saml handles proper XML construction, signing (if SP key configured),
     and encoding. The second return value (request_id) is no longer used by the
     caller but kept for API compatibility.
+
+    Resolves IdP config from the sso_providers DB table first (preferred, since
+    the admin UI writes there); falls back to env-var config for backward
+    compatibility.
     """
+    db_saml = await get_enabled_saml_provider(session)
+    if db_saml is not None:
+        idp_metadata = db_saml.metadata_xml or None
+        if not idp_metadata and db_saml.metadata_url:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
+                resp.raise_for_status()
+                idp_metadata = resp.text
+        if not idp_metadata:
+            raise ValueError("SAML provider is missing IdP metadata (set metadata_xml or metadata_url)")
+        entity_id = db_saml.entity_id or settings.modulo_saml_entity_id
+        sp_key = settings.modulo_saml_sp_private_key or None
+        sp_cert = settings.modulo_saml_sp_x509_cert or None
+        handler = ModuloSamlAuth(
+            entity_id=entity_id,
+            acs_url=acs_url,
+            idp_metadata_xml=idp_metadata,
+            sp_private_key=sp_key,
+            sp_x509_cert=sp_cert,
+        )
+        try:
+            auth_url = handler.get_auth_url()
+        except Exception as exc:
+            raise ValueError(f"Failed to generate SAML AuthnRequest: {exc}") from None
+        return auth_url, ""
+
     if not settings.modulo_saml_enabled:
         raise ValueError("SAML is not enabled")
     if not settings.modulo_license_key:
@@ -519,26 +586,46 @@ async def saml_process_response(
     certificate from metadata (the critical security gap in the old
     implementation), plus condition validation, audience restriction, and
     clock-skew management.
-    """
-    if not settings.modulo_saml_enabled:
-        raise ValueError("SAML is not enabled")
-    if not settings.modulo_license_key:
-        raise ValueError("SAML requires a license key (Team feature)")
 
-    try:
-        idp_metadata = await _saml_fetch_idp_metadata(settings)
-    except (httpx.HTTPError, ValueError) as exc:
-        raise ValueError(f"Failed to fetch IdP metadata: {exc}") from None
+    Resolves IdP metadata from the sso_providers DB table first (preferred, since
+    the admin UI writes there); falls back to env-var config for backward
+    compatibility.
+    """
+    idp_metadata: str | None = None
+    entity_id_override: str | None = None
+    db_saml = await get_enabled_saml_provider(session)
+    if db_saml is not None:
+        idp_metadata = db_saml.metadata_xml or None
+        if not idp_metadata and db_saml.metadata_url:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
+                resp.raise_for_status()
+                idp_metadata = resp.text
+        entity_id_override = db_saml.entity_id or None
+
+    if idp_metadata is None:
+        if not settings.modulo_saml_enabled:
+            raise ValueError("SAML is not enabled")
+        if not settings.modulo_license_key:
+            raise ValueError("SAML requires a license key (Team feature)")
+
+        try:
+            idp_metadata = await _saml_fetch_idp_metadata(settings)
+        except (httpx.HTTPError, ValueError) as exc:
+            raise ValueError(f"Failed to fetch IdP metadata: {exc}") from None
 
     try:
         _, idp_entity_id = _saml_parse_idp_metadata(idp_metadata)
     except (ElementTree.ParseError, ValueError) as exc:
         raise ValueError(f"Failed to parse IdP metadata: {exc}") from None
 
+    if entity_id_override is not None:
+        idp_entity_id = entity_id_override
+
     acs_url = f"{settings.modulo_public_url.rstrip('/')}/api/v1/auth/saml/acs"
     _validate_saml_response_destination(saml_response, acs_url)
     handler = ModuloSamlAuth(
-        entity_id=settings.modulo_saml_entity_id,
+        entity_id=entity_id_override or settings.modulo_saml_entity_id,
         acs_url=acs_url,
         idp_metadata_xml=idp_metadata,
         sp_private_key=settings.modulo_saml_sp_private_key or None,

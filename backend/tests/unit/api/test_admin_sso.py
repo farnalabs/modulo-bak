@@ -64,6 +64,7 @@ def _make_mock_provider(**overrides: object) -> MagicMock:
     provider = MagicMock()
     provider.id = overrides.get("id", _PROVIDER_ID)
     provider.provider_type = overrides.get("provider_type", "oidc")
+    provider.provider_id = overrides.get("provider_id", "test-oidc-provider")
     provider.name = overrides.get("name", "Test OIDC Provider")
     provider.client_id = overrides.get("client_id", "test-client-id")
     provider.client_secret = overrides.get("client_secret", "test-client-secret")

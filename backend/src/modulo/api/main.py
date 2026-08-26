@@ -663,6 +663,7 @@ async def _seed_sso_providers(settings: Settings) -> None:
             provider = SsoProvider(
                 provider_type="oidc",
                 name=entry.get("provider_id", entry.get("name", "Imported OIDC Provider")),
+                provider_id=entry["provider_id"],
                 client_id=entry["client_id"],
                 client_secret=encrypt_stored_secret(entry["client_secret"], settings.fernet_key),
                 discovery_url=entry["discovery_url"],

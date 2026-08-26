@@ -20,6 +20,7 @@ from modulo.auth.sso import (
     saml_process_response,
 )
 from modulo.core.sanitize_log import sanitise_log_value
+from modulo.db.crud.sso_provider import get_enabled_saml_provider, list_enabled_oidc_providers
 from modulo.settings import Settings, get_settings
 
 _MSG_DATABASE_ERROR_PLEASE_TRY = "Database error. Please try again."
@@ -57,17 +58,33 @@ class SsoProvidersResponse(BaseModel):
 async def sso_providers(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
+    session: AsyncSession = Depends(get_db_session),
 ) -> SsoProvidersResponse:
-    """List configured SSO providers (OIDC) and whether SAML is enabled."""
+    """List configured SSO providers (OIDC) and whether SAML is enabled.
+
+    OIDC providers are merged from the sso_providers DB table (preferred) and
+    the env-var fallback, deduplicated by provider_id. SAML is enabled if any
+    enabled SAML provider exists in the DB, or if env-var SAML is fully
+    configured (enabled + license + metadata).
+    """
     try:
-        oidc_providers = [{"provider_id": p["provider_id"]} for p in parse_oidc_providers(settings)]
-        saml_enabled = (
+        db_providers = await list_enabled_oidc_providers(session)
+        db_ids = {p.provider_id for p in db_providers}
+        oidc_list = [{"provider_id": p.provider_id} for p in db_providers if p.provider_id]
+
+        for env_provider in parse_oidc_providers(settings):
+            env_id = env_provider["provider_id"]
+            if env_id not in db_ids:
+                oidc_list.append({"provider_id": env_id})
+
+        db_saml = await get_enabled_saml_provider(session)
+        saml_enabled = db_saml is not None or (
             settings.modulo_saml_enabled
             and bool(settings.modulo_license_key)
             and (bool(settings.modulo_saml_idp_metadata_url) or bool(settings.modulo_saml_idp_metadata_xml))
         )
         return SsoProvidersResponse(
-            oidc=[OidcProviderInfo(**p) for p in oidc_providers],
+            oidc=[OidcProviderInfo(**p) for p in oidc_list],
             saml=saml_enabled,
         )
     except HTTPException:
@@ -92,13 +109,14 @@ async def oidc_login(
     _request: Request,
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
+    session: AsyncSession = Depends(get_db_session),
 ) -> Any:
     """Redirect the user to the OIDC provider's authorization page."""
     public_url = settings.modulo_public_url.rstrip("/")
     redirect_uri = f"{public_url}/api/v1/auth/oidc/{provider}/callback"
 
     try:
-        auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri)
+        auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except HTTPException:
@@ -187,14 +205,14 @@ async def saml_login(
     _request: Request,
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
-    _session: AsyncSession = Depends(get_db_session),
+    session: AsyncSession = Depends(get_db_session),
 ) -> Any:
     """Redirect the user to the SAML IdP for authentication."""
     public_url = settings.modulo_public_url.rstrip("/")
     acs_url = f"{public_url}/api/v1/auth/saml/acs"
 
     try:
-        auth_url, _ = await saml_get_auth_url(settings, acs_url)
+        auth_url, _ = await saml_get_auth_url(settings, acs_url, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except ProgrammingError as exc:
@@ -281,6 +299,7 @@ async def saml_metadata(
     _request: Request,
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
+    session: AsyncSession = Depends(get_db_session),
 ) -> str:
     """Return SP metadata XML for SAML IdP configuration."""
     if not settings.modulo_saml_enabled:
@@ -290,9 +309,11 @@ async def saml_metadata(
         )
 
     try:
+        db_saml = await get_enabled_saml_provider(session)
+        entity_id = (db_saml.entity_id if db_saml is not None else None) or settings.modulo_saml_entity_id
+
         public_url = settings.modulo_public_url.rstrip("/")
         acs_url = f"{public_url}/api/v1/auth/saml/acs"
-        entity_id = settings.modulo_saml_entity_id
 
         return (
             '<?xml version="1.0"?>'

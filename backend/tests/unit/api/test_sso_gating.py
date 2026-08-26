@@ -105,6 +105,7 @@ class TestAdminSsoGating:
         mock_provider = MagicMock()
         mock_provider.id = _PROVIDER_ID
         mock_provider.provider_type = "oidc"
+        mock_provider.provider_id = "test-oidc"
         mock_provider.name = "Test"
         mock_provider.client_id = "cid"
         mock_provider.client_secret = "secret"

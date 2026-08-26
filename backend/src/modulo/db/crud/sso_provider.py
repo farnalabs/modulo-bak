@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 
 from sqlalchemy import select
@@ -35,6 +36,11 @@ _UPDATABLE_SSO_FIELDS = frozenset(
 _LOG_AUDIT_RECORD_FAILED = "Failed to record audit event for SSO provider %s"
 
 
+def _slugify_provider_id(name: str) -> str:
+    """Derive a URL-safe provider_id slug from a human name/slug."""
+    return re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "sso"
+
+
 async def list_providers(session: AsyncSession, *, org_id: uuid.UUID) -> list[SsoProvider]:
     result = await session.execute(
         select(SsoProvider).where(SsoProvider.organisation_id == org_id).order_by(SsoProvider.created_at)
@@ -50,6 +56,31 @@ async def get_provider(
         conditions.append(SsoProvider.organisation_id == org_id)
     result = await session.execute(select(SsoProvider).where(*conditions))
     return result.scalar_one_or_none()
+
+
+async def get_provider_by_provider_id(session: AsyncSession, provider_id: str) -> SsoProvider | None:
+    """Resolve a provider by its URL slug (global lookup — no org filter).
+
+    Pre-auth SSO routes have no user/org context, so providers are resolved
+    globally (consistent with the existing env-var, global behaviour). Self-hosted
+    Modulo is single-org.
+    """
+    result = await session.execute(select(SsoProvider).where(SsoProvider.provider_id == provider_id))
+    return result.scalar_one_or_none()
+
+
+async def get_enabled_saml_provider(session: AsyncSession) -> SsoProvider | None:
+    """Return any enabled SAML provider (global lookup — no org filter)."""
+    result = await session.execute(
+        select(SsoProvider).where(SsoProvider.provider_type == "saml", SsoProvider.enabled).limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_enabled_oidc_providers(session: AsyncSession) -> list[SsoProvider]:
+    """List enabled OIDC providers (global lookup — no org filter)."""
+    result = await session.execute(select(SsoProvider).where(SsoProvider.provider_type == "oidc", SsoProvider.enabled))
+    return list(result.scalars().all())
 
 
 async def create_provider(
@@ -70,6 +101,7 @@ async def create_provider(
     fernet_key: str,
     org_id: uuid.UUID,
     actor_user_id: uuid.UUID | None = None,
+    provider_id: str | None = None,
 ) -> SsoProvider:
     result = await session.execute(
         select(SsoProvider).where(SsoProvider.name == name, SsoProvider.organisation_id == org_id).with_for_update()
@@ -79,9 +111,25 @@ async def create_provider(
         msg = f"An SSO provider with name '{name}' already exists in this organisation"
         raise ValueError(msg)
 
+    pid = _slugify_provider_id(provider_id) if provider_id else _slugify_provider_id(name)
+
+    existing_pids = {
+        p
+        for p in (await session.execute(select(SsoProvider.provider_id).where(SsoProvider.organisation_id == org_id)))
+        .scalars()
+        .all()
+        if p is not None
+    }
+    base_pid = pid
+    n = 2
+    while pid in existing_pids:
+        pid = f"{base_pid}-{n}"
+        n += 1
+
     provider = SsoProvider(
         provider_type=provider_type,
         name=name,
+        provider_id=pid,
         client_id=client_id,
         client_secret=encrypt_stored_secret(client_secret, fernet_key) if client_secret is not None else None,
         discovery_url=discovery_url,
