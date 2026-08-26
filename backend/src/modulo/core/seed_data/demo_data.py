@@ -109,13 +109,17 @@ async def seed_demo_org(
     org = org_result.scalar_one_or_none()
     if org is None:
         org = Organisation(name=slug, slug=slug, settings_json={})
-        session.add(org)
         try:
-            await session.flush()
+            # Insert inside a savepoint so a concurrent boot that already
+            # committed this slug (unique violation) only rolls back the failed
+            # insert — NOT the whole transaction, which session.rollback() would
+            # do (discarding unrelated in-flight writes from concurrent work).
+            async with session.begin_nested():
+                session.add(org)
+                await session.flush()
         except IntegrityError:
-            # A concurrent boot already inserted this slug (unique violation).
-            # Roll back the failed insert and use the row that won.
-            await session.rollback()
+            # Another boot won the race; use the row it committed. The failed
+            # pending insert is discarded automatically by the savepoint.
             org_result = await session.execute(select(Organisation).where(Organisation.slug == slug))
             org = org_result.scalar_one_or_none()
             if org is None:

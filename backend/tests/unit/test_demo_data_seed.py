@@ -15,10 +15,16 @@ from __future__ import annotations
 
 import operator
 import types
+from collections.abc import Generator
+from typing import Self
 
 import pytest
 
-from modulo.core.license import parse_and_verify, set_public_key
+from modulo.core.license import (
+    _LICENSE_PUBLIC_KEY_HEX,
+    parse_and_verify,
+    set_public_key,
+)
 from modulo.core.license_signing import LicenseSigningError
 from modulo.core.registry.crypto import generate_keypair
 from modulo.core.seed_data import demo_data as demo_mod
@@ -38,6 +44,18 @@ def _patch_get_settings(monkeypatch) -> None:
     # seed_demo_org now resolves the signing key via get_settings(); point it at
     # the test keypair so the real signing helpers run end-to-end.
     monkeypatch.setattr(demo_mod, "get_settings", lambda: _settings())
+
+
+@pytest.fixture(autouse=True)
+def _use_test_license_key() -> Generator[None, None, None]:
+    # The license public key is global module state in modulo.core.license and is
+    # clobbered by other test modules' autouse fixtures (e.g. stripe fulfilment
+    # resets it to the builtin dev key). Pin it per-test so this module's signed
+    # licenses always verify against the matching test public key, regardless of
+    # collection order.
+    set_public_key(_TEST_PUB)
+    yield
+    set_public_key(_LICENSE_PUBLIC_KEY_HEX)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +102,16 @@ def _extract_predicates(clause) -> list[tuple[str, object]]:
     return preds
 
 
+class _FakeSavepoint:
+    """No-op stand-in for an AsyncSessionTransaction savepoint."""
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
 class FakeAsyncSession:
     """Minimal in-memory async session for seeding logic."""
 
@@ -105,6 +133,9 @@ class FakeAsyncSession:
 
     async def flush(self) -> None:
         pass
+
+    def begin_nested(self) -> _FakeSavepoint:
+        return _FakeSavepoint()
 
     async def commit(self) -> None:
         pass
