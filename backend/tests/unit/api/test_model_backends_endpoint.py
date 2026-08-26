@@ -1250,3 +1250,33 @@ def test_create_model_backend_integrity_error_returns_409(client: TestClient) ->
             },
         )
     assert resp.status_code == 409
+
+
+def _foreign_org_backend() -> MagicMock:
+    """A model backend owned by a different organisation than the test principal."""
+    foreign = MagicMock()
+    foreign.id = _BACKEND_ID
+    foreign.organisation_id = uuid.uuid4()
+    return foreign
+
+
+def test_update_model_backend_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not update a model backend
+    it does not own. The ownership check must raise 404 before any write."""
+    with patch(
+        "modulo.api.routes.model_backends.get_model_backend",
+        return_value=_foreign_org_backend(),
+    ):
+        resp = client.patch(f"/api/v1/model-backends/{_BACKEND_ID}", json={})
+    assert resp.status_code == 404
+
+
+def test_delete_model_backend_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not delete a model backend
+    it does not own."""
+    with patch(
+        "modulo.api.routes.model_backends.get_model_backend",
+        return_value=_foreign_org_backend(),
+    ):
+        resp = client.delete(f"/api/v1/model-backends/{_BACKEND_ID}")
+    assert resp.status_code == 404

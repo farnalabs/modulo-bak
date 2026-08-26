@@ -474,3 +474,49 @@ def test_update_agent_making_non_executable_without_description_returns_422(clie
         )
     assert resp.status_code == 422
     assert "description" in resp.json()["detail"].lower()
+
+
+def _foreign_org_agent() -> MagicMock:
+    """An agent owned by a different organisation than the test principal."""
+    foreign = MagicMock()
+    foreign.id = _AGENT_ID
+    foreign.organisation_id = uuid.uuid4()
+    return foreign
+
+
+def test_update_agent_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not update an agent it
+    does not own. The ownership check must raise 404 before any write."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_foreign_org_agent()):
+        resp = client.patch(f"/api/v1/agents/{_AGENT_ID}", json=_UPDATE_BODY)
+    assert resp.status_code == 404
+
+
+def test_delete_agent_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not delete an agent it
+    does not own."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_foreign_org_agent()):
+        resp = client.delete(f"/api/v1/agents/{_AGENT_ID}")
+    assert resp.status_code == 404
+
+
+def test_apply_prompt_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: applying an optimized prompt to a foreign-org agent
+    must be denied with 404."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_foreign_org_agent()):
+        resp = client.post(
+            f"/api/v1/agents/{_AGENT_ID}/prompts/v1/apply",
+            json={"suggested_prompt": "x"},
+        )
+    assert resp.status_code == 404
+
+
+def test_rollback_prompt_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: rolling back a foreign-org agent's prompt must be
+    denied with 404."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_foreign_org_agent()):
+        resp = client.put(
+            f"/api/v1/agents/{_AGENT_ID}/prompts/rollback/v1",
+            json={},
+        )
+    assert resp.status_code == 404

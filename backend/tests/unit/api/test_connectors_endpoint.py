@@ -426,3 +426,33 @@ def test_list_connectors_include_in_dev_false_keeps_exclusion(client: TestClient
     assert resp.status_code == 200
     assert mock_list.await_args is not None
     assert mock_list.await_args.kwargs["excluded_tiers"] is None
+
+
+def _foreign_org_connector() -> MagicMock:
+    """A connector owned by a different organisation than the test principal."""
+    foreign = MagicMock()
+    foreign.id = _CONNECTOR_ID
+    foreign.organisation_id = uuid.uuid4()
+    return foreign
+
+
+def test_update_connector_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not update a connector it
+    does not own. The ownership check must raise 404 before any write."""
+    with patch(
+        "modulo.api.routes.connectors.get_connector_instance",
+        return_value=_foreign_org_connector(),
+    ):
+        resp = client.patch(f"/api/v1/connectors/{_CONNECTOR_ID}", json={})
+    assert resp.status_code == 404
+
+
+def test_delete_connector_foreign_org_returns_404(client: TestClient) -> None:
+    """IDOR regression: a foreign-org principal must not delete a connector it
+    does not own."""
+    with patch(
+        "modulo.api.routes.connectors.get_connector_instance",
+        return_value=_foreign_org_connector(),
+    ):
+        resp = client.delete(f"/api/v1/connectors/{_CONNECTOR_ID}")
+    assert resp.status_code == 404
