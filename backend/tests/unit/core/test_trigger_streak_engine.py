@@ -264,8 +264,9 @@ class TestDeactivateSQL:
         drained (never counted, never breaking the walk; never cancelled). The
         status set is derived from TERMINAL_STATUSES (single source of truth)."""
         sql = ts._NO_DELIVERY_DEACTIVATE_SQL
-        assert "r.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
-        assert "r3.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
+        _terminal = "'budget_exceeded','cancelled','complete','cost_ceiling_exceeded','eval_failed','failed','stalled'"
+        assert f"r.status IN ({_terminal})" in sql
+        assert f"r3.status IN ({_terminal})" in sql
         assert "pending" not in sql
 
     def test_guarded_atomic_update(self) -> None:
@@ -302,8 +303,8 @@ class TestMigrationBackfillGrace:
         assert 'ADD COLUMN IF NOT EXISTS "streak_epoch" timestamp with time zone DEFAULT CURRENT_TIMESTAMP' in source
         assert "ix_runs_unclassified_terminal" in source
         heads = ScriptDirectory(str(versions_dir.parent)).get_heads()
-        # FAR-377 (0145_suite_run_trigger_kind) is the current single head.
-        assert heads == ["0145_suite_run_trigger_kind"], f"expected a single head, got {heads}"
+        # FAR-377 (0147_suite_run_trigger_kind) is the current single head.
+        assert heads == ["0147_suite_run_trigger_kind"], f"expected a single head, got {heads}"
 
 
 # ---------------------------------------------------------------------------

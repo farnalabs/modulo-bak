@@ -1,7 +1,7 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0145_suite_run_trigger_kind
-Revises: 0144_broaden_notification_status_in_app
+Revision ID: 0147_suite_run_trigger_kind
+Revises: 0146_extend_runs_status_cost_ceiling
 Create Date: 2026-08-25
 
 Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
@@ -16,10 +16,17 @@ Renumbered a second time from ``0143_suite_run_trigger_kind`` to
 off the real main head ``0143_rest_connector_profile``.
 
 Renumbered a third time from ``0144_suite_run_trigger_kind`` to
-``0145_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0147_suite_run_trigger_kind`` to resolve the collision with main's merged
 ``0144_broaden_notification_status_in_app`` (PR 2009's second merge base). It now
 chains off the real main head ``0144_broaden_notification_status_in_app`` and is
 the single head of the merged tree.
+
+Renumbered a fourth time from ``0147_suite_run_trigger_kind`` to
+``0147_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0145_spend_ceiling`` and ``0146_extend_runs_status_cost_ceiling`` (PR 2009's
+third merge base). It now chains off the real main head
+``0146_extend_runs_status_cost_ceiling`` and is the single head of the merged
+tree.
 
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
@@ -50,8 +57,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0145_suite_run_trigger_kind"
-down_revision: str | None = "0144_broaden_notification_status_in_app"
+revision: str = "0147_suite_run_trigger_kind"
+down_revision: str | None = "0146_extend_runs_status_cost_ceiling"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

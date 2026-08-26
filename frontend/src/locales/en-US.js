@@ -379,7 +379,8 @@ export default {
       "agent_governance_for_your_agentic_sdlc": "Agent governance for your agentic SDLC",
       "login_failed": "Login failed:",
       "enter_your_password": "Enter your password",
-      "modulo": "Modulo"
+      "modulo": "Modulo",
+      "or_continue_with": "or continue with"
     },
     "NotificationsPage": {
       "title": "Notifications",
@@ -1398,7 +1399,20 @@ export default {
       "current_spend": "Current Spend",
       "org_total": "Org Total",
       "no_team_cost_data_available": "No team cost data available.",
-      "todays_accrued_costs_across_all_teams": "Today's accrued costs across all teams"
+      "todays_accrued_costs_across_all_teams": "Today's accrued costs across all teams",
+      "hard_spend_ceilings": "Hard Spend Ceilings",
+      "hard_spend_ceilings_subtitle": "Hard limits on spend. The org lifetime ceiling halts brand-new runs before any billable cost (LLM / sandbox) once the budget is exhausted; per-run and org ceilings are also enforced post-hoc at the run's terminal ledger — a run that overshoots is billed up to completion, then stopped from accruing further. A per-run ceiling caps a single run; an org ceiling caps lifetime spend.",
+      "per_run_ceiling_usd": "Per-run ceiling (USD)",
+      "per_run_ceiling_help": "Maximum billable cost for a single run. Enforced after the run completes: if the run's recorded cost exceeds this, its ledger write is refused and the run stops. 0 blocks all runs. Empty = no limit.",
+      "org_lifetime_ceiling_usd": "Org lifetime ceiling (USD)",
+      "org_lifetime_ceiling_help": "Maximum lifetime spend for the organisation. 0 blocks all runs. Empty = no limit.",
+      "remaining_budget": "Remaining budget",
+      "per_run_ceiling_aria": "Per-run ceiling",
+      "org_lifetime_ceiling_aria": "Org lifetime ceiling",
+      "no_limit": "No limit",
+      "saving": "Saving...",
+      "save": "Save",
+      "ceiling_updated": "Ceilings updated."
     },
     "CostComponentsView": {
       "cost_components": "Cost Components",
@@ -2435,8 +2449,40 @@ export default {
       }
     },
     "AdminHousekeepingView": {
+      "title": "Housekeeping",
+      "subtitle": "Scan for cleanup candidates across your organisation",
+      "refresh_scan": "Refresh Scan",
+      "scanning": "Scanning…",
+      "retry": "Retry",
+      "all_clean_title": "All Clean!",
+      "all_clean_description": "No cleanup candidates found. Everything looks tidy.",
+      "select_all": "Select All",
+      "selected_count": "{count} of {total} selected",
+      "total_candidates": "{count} candidate | {count} candidates",
+      "delete_selected": "Delete {count} Selected",
+      "no_candidates": "No candidates found.",
+      "item_count": "{count} item | {count} items",
+      "cleaning_up": "Cleaning up…",
+      "delete_items": "Delete {count} items",
+      "delete_warning": "This will delete the following items. This action cannot be undone.",
+      "cancel": "Cancel",
+      "scan_error": "Failed to scan for housekeeping candidates",
+      "cleanup_error": "Cleanup failed",
       "confirm_cleanup": "Confirm Cleanup",
-      "checkpoint_retention": "Checkpoint Retention"
+      "checkpoint_retention": "Checkpoint Retention",
+      "checkpoint_retention_description": "Purge LangGraph graph-state checkpoints for terminal runs older than N days. The run rows are kept (outputs, telemetry, classification survive for audit + analytics).",
+      "checkpoint_reclaimable": "{count} run reclaimable | {count} runs reclaimable",
+      "checkpoint_purge_older_than": "Purge terminal runs older than",
+      "checkpoint_day": "day | days",
+      "checkpoint_purge_button": "Purge Checkpoints",
+      "checkpoint_confirm_prompt": "Confirm purge of checkpoints older than {count} day | Confirm purge of checkpoints older than {count} days",
+      "checkpoint_purging": "Purging…",
+      "checkpoint_confirm_purge": "Confirm Purge",
+      "checkpoint_purged_prefix": "Purged",
+      "checkpoint_purged_rows": "{count} checkpoint row | {count} checkpoint rows",
+      "checkpoint_purged_from": "from {count} run | from {count} runs",
+      "checkpoint_freed": "· freed {bytes}",
+      "checkpoint_purge_failed": "Checkpoint purge failed"
     },
     "LifecycleMapList": {
       "create_lifecycle_map": "Create Lifecycle Map",
