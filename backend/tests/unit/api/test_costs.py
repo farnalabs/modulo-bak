@@ -302,6 +302,7 @@ class TestSetTeamSpendLimit:
     def test_sets_team_limit(self, client: TestClient) -> None:
         team = MagicMock()
         team.id = _TEAM_ID
+        team.organisation_id = _ORG_ID
         team.daily_spend_limit = None
 
         with (
@@ -320,6 +321,7 @@ class TestSetTeamSpendLimit:
     def test_clears_team_limit(self, client: TestClient) -> None:
         team = MagicMock()
         team.id = _TEAM_ID
+        team.organisation_id = _ORG_ID
         team.daily_spend_limit = Decimal("50.00")
 
         with (

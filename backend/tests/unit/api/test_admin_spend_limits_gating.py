@@ -240,6 +240,7 @@ class TestSpendLimitsGatingFeatureEnabled:
     def test_set_team_spend_limit_succeeds(self, licensed_client: TestClient) -> None:
         team = MagicMock()
         team.id = _TEAM_ID
+        team.organisation_id = _ORG_ID
         team.daily_spend_limit = None
 
         with (
