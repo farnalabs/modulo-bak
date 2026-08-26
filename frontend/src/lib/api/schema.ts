@@ -10565,21 +10565,10 @@ export interface components {
              */
             split: string;
             /**
-             * Strategy
-             * @default list
-             * @enum {string}
-             */
-            strategy: "list" | "batch";
-            /**
              * Max Items
              * @description Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.
              */
             max_items?: number | null;
-            /**
-             * Batch Size
-             * @description Items per batch when strategy='batch'.
-             */
-            batch_size?: number | null;
         };
         /** FeatureFlagInfo */
         FeatureFlagInfo: {
@@ -11253,11 +11242,6 @@ export interface components {
              * @description Parent (scatter) node id this branch belongs to.
              */
             node: string;
-            /**
-             * Port
-             * @description Upstream output port / state key to read.
-             */
-            port: string;
         };
         /**
          * JourneyCurrentStage
@@ -13136,11 +13120,6 @@ export interface components {
              * @enum {string}
              */
             join_partial_policy: "collect_and_proceed" | "fail";
-            /**
-             * Join Deadline Seconds
-             * @description Join deadline (seconds) for partial-result policy.
-             */
-            join_deadline_seconds?: number | null;
             /**
              * Inputs
              * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.

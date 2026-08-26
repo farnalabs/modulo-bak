@@ -239,7 +239,7 @@ def test_join_node_schema_valid():
         id="00000000-0000-0000-0000-000000000001",
         position=_POS,
         node_type="join",
-        collect=[JoinCollectSpec(node="p", port="out")],
+        collect=[JoinCollectSpec(node="p")],
         aggregate=JoinAggregateSpec(kind="concat"),
     )
     assert node.node_type == "join"
@@ -260,7 +260,7 @@ def test_join_merge_by_key_schema_requires_key():
             id="00000000-0000-0000-0000-000000000003",
             position=_POS,
             node_type="join",
-            collect=[JoinCollectSpec(node="p", port="out")],
+            collect=[JoinCollectSpec(node="p")],
             aggregate=JoinAggregateSpec(kind="merge_by_key"),
         )
 
@@ -293,7 +293,7 @@ def test_join_node_rejects_agent_reference():
             position=_POS,
             node_type="join",
             agent_id="00000000-0000-0000-0000-0000000000aa",
-            collect=[JoinCollectSpec(node="p", port="out")],
+            collect=[JoinCollectSpec(node="p")],
             aggregate=JoinAggregateSpec(kind="concat"),
         )
 

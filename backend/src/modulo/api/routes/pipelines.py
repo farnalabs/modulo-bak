@@ -721,9 +721,6 @@ class PipelineGraphNode(BaseModel):
     # "collect_and_proceed" (default) marks failed branches in the output;
     # "fail" raises. Deadline (seconds) for waiting on slow/partial branches.
     join_partial_policy: Literal["collect_and_proceed", "fail"] = "collect_and_proceed"
-    join_deadline_seconds: int | None = Field(
-        default=None, ge=1, description="Join deadline (seconds) for partial-result policy."
-    )
     # FAR-416 (FAR-402 F1): ports are ADDITIVE metadata over the flat
     # run_context/artifact dict. A port name maps 1:1 to the flat-state key the
     # node already uses (identity mapping). When absent, the lazy backfill

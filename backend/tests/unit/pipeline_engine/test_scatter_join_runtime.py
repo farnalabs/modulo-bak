@@ -90,7 +90,7 @@ def _scatter_join_graph_json(
     join = {
         "id": join_id,
         "node_type": "join",
-        "collect": [{"node": scatter_id, "port": "output"}],
+        "collect": [{"node": scatter_id}],
         "aggregate": {"kind": "concat"},
     }
     return {

@@ -413,10 +413,11 @@ def make_scatter_node_fn(
     """Build the runtime node function for a scatter (fan-out) node.
 
     At execution the split source port is read from ``state``; it is expanded
-    into N child branches (each a unique ``child_id``) which are executed by the
-    standard node factory. Per-child outputs are written back into state keyed
-    by their child id, plus a ``__scatter_manifest__`` map so a downstream join
-    can locate them. An empty split source succeeds vacuously (no child calls).
+    into N child branches (each a unique ``child_id``) which are executed
+    sequentially by the standard node factory in P3. Per-child outputs are
+    written back into state keyed by their child id, plus a
+    ``__scatter_manifest__`` map so a downstream join can locate them. An empty
+    split source succeeds vacuously (no child calls).
     """
     parent_id = str(node_def["id"])
     fan_out = node_def["fan_out"]
@@ -531,7 +532,7 @@ def _add_node_to_graph(
 
     if node_def.get("fan_out") is not None and node_type in ("agent", "sandbox_agent"):
         # FAR-402 P3 / FAR-417: a scatter node expands its split source into N
-        # parallel child branches at runtime, each with a unique correlation id.
+        # child branches at runtime, each with a unique correlation id.
         # Both agent and sandbox_agent nodes are executable as children, so
         # fan_out is honored for both (composite is rejected at validation
         # because it has no runtime child factory).

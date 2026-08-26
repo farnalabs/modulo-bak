@@ -3,10 +3,11 @@
 Implements FAR-402 design §4 B:
 
 * **Scatter (fan-out):** a node with ``fan_out`` splits a source port's iterable
-  payload into N parallel branches. Compiles to **N DISTINCT child node
-  identities** (unique ``node_id = parent + index``) so audit / claim /
-  feedback keys stay unique. A hard ceiling + batched-scatter cap enforces
-  fail-closed behaviour (no unbounded materialisation).
+  payload into N branches. Compiles to **N DISTINCT child node identities**
+  (unique ``node_id = parent + index``) so audit / claim / feedback keys stay
+  unique. A hard ceiling enforces fail-closed behaviour (no unbounded
+  materialisation). Branch execution is sequential in P3; the contract only
+  exposes knobs that the runtime actually honours (see ``FanOutConfig``).
 * **Join (fan-in):** a ``join`` node collects upstream branch outputs and
   aggregates them (``concat`` | ``merge_by_key`` | ``map``). The collected
   outputs are merged with ``cost_controller.finalize._merge_stored_outputs``
@@ -32,33 +33,46 @@ from modulo.core.cost_controller.finalize import _merge_stored_outputs
 
 _log = logging.getLogger("modulo.core.pipeline_engine.scatter_join")
 
-# Default hard ceiling on fan-out cardinality (design §4 B: "Hard ceiling +
-# batched scatter required (no unbounded materialization)").
+# Per-expression JMESPath compile cache (design §4 B R1): compile once, reuse
+# across every collected branch so fan-out over many items stays cheap.
+_JMESPATH_CACHE: dict[str, Any] = {}
+
+# Default hard ceiling on fan-out cardinality (design §4 B: "Hard ceiling
+# required (no unbounded materialization)").
 FANOUT_DEFAULT_MAX = 1000
 
-ScatterStrategy = Literal["list", "batch"]
 JoinAggregateKind = Literal["concat", "merge_by_key", "map", "custom_function"]
 JoinPartialPolicy = Literal["collect_and_proceed", "fail"]
 
 
 class FanOutConfig(BaseModel):
-    """Declares a scatter (fan-out) on an agent / sandbox_agent node."""
+    """Declares a scatter (fan-out) on an agent / sandbox_agent node.
+
+    Only the ``split`` source and the ``max_items`` cardinality ceiling are
+    honoured by the runtime — there is no batching/parallelism in P3, so those
+    knobs are intentionally absent from the contract rather than accepted and
+    silently ignored.
+    """
 
     split: str = Field(description="Name of the source port / state key to split.")
-    strategy: ScatterStrategy = "list"
     max_items: int | None = Field(
         default=None,
         ge=1,
         description="Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.",
     )
-    batch_size: int | None = Field(default=None, ge=1, description="Items per batch when strategy='batch'.")
 
 
 class JoinCollectSpec(BaseModel):
-    """One upstream branch a join node collects from."""
+    """One upstream branch a join node collects from.
+
+    Only the parent ``node`` is read by the runtime (it locates the scatter
+    manifest and merges every child output of that parent). The ``port`` knob
+    was removed from the contract because no code path selected a specific
+    output port; collecting all child outputs of the parent is the supported
+    semantics.
+    """
 
     node: str = Field(description="Parent (scatter) node id this branch belongs to.")
-    port: str = Field(description="Upstream output port / state key to read.")
 
 
 class JoinAggregateSpec(BaseModel):
@@ -164,10 +178,15 @@ def _collect_outputs(collected: list[dict[str, Any]]) -> dict[str, Any]:
 def _apply_map(output: Any, expression: str) -> Any:
     """Apply a JMESPath ``map_expression`` to a single collected item.
 
-    Reuses the single shared JMESPath evaluator (design §4 B R1).
+    Compiles the expression once and caches it per expression string so a
+    scatter→join with many branches only pays the JMESPath compile cost a
+    single time (design §4 B R1).
     """
     try:
-        compiled = jmespath.compile(expression)
+        compiled = _JMESPATH_CACHE.get(expression)
+        if compiled is None:
+            compiled = jmespath.compile(expression)
+            _JMESPATH_CACHE[expression] = compiled
     except jmespath.exceptions.JMESPathError as exc:  # pragma: no cover - defensive
         raise JoinConfigurationError(f"Invalid map_expression JMESPath: {exc}") from exc
     return compiled.search(output if isinstance(output, (dict, list)) else {"value": output})
@@ -236,8 +255,11 @@ def aggregate_join_results(
 def child_teardown_dedup_key(run_id: str, node_id: str, index: int) -> str:
     """Idempotent teardown dedupe key (design §4 B: ``run+node+index``).
 
-    Ties child teardown to run cancellation AND join completion AND scatter-level
-    failure; the key makes teardown idempotent across all three triggers.
+    Emitted into the ``scatter.complete`` observability event as a stable key
+    that a future teardown/cancellation hook can use to dedupe child cleanup
+    across run cancellation, join completion, and scatter-level failure. There
+    is no consumer in P3 yet — this is a forward-compatibility hook, not an
+    active cancellation mechanism.
     """
     return f"{run_id}::{node_id}::{index}"
 
@@ -285,7 +307,7 @@ async def run_scatter_node(
     cfg = node_def.get("fan_out")
     cfg = cfg if isinstance(cfg, FanOutConfig) else FanOutConfig.model_validate(cfg)
     cap = effective_fan_out_cap(cfg)
-    emit("scatter.start", node_id=parent_id, cap=cap, strategy=cfg.strategy)
+    emit("scatter.start", node_id=parent_id, cap=cap)
 
     if not items:
         emit("scatter.complete", node_id=parent_id, count=0, vacuous=True)

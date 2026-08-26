@@ -1825,7 +1825,6 @@ async function saveEdgeConfig() {
           collect: n.collect ?? null,
           aggregate: n.aggregate ?? null,
           join_partial_policy: n.join_partial_policy || 'collect_and_proceed',
-          join_deadline_seconds: n.join_deadline_seconds ?? null,
           capability_scope: n.capability_scope || null,
         })),
         edges: updatedEdges,
@@ -2114,7 +2113,6 @@ async function saveGraph() {
           collect: n.collect ?? null,
           aggregate: n.aggregate ?? null,
           join_partial_policy: n.join_partial_policy || 'collect_and_proceed',
-          join_deadline_seconds: n.join_deadline_seconds ?? null,
           capability_scope: n.capability_scope || null,
         })),
         edges: rawEdges.value.map((e: any) => ({
