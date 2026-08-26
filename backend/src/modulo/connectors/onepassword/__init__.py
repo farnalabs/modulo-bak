@@ -13,6 +13,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 
 class OnePasswordConnector(ConnectorBase):
@@ -31,6 +32,7 @@ class OnePasswordConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(self._base)
         return httpx.AsyncClient(
             base_url=self._base,
             headers=self._headers(),

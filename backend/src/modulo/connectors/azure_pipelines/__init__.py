@@ -18,6 +18,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 _AZURE_DEVOPS_API = "https://dev.azure.com"
 
@@ -63,6 +64,7 @@ class AzurePipelinesConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(_AZURE_DEVOPS_API)
         return httpx.AsyncClient(
             base_url=_AZURE_DEVOPS_API,
             headers=self._headers(),

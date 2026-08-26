@@ -17,6 +17,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 
 def _parse_teamcity_status(state: str, status: str | None = None) -> CIRunStatus:
@@ -52,6 +53,7 @@ class TeamCityConnector(ConnectorBase):
         return {"Authorization": f"Bearer {self._token}"}
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(self._base_url)
         return httpx.AsyncClient(
             base_url=self._base_url,
             headers=self._auth_header(),

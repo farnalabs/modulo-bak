@@ -21,6 +21,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 
 class TrivyConnector(ConnectorBase):
@@ -54,6 +55,7 @@ class TrivyConnector(ConnectorBase):
         return headers
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(self._base_url)
         return httpx.AsyncClient(base_url=self._base_url, headers=self._headers(), timeout=60)
 
     async def health_check(self) -> HealthResult:

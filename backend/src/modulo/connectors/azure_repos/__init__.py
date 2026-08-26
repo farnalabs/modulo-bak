@@ -15,6 +15,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 
 class AzureReposConnector(ConnectorBase):
@@ -61,6 +62,7 @@ class AzureReposConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(self._base_url)
         return httpx.AsyncClient(
             base_url=self._base_url,
             headers=self._headers(),
@@ -69,6 +71,7 @@ class AzureReposConnector(ConnectorBase):
 
     async def health_check(self) -> HealthResult:
         """Verify API access by fetching the authenticated user's profile."""
+        validate_outbound_url(self._base_url)
         try:
             async with httpx.AsyncClient(headers=self._headers(), timeout=30) as client:
                 r = await client.get(
