@@ -7006,11 +7006,7 @@ def test_empty_raises_context_body_lens_flags_silent_false_greens():
         "def test_foo():\n    with pytest.warns(UserWarning):\n        pass\n",
         "import pytest\ndef test_foo():\n    with raises(ValueError):\n        pass\n",
         "import pytest\ndef test_foo():\n    with warns(UserWarning):\n        pass\n",
-        (
-            "def test_foo():\n"
-            "    with pytest.raises(ValueError):\n"
-            "        \"\"\"docstring only\"\"\"\n"
-        ),
+        ('def test_foo():\n    with pytest.raises(ValueError):\n        """docstring only"""\n'),
         "def test_foo():\n    with pytest.raises(ValueError):\n        # comment only\n        pass\n",
     ]
     for source in positive_sources:
