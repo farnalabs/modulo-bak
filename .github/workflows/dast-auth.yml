@@ -59,8 +59,8 @@ jobs:
       - name: Login and run authenticated ZAP API scan
         shell: bash
         env:
-          DAST_EMAIL: ${{ secrets.DAST_STAGING_EMAIL || 'demo' }}
-          DAST_PASSWORD: ${{ secrets.DAST_STAGING_PASSWORD || 'demo' }}
+          DAST_EMAIL: ${{ secrets.DAST_STAGING_EMAIL || secrets.E2E_STAGING_ADMIN_EMAIL || 'demo' }}
+          DAST_PASSWORD: ${{ secrets.DAST_STAGING_PASSWORD || secrets.E2E_STAGING_ADMIN_PASSWORD || 'demo' }}
           TARGET: ${{ github.event.inputs.target_url || 'https://staging.modulo.run' }}
           SCAN_TYPE: ${{ github.event.inputs.scan_type || 'baseline' }}
         run: |
