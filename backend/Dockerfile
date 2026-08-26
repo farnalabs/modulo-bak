@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1.7
-FROM python:3.12-slim
+# syntax=docker/dockerfile:1.26
+FROM python:3.14-slim
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" \
