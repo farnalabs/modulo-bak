@@ -278,8 +278,4 @@ __all__ = [
     "record_deduplicated",
     "evaluate_rest_rollback",
     "is_unknown_like",
-    # --- FAR-435 run-level fetch scope (referenced only by tests; the production
-    #     path derives the scope via _run_connector_fetch_scope, so vulture sees
-    #     no prod call site for the pure helper compute_run_fetch_scope) ---
-    "compute_run_fetch_scope",
 ]

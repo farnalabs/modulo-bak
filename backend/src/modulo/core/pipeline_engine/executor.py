@@ -493,50 +493,6 @@ def _seed_state(
     }
 
 
-def _run_connector_fetch_scope(
-    graph_json: dict[str, Any] | None,
-    agent_connector_grants: dict[str, set[str]] | None = None,
-) -> list[str] | None:
-    """Compute the run-level ``allowed_connectors`` fetch scope (FAR-435).
-
-    The scope passed to ``ConnectorHub.initialise`` is the UNION of:
-
-    * (a) every node's ``capability_scope.allowed_connectors`` — the node-level
-      narrowing (connector instance-ids and/or connector types) that FAR-418
-      adds per node; and
-    * (b) every referenced Agent's ``connector_type_refs`` grants — so agent
-      nodes (which have NO static connector binding and tool-call the hub at
-      runtime) are still able to reach their granted connectors.
-
-    The union is a SUPERSET: it is as broad as any single node's scope, so a
-    per-node narrow-gate can never be silently defeated by an over-tight run
-    scope. ``agent_connector_grants`` maps ``agent_id`` (string) → the set of
-    granted connector-type strings (see ``agent_granted_connector_types``).
-
-    Returns a list suitable for ``initialise``'s ``allowed_connectors``, or
-    ``None`` when the union is EMPTY — the unrestricted/legacy default (no
-    narrowing, the pre-scope behaviour).
-    """
-    scope: set[str] = set()
-    if isinstance(graph_json, dict):
-        for node in graph_json.get("nodes", []) or []:
-            if not isinstance(node, dict):
-                continue
-            cap_scope = node.get("capability_scope") or {}
-            if isinstance(cap_scope, dict):
-                allowed = cap_scope.get("allowed_connectors")
-                if isinstance(allowed, (list, tuple, set)):
-                    scope.update(str(entry) for entry in allowed if entry)
-            agent_id = node.get("agent_id")
-            if agent_id is not None and agent_connector_grants:
-                grants = agent_connector_grants.get(str(agent_id))
-                if grants:
-                    scope.update(grants)
-    if not scope:
-        return None
-    return sorted(scope)
-
-
 def _map_lg_event(
     lg_event: dict[str, Any],
     node_ids: set[str],
@@ -2008,7 +1964,10 @@ class PipelineExecutor:
                 await set_rls_execution_context(session)
                 from sqlalchemy import select
 
-                from modulo.core.capability_scope import agent_granted_connector_types
+                from modulo.core.capability_scope import (
+                    agent_granted_connector_types,
+                    compute_run_fetch_scope,
+                )
                 from modulo.db.models.agent import Agent
                 from modulo.db.models.connector_instance import ConnectorInstance
 
@@ -2040,7 +1999,7 @@ class PipelineExecutor:
                         )
                         for agent in agent_rows:
                             grants[str(agent.id)] = agent_granted_connector_types(agent.connector_type_refs)
-                    allowed_connectors = _run_connector_fetch_scope(graph_json, grants)
+                    allowed_connectors = compute_run_fetch_scope(graph_json, grants)
                     self._run_connector_scope = allowed_connectors
                 else:
                     allowed_connectors = self._run_connector_scope
@@ -3365,7 +3324,13 @@ class PipelineExecutor:
         # allowed_connectors (node capability_scope union Agent
         # connector_type_refs grants) is computed from the graph at run start so
         # the hub decrypts ONLY those connectors; out-of-scope credentials are
-        # never disclosed.
+        # never disclosed. The scope is computed by
+        # ``modulo.core.capability_scope.compute_run_fetch_scope``. CONTRACT
+        # CHANGE (FAR-435 tightening vs the old fall-back behaviour): a run that
+        # MIXES connector-scoped and connector-unrestricted nodes no longer falls
+        # back to fetch-everything — it fetches only the scoped union. The legacy
+        # fetch-everything behaviour survives ONLY for fully-unrestricted runs
+        # (no node contributes any connector), where the union is empty → None.
         try:
             connector_hub = await self._init_connector_hub(org_id, graph_json=graph_json)
         except (Exception, asyncio.CancelledError):

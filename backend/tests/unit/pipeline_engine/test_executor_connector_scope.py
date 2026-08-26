@@ -1,6 +1,6 @@
 """Tests for FAR-435 executor run-level connector fetch scope wiring.
 
-Covers the pure run-scope computation (``_run_connector_fetch_scope`` — the
+Covers the pure run-scope computation (``compute_run_fetch_scope`` — the
 UNION of node ``capability_scope.allowed_connectors`` and referenced Agents'
 ``connector_type_refs`` grants) and the ``_init_connector_hub(graph_json=...)``
 wiring that passes the derived scope to ``ConnectorHub.initialise``, so the
@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from modulo.core.pipeline_engine.executor import PipelineExecutor, _run_connector_fetch_scope
+from modulo.core.capability_scope import compute_run_fetch_scope
+from modulo.core.pipeline_engine.executor import PipelineExecutor
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
 
 # ---------------------------------------------------------------------------
-# Pure run-scope computation: _run_connector_fetch_scope
+# Pure run-scope computation: compute_run_fetch_scope
 # ---------------------------------------------------------------------------
 
 
@@ -40,7 +41,7 @@ def test_node_scopes_and_agent_grants_are_unioned():
         ]
     }
     grants = {str(graph["nodes"][1]["agent_id"]): {"slack", sl}}
-    result = _run_connector_fetch_scope(graph, grants)
+    result = compute_run_fetch_scope(graph, grants)
     assert set(result) == {"github", "slack", gh, sl}
 
 
@@ -50,15 +51,15 @@ def test_node_without_capability_scope_falls_back_to_agent_grants():
     agent_id = str(uuid.uuid4())
     graph = {"nodes": [{"id": "n1", "agent_id": agent_id}]}
     grants = {agent_id: {"github", "slack"}}
-    assert set(_run_connector_fetch_scope(graph, grants)) == {"github", "slack"}
+    assert set(compute_run_fetch_scope(graph, grants)) == {"github", "slack"}
 
 
 def test_empty_union_returns_none():
     """An empty union (no node scopes AND no agent grants) → None == unrestricted."""
     graph = {"nodes": [{"node_type": "transform"}, {"id": "n2", "agent_id": str(uuid.uuid4())}]}
-    assert _run_connector_fetch_scope(graph, None) is None
-    assert _run_connector_fetch_scope(None, None) is None
-    assert _run_connector_fetch_scope({"nodes": []}, {"a": {"github"}}) is None
+    assert compute_run_fetch_scope(graph, None) is None
+    assert compute_run_fetch_scope(None, None) is None
+    assert compute_run_fetch_scope({"nodes": []}, {"a": {"github"}}) is None
 
 
 def test_run_scope_is_superset_of_any_single_node_scope():
@@ -71,7 +72,7 @@ def test_run_scope_is_superset_of_any_single_node_scope():
             {"id": "n2", "capability_scope": {"allowed_connectors": ["slack", inst]}},
         ]
     }
-    result = set(_run_connector_fetch_scope(graph, None))
+    result = set(compute_run_fetch_scope(graph, None))
     for node in graph["nodes"]:
         node_scope = set(node["capability_scope"]["allowed_connectors"])
         assert node_scope.issubset(result)
@@ -84,14 +85,14 @@ def test_agent_runtime_access_preserved():
     agent_id = str(uuid.uuid4())
     graph = {"nodes": [{"id": "n1", "agent_id": agent_id, "node_type": "agent"}]}
     grants = {agent_id: {"github", "slack"}}
-    result = _run_connector_fetch_scope(graph, grants)
+    result = compute_run_fetch_scope(graph, grants)
     assert set(result) == {"github", "slack"}
 
 
 def test_malformed_nodes_and_non_dict_graph_tolerated():
     graph = {"nodes": [None, "junk", {"id": "x"}, {"capability_scope": {"allowed_connectors": ["github"]}}]}
-    assert _run_connector_fetch_scope(graph) == ["github"]
-    assert _run_connector_fetch_scope([], None) is None
+    assert compute_run_fetch_scope(graph) == ["github"]
+    assert compute_run_fetch_scope([], None) is None
 
 
 # ---------------------------------------------------------------------------
