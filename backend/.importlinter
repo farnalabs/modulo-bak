@@ -62,6 +62,10 @@ ignore_imports =
     modulo.core.feature_flags -> modulo.api.dependencies
     modulo.core.logging_config -> modulo.api.dependencies
     modulo.core.dispatch -> modulo.api.dependencies
+    # FAR-450 — the boot-time demo-org seed needs the engine/session factory
+    # (same as feature_flags/dispatch/logging_config) to open its own
+    # per-org transaction when iterating DEMO_ORGS.
+    modulo.core.seed_data.demo_data -> modulo.api.dependencies
 
 [importlinter:contract:db-does-not-import-core]
 name = DB layer has no business logic imports
