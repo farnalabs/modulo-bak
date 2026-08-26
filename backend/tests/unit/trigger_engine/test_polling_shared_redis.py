@@ -130,8 +130,8 @@ async def test_trigger_rest_connector_enforces_shared_redis_budget_across_worker
         results.append(await limiter_b.consume("api.example.com/widgets"))
 
     assert results.count(True) == 3
-    assert worker_a._rate_buckets == {}
-    assert worker_b._rate_buckets == {}
+    assert not worker_a._rate_buckets
+    assert not worker_b._rate_buckets
 
 
 # Per-tenant (cross-org) isolation on the trigger path.
@@ -165,7 +165,7 @@ async def test_trigger_rest_connector_per_tenant_isolation() -> None:
     assert "default" not in store
 
 
-async def test_trigger_rest_connector_shared_limiter_without_tenant_raises() -> None:
+def test_trigger_rest_connector_shared_limiter_without_tenant_raises() -> None:
     """A shared (Redis) limiter configured without a tenant FAILS LOUDLY (FAR-439)."""
     redis = _FakeRedis({})
     connector = _build_polling_connector("rest", _rest_config(), _REST_CREDS, redis_client=redis, tenant_id=None)
@@ -190,8 +190,8 @@ async def test_trigger_rest_connector_no_local_bucket_fallback_when_redis_config
     assert await limiter.consume("dest") is True
     assert await limiter.consume("dest") is False
 
-    assert connector._rate_buckets == {}
-    assert limiter.buckets == {}
+    assert not connector._rate_buckets
+    assert not limiter.buckets
 
 
 async def test_trigger_rest_connector_fails_closed_on_redis_outage() -> None:
@@ -204,8 +204,8 @@ async def test_trigger_rest_connector_fails_closed_on_redis_outage() -> None:
     with pytest.raises(SharedBudgetUnavailableError):
         await limiter.consume("dest")
 
-    assert connector._rate_buckets == {}
-    assert limiter.buckets == {}
+    assert not connector._rate_buckets
+    assert not limiter.buckets
 
 
 # Composition root resolver: resolve_shared_rate_limit_redis.
@@ -546,3 +546,6 @@ async def test_close_polling_resources_tolerates_close_and_aclose_errors() -> No
     redis.aclose.side_effect = RuntimeError("aclose failed")
 
     await _close_polling_resources(connector, redis)
+
+    connector.close.assert_awaited_once()
+    redis.aclose.assert_awaited_once()
