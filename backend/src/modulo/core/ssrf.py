@@ -1,8 +1,10 @@
 """Shared SSRF-safe URL validation for outbound requests.
 
-Blocks private/loopback/link-local/cloud-metadata/CGNAT ranges via DNS
-resolution. Used by notification endpoints, SSO test connections,
-observability test, and error-forwarder test paths.
+Blocks private/link-local/cloud-metadata/CGNAT ranges via DNS resolution.
+Loopback is blocked by default but allowlistable: a self-hosted deployment can
+opt into localhost model backends by putting the loopback range into
+``SSRF_ALLOW_PRIVATE_RANGES``. Used by notification endpoints, SSO test
+connections, observability test, and error-forwarder test paths.
 
 Beyond *validating* a URL, this module owns the **pinned-IP connection
 transport**: an ``httpx`` transport that resolves and validates a target once,
@@ -48,8 +50,8 @@ _EXCLUDED_NETWORKS = [
 
 # IPv6 ranges that are never valid HTTP egress targets and must never be made
 # reachable by an allowlist: site-local (deprecated but still routed in some
-# stacks) and multicast. These sit alongside loopback / link-local / the
-# metadata ranges above as a NON-NEGOTIABLE blocked floor.
+# stacks) and multicast. These sit alongside link-local / the metadata ranges
+# above as a NON-NEGOTIABLE blocked floor.
 _NON_NEGOTIABLE_BLOCKED = [
     ipaddress.ip_network("fec0::/10"),  # IPv6 site-local
     ipaddress.ip_network("ff00::/8"),  # IPv6 multicast
@@ -170,10 +172,11 @@ def _is_blocked_ip(ip_str: str, extra_allow: tuple[Network, ...] = ()) -> bool:
     """Check if an IP address should be blocked.
 
     Order matters: the NON-NEGOTIABLE floor is checked *before* the allowlist is
-    consulted. Loopback, link-local, multicast, cloud-metadata and the other
+    consulted. Link-local, multicast, cloud-metadata and the other
     ``_EXCLUDED_NETWORKS``/``_NON_NEGOTIABLE_BLOCKED`` ranges can never be made
-    reachable by a tenant or global allowlist. Only after those hard floors does
-    the configurable allowlist get a say over the remaining private ranges.
+    reachable by a tenant or global allowlist. Loopback is blocked by default
+    but allowlistable. Only after those hard floors does the configurable
+    allowlist get a say over the remaining private ranges.
     """
     try:
         addr = ipaddress.ip_address(ip_str)
@@ -181,7 +184,12 @@ def _is_blocked_ip(ip_str: str, extra_allow: tuple[Network, ...] = ()) -> bool:
         return True  # fail-closed on unparseable
 
     # NON-NEGOTIABLE floor — blocked regardless of any allowlist.
-    if addr.is_loopback or addr.is_link_local or addr.is_multicast:
+    # Loopback is intentionally NOT here: it is blocked by default (via
+    # ``addr.is_private`` below) but ALLOWLISTABLE, so a self-hosted deployment
+    # can reach a localhost Ollama/vLLM/LM Studio backend by putting the
+    # loopback range in SSRF_ALLOW_PRIVATE_RANGES. Link-local, multicast and
+    # the metadata/CGNAT floors below remain non-negotiable.
+    if addr.is_link_local or addr.is_multicast:
         return True
     for net in _EXCLUDED_NETWORKS:
         if addr in net:
@@ -191,8 +199,9 @@ def _is_blocked_ip(ip_str: str, extra_allow: tuple[Network, ...] = ()) -> bool:
             return True
 
     # Configurable allowlist (global + tenant-scoped overlay) may permit other
-    # private ranges. Loopback / link-local / metadata already returned True
-    # above, so this can never weaken the floor.
+    # private ranges. Link-local / multicast / metadata already returned True
+    # above, so this can never weaken the floor; loopback falls through here,
+    # so an allowlist covering it (e.g. 127.0.0.0/8) makes it reachable.
     for net in _get_effective_allowlist(extra_allow):
         if addr in net:
             return False
