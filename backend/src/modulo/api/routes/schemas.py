@@ -67,6 +67,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/schemas", tags=["schemas"])
 
 
+async def _assert_owns_schema(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> "Schema":
+    """Load a schema by id and assert the caller's org owns it.
+
+    The application session runs with BYPASSRLS, so tenant isolation must be
+    enforced explicitly. Raises 404 (not 403) to avoid leaking existence.
+    """
+    schema = await get_schema(session, schema_id)
+    if schema is None or schema.organisation_id != principal.organisation_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+    return schema
+
+
 # ---------------------------------------------------------------------------
 # Schema models
 # ---------------------------------------------------------------------------
@@ -356,6 +368,7 @@ async def update_schema_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await update_schema(session, schema_id, updates)
     except IntegrityError:
         logger.exception("schemas.update_integrity")
@@ -401,6 +414,7 @@ async def deprecate_schema_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await deprecate_schema(session, schema_id)
     except IntegrityError:
         logger.exception("schemas.deprecate_schema_endpoint")
@@ -455,6 +469,7 @@ async def move_schema_to_folder_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await move_schema_to_folder(session, schema_id, req.folder_id)
     except ValueError as e:
         raise HTTPException(
@@ -484,6 +499,7 @@ async def delete_schema_endpoint(
         try:
             async with session.begin():
                 await set_rls_org(session, principal.organisation_id)
+                await _assert_owns_schema(session, schema_id, principal)
                 deleted = await delete_schema(session, schema_id, force=force)
         except SchemaDeletionProtectedError as exc:
             raise HTTPException(
@@ -595,9 +611,7 @@ async def create_schema_version_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            schema = await get_schema(session, schema_id)
-            if schema is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+            await _assert_owns_schema(session, schema_id, principal)
             sv = await create_schema_version(
                 session,
                 org_id=principal.organisation_id,
