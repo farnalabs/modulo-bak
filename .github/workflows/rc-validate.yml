@@ -113,6 +113,6 @@ jobs:
         if: success()
         run: |
           VALIDATED_TAG="validated/${RC_TAG}"
-          git tag -f -a "$VALIDATED_TAG" -m "rc-validate SUCCESS for ${RC_TAG}"
+          git tag -f -a "$VALIDATED_TAG" -m "rc-validate SUCCESS for ${RC_TAG}" "${RC_TAG}^{commit}"
           git push origin "$VALIDATED_TAG" --force
           echo "Validation marker pushed: $VALIDATED_TAG"
