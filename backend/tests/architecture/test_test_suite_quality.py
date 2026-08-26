@@ -376,8 +376,8 @@ regression that silently weakens the suite:
   ``monkeypatch.chdir(tmp_path)`` restores the original directory at teardown
   automatically and is the pytest-blessed form — a function that requests
   ``monkeypatch`` is trusted even when it ``os.chdir``'s directly. Reads of the
-   working directory (``os.getcwd()``, ``Path.cwd()``) are left alone, as are
-   directory *creation* calls (``os.makedirs``/``os.mkdir``/``Path.mkdir``)
+  working directory (``os.getcwd()``, ``Path.cwd()``) are left alone, as are
+  directory *creation* calls (``os.makedirs``/``os.mkdir``/``Path.mkdir``)
    that never change the process CWD
 - an assertion that constructs a *fresh non-deterministic value* directly in
    its test expression — ``uuid.uuid4()``/``uuid.uuid1()``/``uuid4()`` (and
@@ -449,6 +449,7 @@ of a bare "assert not violations", mirroring the sibling architecture tests.
 """
 
 import ast
+import functools
 import operator
 import re
 from fractions import Fraction
@@ -499,6 +500,7 @@ def _iter_test_modules():
         yield path
 
 
+@functools.cache
 def _parse(path: Path):
     try:
         return ast.parse(path.read_text(encoding="utf-8"))
@@ -5909,9 +5911,10 @@ def _blocking_sleep_in_async_violations(tree: ast.AST) -> list[tuple[int, str]]:
     real duration (each second is a second of CI) or when the async body shares
     a loop with concurrent work. Only the ``import time`` attribute spelling
     (``time.sleep(...)``) is matched: the ``from time import sleep`` bare-name
-    twin cannot be distinguished statically from a local ``sleep`` helper, and
-    calls inside a plain ``def`` are left alone because a blocking sleep is the
-    only way a synchronous helper can wait."""
+    twin cannot be distinguished statically from a local ``sleep`` helper. A
+    ``time.sleep`` inside a *nested* plain ``def`` within the async body is
+    still flagged: the nested helper is awaited on the same loop, so its
+    blocking sleep freezes that loop just like an inline call."""
     found: list[tuple[int, str]] = []
     for fn in ast.walk(tree):
         if not isinstance(fn, ast.AsyncFunctionDef):
