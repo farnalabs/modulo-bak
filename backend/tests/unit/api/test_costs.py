@@ -349,6 +349,27 @@ class TestSetTeamSpendLimit:
 
         assert resp.status_code == 404
 
+    def test_cross_org_team_returns_404_and_is_not_mutated(self, client: TestClient) -> None:
+        # Principal org is _ORG_ID; get_team returns a team in a DIFFERENT org.
+        other_org = uuid.UUID("00000000-0000-0000-0000-000000000099")
+        team = MagicMock()
+        team.id = _TEAM_ID
+        team.organisation_id = other_org
+        team.daily_spend_limit = Decimal("50.00")
+
+        with (
+            patch(
+                "modulo.api.routes.costs.get_team",
+                return_value=team,
+            ),
+            patch("modulo.api.routes.costs.set_rls_org"),
+        ):
+            resp = client.put(self.ENDPOINT, json={"daily_spend_limit": 75.0})
+
+        assert resp.status_code == 404
+        # The org-scoping guard must short-circuit before any mutation.
+        assert team.daily_spend_limit == Decimal("50.00")
+
     def test_invalid_team_id_returns_422(self, client: TestClient) -> None:
         resp = client.put(
             "/api/v1/admin/costs/limits/teams/not-a-uuid",
