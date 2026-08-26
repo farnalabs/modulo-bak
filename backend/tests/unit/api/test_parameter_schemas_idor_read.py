@@ -1,4 +1,10 @@
-"""Unit tests for /api/v1/parameter-schemas endpoints (IDOR ownership guards)."""
+"""Unit tests for /api/v1/parameter-schemas READ endpoints (IDOR ownership guards).
+
+These regression tests are kept in a dedicated module (separate from the
+write-endpoint tenant-isolation tests added by PR #2069 in
+test_parameter_schemas_endpoint.py) so the two sibling PRs do not both add
+the same new file and collide in the merge queue.
+"""
 
 import uuid
 from collections.abc import AsyncGenerator, Generator
