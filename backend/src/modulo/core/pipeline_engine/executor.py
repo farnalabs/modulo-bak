@@ -43,6 +43,7 @@ from opentelemetry.trace import set_span_in_context
 from sqlalchemy import Boolean, Uuid, bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.audit_logger import append_audit_event
 from modulo.core.connector_hub.locking import _uuid_to_lock_keys
 from modulo.core.cost_controller.finalize import derive_node_type_map, finalize_cost
@@ -100,6 +101,7 @@ from modulo.core.pipeline_engine.node_runner import (
 from modulo.core.pipeline_engine.output_filter import OutputRejectedError
 from modulo.core.pipeline_engine.port_resolver import compute_port_topology_hash
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
+from modulo.core.spend_ceiling import ORG_CEILING_EXCEEDED, evaluate_org_spend_ceiling
 from modulo.core.trigger_engine.agent_signal import fire_agent_signal
 from modulo.db.crud.pipeline import get_pipeline
 from modulo.db.crud.run import (
@@ -117,6 +119,7 @@ from modulo.db.crud.run import (
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
 from modulo.db.models.model_backend import ModelBackend
+from modulo.db.models.organisation import Organisation
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import ACTIVE_RUN_STATUSES, TERMINAL_STATUSES, Run
@@ -1460,7 +1463,7 @@ class PipelineExecutor:
             decline_code, decline_detail = self._capacity_decline(
                 max_concurrent=max_concurrent,
                 active_count=active_count,
-                pipeline_capacity_ok=pipeline_capacity_ok,
+                _pipeline_capacity_ok=pipeline_capacity_ok,
                 org_sandbox_cap=org_sandbox_cap,
                 org_count=org_sandbox_count,
                 org_capacity_ok=org_sandbox_cap_ok,
@@ -1486,6 +1489,79 @@ class PipelineExecutor:
             if pending_run is None:
                 raise RunNotFoundError(run_id)
             return pending_run
+
+    async def _check_spend_ceiling_gate(
+        self,
+        *,
+        run_id: uuid.UUID,
+        org_id: uuid.UUID,
+        claim_token: str | None,
+    ) -> Run | None:
+        """Halt a run BEFORE any billable step when the org budget is exhausted.
+
+        Reads the org's FAR-391 lifetime spend ceiling and its consumed total. If
+        the org is already at/over its ceiling (no remaining budget for ANY new
+        run), the run is terminalized as ``cost_ceiling_exceeded`` and returned so
+        ``execute()`` never spawns an LLM / E2B call. Returns ``None`` when the
+        run may proceed (no ceiling, budget remaining, or any read error).
+
+        FAIL-OPEN by design (mirrors ``_check_capacity``): a settings/DB read
+        failure must NEVER block the run — the terminal ledger block in
+        ``finalize.py`` is the authoritative hard ceiling that refuses billing
+        beyond the limit regardless of this pre-gate.
+
+        Only the org ceiling is checked here (the per-run ceiling is enforced
+        after the run has incurred cost, at the terminal ledger block, because a
+        run's cost is only known once nodes have executed).
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                await set_rls_org(session, org_id)
+                await set_rls_execution_context(session)
+                org = (
+                    await session.execute(select(Organisation).where(Organisation.id == org_id))
+                ).scalar_one_or_none()
+                if org is None:
+                    return None
+                # Pass a minimal 1-cent charge as the "next run" so the gate
+                # honours the documented at-ceiling / kill-switch semantics: with
+                # zero remaining budget (cumulative >= ceiling, or ceiling == 0)
+                # the run must be terminalized BEFORE any billable work, not left
+                # to the finalize ledger block. A ceiling of 0 therefore blocks
+                # every new run, and an org exactly at its ceiling (1 cent would
+                # exceed it) is halted. A genuinely non-empty remaining budget
+                # (>= 1 cent) still passes so the run can execute.
+                decision = evaluate_org_spend_ceiling(
+                    org_cumulative_spend_cents=org.org_cumulative_spend_cents or 0,
+                    additional_cents=1,
+                    spend_ceiling_cents=org.spend_ceiling_cents,
+                )
+                if decision.allowed:
+                    return None
+                await update_run_status(
+                    session,
+                    run_id,
+                    "cost_ceiling_exceeded",
+                    error_code=ORG_CEILING_EXCEEDED,
+                    error_detail=decision.message,
+                    claim_token=claim_token,
+                )
+                halted_run = await get_run(session, run_id)
+                if halted_run is None:
+                    raise RunNotFoundError(run_id)
+                _log.info(
+                    "pipeline.spend_ceiling_gate_halt",
+                    extra={"run_id": str(run_id), "org_id": str(org_id)},
+                )
+                return halted_run
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception(
+                "pipeline.spend_ceiling_gate_failed",
+                extra={"run_id": str(run_id), "org_id": str(org_id)},
+            )
+            return None
 
     async def _claim_run_and_audit(
         self,
@@ -1626,7 +1702,7 @@ class PipelineExecutor:
         *,
         max_concurrent: int,
         active_count: int,
-        pipeline_capacity_ok: bool,
+        _pipeline_capacity_ok: bool,
         org_sandbox_cap: int | None,
         org_count: int,
         org_capacity_ok: bool,
@@ -1688,7 +1764,7 @@ class PipelineExecutor:
     def _build_eval_defs_by_node(
         eval_rows: list[EvalDefinition],
         org_id: uuid.UUID,
-        pipeline_id: uuid.UUID,
+        _pipeline_id: uuid.UUID,
     ) -> dict[str, list[EvalDefDTO]]:
         """Convert eval definition ORM rows to a dict keyed by node id."""
         eval_defs_by_node: dict[str, list[EvalDefDTO]] = {}
@@ -1853,8 +1929,28 @@ class PipelineExecutor:
         decrypts ONLY those connectors, so out-of-scope credentials are never
         disclosed. Pass ``None`` (the default) to fetch every active org connector,
         preserving the pre-scope behaviour (used for compensation and unscoped runs).
+
+        Contract (fail-closed on the configured path):
+          - If NO active connectors are configured for this run, returns None —
+            the node_runner treats a None hub as vacuous success, which is correct
+            only when no connector work is expected.
+          - If connectors ARE configured, any failure to build the hub (settings
+            read, secrets_backend construction, ConnectorHub construction,
+            ``__aenter__``, or ``initialise``) RAISES, so the run terminalises as
+            FAILED rather than silently completing green with no connector work.
         """
         hub: Any | None = None
+        # Fail-closed default (FAR-439): ``connectors_configured`` starts True so
+        # that ANY failure that prevents us from determining whether connectors
+        # exist — a failed session / RLS / ``session.execute`` read, a settings
+        # read, secrets_backend construction, ConnectorHub construction,
+        # ``__aenter__``, or ``initialise`` — takes the re-raise path below. It is
+        # set False ONLY when the reader query returns a confirmed-EMPTY result
+        # (no error): the single case where ``hub=None`` (vacuous success) is
+        # correct. A read/query error is NOT swallowed into the None path —
+        # "couldn't determine whether connectors exist" is a fatal hub-build
+        # failure (fail closed), not evidence that none are configured.
+        connectors_configured = True
         try:
             async with self._session_factory() as session, session.begin():
                 await set_rls_org(session, org_id)
@@ -1876,6 +1972,8 @@ class PipelineExecutor:
                     .all()
                 )
                 if isinstance(rows, list) and rows:
+                    # Connectors confirmed configured: build the hub. Any failure
+                    # below re-raises (fail closed) via the configured path.
                     from modulo.core.connector_hub import ConnectorHub
                     from modulo.core.pipeline_engine.decorator import set_connector_hub
                     from modulo.core.runtime_provider import create_default_hub
@@ -1891,13 +1989,45 @@ class PipelineExecutor:
                     hub = ConnectorHub(
                         secrets_backend=secrets_backend,
                         runtime_provider=runtime_hub,
+                        org_id=str(org_id),
                     )
                     await hub.__aenter__()
                     await hub.initialise(rows, allowed_connectors=allowed_connectors)
                     set_connector_hub(hub)
+                else:
+                    # Confirmed-EMPTY result (no error): the ONE genuine "no
+                    # connectors configured" case. ``connectors_configured`` False
+                    # -> ``hub=None`` (vacuous success). Unreachable from a read
+                    # error — the fail-closed default above re-raises instead.
+                    connectors_configured = False
         except asyncio.CancelledError:
             raise
+        except SharedBudgetUnavailableError:
+            # Configured-but-unconstructable shared Redis budget / settings-read
+            # failure on the executor path (FAR-439). Swallowing it and returning
+            # None would make the connector node vacuously "succeed" with the
+            # "no connector hub" fallback, silently no-op'ing the remote
+            # integration and finalising the run GREEN. Fail closed, loudly.
+            _log.exception("pipeline.connector_hub_init_failed_shared_budget")
+            if hub is not None:
+                await _teardown_hub(hub)
+            raise
         except Exception:
+            if connectors_configured:
+                # Fail closed, loudly: connectors ARE configured, OR we could NOT
+                # establish that they are NOT (a read/query error with the
+                # fail-closed default). A run that may require connector work must
+                # never fall through to ``hub=None`` — the node_runner would treat
+                # it as vacuous success, silently no-op'ing a configured remote
+                # integration and finalising the run GREEN. Re-raise so the run
+                # terminalises as FAILED.
+                _log.exception("pipeline.connector_hub_init_failed_configured")
+                if hub is not None:
+                    await _teardown_hub(hub)
+                raise
+            # Defensive: ``connectors_configured`` is False ONLY on a confirmed
+            # empty result, which never raises — this branch is otherwise
+            # unreachable. Keep the vacuous-success return for safety.
             _log.exception("pipeline.connector_hub_init_failed")
             if hub is not None:
                 await _teardown_hub(hub)
@@ -2666,6 +2796,17 @@ class PipelineExecutor:
             # capacity check ran) is never resurrected.
             return capacity_run
 
+        # FAR-391 — hard spend-ceiling gate. Runs BEFORE any billable step is
+        # spawned (no LLM / E2B call happens until ``_prepare_and_stream`` below).
+        # If the org's lifetime budget is already exhausted, the run is halted
+        # immediately as ``cost_ceiling_exceeded`` so no billable work starts.
+        # FAIL-OPEN: any error reading the ceilings must never block the run —
+        # the terminal ledger block (finalize.py) is the authoritative hard
+        # ceiling that refuses billing beyond the limit regardless.
+        ceiling_run = await self._check_spend_ceiling_gate(run_id=run_id, org_id=org_id, claim_token=claim_token)
+        if ceiling_run is not None:
+            return ceiling_run
+
         final_status: str = "failed"
         error_code: str | None = None
         error_detail: str | None = None
@@ -3147,11 +3288,30 @@ class PipelineExecutor:
         # connectors, so out-of-scope credentials are never disclosed.
         from modulo.core.capability_scope import compute_run_fetch_scope
 
-        connector_hub = await self._init_connector_hub(
-            org_id,
-            allowed_connectors=compute_run_fetch_scope(graph_json),
-        )
-
+        try:
+            connector_hub = await self._init_connector_hub(
+                org_id,
+                allowed_connectors=compute_run_fetch_scope(graph_json),
+            )
+        except (Exception, asyncio.CancelledError):
+            # FAR-439: a configured-path connector-hub failure RAISES (fail closed).
+            # Catch the run-abort paths (Exception + asyncio.CancelledError) but not
+            # KeyboardInterrupt/SystemExit — those terminate the process and must not
+            # be swallowed into a teardown-and-reraise.
+            # That raise propagates out of execute() BEFORE the post-stream
+            # try/finally runs, so the resources acquired above (the model-backend
+            # hub and its ContextVar, the run's cancellation-check / audit-hook
+            # ContextVars, and the broker) would leak. Tear them down before
+            # re-raising so no async client is left dangling and the re-entry gets
+            # a fresh broker — mirroring _cleanup_run_resources.
+            if model_backend_hub is not None:
+                await _teardown_hub(model_backend_hub)
+            set_model_backend_hub(None)
+            set_connector_hub(None)
+            set_cancellation_check(None)
+            set_audit_hook(None)
+            get_registry().close(run_id)
+            raise
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
         # guard B below both require this).

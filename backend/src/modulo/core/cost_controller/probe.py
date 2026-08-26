@@ -82,6 +82,7 @@ PROBE_TERMINAL_STATUSES = (
     "stalled",
     "budget_exceeded",
     "router_no_match",
+    "cost_ceiling_exceeded",
 )
 
 # Per-org statement/query timeout (one stalled org cannot block the cadence).
@@ -94,7 +95,8 @@ _SAMPLE_QUERY_EXPLAIN_TEMPLATE = (
     "SELECT id, total_cost_usd, cost_breakdown, started_at, ledger_written, ledger_refused_at "
     "FROM runs "
     "WHERE organisation_id = :org_id "
-    "AND status IN ('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded') "
+    "AND status IN ('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', "
+    "'budget_exceeded', 'cost_ceiling_exceeded') "
     "AND cost_breakdown IS NOT NULL "
     "ORDER BY started_at DESC "
     "LIMIT 50"

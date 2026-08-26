@@ -1,7 +1,7 @@
 """runs — add ``router_no_match`` to the ``ck_runs_status`` CHECK constraint.
 
 Revision ID: 0139_add_router_no_match_status
-Revises: 0144_broaden_notification_status_in_app
+Revises: 0147_json_to_jsonb_standardize
 Create Date: 2026-08-24
 
 FAR-402 P1 (FAR-415) introduces the ``router_no_match`` terminal run status
@@ -22,8 +22,11 @@ but collided with main's ``0138_eval_versioning``. It is renumbered to
 ``0141_pipeline_edge_ports``; after main advanced to ``0143_rest_connector_profile``
 (FAR-412 REST connector profile) the down-revision was updated to ``0143``. After
 main advanced again to ``0144_broaden_notification_status_in_app`` (FAR-436) the
-down-revision is updated to ``0144`` so the migration graph stays a single linear
-chain with ``0139`` re-parented onto ``0144`` as the head.
+down-revision was updated to ``0144`` and then to ``0147_json_to_jsonb_standardize``
+after main advanced through 0145/0146/0147. The migration graph stays a single
+linear chain with ``0139`` re-parented onto ``0147`` as the head. The recreated
+constraint list MUST include ``cost_ceiling_exceeded`` (added by 0146) as well as
+``router_no_match`` so this migration does not clobber main's status addition.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "0139_add_router_no_match_status"
-down_revision: str | None = "0144_broaden_notification_status_in_app"
+down_revision: str | None = "0147_json_to_jsonb_standardize"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
@@ -49,7 +52,7 @@ _UPGRADE_SQL = (
     "'claimed'::character varying, 'complete'::character varying, "
     "'failed'::character varying, 'cancelled'::character varying, "
     "'eval_failed'::character varying, 'stalled'::character varying, "
-    "'budget_exceeded'::character varying, 'router_no_match'::character varying])::text[]))); "
+    "'budget_exceeded'::character varying, 'cost_ceiling_exceeded'::character varying, 'router_no_match'::character varying])::text[]))); "
     "END IF; "
     "END $$;"
 )
@@ -65,7 +68,7 @@ _DOWNGRADE_SQL = (
     "'claimed'::character varying, 'complete'::character varying, "
     "'failed'::character varying, 'cancelled'::character varying, "
     "'eval_failed'::character varying, 'stalled'::character varying, "
-    "'budget_exceeded'::character varying])::text[]))); "
+    "'budget_exceeded'::character varying, 'cost_ceiling_exceeded'::character varying])::text[]))); "
     "END $$;"
 )
 

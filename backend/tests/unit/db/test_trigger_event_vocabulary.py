@@ -32,7 +32,13 @@ no-op. The drift-guard tests below are the meaningful contract.
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
+from types import ModuleType
+
+from alembic.script import ScriptDirectory
+
+from modulo.db.models.trigger_event import VALIDATION_RESULT_VALUES
 
 _MIGRATION_NAME = "0110_schema_pipeline_runtime"
 _MIGRATION_PATH = (
@@ -45,3 +51,65 @@ _MIGRATION_PATH = (
 # the metrics_staging migration (0121), and the FAR-363 library_sync_state
 # (0122) + relax_registry_signature_check (0123) migrations.
 _CHAIN_HEAD_MIGRATION_NAME = "0139_add_router_no_match_status"
+_CHECK_CONSTRAINT_NAME = "ck_trigger_events_validation_result"
+
+
+def _load_migration() -> ModuleType:
+    assert _MIGRATION_PATH.exists(), f"Migration file missing: {_MIGRATION_PATH}"
+    spec = importlib.util.spec_from_file_location(f"migration_{_MIGRATION_NAME}", _MIGRATION_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _script() -> ScriptDirectory:
+    return ScriptDirectory(str(_MIGRATION_PATH.parent.parent))
+
+
+class TestModelVocabulary:
+    def test_auto_deactivated_in_model_vocabulary(self) -> None:
+        assert "auto_deactivated" in VALIDATION_RESULT_VALUES
+
+    def test_guardrail_blocked_in_model_vocabulary(self) -> None:
+        # Folded in from main's 0106 (guardrail_blocked), now part of 0008.
+        assert "guardrail_blocked" in VALIDATION_RESULT_VALUES
+
+    def test_model_vocabulary_is_21_values(self) -> None:
+        assert len(VALIDATION_RESULT_VALUES) == 21
+        assert len(set(VALIDATION_RESULT_VALUES)) == len(VALIDATION_RESULT_VALUES)
+
+    def test_orm_check_constraint_includes_auto_deactivated(self) -> None:
+        from sqlalchemy import CheckConstraint
+
+        from modulo.db.models.trigger_event import TriggerEvent
+
+        checks = [c for c in TriggerEvent.__table_args__ if isinstance(c, CheckConstraint)]
+        check = next(c for c in checks if c.name == _CHECK_CONSTRAINT_NAME)
+        assert "auto_deactivated" in check.sqltext.text
+
+
+class TestReconciliationMigration:
+    def test_0008_is_single_chain_head(self) -> None:
+        script = _script()
+        heads = script.get_heads()
+        assert heads == [_CHAIN_HEAD_MIGRATION_NAME], f"expected a single head, got {heads}"
+
+    def test_0008_owns_trigger_events_validation_constraint(self) -> None:
+        """The reconciliation migration must create the constraint with the
+        FULL model vocabulary — a value in the model but missing from the
+        migration breaks the constraint on a fresh DB, and a value in the
+        migration but not the model widens the constraint beyond the ORM."""
+        _load_migration()
+        source = Path(_MIGRATION_PATH).read_text(encoding="utf-8")
+        assert _CHECK_CONSTRAINT_NAME in source
+        for value in VALIDATION_RESULT_VALUES:
+            assert f"'{value}'" in source, f"0008 constraint DDL missing {value!r}"
+
+    def test_0008_constraint_guards_idempotency(self) -> None:
+        """The constraint is added only when absent (pg_constraint guard), so
+        re-running the reconciliation migration is a no-op."""
+        source = Path(_MIGRATION_PATH).read_text(encoding="utf-8")
+        assert f"conname='{_CHECK_CONSTRAINT_NAME}'" in source
+        assert f"ADD CONSTRAINT {_CHECK_CONSTRAINT_NAME} CHECK" in source

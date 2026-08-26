@@ -1553,6 +1553,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/costs/ceiling": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Spend Ceiling */
+        get: operations["get_spend_ceiling_api_v1_admin_costs_ceiling_get"];
+        /** Set Spend Ceiling */
+        put: operations["set_spend_ceiling_api_v1_admin_costs_ceiling_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/costs/circuit-breaker/{pipeline_id}/reset": {
         parameters: {
             query?: never;
@@ -9628,6 +9646,15 @@ export interface components {
             }[];
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
             /** Alert Thresholds */
             alert_thresholds?: number[];
             /**
@@ -10583,6 +10610,27 @@ export interface components {
             /** Organisation Id */
             organisation_id?: string | null;
         };
+        /**
+         * FanOutConfig
+         * @description Declares a scatter (fan-out) on an agent / sandbox_agent node.
+         *
+         *     Only the ``split`` source and the ``max_items`` cardinality ceiling are
+         *     honoured by the runtime — there is no batching/parallelism in P3, so those
+         *     knobs are intentionally absent from the contract rather than accepted and
+         *     silently ignored.
+         */
+        FanOutConfig: {
+            /**
+             * Split
+             * @description Name of the source port / state key to split.
+             */
+            split: string;
+            /**
+             * Max Items
+             * @description Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.
+             */
+            max_items?: number | null;
+        };
         /** FeatureFlagInfo */
         FeatureFlagInfo: {
             /** Name */
@@ -11223,6 +11271,44 @@ export interface components {
         InstallRequest: {
             /** Target Team Id */
             target_team_id?: string | null;
+        };
+        /**
+         * JoinAggregateSpec
+         * @description Aggregation applied by a join node to its collected branches.
+         */
+        JoinAggregateSpec: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "concat" | "merge_by_key" | "map" | "custom_function";
+            /**
+             * Key
+             * @description Field name for merge_by_key (read from each collected item's output).
+             */
+            key?: string | null;
+            /**
+             * Map Expression
+             * @description JMESPath expression for map aggregation.
+             */
+            map_expression?: string | null;
+        };
+        /**
+         * JoinCollectSpec
+         * @description One upstream branch a join node collects from.
+         *
+         *     Only the parent ``node`` is read by the runtime (it locates the scatter
+         *     manifest and merges every child output of that parent). The ``port`` knob
+         *     was removed from the contract because no code path selected a specific
+         *     output port; collecting all child outputs of the parent is the supported
+         *     semantics.
+         */
+        JoinCollectSpec: {
+            /**
+             * Node
+             * @description Parent (scatter) node id this branch belongs to.
+             */
+            node: string;
         };
         /**
          * JourneyCurrentStage
@@ -12966,7 +13052,7 @@ export interface components {
              * @default agent
              * @enum {string}
              */
-            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "router" | "hitl";
+            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "router" | "hitl" | "join";
             /** Agent Id */
             agent_id?: string | null;
             position: components["schemas"]["GraphPosition"];
@@ -13105,6 +13191,16 @@ export interface components {
             hitl_config?: {
                 [key: string]: unknown;
             } | null;
+            fan_out?: components["schemas"]["FanOutConfig"] | null;
+            /** Collect */
+            collect?: components["schemas"]["JoinCollectSpec"][] | null;
+            aggregate?: components["schemas"]["JoinAggregateSpec"] | null;
+            /**
+             * Join Partial Policy
+             * @default collect_and_proceed
+             * @enum {string}
+             */
+            join_partial_policy: "collect_and_proceed" | "fail";
             /**
              * Inputs
              * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.
@@ -14998,6 +15094,19 @@ export interface components {
              */
             account_id: string;
         };
+        /** SetSpendCeilingRequest */
+        SetSpendCeilingRequest: {
+            /**
+             * Max Run Cost
+             * @description Per-run hard ceiling in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            max_run_cost?: number | null;
+            /**
+             * Spend Ceiling
+             * @description Org lifetime budget in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            spend_ceiling?: number | null;
+        };
         /** SetSpendLimitRequest */
         SetSpendLimitRequest: {
             /** Daily Spend Limit */
@@ -15211,6 +15320,20 @@ export interface components {
             tag?: string | null;
             /** Notes */
             notes?: string | null;
+        };
+        /** SpendCeilingResponse */
+        SpendCeilingResponse: {
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
+            /** Remaining Budget Usd */
+            remaining_budget_usd?: number | null;
         };
         /** SpendLimitResponse */
         SpendLimitResponse: {
@@ -15751,6 +15874,10 @@ export interface components {
         UpdateCostControlsRequest: {
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
             /** Alert Thresholds */
             alert_thresholds?: number[] | null;
             /** Circuit Breaker Enabled */
@@ -20337,6 +20464,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CostControlsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_spend_ceiling_api_v1_admin_costs_ceiling_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_spend_ceiling_api_v1_admin_costs_ceiling_put: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSpendCeilingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
                 };
             };
             /** @description Validation Error */
