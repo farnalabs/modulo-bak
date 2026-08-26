@@ -6048,8 +6048,10 @@ def _unconditional_skip_marker_violations(tree: ast.AST) -> list[tuple[int, str]
     """Return ``(lineno, detail)`` pairs for every unconditional ``@skip`` marker.
 
     ``@pytest.mark.skip(...)`` (or the bare imported ``@skip`` decorator) on a
-    test function/method — and the module-level ``pytestmark = pytest.mark.skip``
-    form that deselects every test in the module — permanently removes the item
+    test function/method, a class-level ``@pytest.mark.skip`` decorator (which
+    permanently deselects every test defined in the class) — and the
+    module-level ``pytestmark = pytest.mark.skip`` form that deselects every
+    test in the module — permanently removes the item
     from every run: unlike ``skipif`` there is no condition argument to gate on,
     so the deselection is unconditional and the test reports green while its
     body never runs. The body-statement sibling goggles this class separately;
@@ -6103,7 +6105,7 @@ def _unconditional_skip_marker_violations(tree: ast.AST) -> list[tuple[int, str]
         )
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if any(_decorator_name(d) == "fixture" for d in node.decorator_list):
                 continue
             is_test = node.name.startswith("test_") or any(_is_mark_decorator(d) for d in node.decorator_list)
@@ -6152,9 +6154,9 @@ def test_no_unconditional_skip_markers():
 def test_unconditional_skip_marker_lens_flags_permanent_deselection():
     """Synthetic positive/negative control for the unconditional-skip-marker
     lens: it must flag the ``@pytest.mark.skip`` decorator (called and bare,
-    with and without a reason, on sync and async tests, on methods and at
-    module level via ``pytestmark =``) and ignore ``@skipif``, ``@xfail``,
-    non-test helpers, fixtures, and unrelated marks."""
+    with and without a reason, on sync and async tests, on methods, at the
+    class level, and at module level via ``pytestmark =``) and ignore
+    ``@skipif``, ``@xfail``, non-test helpers, fixtures, and unrelated marks."""
     positive_sources = [
         "@pytest.mark.skip\ndef test_foo():\n    assert x\n",
         "@pytest.mark.skip()\ndef test_foo():\n    assert x\n",
@@ -6166,6 +6168,14 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
             "\n"
             "class TestFoo:\n"
             "    @pytest.mark.skip(reason='legacy')\n"
+            "    def test_bar(self):\n"
+            "        assert x\n"
+        ),
+        (
+            "import pytest\n"
+            "\n"
+            "@pytest.mark.skip(reason='legacy')\n"
+            "class TestFoo:\n"
             "    def test_bar(self):\n"
             "        assert x\n"
         ),
