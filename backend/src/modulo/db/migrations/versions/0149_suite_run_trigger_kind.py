@@ -1,7 +1,7 @@
 """Trigger run_kind discriminator + eval_suite_id binding (FAR-377).
 
-Revision ID: 0148_suite_run_trigger_kind
-Revises: 0147_json_to_jsonb_standardize
+Revision ID: 0149_suite_run_trigger_kind
+Revises: 0148_pipeline_snapshot_versioning_far420
 Create Date: 2026-08-25
 
 Renumbered from the former ``0138_trigger_run_kind_suite`` to resolve the
@@ -34,6 +34,13 @@ Renumbered a fifth time from ``0147_suite_run_trigger_kind`` to
 off the real main head ``0147_json_to_jsonb_standardize`` and is the single head
 of the merged tree.
 
+Renumbered a sixth time from ``0148_suite_run_trigger_kind`` to
+``0149_suite_run_trigger_kind`` to resolve the collision with main's merged
+``0148_pipeline_snapshot_versioning_far420`` (PR 2009's fifth/merge-queue merge
+base). It now chains off the real main head
+``0148_pipeline_snapshot_versioning_far420`` and is the single head of the
+merged tree.
+
 Scheduled / event-driven eval execution (FAR-377). A ``trigger`` already owns a
 ``pipeline_id`` (the suite's owning/placeholder pipeline, satisfying the existing
 FK + constraints) but has no way to say "this scheduled/event-driven trigger
@@ -63,8 +70,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0148_suite_run_trigger_kind"
-down_revision: str | None = "0147_json_to_jsonb_standardize"
+revision: str = "0149_suite_run_trigger_kind"
+down_revision: str | None = "0148_pipeline_snapshot_versioning_far420"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

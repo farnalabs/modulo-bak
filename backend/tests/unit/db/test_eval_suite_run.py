@@ -572,7 +572,8 @@ def test_single_migration_head() -> None:
     # -> 0146_extend_runs_status_cost_ceiling (FAR-391, renumbered from 0145).
     # -> 0147_json_to_jsonb_standardize (db-jsonb-standardize renumber from 0145
     #    to avoid colliding with main's 0145_spend_ceiling, chains off 0146).
-    # -> 0148_suite_run_trigger_kind (FAR-377, renumbered off the 0147 head).
+    # -> 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147_json_to_jsonb_standardize.
+    # -> 0149_suite_run_trigger_kind (FAR-377) chains off 0148_pipeline_snapshot_versioning_far420 and is the head.
     chaining_off_0131 = [p for p in revisions if parents[p] == "0131_eval_dataset_corpus"]
     assert [_basename(p) for p in chaining_off_0131] == ["0132_agent_connector_report_soft_delete_audit.py"]
     chaining_off_0132 = [p for p in revisions if parents[p] == "0132_agent_connector_report_soft_delete_audit"]
@@ -590,19 +591,22 @@ def test_single_migration_head() -> None:
     # Nothing chains off 0138 except 0140 (the FAR-379 alerting migration).
     chaining_off_0138 = [p for p in revisions if parents[p] == "0138_eval_versioning"]
     assert [_basename(p) for p in chaining_off_0138] == ["0140_eval_regression_alert.py"]
-    # Nothing chains off 0140 except 0141 (the FAR-416 pipeline edge ports migration).
+    # 0141_pipeline_edge_ports (FAR-416, main) chains off 0140,
+    # 0144_broaden_notification_status_in_app (main) chains off 0143, and
+    # 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147_json_to_jsonb_standardize.
     chaining_off_0140 = [p for p in revisions if parents[p] == "0140_eval_regression_alert"]
     assert [_basename(p) for p in chaining_off_0140] == ["0141_pipeline_edge_ports.py"]
-    # Nothing chains off 0141 except 0142 (main's FK-index migration).
+    # 0142_merge_heads_add_fk_indexes (main, FK-index pass) chains off 0141.
     chaining_off_0141 = [p for p in revisions if parents[p] == "0141_pipeline_edge_ports"]
     assert [_basename(p) for p in chaining_off_0141] == ["0142_merge_heads_add_fk_indexes.py"]
-    # What chains off 0142 -> the FAR-412 REST connector profile migration.
+    # 0143_rest_connector_profile (FAR-412, main) chains off 0142.
     chaining_off_0142 = [p for p in revisions if parents[p] == "0142_merge_heads_add_fk_indexes"]
     assert [_basename(p) for p in chaining_off_0142] == ["0143_rest_connector_profile.py"]
     # Nothing chains off 0143 except 0144 (main's broaden notification status, in_app).
     # 0145_spend_ceiling (FAR-391) chains off 0144, 0146_extend_runs_status_cost_ceiling
-    # chains off 0145, 0147_json_to_jsonb_standardize chains off 0146, and
-    # 0148_suite_run_trigger_kind (FAR-377) chains off 0147 and is the head.
+    # chains off 0145, 0147_json_to_jsonb_standardize chains off 0146,
+    # 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147,
+    # and 0149_suite_run_trigger_kind (FAR-377) chains off 0148 and is the head.
     chaining_off_0143 = [p for p in revisions if parents[p] == "0143_rest_connector_profile"]
     assert [_basename(p) for p in chaining_off_0143] == ["0144_broaden_notification_status_in_app.py"]
     # What chains off 0144 (broaden notification status) -> 0145_spend_ceiling (FAR-391).
@@ -611,15 +615,20 @@ def test_single_migration_head() -> None:
     # What chains off 0145 (spend ceiling) -> 0146_extend_runs_status_cost_ceiling (FAR-391).
     chaining_off_0145 = [p for p in revisions if parents[p] == "0145_spend_ceiling"]
     assert [_basename(p) for p in chaining_off_0145] == ["0146_extend_runs_status_cost_ceiling.py"]
-    # 0146 -> 0147_json_to_jsonb_standardize; 0147 -> 0148_suite_run_trigger_kind (FAR-377).
+    # 0146 -> 0147_json_to_jsonb_standardize; 0147 -> 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6);
+    # 0148 -> 0149_suite_run_trigger_kind (FAR-377).
     chaining_off_0146 = [p for p in revisions if parents[p] == "0146_extend_runs_status_cost_ceiling"]
     assert [_basename(p) for p in chaining_off_0146] == ["0147_json_to_jsonb_standardize.py"]
-    # What chains off 0147 (json_to_jsonb_standardize) -> 0148_suite_run_trigger_kind (FAR-377).
+    # 0148_pipeline_snapshot_versioning_far420 (FAR-402 P6) chains off 0147;
+    # 0149_suite_run_trigger_kind (FAR-377) chains off 0148 and is the head.
     chaining_off_0147 = [p for p in revisions if parents[p] == "0147_json_to_jsonb_standardize"]
-    assert [_basename(p) for p in chaining_off_0147] == ["0148_suite_run_trigger_kind.py"]
-    # Nothing chains off 0148 -> it is the single head.
-    chaining_off_0148 = [p for p in revisions if parents[p] == "0148_suite_run_trigger_kind"]
-    assert chaining_off_0148 == []
+    assert [_basename(p) for p in chaining_off_0147] == ["0148_pipeline_snapshot_versioning_far420.py"]
+    # What chains off 0148 (pipeline_snapshot_versioning_far420) -> 0149_suite_run_trigger_kind (FAR-377).
+    chaining_off_0148 = [p for p in revisions if parents[p] == "0148_pipeline_snapshot_versioning_far420"]
+    assert [_basename(p) for p in chaining_off_0148] == ["0149_suite_run_trigger_kind.py"]
+    # Nothing chains off 0149 -> it is the single head.
+    chaining_off_0149 = [p for p in revisions if parents[p] == "0149_suite_run_trigger_kind"]
+    assert chaining_off_0149 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
