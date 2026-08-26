@@ -80,6 +80,23 @@ def _extract_trend_counts(trend_row: object) -> dict[str, int]:
     }
 
 
+def _comparison_points(trend: list[OkrTrendPoint]) -> tuple[float, float] | None:
+    """Return ``(previous, latest)`` pass rates for trend comparison.
+
+    Prefers the two most recent non-empty, non-overlapping discrete windows
+    (excluding ``overall``). When fewer than two discrete windows carry data,
+    falls back to any two data-carrying points (which may include ``overall``).
+    Returns ``None`` when there is not enough data to compare.
+    """
+    discrete = [p for p in trend if p.total_evals > 0 and p.period != "overall"]
+    if len(discrete) >= 2:
+        return discrete[-2].pass_rate, discrete[-1].pass_rate
+    points_with_data = [p for p in trend if p.total_evals > 0]
+    if len(points_with_data) >= 2:
+        return points_with_data[-2].pass_rate, points_with_data[-1].pass_rate
+    return None
+
+
 def _compute_trend_direction(trend: list[OkrTrendPoint], threshold: float = 0.05) -> TrendDirection:
     """Determine trend direction from sequential trend points.
 
@@ -87,16 +104,10 @@ def _compute_trend_direction(trend: list[OkrTrendPoint], threshold: float = 0.05
     Excludes ``overall`` (which overlaps with all windows). A change of
     less than *threshold* (default 0.05) is considered stable.
     """
-    discrete = [p for p in trend if p.total_evals > 0 and p.period != "overall"]
-    if len(discrete) >= 2:
-        latest = discrete[-1].pass_rate
-        previous = discrete[-2].pass_rate
-    else:
-        points_with_data = [p for p in trend if p.total_evals > 0]
-        if len(points_with_data) < 2:
-            return "stable"
-        latest = points_with_data[-1].pass_rate
-        previous = points_with_data[-2].pass_rate
+    comparison = _comparison_points(trend)
+    if comparison is None:
+        return "stable"
+    previous, latest = comparison
     delta = latest - previous
 
     if delta <= -threshold:
