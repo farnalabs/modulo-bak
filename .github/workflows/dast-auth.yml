@@ -1,0 +1,114 @@
+name: "DAST: Authenticated API Scan"
+
+on:
+  schedule:
+    # Nightly authenticated API scan against staging, 02:40 UTC. Report-only.
+    - cron: '40 2 * * *'
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL'
+        required: false
+        default: 'https://staging.modulo.run'
+      scan_type:
+        description: 'baseline (safe/passive) or full (active)'
+        required: false
+        default: 'baseline'
+
+permissions:
+  contents: read
+
+jobs:
+  dast-auth:
+    name: Authenticated OWASP ZAP API scan
+    runs-on: ubicloud-standard-2
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Generate OpenAPI from backend + inject servers URL
+        working-directory: backend
+        shell: bash
+        env:
+          DATABASE_URL: "sqlite+aiosqlite:///./modulo-gen-test.db"
+          SECRET_KEY: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          FERNET_KEY: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          MODULO_CSRF_ENABLED: "false"
+        run: |
+          uv sync --frozen
+          cat > /tmp/gen_openapi.py <<'EOF'
+          import json, sys
+          sys.tracebacklimit = 0
+          from modulo.api.main import app
+          with open("/tmp/modulo_openapi.json", "w", encoding="utf-8") as f:
+              json.dump(app.openapi(), f, ensure_ascii=False)
+          print("OPENAPI_DUMPED")
+          EOF
+          uv run --no-build --no-sync python /tmp/gen_openapi.py
+          TARGET="${{ github.event.inputs.target_url || 'https://staging.modulo.run' }}"
+          mkdir -p "$GITHUB_WORKSPACE/zap-report"
+          python3 -c "import json; p=json.load(open('/tmp/modulo_openapi.json')); p['servers']=[{'url':\"$TARGET\"}]; json.dump(p, open('$GITHUB_WORKSPACE/zap-report/modulo_openapi_target.json','w')); print('servers injected, paths=', len(p['paths']))"
+
+      - name: Login and run authenticated ZAP API scan
+        shell: bash
+        env:
+          DAST_EMAIL: ${{ secrets.DAST_STAGING_EMAIL || 'demo' }}
+          DAST_PASSWORD: ${{ secrets.DAST_STAGING_PASSWORD || 'demo' }}
+          TARGET: ${{ github.event.inputs.target_url || 'https://staging.modulo.run' }}
+          SCAN_TYPE: ${{ github.event.inputs.scan_type || 'baseline' }}
+        run: |
+          set -euo pipefail
+          echo "Logging in as ${DAST_EMAIL} ..."
+          LOGIN=$(curl -s -m 30 -X POST "${TARGET}/api/v1/auth/login" -H "Content-Type: application/json" -d "{\"email\":\"${DAST_EMAIL}\",\"password\":\"${DAST_PASSWORD}\"}")
+          TOKEN=$(echo "$LOGIN" | python3 -c "import sys,json; print(json.load(sys.stdin).get('access_token',''))" 2>/dev/null || echo "")
+          if [ -z "$TOKEN" ]; then echo "::error::Login failed"; echo "$LOGIN"; exit 1; fi
+          echo "::add-mask::${TOKEN}"
+          echo "login ok, token_len=${#TOKEN}"
+          ZAPOPTS="-config replacer.full_list(0).description=modulo-auth -config replacer.full_list(0).enabled=true -config replacer.full_list(0).matchtype=REQUEST_HEADER -config replacer.full_list(0).matchregex=true -config replacer.full_list(0).matchstring=Authorization -config replacer.full_list(0).replacement=Bearer ${TOKEN} -config replacer.full_list(0).init=true"
+          if [ "$SCAN_TYPE" = "full" ]; then
+            docker run --rm -t -v "$PWD/zap-report:/zap/wrk/:rw" ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t /zap/wrk/modulo_openapi_target.json -f openapi -r /zap/wrk/zap-api-report.html -J /zap/wrk/zap-api-report.json -z "${ZAPOPTS}" || echo "::warning::ZAP scan completed with non-zero exit (see report)"
+          else
+            docker run --rm -t -v "$PWD/zap-report:/zap/wrk/:rw" ghcr.io/zaproxy/zaproxy:stable zap-api-scan.py -t /zap/wrk/modulo_openapi_target.json -f openapi -S -r /zap/wrk/zap-api-report.html -J /zap/wrk/zap-api-report.json -z "${ZAPOPTS}" || echo "::warning::ZAP scan completed with non-zero exit (see report)"
+          fi
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-auth-report-${{ github.run_id }}
+          path: zap-report/
+          if-no-files-found: ignore
+
+      - name: Summarize findings
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+          p = "zap-report/zap-api-report.json"
+          if not os.path.exists(p):
+              print("No JSON report generated - check the scan step."); sys.exit(0)
+          d = json.load(open(p))
+          agg = {}
+          riskorder = {"Critical":0,"High":1,"Medium":2,"Low":3,"Informational":4}
+          for s in d.get("site", []):
+              for a in s.get("alerts", []):
+                  name = a.get("name") or a.get("alert") or "?"
+                  risk = (a.get("riskdesc") or "?").split(" (")[0]
+                  try: cnt = int(a.get("count", 1))
+                  except: cnt = 1
+                  agg.setdefault(name, [0, risk])
+                  agg[name][0] += cnt
+                  agg[name][1] = risk
+          print("=== AUTHENTICATED ZAP FINDINGS ===")
+          for n in sorted(agg, key=lambda n: (riskorder.get(agg[n][1], 9), n)):
+              print(f"{agg[n][0]:>3} x {agg[n][1]} : {n}")
+          print(f"=== {len(agg)} distinct findings ===")
+          PYEOF
