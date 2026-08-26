@@ -11,6 +11,7 @@ so every test here fails if the deny path is removed.
 
 import uuid
 from collections.abc import AsyncGenerator, Generator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -96,7 +97,36 @@ def client() -> Generator[TestClient, None, None]:
 def _wrong_org_agent() -> MagicMock:
     a = MagicMock()
     a.organisation_id = _WRONG_ORG_ID
+    a.prompt_version_history = [
+        {
+            "version": "v1",
+            "template": "x",
+            "created_at": "",
+            "notes": "",
+            "optimized_from": None,
+            "eval_result_ids": [],
+        },
+        {
+            "version": "v2",
+            "template": "y",
+            "created_at": "",
+            "notes": "",
+            "optimized_from": "v1",
+            "eval_result_ids": [],
+        },
+    ]
+    a.prompt_template = "x"
     return a
+
+
+_PROMPT_VERSION_ENTRY = {
+    "version": "v1",
+    "template": "x",
+    "created_at": "",
+    "notes": "",
+    "optimized_from": None,
+    "eval_result_ids": [],
+}
 
 
 def _wrong_org_connector() -> MagicMock:
@@ -127,9 +157,26 @@ class TestAgentCrossOrgDeny:
         assert resp.status_code == 404
 
     def test_optimize_prompt_wrong_org_returns_404(self, client: TestClient) -> None:
+        optimize_result = SimpleNamespace(suggested_prompt="p", rationale="r", analysis="a")
         with (
             patch("modulo.api.routes.agents.get_agent", return_value=_wrong_org_agent()),
             patch("modulo.api.routes.agents.set_rls_org"),
+            patch(
+                "modulo.api.routes.agents.get_eval_results_with_defs",
+                return_value=([MagicMock()], [MagicMock()]),
+            ),
+            patch(
+                "modulo.api.routes.agents.create_secrets_backend",
+                return_value=MagicMock(get_secret=MagicMock(return_value="{}")),
+            ),
+            patch(
+                "modulo.core.model_backend_hub._build_backend",
+                return_value=MagicMock(invoke=AsyncMock(return_value=MagicMock(content="ok"))),
+            ),
+            patch(
+                "modulo.api.routes.agents.PromptOptimizer",
+                return_value=MagicMock(optimize=AsyncMock(return_value=optimize_result)),
+            ),
         ):
             resp = client.post(
                 f"/api/v1/agents/{_AGENT_ID}/prompts/v1/optimize",
@@ -149,6 +196,10 @@ class TestAgentCrossOrgDeny:
         with (
             patch("modulo.api.routes.agents.get_agent", return_value=_wrong_org_agent()),
             patch("modulo.api.routes.agents.set_rls_org"),
+            patch(
+                "modulo.api.routes.agents.get_prompt_version",
+                return_value=_PROMPT_VERSION_ENTRY,
+            ),
         ):
             resp = client.get(f"/api/v1/agents/{_AGENT_ID}/prompts/v1")
         assert resp.status_code == 404
@@ -157,6 +208,10 @@ class TestAgentCrossOrgDeny:
         with (
             patch("modulo.api.routes.agents.get_agent", return_value=_wrong_org_agent()),
             patch("modulo.api.routes.agents.set_rls_org"),
+            patch(
+                "modulo.api.routes.agents.get_prompt_version",
+                return_value=_PROMPT_VERSION_ENTRY,
+            ),
         ):
             resp = client.post(
                 f"/api/v1/agents/{_AGENT_ID}/prompts/diff",
