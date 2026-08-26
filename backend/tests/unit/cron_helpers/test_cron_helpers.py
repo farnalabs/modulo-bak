@@ -3085,6 +3085,10 @@ class TestFireSuiteRunTriggerPersists:
                 "modulo.core.eval_engine.execute_suite_run.build_suite_run",
                 side_effect=fake_build_suite_run,
             ),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[],
+            ),
         ):
             result = await ch.fire_suite_run_trigger(
                 org_id=org_id,
@@ -3174,6 +3178,10 @@ class TestFireSuiteRunTriggerPersists:
                 "modulo.core.eval_engine.execute_suite_run.build_suite_run",
                 side_effect=fake_build_suite_run,
             ),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[],
+            ),
         ):
             result = await ch.fire_suite_run_trigger(
                 org_id=org_id,
@@ -3185,3 +3193,73 @@ class TestFireSuiteRunTriggerPersists:
         # Defaults resolve to the module constant (0.001) and are stored as str.
         assert captured[0].extra["cost_per_llm_case"] == "0.001"
         assert captured[0].extra["suite_ceiling"] is None
+
+    @pytest.mark.asyncio
+    async def test_llm_judge_suite_is_rejected_at_fire_boundary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``run_kind='suite_run'`` trigger whose suite contains an ``llm_judge``
+        definition must be skipped at the fire boundary (never built into a doomed
+        ``pending`` run that hard-fails at execution). The scheduled path does not
+        wire a judge callable, so such config must not promise a run it cannot
+        deliver (FAR-377 reviewer finding).
+        """
+        _patch_env(monkeypatch)
+
+        org_id = ORG
+        trigger_id = TRIGGER_A
+        suite_id = uuid.uuid4()
+        dataset_id = uuid.uuid4()
+        model_backend_id = uuid.uuid4()
+
+        trigger = MagicMock()
+        trigger.id = trigger_id
+        trigger.organisation_id = org_id
+        trigger.active = True
+        trigger.deleted_at = None
+        trigger.run_kind = "suite_run"
+        trigger.eval_suite_id = suite_id
+        trigger.max_concurrent_runs = 5
+        trigger.daily_spend_limit = None
+        trigger.config_json = {
+            "dataset_id": str(dataset_id),
+            "model_backend_id": str(model_backend_id),
+        }
+
+        advisory = MagicMock()
+        advisory.scalar_one.return_value = True
+        trigger_res = MagicMock()
+        trigger_res.scalar_one_or_none.return_value = trigger
+        count_res = MagicMock()
+        count_res.scalar_one.return_value = 0
+        update_res = MagicMock()
+
+        # EvalDefinitionRow-shaped double carrying an ``llm_judge`` eval_type.
+        llm_judge_def = MagicMock()
+        llm_judge_def.eval_type = "llm_judge"
+
+        session = _MockSession([advisory, trigger_res, count_res, update_res])
+        factory = MagicMock(return_value=session)
+
+        with (
+            patch.object(ch, "_open_factory", return_value=factory),
+            patch.object(ch, "get_settings", return_value=_settings()),
+            patch.object(ch, "_set_rls_org", new_callable=AsyncMock),
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.load_suite_definitions",
+                return_value=[llm_judge_def],
+            ) as load_defs,
+            patch(
+                "modulo.core.eval_engine.execute_suite_run.build_suite_run",
+            ) as build_suite_run,
+        ):
+            result = await ch.fire_suite_run_trigger(
+                org_id=org_id,
+                trigger_id=trigger_id,
+                pipeline_id=None,
+            )
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "llm_judge_unsupported"
+        assert result["suite_id"] == str(suite_id)
+        # The run must NOT be built — the fire is rejected before build.
+        load_defs.assert_awaited_once()
+        build_suite_run.assert_not_called()

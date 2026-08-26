@@ -659,8 +659,53 @@ async def fire_suite_run_trigger(
             raise
         except Exception:
             _log.exception("fire_suite_run_trigger: enqueue failed for suite_run %s", result.get("suite_run_id"))
+            # Terminalise the freshly-committed (``pending``) SuiteRun in its OWN
+            # transaction so it is never stranded ``pending`` forever. Re-raising
+            # would only retry the fire job and create a *duplicate* pending run
+            # (the fire is not idempotent in run creation), re-introducing the
+            # exact stranded-``pending`` state the transaction-boundary fix
+            # eliminated. Mirrors the production path: a run that cannot be
+            # dispatched must land ``failed`` with an error_detail + Error
+            # Dashboard ingest (FAR-377 reviewer finding).
+            await _fail_suite_run_on_enqueue_error(result["suite_run_id"], org_id)
             result["dispatched"] = "enqueue_failed"
     return result
+
+
+async def _fail_suite_run_on_enqueue_error(suite_run_id: str, org_id: str) -> None:
+    """Terminalise a ``pending`` SuiteRun whose ``execute_suite_run`` job could not be enqueued.
+
+    Called from ``fire_suite_run_trigger`` when ``_enqueue_suite_run_execution``
+    raises (Redis down / SAQ unavailable). The SuiteRun was already committed as
+    ``pending`` by ``cron_helpers.fire_suite_run_trigger``; without this it would
+    sit ``pending`` forever (nothing reconciles stuck ``pending`` suite_runs).
+    Promotes ``pending -> running -> failed`` (the legal edge) via ``_fail_run``
+    and ingests the failure to the Error Dashboard, isolated in its own
+    committed transaction so the fire job itself can still return cleanly.
+    """
+    from modulo.core.eval_engine.execute_suite_run import _fail_run
+    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.rls import set_rls_org as _set_rls
+
+    rid = uuid.UUID(suite_run_id)
+    oid = uuid.UUID(org_id)
+    factory = _make_session_factory()
+    try:
+        async with factory() as session, session.begin():
+            await _set_rls(session, oid)
+            run = await session.get(SuiteRun, rid)
+            if run is None or run.organisation_id != oid:
+                _log.warning("fire_suite_run_trigger: cannot terminalise missing/cross-org suite_run %s", rid)
+                return
+            await _fail_run(
+                session,
+                run,
+                "SuiteRun could not be dispatched (SAQ/Redis enqueue failed); the run was never executed.",
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("fire_suite_run_trigger: failed to terminalise suite_run %s after enqueue error", rid)
 
 
 async def _enqueue_suite_run_execution(suite_run_id: str, org_id: str) -> str | None:
