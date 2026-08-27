@@ -47,6 +47,7 @@ def upgrade() -> None:
             base := lower(regexp_replace(r.name, '[^a-zA-Z0-9]+', '-', 'g'));
             base := trim(both '-' from base);
             IF base = '' THEN base := 'sso'; END IF;
+            base := left(base, 58);
             cand := base; n := 2;
             WHILE EXISTS (SELECT 1 FROM sso_providers WHERE provider_id = cand AND id <> r.id) LOOP
               cand := base || '-' || n; n := n + 1;

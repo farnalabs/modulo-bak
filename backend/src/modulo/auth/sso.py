@@ -17,7 +17,7 @@ from modulo.auth.jwt import create_access_token, create_refresh_token
 from modulo.auth.oidc_verify import OidcVerifyError, verify_id_token
 from modulo.auth.saml_handler import ModuloSamlAuth, SamlAuthError
 from modulo.auth.secret_storage import decode_stored_secret
-from modulo.core.ssrf import validate_outbound_url_async
+from modulo.core.ssrf import pinned_async_client, validate_outbound_url_async
 from modulo.db.crud.account import create_account, get_account_by_email, update_last_login
 from modulo.db.crud.org_membership import create_membership, get_membership_by_account_and_org
 from modulo.db.crud.sso_provider import get_enabled_saml_provider, get_provider_by_provider_id
@@ -291,7 +291,10 @@ async def oidc_get_authorize_url(
         raise ValueError(f"OIDC provider '{provider_id}' is missing client_id or discovery_url")
 
     try:
-        disc = await _fetch_discovery(discovery_url)
+        if _db_provider is not None:
+            disc = await _fetch_discovery_pinned(discovery_url)
+        else:
+            disc = await _fetch_discovery(discovery_url)
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to fetch discovery document: {exc}") from None
     auth_endpoint = disc.get("authorization_endpoint")
@@ -341,7 +344,10 @@ async def oidc_process_callback(
         raise ValueError(f"OIDC provider '{provider_id}' is missing required configuration")
 
     try:
-        disc = await _fetch_discovery(discovery_url)
+        if db_provider is not None:
+            disc = await _fetch_discovery_pinned(discovery_url)
+        else:
+            disc = await _fetch_discovery(discovery_url)
     except httpx.HTTPError as exc:
         raise ValueError(f"Failed to fetch discovery document: {exc}") from None
 
@@ -462,6 +468,17 @@ async def _fetch_discovery(discovery_url: str) -> dict[str, object]:
         return _require_json_object(decoded, "OIDC discovery document")
 
 
+async def _fetch_discovery_pinned(discovery_url: str) -> dict[str, object]:
+    async with await pinned_async_client(discovery_url) as client:
+        resp = await client.get(discovery_url, timeout=httpx.Timeout(10.0, connect=5.0))
+        resp.raise_for_status()
+        try:
+            decoded = resp.json()
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON in discovery document: {exc}") from None
+        return _require_json_object(decoded, "OIDC discovery document")
+
+
 async def _exchange_code(
     token_endpoint: str,
     client_id: str,
@@ -542,7 +559,7 @@ async def _resolve_saml_config(
             except ValueError as exc:
                 raise ValueError(f"Rejected SAML metadata_url for provider: {exc}") from None
             try:
-                async with httpx.AsyncClient() as client:
+                async with await pinned_async_client(db_saml.metadata_url) as client:
                     resp = await client.get(db_saml.metadata_url, timeout=httpx.Timeout(15.0, connect=5.0))
                     resp.raise_for_status()
                     idp_metadata = resp.text
@@ -666,9 +683,6 @@ async def saml_process_response(
         _, idp_entity_id = _saml_parse_idp_metadata(idp_metadata)
     except (ElementTree.ParseError, ValueError) as exc:
         raise ValueError(f"Failed to parse IdP metadata: {exc}") from None
-
-    if db_saml is not None and db_saml.entity_id is not None:
-        idp_entity_id = db_saml.entity_id
 
     acs_url = f"{settings.modulo_public_url.rstrip('/')}/api/v1/auth/saml/acs"
     _validate_saml_response_destination(saml_response, acs_url)

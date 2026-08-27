@@ -38,7 +38,8 @@ _LOG_AUDIT_RECORD_FAILED = "Failed to record audit event for SSO provider %s"
 
 def _slugify_provider_id(name: str) -> str:
     """Derive a URL-safe provider_id slug from a human name/slug."""
-    return re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "sso"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower() or "sso"
+    return slug[:58]
 
 
 async def list_providers(session: AsyncSession, *, org_id: uuid.UUID) -> list[SsoProvider]:
