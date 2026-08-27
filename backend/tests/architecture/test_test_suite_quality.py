@@ -5437,7 +5437,7 @@ def test_any_equality_lens_flags_fixed_outcomes():
         assert not _any_equality_tautologies(tree), f"lens should NOT flag:\n{source}"
 
 
-_CONTAINER_LITERALS = (ast.List, ast.Dict, ast.Set, ast.Tuple)
+_CONTAINER_LITERAL_NODE_TYPES = (ast.List, ast.Dict, ast.Set, ast.Tuple)
 
 
 def _container_literal_truthiness_violations(tree: ast.AST) -> list[tuple[int, str]]:
@@ -5470,7 +5470,7 @@ def _container_literal_truthiness_violations(tree: ast.AST) -> list[tuple[int, s
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
             negated = True
             test = test.operand
-        if not isinstance(test, _CONTAINER_LITERALS):
+        if not isinstance(test, _CONTAINER_LITERAL_NODE_TYPES):
             continue
         if isinstance(test, ast.Dict):
             if any(key is None for key in test.keys):
