@@ -19,6 +19,7 @@ select = [
     "RET",
     "PYI",
     "FURB",
+    "PIE",
 ]
 ignore = [
     "S101",
