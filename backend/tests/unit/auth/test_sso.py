@@ -1137,7 +1137,7 @@ class TestOidcGetAuthorizeUrlDb:
             scopes=json.dumps(["openid", "email"]),
         )
         session = _mock_session(scalar=provider)
-        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+        with patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc:
             mock_disc.return_value = {
                 "authorization_endpoint": "https://example.auth0.com/authorize",
             }
@@ -1175,7 +1175,7 @@ class TestOidcProcessCallbackDb:
         )
 
         with (
-            patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc,
             patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
             patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
             patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
