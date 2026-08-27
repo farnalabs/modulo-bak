@@ -123,6 +123,12 @@ async def change_password(
 ) -> dict[str, str]:
     try:
         async with session.begin():
+            # Scope the transaction to the user's org UP FRONT so the
+            # token_families operations below (list/blacklist) run org-scoped
+            # rather than relying on a fail-open RLS policy when the org
+            # context is not yet set.
+            await set_rls_org(session, current_user.organisation_id)
+
             account = await get_account_by_id(session, current_user.account_id)
             if account is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_ACCOUNT_NOT_FOUND)
@@ -161,10 +167,11 @@ async def change_password(
 
             # Audit is fail-open-with-alert: the password change ALWAYS commits;
             # a failed audit write is loudly logged and never rolls back the change.
+            # The org context is already set at the top of the transaction, so
+            # the audit event below is org-scoped without a redundant re-set.
             try:
                 from modulo.core.audit_logger import append_audit_event
 
-                await set_rls_org(session, current_user.organisation_id)
                 await append_audit_event(
                     session,
                     org_id=current_user.organisation_id,
