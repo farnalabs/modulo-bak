@@ -10,14 +10,18 @@ slug column (the URL key used at /api/v1/auth/oidc/{provider_id}/login) and a
 partial unique index (organisation_id, provider_id) so the runtime can resolve
 IdP config from the DB first, falling back to env vars for backward compat.
 
-Existing rows are backfilled: the slug is derived from `name` (postgres uses
-regexp_replace; sqlite lowercases the name). The column is nullable so the
-unique index can stay partial.
+Existing rows are backfilled: the slug is derived from `name`, trimmed of
+non-alphanumerics, defaulted to `sso`, truncated to 58 chars, and de-duplicated
+per organisation with a ``-N`` suffix so the unique index can never abort on a
+same-name collision (the suffix always fits ``String(64)``). The column is
+nullable so the unique index can stay partial.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
@@ -26,6 +30,48 @@ revision: str = "0151_sso_provider_id"
 down_revision: str | None = "0150_add_router_no_match_status"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+def _slugify(value: str) -> str:
+    """Derive a URL-safe, 58-char max provider_id slug from a name.
+
+    Mirrors ``crud.sso_provider._slugify_provider_id`` so the migration produces
+    the same slugs the app would. 58 leaves room for a ``-N`` dedupe suffix
+    inside ``String(64)``.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value or "").strip("-").lower() or "sso"
+    return slug[:58]
+
+
+def _backfill_sqlite(bind: Any) -> None:
+    """Collision-safe provider_id backfill for SQLite (no regexp_replace/DO block).
+
+    Walks the rows, deriving the slug from `name` and appending ``-N`` while a
+    ``(organisation_id, provider_id)`` collision exists in the row's own
+    organisation (per-org dedupe, matching the partial unique index).
+    """
+    rows = bind.execute(
+        sa.text("SELECT id, organisation_id, name FROM sso_providers WHERE provider_id IS NULL")
+    ).fetchall()
+    for row in rows:
+        base = _slugify(row.name)
+        candidate = base
+        n = 2
+        while (
+            bind.execute(
+                sa.text(
+                    "SELECT 1 FROM sso_providers WHERE organisation_id = :org AND provider_id = :pid AND id <> :row_id"
+                ),
+                {"org": row.organisation_id, "pid": candidate, "row_id": row.id},
+            ).first()
+            is not None
+        ):
+            candidate = f"{base}-{n}"
+            n += 1
+        bind.execute(
+            sa.text("UPDATE sso_providers SET provider_id = :pid WHERE id = :row_id"),
+            {"pid": candidate, "row_id": row.id},
+        )
 
 
 def upgrade() -> None:
@@ -49,7 +95,7 @@ def upgrade() -> None:
             IF base = '' THEN base := 'sso'; END IF;
             base := left(base, 58);
             cand := base; n := 2;
-            WHILE EXISTS (SELECT 1 FROM sso_providers WHERE provider_id = cand AND id <> r.id) LOOP
+            WHILE EXISTS (SELECT 1 FROM sso_providers WHERE organisation_id = r.organisation_id AND provider_id = cand AND id <> r.id) LOOP
               cand := base || '-' || n; n := n + 1;
             END LOOP;
             UPDATE sso_providers SET provider_id = cand WHERE id = r.id;
@@ -58,7 +104,7 @@ def upgrade() -> None:
         """
         )
     else:
-        op.execute("UPDATE sso_providers SET provider_id = COALESCE(lower(name), 'sso') WHERE provider_id IS NULL")
+        _backfill_sqlite(bind)
 
     if is_pg:
         op.execute(
@@ -71,6 +117,7 @@ def upgrade() -> None:
             "sso_providers",
             ["organisation_id", "provider_id"],
             unique=True,
+            sqlite_where=sa.text("provider_id IS NOT NULL"),
         )
 
 

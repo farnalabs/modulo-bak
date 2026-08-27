@@ -8,8 +8,21 @@ from cryptography.fernet import Fernet
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.auth.secret_storage import DecryptionError, decode_stored_secret
-from modulo.db.crud.sso_provider import create_provider, update_provider
+from modulo.db.crud.sso_provider import _slugify_provider_id, create_provider, update_provider
 from modulo.db.models.sso_provider import SsoProvider
+
+
+def test_slugify_symbol_only_or_empty_name_defaults_to_sso() -> None:
+    assert _slugify_provider_id("###") == "sso"
+    assert _slugify_provider_id("") == "sso"
+    assert _slugify_provider_id("  ") == "sso"
+
+
+def test_slugify_long_name_truncates_within_string_64() -> None:
+    long_name = "x" * 200
+    slug = _slugify_provider_id(long_name)
+    assert len(slug) <= 64
+    assert slug == "x" * 58
 
 
 def test_decode_rejects_encrypted_secret_from_different_key() -> None:
