@@ -5,7 +5,7 @@ Revises: 0146_extend_runs_status_cost_ceiling
 Create Date: 2026-08-24
 
 The codebase adopted ``jsonb`` as its JSON standard (see 0129_runs_json_to_jsonb
-and the many columns created as ``jsonb`` directly), but ~67 columns are still
+and the many columns created as ``jsonb`` directly), but ~66 columns are still
 typed plain ``json`` in Postgres. ``jsonb`` gives binary storage, faster
 containment/``@>`` operators, and GIN-indexability, so this migration brings the
 remaining columns up to the same standard.
@@ -16,21 +16,59 @@ Columns that are already ``jsonb`` (e.g. ``runs.*``,
 is lossless (NULL stays NULL; well-formed ``json`` re-parses identically as
 ``jsonb``).
 
+Why this rewrite is NON-BLOCKING and RESUMABLE
+---------------------------------------------
+The original migration ran a direct
+``ALTER TABLE public."<table>" ALTER COLUMN "<col>" TYPE <target> USING ...``
+for each ``(table, column)`` pair. Every ``ALTER COLUMN ... TYPE`` takes an
+ACCESS EXCLUSIVE lock **and** performs a full-table rewrite. On hot, live tables
+(``pipeline_snapshots``, ``agents``, ``organisations``, ``chat_messages``,
+``eval_cases``, ``saved_views``, ``library_sync_state``, ...) that lock is never
+acquired under writer contention, so the migration hangs forever and wedges the
+deploy — the exact bug that blocked deploys on ``runs`` in 0129_runs_json_to_jsonb.
+
+This rewrite reuses the proven, table-generalised 0129 algorithm. The
+``json`` -> ``jsonb`` cast is lossless for every existing row (NULL stays NULL;
+well-formed ``json`` re-parses identically as ``jsonb``), so each column is
+converted additively and in place:
+
+1. **Add a temp ``{col}_{target}`` column** (fast: brief ACCESS EXCLUSIVE,
+   metadata-only — no data rewrite), gated on ``information_schema.columns``.
+2. **Batch backfill** ``{col}_{target} = {col}::cast`` for rows where the temp
+   column is still NULL, in chunks of 1000, committing after every batch.
+   Row-level only: no table lock, safe under concurrent writes, and resumable
+   because only still-pending rows are touched.
+3. **Swap** by renaming: ``{col}`` -> ``{col}_old``, then ``{col}_{target}`` ->
+   ``{col}``, then drop ``{col}_old``. Each rename/drop is a brief metadata-only
+   lock; there is no data rewrite.
+4. **Finalize** by mirroring the original ``is_nullable``/``column_default``
+   captured before any rename.
+
+Every phase is idempotent (column-existence gates on ADD/RENAME/DROP and
+``WHERE {col}_{target} IS NULL`` gates the backfill), so a migration that fails
+midway simply re-runs: already-converted columns are skipped and only the
+remaining rows are backfilled.
+
 This is a Postgres-only change: SQLite/MariaDB use the ORM's generic ``JSON``
 type, so the migration is skipped on non-Postgres dialects.
 
-Downgrade reverts the same columns from ``jsonb`` back to ``json``.
+Downgrade reverts each column ``jsonb`` -> ``json`` using the same non-blocking,
+resumable pattern (add ``{col}_json``, batch ``::json`` backfill, swap, drop).
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from alembic import op
-from sqlalchemy import text
+from sqlalchemy import column, select, table, text, update
+from sqlalchemy.dialects.postgresql import JSON as PG_JSON
+from sqlalchemy.dialects.postgresql import JSONB
 
 revision: str = "0147_json_to_jsonb_standardize"
 down_revision: str | None = "0146_extend_runs_status_cost_ceiling"
-branch_labels: str | None = None
-depends_on: str | None = None
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 # (table, column) pairs still typed ``json`` in Postgres that this migration
 # promotes to ``jsonb``. Constants only - no user input reaches the DDL.
@@ -103,20 +141,126 @@ _JSON_TO_JSONB: tuple[tuple[str, str], ...] = (
     ("feature_flag_catalog", "depends_on"),
 )
 
+_SCHEMA = "public"
+_BATCH_SIZE = 1000
+_OLD_SUFFIX = "_old"
 
-def _promote(target: str) -> None:
-    bind = op.get_bind()
-    if bind.dialect.name != "postgresql":
+
+def _column_meta(bind, table_name: str, column_name: str) -> dict | None:
+    """Return ``{is_nullable, column_default}`` for ``table_name.column_name`` or None.
+
+    Uses ``information_schema.columns`` so the existence check doubles as a read
+    of the original column's nullability/default before any rename invalidates
+    it. Postgres-only; the caller gates on the dialect.
+    """
+    row = bind.execute(
+        text(
+            "SELECT is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table AND column_name = :col"
+        ),
+        {"schema": _SCHEMA, "table": table_name, "col": column_name},
+    ).fetchone()
+    if row is None:
+        return None
+    return {"is_nullable": row[0], "column_default": row[1]}
+
+
+def _cast_type(cast: str):
+    """Return the Postgres SQLAlchemy type for a ``::cast`` target."""
+    return JSONB() if cast == "jsonb" else PG_JSON()
+
+
+def _backfill(bind, table_name: str, col: str, tmp: str, cast: str) -> None:
+    """Backfill ``tmp`` from ``col`` in bounded batches, committing each batch.
+
+    Uses a SQLAlchemy Core ``update`` (not a raw string) so the row predicate is
+    parameterised and no f-string SQL reaches the executor. ``{tmp} IS NULL``
+    makes it resumable; ``ctid IN (SELECT ... LIMIT 1000)`` caps each UPDATE so
+    it holds no long transaction and never blocks writers (row-level locks
+    only). Loops until a batch touches zero rows.
+    """
+    tbl = table(table_name, column("ctid"), column(col), column(tmp), schema=_SCHEMA)
+    pending = tbl.c[tmp].is_(None) & tbl.c[col].isnot(None)
+    ctid_subq = select(tbl.c.ctid).where(pending).limit(_BATCH_SIZE)
+    stmt = update(tbl).where(pending).where(tbl.c.ctid.in_(ctid_subq)).values({tmp: tbl.c[col].cast(_cast_type(cast))})
+    while True:
+        result = bind.execute(stmt)
+        rowcount = result.rowcount
+        bind.commit()
+        if rowcount == 0:
+            break
+
+
+def _add_temp_column(bind, table_name: str, tmp: str, cast: str) -> None:
+    """Add ``tmp`` (typed ``cast``) if absent — brief metadata-only lock."""
+    if _column_meta(bind, table_name, tmp) is not None:
         return
-    for table, column in _JSON_TO_JSONB:
-        op.execute(
-            text(f'ALTER TABLE public."{table}" ALTER COLUMN "{column}" TYPE {target} USING "{column}"::{target};')
-        )
+    op.execute(text(f'ALTER TABLE public."{table_name}" ADD COLUMN "{tmp}" {cast}'))
+    bind.commit()
+
+
+def _swap(bind, table_name: str, col: str, tmp: str, old: str) -> None:
+    """Rename ``col`` -> ``old``, ``tmp`` -> ``col``, drop ``old``.
+
+    Skips entirely if the ``old`` column already exists (re-run safety). Each
+    step is a brief metadata-only lock; no data is rewritten.
+    """
+    if _column_meta(bind, table_name, old) is not None:
+        return
+    op.execute(text(f'ALTER TABLE public."{table_name}" RENAME COLUMN "{col}" TO "{old}"'))
+    bind.commit()
+    op.execute(text(f'ALTER TABLE public."{table_name}" RENAME COLUMN "{tmp}" TO "{col}"'))
+    bind.commit()
+    op.execute(text(f'ALTER TABLE public."{table_name}" DROP COLUMN "{old}"'))
+    bind.commit()
+
+
+def _finalize(bind, table_name: str, col: str, orig: dict) -> None:
+    """Mirror the original column's nullability/default onto the swapped column.
+
+    The temp column is added nullable without a default, so after the swap the
+    new ``col`` must be re-constrained to match the original. The cast is
+    lossless, so the backfilled data is identical and ``SET NOT NULL`` is safe.
+    """
+    if orig["is_nullable"] == "NO":
+        op.execute(text(f'ALTER TABLE public."{table_name}" ALTER COLUMN "{col}" SET NOT NULL'))
+        bind.commit()
+    if orig["column_default"] is not None:
+        op.execute(text(f'ALTER TABLE public."{table_name}" ALTER COLUMN "{col}" SET DEFAULT {orig["column_default"]}'))
+        bind.commit()
+
+
+def _convert(bind, *, tmp_suffix: str, cast: str) -> None:
+    """Non-blockingly convert each ``_JSON_TO_JSONB`` column via a temp column.
+
+    ``tmp_suffix`` names the temporary column (``jsonb`` upgrading ``json`` ->
+    ``jsonb``, ``json`` downgrading ``jsonb`` -> ``json``); the held-back column
+    is always ``{col}_old``. Additive and idempotent, so a failed run resumes
+    cleanly on re-execution.
+    """
+    for table_name, column_name in _JSON_TO_JSONB:
+        orig = _column_meta(bind, table_name, column_name)
+        if orig is None:
+            # Column absent (non-standard DB) — nothing to convert.
+            continue
+        tmp = f"{column_name}_{tmp_suffix}"
+        _add_temp_column(bind, table_name, tmp, cast)
+        _backfill(bind, table_name, column_name, tmp, cast)
+        _swap(bind, table_name, column_name, tmp, f"{column_name}{_OLD_SUFFIX}")
+        _finalize(bind, table_name, column_name, orig)
 
 
 def upgrade() -> None:
-    _promote("jsonb")
+    # Postgres-only: plain ``json`` -> ``jsonb`` cast. SQLite uses the ORM model
+    # (generic JSON), so skip on non-Postgres dialects.
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    _convert(bind, tmp_suffix="jsonb", cast="jsonb")
 
 
 def downgrade() -> None:
-    _promote("json")
+    bind = op.get_bind()
+    if bind.dialect.name != "postgresql":
+        return
+    _convert(bind, tmp_suffix="json", cast="json")
