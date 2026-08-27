@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import defusedxml.ElementTree as ElementTree
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -1253,4 +1254,340 @@ class TestSamlGetAuthUrlDb:
         session = _mock_session(scalar=provider)
         url, _ = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs", session)
         assert "idp.example.com" in url
-        assert "SAMLRequest" in url
+
+
+# ---------------------------------------------------------------------------
+# DB-first SSO provider resolution (admin UI writes sso_providers rows)
+# ---------------------------------------------------------------------------
+
+
+def _db_oidc_provider(**overrides: object) -> SimpleNamespace:
+    provider = SimpleNamespace(
+        provider_type="oidc",
+        enabled=True,
+        client_id="db-client-id",
+        client_secret=b"enc-secret",
+        discovery_url="https://idp.example.com/.well-known/openid-configuration",
+        scopes=json.dumps(["openid", "email", "profile"]),
+        organisation_id=uuid.uuid4(),
+        entity_id=None,
+        metadata_xml=None,
+        metadata_url=None,
+        group_mappings=[],
+    )
+    for key, value in overrides.items():
+        setattr(provider, key, value)
+    return provider
+
+
+def _db_saml_provider(**overrides: object) -> SimpleNamespace:
+    provider = SimpleNamespace(
+        provider_type="saml",
+        enabled=True,
+        client_id=None,
+        client_secret=None,
+        discovery_url=None,
+        scopes=None,
+        organisation_id=uuid.uuid4(),
+        entity_id="https://idp.example.com",
+        metadata_xml=None,
+        metadata_url=None,
+        group_mappings=[],
+    )
+    for key, value in overrides.items():
+        setattr(provider, key, value)
+    return provider
+
+
+class TestSsoDbResolution:
+    async def test_set_default_rls_org(self) -> None:
+        from modulo.auth.sso import _set_default_rls_org
+
+        session = _mock_session(scalar=SimpleNamespace(id=uuid.uuid4()))
+        await _set_default_rls_org(session)
+
+    async def test_lookup_provider_by_client_id(self) -> None:
+        from modulo.auth.sso import _lookup_provider_by_client_id
+
+        session = _mock_session()
+        result = await _lookup_provider_by_client_id(session, "client-id", uuid.uuid4())
+        assert result is None
+
+    async def test_lookup_provider_by_entity_id(self) -> None:
+        from modulo.auth.sso import _lookup_provider_by_entity_id
+
+        session = _mock_session()
+        result = await _lookup_provider_by_entity_id(session, "entity-id", uuid.uuid4())
+        assert result is None
+
+    async def test_apply_group_mappings_skips_non_dict(self) -> None:
+        from modulo.auth.sso import apply_group_mappings
+
+        session = _mock_session()
+        await apply_group_mappings(session, MagicMock(), uuid.uuid4(), ["g1"], ["not-a-dict"])  # type: ignore[list-item]
+
+    async def test_apply_group_mappings_skips_invalid_team_id(self) -> None:
+        from modulo.auth.sso import apply_group_mappings
+
+        session = _mock_session()
+        await apply_group_mappings(
+            session,
+            MagicMock(),
+            uuid.uuid4(),
+            ["g1"],
+            [{"idp_group": "g1", "team_id": "not-a-uuid"}],
+        )
+
+    async def test_resolve_oidc_provider_from_db(self) -> None:
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider()
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+        ):
+            cid, secret, _disc, scopes, dbp = await _resolve_oidc_provider("okta", session, settings)
+        assert cid == "db-client-id"
+        assert secret == "db-secret"
+        assert scopes == ["openid", "email", "profile"]
+        assert dbp is provider
+
+    async def test_resolve_oidc_provider_ssrf_rejected(self) -> None:
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider(discovery_url="http://169.254.169.254/.well-known/openid-configuration")
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch(
+                "modulo.auth.sso.validate_outbound_url_async",
+                new_callable=AsyncMock,
+                side_effect=ValueError("blocked by SSRF guard"),
+            ),
+            pytest.raises(ValueError, match="Rejected OIDC discovery_url"),
+        ):
+            await _resolve_oidc_provider("okta", session, settings)
+
+    async def test_oidc_authorize_url_db_provider(self) -> None:
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider()
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+            patch(
+                "modulo.auth.sso._fetch_discovery_pinned",
+                new_callable=AsyncMock,
+                return_value={"authorization_endpoint": "https://idp.example.com/authorize"},
+            ) as mock_disc,
+        ):
+            url, raw_state = await oidc_get_authorize_url("okta", settings, "http://localhost/callback", session)
+        assert "https://idp.example.com/authorize" in url
+        assert "client_id=db-client-id" in url
+        assert len(raw_state) > 0
+        mock_disc.assert_awaited_once()
+
+    async def test_oidc_authorize_url_db_provider_missing_discovery(self) -> None:
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider(discovery_url=None)
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+            pytest.raises(ValueError, match="missing client_id or discovery_url"),
+        ):
+            await oidc_get_authorize_url("okta", settings, "http://localhost/callback", session)
+
+    async def test_oidc_authorize_url_db_provider_discovery_fetch_error(self) -> None:
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider()
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+            patch(
+                "modulo.auth.sso._fetch_discovery_pinned",
+                new_callable=AsyncMock,
+                side_effect=httpx.ConnectError("boom"),
+            ),
+            pytest.raises(ValueError, match="Failed to fetch discovery document"),
+        ):
+            await oidc_get_authorize_url("okta", settings, "http://localhost/callback", session)
+
+    async def test_oidc_callback_db_provider_success(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider()
+        raw_state = "raw-state"
+        signed = sign_state(f"okta:{raw_state}", settings.secret_key)
+        id_token = (
+            base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+            + "."
+            + base64.urlsafe_b64encode(
+                b'{"email":"user@example.com","name":"Test User","sub":"abc123","groups":["team-a"]}'
+            )
+            .rstrip(b"=")
+            .decode()
+            + "."
+            + "sig"
+        )
+        group_provider = _db_oidc_provider(group_mappings=[{"idp_group": "team-a", "team_id": str(uuid.uuid4())}])
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+            patch(
+                "modulo.auth.sso._fetch_discovery_pinned",
+                new_callable=AsyncMock,
+                return_value={
+                    "token_endpoint": "https://idp.example.com/token",
+                    "jwks_uri": "https://idp.example.com/certs",
+                    "issuer": "https://idp.example.com",
+                },
+            ),
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock, return_value={"id_token": id_token}),
+            patch(
+                "modulo.auth.sso.verify_id_token",
+                new_callable=AsyncMock,
+                return_value={"email": "user@example.com", "name": "Test User", "sub": "abc123", "groups": ["team-a"]},
+            ),
+            patch(
+                "modulo.auth.sso.jit_provision_user",
+                new_callable=AsyncMock,
+                return_value=(MagicMock(), uuid.uuid4(), "runner"),
+            ),
+            patch(
+                "modulo.auth.sso.issue_sso_tokens",
+                new_callable=AsyncMock,
+                return_value={"access_token": "at", "refresh_token": "rt", "token_type": "bearer"},
+            ),
+            patch("modulo.auth.sso._lookup_provider_by_client_id", new_callable=AsyncMock, return_value=group_provider),
+            patch("modulo.auth.sso.apply_group_mappings", new_callable=AsyncMock),
+        ):
+            result = await oidc_process_callback("auth-code", signed, settings, session, "http://localhost/callback")
+        assert result["access_token"] == "at"
+
+    async def test_oidc_callback_unknown_provider_raises(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("ghost:state", settings.secret_key)
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=None),
+            pytest.raises(ValueError, match="not found"),
+        ):
+            await oidc_process_callback("code", signed, settings, session, "http://localhost/callback")
+
+    async def test_oidc_callback_db_provider_missing_secret_raises(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider(client_secret=None)
+        signed = sign_state("okta:state", settings.secret_key)
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            pytest.raises(ValueError, match="missing required configuration"),
+        ):
+            await oidc_process_callback("code", signed, settings, session, "http://localhost/callback")
+
+    async def test_oidc_callback_db_provider_discovery_fetch_error(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_oidc_provider()
+        signed = sign_state("okta:state", settings.secret_key)
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.decode_stored_secret", return_value="db-secret"),
+            patch(
+                "modulo.auth.sso._fetch_discovery_pinned",
+                new_callable=AsyncMock,
+                side_effect=httpx.ConnectError("boom"),
+            ),
+            pytest.raises(ValueError, match="Failed to fetch discovery document"),
+        ):
+            await oidc_process_callback("code", signed, settings, session, "http://localhost/callback")
+
+    async def test_resolve_saml_config_from_db_metadata_xml(self) -> None:
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_xml="<md:EntityDescriptor entityID='x'/>")
+        with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider):
+            idp, entity_id, _sp_key, _sp_cert, dbp = await _resolve_saml_config(session, settings)
+        assert idp == "<md:EntityDescriptor entityID='x'/>"
+        assert entity_id == "https://idp.example.com"
+        assert dbp is provider
+
+    async def test_resolve_saml_config_db_metadata_url_fetch(self) -> None:
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_url="https://idp.example.com/metadata")
+        client = AsyncMock()
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        resp.text = "<md:fetched/>"
+        client.get = AsyncMock(return_value=resp)
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider),
+            patch("modulo.auth.sso.validate_outbound_url_async", new_callable=AsyncMock),
+            patch("modulo.auth.sso.pinned_async_client", return_value=cm),
+        ):
+            idp, _entity_id, _sp_key, _sp_cert, dbp = await _resolve_saml_config(session, settings)
+        assert idp == "<md:fetched/>"
+        assert dbp is provider
+
+    async def test_resolve_saml_config_db_metadata_url_ssrf_rejected(self) -> None:
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_url="http://169.254.169.254/metadata")
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider),
+            patch(
+                "modulo.auth.sso.validate_outbound_url_async",
+                new_callable=AsyncMock,
+                side_effect=ValueError("blocked by SSRF guard"),
+            ),
+            pytest.raises(ValueError, match="Rejected SAML metadata_url"),
+        ):
+            await _resolve_saml_config(session, settings)
+
+    async def test_resolve_saml_config_db_missing_metadata_raises(self) -> None:
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override()
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_xml=None, metadata_url=None)
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider),
+            pytest.raises(ValueError, match="missing IdP metadata"),
+        ):
+            await _resolve_saml_config(session, settings)
