@@ -132,7 +132,7 @@ def test_refresh_success_for_active_account(client: TestClient, mock_session: As
     resolve_role.assert_awaited_once()
     advance.assert_awaited_once()
     # A successful refresh never touches the family blacklist.
-    assert _blacklist_update_sqls(mock_session) == []
+    assert not _blacklist_update_sqls(mock_session)
 
 
 def test_refresh_deactivated_account_denied_and_blacklisted(client: TestClient, mock_session: AsyncMock) -> None:
@@ -202,4 +202,4 @@ def test_refresh_active_system_admin_without_membership_succeeds(client: TestCli
         resp = client.post("/api/v1/auth/refresh", json={"refresh_token": _make_refresh_token(None)})
     assert resp.status_code == 200
     advance.assert_awaited_once()
-    assert _blacklist_update_sqls(mock_session) == []
+    assert not _blacklist_update_sqls(mock_session)
