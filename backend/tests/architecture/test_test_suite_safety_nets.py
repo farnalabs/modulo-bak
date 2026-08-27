@@ -24,6 +24,7 @@ Every lens reports actionable file:line diagnostics instead of a bare
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import yaml
@@ -315,6 +316,80 @@ def _quarantine_entries() -> list[dict]:
     return list(data.get("quarantine") or [])
 
 
+def _stripped_symbol(nodeid_symbol: str) -> str:
+    """Strip the ``[...]`` parametrization suffix from a nodeid symbol so the
+    bare ``test_foo[abc]`` resolves to the underlying ``test_foo`` definition."""
+    return nodeid_symbol.split("[", 1)[0]
+
+
+def _resolves_definitions(nodeid_symbol: str, symbols: set[str]) -> bool:
+    """Return True when ``nodeid_symbol`` resolves against the collected set.
+
+    The pytest nodeid symbol may be a bare function (``test_foo``), a bare
+    class reference (``TestFoo``), or a ``Class::method`` chain
+    (``TestFoo::test_bar``), each possibly with a ``[...]`` parametrization
+    suffix. A ``Class::method`` node only resolves when *both* the class and
+    the exact method exist, so a renamed method is caught even though its
+    class still does."""
+    symbol = _stripped_symbol(nodeid_symbol)
+    parts = symbol.split("::")
+    if len(parts) == 1:
+        return symbol in symbols
+    if len(parts) == 2:
+        return parts[0] in symbols and symbol in symbols
+    return any(symbol in s for s in symbols)
+
+
+def _collect_definitions(path: Path) -> set[str]:
+    """Return the set of pytest-collectable test symbols defined in ``path``.
+
+    Walks the module AST for every ``test_*`` function (top level or inside a
+    ``Test*`` class) plus every ``Test*`` class, matching pytest's collection
+    rules closely enough to catch a renamed/deleted test. Collectable symbols
+    carry a ``TestCase<kind>.nodes`` name for BDD steps (``Scenario``/
+    ``ScenarioOutline``/``Feature``/``Given``/...) and plain ``test_*`` functions
+    everywhere else.
+    """
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return set()
+
+    symbols: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            symbols.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            symbols.add(node.name)
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name.startswith("test_"):
+                    symbols.add(f"{node.name}::{sub.name}")
+                elif isinstance(sub, ast.ClassDef) and sub.name.startswith("TestCase"):
+                    for nested in sub.body:
+                        if isinstance(nested, (ast.FunctionDef, ast.AsyncFunctionDef)) and nested.name.startswith(
+                            ("nodes", "gherkin")
+                        ):
+                            symbols.add(f"{node.name}::{sub.name}::{nested.name}")
+    return symbols
+
+
+def _resolve_quarantine_target(test_id: str) -> tuple[Path | None, str | None, str]:
+    """Return ``(file, test_name, error)`` for a quarantine ``test_id``.
+
+    ``file`` is the resolved module path (or ``None`` when the nodeid is
+    malformed or the file does not exist), ``test_name`` is the symbol after
+    the ``::`` separator (or ``None`` on failure), and ``error`` is non-empty
+    exactly when the entry cannot be resolved to a file.
+    """
+    if "::" not in test_id:
+        return None, None, "entry missing '::' separator between file and test name"
+    path_part, test_part = test_id.split("::", 1)
+    resolved = BACKEND / path_part if path_part.startswith("tests/") else REPO / path_part
+    if not resolved.exists():
+        return None, None, f"file not found ({resolved}) — rename or remove the entry"
+    return resolved, test_part, ""
+
+
 def _workflow_run_blocks(workflow: Path) -> list[str]:
     """Return every step ``run:`` string in a GitHub Actions workflow."""
     data = yaml.safe_load(workflow.read_text(encoding="utf-8"))
@@ -388,21 +463,29 @@ def test_awaiting_implementation_set_is_pinned():
 
 
 def test_quarantine_registry_entries_resolve():
-    """Every quarantined test_id must point at a real test file and carry the
-    fields the plugin needs — a stale entry is a dead safety net."""
+    """Every quarantined test_id must point at a real test file, resolve to a
+    real collectable test symbol inside that file, and carry the fields the
+    plugin needs — a stale entry (a missing file, or a renamed/deleted test
+    function or class) is a dead safety net that silently stops protecting
+    anything because the xfail marker never applies."""
     violations = []
     for entry in _quarantine_entries():
         test_id = str(entry.get("test_id", ""))
         if not test_id:
             violations.append("  entry missing test_id")
             continue
-        if "::" not in test_id:
-            violations.append(f"  {test_id}: not in 'path::test_name' nodeid form")
+        _path, test_part, error = _resolve_quarantine_target(test_id)
+        if error:
+            violations.append(f"  {test_id}: {error}")
             continue
-        path_part, _test_part = test_id.split("::", 1)
-        resolved = BACKEND / path_part if path_part.startswith("tests/") else REPO / path_part
-        if not resolved.exists():
-            violations.append(f"  {test_id}: file not found ({resolved}) — rename or remove the entry")
+        if not test_part:
+            violations.append(f"  {test_id}: missing test name after '::'")
+            continue
+        if not _resolves_definitions(test_part, _collect_definitions(_path)):
+            violations.append(
+                f"  {test_id}: test symbol {_stripped_symbol(test_part)!r} not found in {_path} — "
+                "the test was renamed/deleted, so this quarantine entry protects nothing"
+            )
         if not entry.get("reason"):
             violations.append(f"  {test_id}: missing required 'reason' field")
         if not entry.get("expiry"):
