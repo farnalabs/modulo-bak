@@ -132,6 +132,10 @@ jobs:
           ref: main
           fetch-depth: 1
 
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
+
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
           python-version: "3.12"
@@ -185,6 +189,10 @@ jobs:
         with:
           ref: main
           fetch-depth: 1
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
@@ -243,6 +251,10 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: uv sync --frozen
 
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
         with:
