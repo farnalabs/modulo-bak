@@ -162,7 +162,10 @@ def group_mapping_configured(idp_group: str, team_id: str, role: str, ctx: dict[
 @when("I initiate SAML login")
 def initiate_saml_login(request: Any, ctx: dict[str, Any], client: Any) -> None:
     _setup_saml_client(ctx.get("license_key", "test-license-key"))
-    with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
+    with (
+        patch("modulo.auth.sso.get_enabled_saml_provider", return_value=None),
+        patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
+    ):
         mock_fetch.return_value = _SAMPLE_IDP_METADATA
         resp = client.get("/api/v1/auth/saml/login", follow_redirects=False)
         _store_response(request, ctx, resp)
@@ -189,6 +192,7 @@ def acs_valid_response(request: Any, ctx: dict[str, Any], client: Any) -> None:
     encoded = _make_saml_response(email, name)
 
     with (
+        patch("modulo.auth.sso.get_enabled_saml_provider", return_value=None),
         patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
         patch("modulo.auth.sso.ModuloSamlAuth") as mock_handler,
         patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
@@ -242,6 +246,7 @@ def acs_malformed_response(request: Any, ctx: dict[str, Any], client: Any) -> No
     from modulo.auth.saml_handler import SamlAuthError
 
     with (
+        patch("modulo.auth.sso.get_enabled_saml_provider", return_value=None),
         patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
         patch("modulo.auth.sso.ModuloSamlAuth") as mock_handler,
     ):
@@ -271,6 +276,7 @@ def acs_with_groups(groups: str, request: Any, ctx: dict[str, Any], client: Any)
     encoded = _make_saml_response(email, name, groups=group_list)
 
     with (
+        patch("modulo.auth.sso.get_enabled_saml_provider", return_value=None),
         patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
         patch("modulo.auth.sso.ModuloSamlAuth") as mock_handler,
         patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,

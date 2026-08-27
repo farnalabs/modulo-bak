@@ -354,6 +354,7 @@ def saml_acs_with_groups(groups: str, request: Any, ctx: dict[str, Any], client:
     encoded = _make_saml_response(email, name, groups=group_list)
 
     with (
+        patch("modulo.auth.sso.get_enabled_saml_provider", return_value=None),
         patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
         patch("modulo.auth.sso.ModuloSamlAuth") as mock_handler,
         patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,

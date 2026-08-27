@@ -548,6 +548,7 @@ class TestOidcCallbackIntegration:
         )
 
         with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", return_value=None),
             patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
             patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
             patch("httpx.AsyncClient") as cls,
@@ -607,6 +608,7 @@ class TestOidcCallbackIntegration:
         )
 
         with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", return_value=None),
             patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock),
             patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock),
             patch("httpx.AsyncClient") as cls,
@@ -649,7 +651,10 @@ class TestOidcCallbackIntegration:
         mock_client.get = AsyncMock(side_effect=httpx.ConnectError("Connection refused"))
         mock_client.post = AsyncMock()
 
-        with patch("httpx.AsyncClient") as cls:
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", return_value=None),
+            patch("httpx.AsyncClient") as cls,
+        ):
             cls.return_value.__aenter__.return_value = mock_client
 
             with pytest.raises(ValueError, match="Failed to fetch discovery document"):
@@ -691,7 +696,10 @@ class TestOidcCallbackIntegration:
             post_map={_TOKEN_ENDPOINT: token_resp},
         )
 
-        with patch("httpx.AsyncClient") as cls:
+        with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", return_value=None),
+            patch("httpx.AsyncClient") as cls,
+        ):
             cls.return_value.__aenter__.return_value = mock_client
 
             with pytest.raises(ValueError, match="Failed to exchange authorization code"):
@@ -735,6 +743,7 @@ class TestOidcCallbackIntegration:
         )
 
         with (
+            patch("modulo.auth.sso.get_provider_by_provider_id", return_value=None),
             patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
             patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
             patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock),

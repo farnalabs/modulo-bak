@@ -1157,6 +1157,11 @@ export interface paths {
         /**
          * Sso Providers
          * @description List configured SSO providers (OIDC) and whether SAML is enabled.
+         *
+         *     OIDC providers are merged from the sso_providers DB table (preferred) and
+         *     the env-var fallback, deduplicated by provider_id. SAML is enabled if any
+         *     enabled SAML provider exists in the DB, or if env-var SAML is fully
+         *     configured (enabled + license + metadata).
          */
         get: operations["sso_providers_api_v1_auth_sso_providers_get"];
         put?: never;
@@ -15438,6 +15443,8 @@ export interface components {
             provider_type: string;
             /** Name */
             name: string;
+            /** Provider Id */
+            provider_id?: string | null;
             /** Client Id */
             client_id?: string | null;
             /** Client Secret */
@@ -15479,6 +15486,8 @@ export interface components {
             provider_type: string;
             /** Name */
             name: string;
+            /** Provider Id */
+            provider_id?: string | null;
             /** Client Id */
             client_id?: string | null;
             /** Client Secret */

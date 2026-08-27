@@ -32,13 +32,17 @@ class _AutobeginAwareSession:
 
     def __init__(self) -> None:
         self._in_tx = False
+        # scalar_one_or_none() -> None so _set_default_rls_org finds no org and
+        # skips the RLS transaction; the callback body is what this test exercises.
+        self._execute_result = MagicMock()
+        self._execute_result.scalar_one_or_none.return_value = None
 
     def begin(self) -> "_BeginCtx":
         return _BeginCtx(self)
 
     async def execute(self, stmt: object, *args: object) -> MagicMock:
         assert self._in_tx, "execute() ran outside session.begin() (autobegin=False)"
-        return MagicMock()
+        return self._execute_result
 
 
 class _BeginCtx:
