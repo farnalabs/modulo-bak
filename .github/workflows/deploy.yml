@@ -508,15 +508,40 @@ jobs:
           # (Dockerfile.fly COPYs it to /release.sh, matching the [release]
           # command in fly.toml).
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
-          fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
+          RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
             --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x --memory 1024
+            --vm-size shared-cpu-1x --memory 1024 --json 2>/dev/null || \
+            fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
+              --entrypoint /bin/bash --command "/release.sh" \
+              --vm-size shared-cpu-1x --memory 1024)"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
           fi
 
-          MID="$(fly machine list --app staging-modulo --json 2>/dev/null | python3 -c '
+          # Capture the machine ID directly from the launch output (flyctl
+          # prints it at create time) instead of re-listing machines and
+          # matching by image. The list-based match is racy (config.image can
+          # be normalized or briefly absent right after launch) and has been
+          # failing intermittently, aborting the whole deploy even though the
+          # migration machine is up.
+          MID="$(printf '%s' "$RUN_OUTPUT" | python3 -c '
+          import json, re, sys
+          text = sys.stdin.read()
+          try:
+              d = json.loads(text)
+              if isinstance(d, dict) and d.get("id"):
+                  sys.stdout.write(d["id"])
+                  sys.exit(0)
+          except Exception:
+              pass
+          m = re.search(r"Machine\s+ID:\s*([A-Za-z0-9]+)", text)
+          if m:
+              sys.stdout.write(m.group(1))
+              sys.exit(0)
+          ')"
+          if [ -z "$MID" ]; then
+            MID="$(fly machine list --app staging-modulo --json 2>/dev/null | python3 -c '
           import json, os, sys
           image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
           try:
@@ -537,6 +562,7 @@ jobs:
                   print(mid)
                   break
           ')"
+          fi
           if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
@@ -1152,15 +1178,40 @@ jobs:
           # (Dockerfile.fly COPYs it to /release.sh, matching the [release]
           # command in fly.toml).
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
-          fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
+          RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
             --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x --memory 1024
+            --vm-size shared-cpu-1x --memory 1024 --json 2>/dev/null || \
+            fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
+              --entrypoint /bin/bash --command "/release.sh" \
+              --vm-size shared-cpu-1x --memory 1024)"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
           fi
 
-          MID="$(fly machine list --app app-modulo --json 2>/dev/null | python3 -c '
+          # Capture the machine ID directly from the launch output (flyctl
+          # prints it at create time) instead of re-listing machines and
+          # matching by image. The list-based match is racy (config.image can
+          # be normalized or briefly absent right after launch) and has been
+          # failing intermittently, aborting the whole deploy even though the
+          # migration machine is up.
+          MID="$(printf '%s' "$RUN_OUTPUT" | python3 -c '
+          import json, re, sys
+          text = sys.stdin.read()
+          try:
+              d = json.loads(text)
+              if isinstance(d, dict) and d.get("id"):
+                  sys.stdout.write(d["id"])
+                  sys.exit(0)
+          except Exception:
+              pass
+          m = re.search(r"Machine\s+ID:\s*([A-Za-z0-9]+)", text)
+          if m:
+              sys.stdout.write(m.group(1))
+              sys.exit(0)
+          ')"
+          if [ -z "$MID" ]; then
+            MID="$(fly machine list --app app-modulo --json 2>/dev/null | python3 -c '
           import json, os, sys
           image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
           try:
@@ -1181,6 +1232,7 @@ jobs:
                   print(mid)
                   break
           ')"
+          fi
           if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
