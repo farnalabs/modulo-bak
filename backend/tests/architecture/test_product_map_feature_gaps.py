@@ -172,9 +172,7 @@ def test_graph_root_registry_index_enumerates_every_manifest_feature():
     assert _REGISTRY_INDEX_START in index_text, (
         "graph root must declare the 'Index — manifest feature registry' section"
     )
-    assert _REGISTRY_INDEX_END in index_text, (
-        "graph root must declare the 'Index — feature graph entries' section"
-    )
+    assert _REGISTRY_INDEX_END in index_text, "graph root must declare the 'Index — feature graph entries' section"
     index_section = index_text.split(_REGISTRY_INDEX_START, 1)[1].split(_REGISTRY_INDEX_END, 1)[0]
     missing = sorted(
         feature
