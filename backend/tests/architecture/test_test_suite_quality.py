@@ -2810,9 +2810,7 @@ def _unbounded_async_wait_violations(tree: ast.AST) -> list[tuple[int, str]]:
     def _timeout_is_bounded(call: ast.Call) -> bool:
         if call.keywords:
             for kw in call.keywords:
-                if kw.arg == "timeout" and not (
-                    isinstance(kw.value, ast.Constant) and kw.value.value is None
-                ):
+                if kw.arg == "timeout" and not (isinstance(kw.value, ast.Constant) and kw.value.value is None):
                     return True
         if len(call.args) >= 2:
             second = call.args[1]
