@@ -133,6 +133,16 @@ Fresh entries for these features are added to the graph below as behaviour track
 Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 `manifest.yaml`) are tracked here as well, keyed by their `feat-*` id.
 
+> **Known gap (2026-08-27 product-map walk):** the following registered manifest
+> features still lack a behaviour-tracker entry here and are therefore absent from the
+> feature graph's human-readable layer: `feat-analytics`, `feat-audit`, `feat-auth`,
+> `feat-connectors` (behaviours are tracked inline in `manifest.yaml`), `feat-costs`,
+> `feat-dashboard`, `feat-environments`, `feat-evals`, `feat-feedback`, `feat-guardrails`,
+> `feat-hitl`, `feat-lifecycle-maps`, `feat-observability`, `feat-onboarding`, `feat-org`,
+> `feat-plugins`, `feat-product-analytics`, `feat-remy`, `feat-router`, `feat-runs`,
+> `feat-runtime`, `feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-triggers`,
+> `feat-variants`.
+
 ### Auth and Security
 - [feat-core-oidc-integration](auth/oidc-integration.md) => PRD 9.4
 - [feat-core-saml-integration](auth/saml-integration.md) => PRD 9.4
@@ -147,9 +157,27 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 ### Infra
 - [feat-infra-health](infra/health-checks.md) => PRD N/A
 
-### Pipelines
+### Schema & Data
+- [feat-schemas](schemas/schemas.md) => PRD N/A
+
+### Build & Pipelines
+- [feat-pipelines](pipelines/pipelines.md) => PRD N/A
 - [feat-pipelines-pipeline-versioning](pipelines/snapshot-versioning.md) => PRD 8.13
 - [feat-pipelines-pipeline-diff-rollback](pipelines/pipeline-diff-rollback.md) => PRD 8.13
 
+### Configure
+- [feat-model-backends](configure/model-backends.md) => PRD N/A
+- [feat-mcp](configure/mcp.md) => PRD N/A
+
+### Notifications
+- [feat-notifications](notifications/notifications.md) => PRD N/A
+
+### Library
+- [feat-library](library/library.md) => PRD N/A
+
+### Licensing
+- [feat-license](licensing/license.md) => PRD N/A
+
 ### Teams
+- [feat-teams](teams/teams.md) => PRD N/A
 - [feat-teams-org-entity](teams/org-entity.md) => PRD 9.1, 6.2
