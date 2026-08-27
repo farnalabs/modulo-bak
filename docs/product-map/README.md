@@ -133,6 +133,15 @@ Fresh entries for these features are added to the graph below as behaviour track
 Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 `manifest.yaml`) are tracked here as well, keyed by their `feat-*` id.
 
+> **Known gap (2026-08-27 product-map walk):** the following registered manifest
+> features still lack a behaviour-tracker entry here and are therefore absent from the
+> feature graph's human-readable layer: `feat-auth`, `feat-connectors` (behaviours are
+> tracked inline in `manifest.yaml`), `feat-costs`, `feat-dashboard`, `feat-environments`,
+> `feat-evals`, `feat-feedback`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
+> `feat-mcp`, `feat-model-backends`, `feat-notifications`, `feat-onboarding`, `feat-org`,
+> `feat-pipelines`, `feat-plugins`, `feat-remy`, `feat-router`, `feat-runs`, `feat-runtime`,
+> `feat-schemas`, `feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-teams`.
+
 ### Auth and Security
 - [feat-core-oidc-integration](auth/oidc-integration.md) => PRD 9.4
 - [feat-core-saml-integration](auth/saml-integration.md) => PRD 9.4
@@ -150,6 +159,24 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 ### Pipelines
 - [feat-pipelines-pipeline-versioning](pipelines/snapshot-versioning.md) => PRD 8.13
 - [feat-pipelines-pipeline-diff-rollback](pipelines/pipeline-diff-rollback.md) => PRD 8.13
+
+### Monitor
+- [feat-observability](monitor/observability.md) => PRD N/A
+
+### Build & runs
+- [feat-analytics](analytics/analytics.md) => PRD N/A
+
+### Configure
+- [feat-guardrails](configure/guardrails.md) => PRD 7.4
+- [feat-hitl](configure/hitl.md) => PRD 7.3
+- [feat-triggers](configure/triggers.md) => PRD 6.1
+
+### Improve
+- [feat-variants](improve/variants.md) => PRD N/A
+
+### Audit & Admin
+- [feat-audit](audit/audit-log.md) => PRD 9.3
+- [feat-product-analytics](admin/product-analytics.md) => PRD N/A
 
 ### Teams
 - [feat-teams-org-entity](teams/org-entity.md) => PRD 9.1, 6.2
