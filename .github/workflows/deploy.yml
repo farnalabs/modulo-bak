@@ -1236,7 +1236,8 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           IMAGE_REF: ${{ steps.build.outputs.IMAGE_REF }}
-        continue-on-error: true
+        # Best-effort by design - the [release] command inside fly deploy remains the authoritative migrator.
+        continue-on-error: true  # nosemgrep:semgrep.continue-on-error-in-ci
         run: |
           curl -fsSL https://fly.io/install.sh | sh
           export FLYCTL_INSTALL="/home/runner/.fly"
