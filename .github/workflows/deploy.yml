@@ -510,7 +510,7 @@ jobs:
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
           fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
             --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x-1gb
+            --vm-size shared-cpu-1x --memory 1024
           if [ $? -ne 0 ]; then
             echo "::warning::Pre-deploy migration machine failed - falling back to release-command migration during deploy (health gate absorbs the wait)."
             exit 0
@@ -610,12 +610,13 @@ jobs:
                 DELAY=$((RETRY_DELAY * 2 ** (attempt - 1)))
                 echo "Deploy failed (exit $EXIT_CODE) -- retrying in ${DELAY}s..."
                 sleep $DELAY
-              else
-                echo "Deploy failed after $MAX_RETRIES attempts"
-                exit $EXIT_CODE
               fi
             fi
           done
+          # Exhaustion is fatal: a masked deploy failure must never count as a
+          # fresh successful deploy for the throttle (2026-08-27 incident).
+          echo "::error::Deploy failed after $MAX_RETRIES attempts - failing the run so the throttle does not count it as a fresh deploy (2026-08-27: masked failure poisoned the throttle for 3h)."
+          exit 1
 
       - name: Destroy pre-migrate machine
         if: always()
@@ -1159,7 +1160,7 @@ jobs:
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
           fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
             --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x-1gb
+            --vm-size shared-cpu-1x --memory 1024
           if [ $? -ne 0 ]; then
             echo "::warning::Pre-deploy migration machine failed - falling back to release-command migration during deploy (health gate absorbs the wait)."
             exit 0
@@ -1236,8 +1237,6 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
           IMAGE_REF: ${{ steps.build.outputs.IMAGE_REF }}
-        # Best-effort by design - the [release] command inside fly deploy remains the authoritative migrator.
-        continue-on-error: true  # nosemgrep:semgrep.continue-on-error-in-ci
         run: |
           curl -fsSL https://fly.io/install.sh | sh
           export FLYCTL_INSTALL="/home/runner/.fly"
@@ -1262,12 +1261,13 @@ jobs:
                 DELAY=$((RETRY_DELAY * 2 ** (attempt - 1)))
                 echo "Deploy failed (exit $EXIT_CODE) -- retrying in ${DELAY}s..."
                 sleep $DELAY
-              else
-                echo "Deploy failed after $MAX_RETRIES attempts"
-                exit $EXIT_CODE
               fi
             fi
           done
+          # Exhaustion is fatal: a masked deploy failure must never count as a
+          # fresh successful deploy for the throttle (2026-08-27 incident).
+          echo "::error::Deploy failed after $MAX_RETRIES attempts - failing the run so the throttle does not count it as a fresh deploy (2026-08-27: masked failure poisoned the throttle for 3h)."
+          exit 1
 
       - name: Destroy pre-migrate machine
         if: always()
