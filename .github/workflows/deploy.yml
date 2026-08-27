@@ -541,29 +541,6 @@ jobs:
               sys.exit(0)
           ')"
           if [ -z "$MID" ]; then
-            MID="$(fly machine list --app staging-modulo --json 2>/dev/null | python3 -c '
-          import json, os, sys
-          image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
-          try:
-              machines = json.load(sys.stdin)
-          except Exception:
-              machines = []
-          pre = set()
-          try:
-              with open("/tmp/premigrate-preexisting.txt") as f:
-                  pre = {line.strip() for line in f if line.strip()}
-          except Exception:
-              pass
-          for m in machines:
-              mid = m.get("id")
-              cfg = m.get("config") or {}
-              mimage = cfg.get("image") or m.get("image") or ""
-              if mid and mimage == image and mid not in pre:
-                  print(mid)
-                  break
-          ')"
-          fi
-          if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
           fi
@@ -1210,29 +1187,6 @@ jobs:
               sys.stdout.write(m.group(1))
               sys.exit(0)
           ')"
-          if [ -z "$MID" ]; then
-            MID="$(fly machine list --app app-modulo --json 2>/dev/null | python3 -c '
-          import json, os, sys
-          image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
-          try:
-              machines = json.load(sys.stdin)
-          except Exception:
-              machines = []
-          pre = set()
-          try:
-              with open("/tmp/premigrate-preexisting.txt") as f:
-                  pre = {line.strip() for line in f if line.strip()}
-          except Exception:
-              pass
-          for m in machines:
-              mid = m.get("id")
-              cfg = m.get("config") or {}
-              mimage = cfg.get("image") or m.get("image") or ""
-              if mid and mimage == image and mid not in pre:
-                  print(mid)
-                  break
-          ')"
-          fi
           if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
