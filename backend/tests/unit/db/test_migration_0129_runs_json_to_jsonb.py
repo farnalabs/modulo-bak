@@ -92,3 +92,20 @@ def test_upgrade_uses_non_blocking_temp_column_and_batch_backfill() -> None:
     assert "update(" in code, "backfill must use an UPDATE statement"
     assert "_BATCH_SIZE" in code, "backfill must be bounded (row-level, no table lock)"
     assert ".cast(" in code, "backfill must copy via the lossless ::cast"
+
+
+def test_helpers_use_dedicated_autocommit_connection() -> None:
+    """The migration must run SQL on a dedicated autocommit connection.
+
+    Alembic wraps each migration in ``context.begin_transaction()``. Calling an
+    explicit ``.commit()`` on ``op.get_bind()`` closes that transaction and
+    breaks every subsequent statement — the root cause of the CI migration break
+    (``Can't operate on closed transaction inside context manager``) this fix
+    addresses. The migration must instead obtain its own autocommit connection
+    from the engine so per-statement commits don't fight alembic's transaction.
+    """
+    code = _source_code()
+    assert ".commit(" not in code, "no explicit .commit() on alembic's connection"
+    assert "AUTOCOMMIT" in code, "must use an isolation_level=AUTOCOMMIT connection"
+    assert "isolation_level=" in code, "must set isolation_level on the connection"
+    assert "engine.connect(" in code, "must connect via the engine, independent of alembic"

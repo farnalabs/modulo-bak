@@ -25,9 +25,17 @@ using this additive, per-column algorithm:
 1. **Add a temp ``jsonb`` column** ``{col}_jsonb`` (fast: brief ACCESS
    EXCLUSIVE, metadata-only — no data rewrite).
 2. **Batch backfill** ``{col}_jsonb = {col}::jsonb`` for rows where
-   ``{col}_jsonb IS NULL`` in chunks of 1000, committing after every batch.
-   Row-level only: no table lock, safe under concurrent writes, and resumable
-   because only still-pending rows are touched.
+   ``{col}_jsonb IS NULL`` in chunks of 1000. Row-level only: no table lock,
+   safe under concurrent writes, and resumable because only still-pending rows
+   are touched.
+
+Every statement runs on a **dedicated autocommit connection** obtained from
+alembic's engine (not on ``op.get_bind()``), because alembic wraps the migration
+in a transaction context manager and an explicit ``.commit()`` on its connection
+would close that transaction and break the next statement. The autocommit
+connection commits each statement independently, so the migration stays
+resumable while alembic's own transaction (which records the version row) is
+kept intact.
 3. **Swap** by renaming: ``{col}`` -> ``{col}_old``, then ``{col}_jsonb`` ->
    ``{col}``, then drop ``{col}_old``. Each rename/drop is a brief
    metadata-only lock; there is no data rewrite.
@@ -53,7 +61,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from alembic import op
-from sqlalchemy import column, select, table, text, update
+from sqlalchemy import Connection, column, select, table, text, update
 from sqlalchemy.dialects.postgresql import JSON as PG_JSON
 from sqlalchemy.dialects.postgresql import JSONB
 
@@ -79,14 +87,15 @@ _BATCH_SIZE = 1000
 _OLD_SUFFIX = "_old"
 
 
-def _column_meta(bind, table: str, column: str) -> dict | None:
+def _column_meta(ac, table: str, column: str) -> dict | None:
     """Return ``{is_nullable, column_default}`` for ``table.column`` or None.
 
     Uses ``information_schema.columns`` so the existence check doubles as a read
     of the original column's nullability/default before any rename invalidates
-    it. Postgres-only; the caller gates on the dialect.
+    it. Runs on the dedicated autocommit connection (``ac``); Postgres-only, the
+    caller gates on the dialect.
     """
-    row = bind.execute(
+    row = ac.execute(
         text(
             "SELECT is_nullable, column_default FROM information_schema.columns "
             "WHERE table_schema = 'public' AND table_name = :table AND column_name = :col"
@@ -103,14 +112,15 @@ def _cast_type(cast: str):
     return JSONB() if cast == "jsonb" else PG_JSON()
 
 
-def _backfill(bind, col: str, tmp: str, cast: str) -> None:
-    """Backfill ``tmp`` from ``col`` in bounded batches, committing each batch.
+def _backfill(ac, col: str, tmp: str, cast: str) -> None:
+    """Backfill ``tmp`` from ``col`` in bounded batches on the autocommit ``ac``.
 
     Uses a SQLAlchemy Core ``update`` (not a raw string) so the row predicate is
     parameterised and no f-string SQL reaches the executor. ``{tmp} IS NULL``
     makes it resumable; ``ctid IN (SELECT ... LIMIT 1000)`` caps each UPDATE so
     it holds no long transaction and never blocks writers (row-level locks
-    only). Loops until a batch touches zero rows.
+    only). Loops until a batch touches zero rows. ``ac`` is autocommit, so each
+    statement commits itself and nothing is explicitly committed here.
     """
     runs_tbl = table(_TABLE, column("ctid"), column(col), column(tmp), schema=_SCHEMA)
     pending = runs_tbl.c[tmp].is_(None) & runs_tbl.c[col].isnot(None)
@@ -122,38 +132,37 @@ def _backfill(bind, col: str, tmp: str, cast: str) -> None:
         .values({tmp: runs_tbl.c[col].cast(_cast_type(cast))})
     )
     while True:
-        result = bind.execute(stmt)
+        result = ac.execute(stmt)
         rowcount = result.rowcount
-        bind.commit()
         if rowcount == 0:
             break
 
 
-def _add_temp_column(bind, tmp: str, cast: str) -> None:
-    """Add ``tmp`` (typed ``cast``) if absent — brief metadata-only lock."""
-    if _column_meta(bind, _TABLE, tmp) is not None:
+def _add_temp_column(ac, tmp: str, cast: str) -> None:
+    """Add ``tmp`` (typed ``cast``) if absent — brief metadata-only lock.
+
+    Runs the ADD COLUMN on the autocommit ``ac`` so it commits independently of
+    alembic's open transaction manager.
+    """
+    if _column_meta(ac, _TABLE, tmp) is not None:
         return
-    op.execute(text(f'ALTER TABLE public."{_TABLE}" ADD COLUMN "{tmp}" {cast}'))
-    bind.commit()
+    ac.execute(text(f'ALTER TABLE public."{_TABLE}" ADD COLUMN "{tmp}" {cast}'))
 
 
-def _swap(bind, col: str, tmp: str, old: str) -> None:
+def _swap(ac, col: str, tmp: str, old: str) -> None:
     """Rename ``col`` -> ``old``, ``tmp`` -> ``col``, drop ``old``.
 
     Skips entirely if the ``old`` column already exists (re-run safety). Each
     step is a brief metadata-only lock; no data is rewritten.
     """
-    if _column_meta(bind, _TABLE, old) is not None:
+    if _column_meta(ac, _TABLE, old) is not None:
         return
-    op.execute(text(f'ALTER TABLE public."{_TABLE}" RENAME COLUMN "{col}" TO "{old}"'))
-    bind.commit()
-    op.execute(text(f'ALTER TABLE public."{_TABLE}" RENAME COLUMN "{tmp}" TO "{col}"'))
-    bind.commit()
-    op.execute(text(f'ALTER TABLE public."{_TABLE}" DROP COLUMN "{old}"'))
-    bind.commit()
+    ac.execute(text(f'ALTER TABLE public."{_TABLE}" RENAME COLUMN "{col}" TO "{old}"'))
+    ac.execute(text(f'ALTER TABLE public."{_TABLE}" RENAME COLUMN "{tmp}" TO "{col}"'))
+    ac.execute(text(f'ALTER TABLE public."{_TABLE}" DROP COLUMN "{old}"'))
 
 
-def _finalize(bind, col: str, orig: dict) -> None:
+def _finalize(ac, col: str, orig: dict) -> None:
     """Mirror the original column's nullability/default onto the swapped column.
 
     The temp column is added nullable without a default, so after the swap the
@@ -161,44 +170,65 @@ def _finalize(bind, col: str, orig: dict) -> None:
     lossless, so the backfilled data is identical and ``SET NOT NULL`` is safe.
     """
     if orig["is_nullable"] == "NO":
-        op.execute(text(f'ALTER TABLE public."{_TABLE}" ALTER COLUMN "{col}" SET NOT NULL'))
-        bind.commit()
+        ac.execute(text(f'ALTER TABLE public."{_TABLE}" ALTER COLUMN "{col}" SET NOT NULL'))
     if orig["column_default"] is not None:
-        op.execute(text(f'ALTER TABLE public."{_TABLE}" ALTER COLUMN "{col}" SET DEFAULT {orig["column_default"]}'))
-        bind.commit()
+        ac.execute(text(f'ALTER TABLE public."{_TABLE}" ALTER COLUMN "{col}" SET DEFAULT {orig["column_default"]}'))
 
 
-def _convert(bind, *, tmp_suffix: str, cast: str) -> None:
+def _convert(ac, *, tmp_suffix: str, cast: str) -> None:
     """Non-blockingly convert each ``_JSON_COLUMNS`` column via a temp column.
 
     ``tmp_suffix`` names the temporary column (``jsonb`` upgrading ``json`` ->
     ``jsonb``, ``json`` downgrading ``jsonb`` -> ``json``); the held-back column
     is always ``{col}_old``. Additive and idempotent, so a failed run resumes
-    cleanly on re-execution.
+    cleanly on re-execution. Runs on the dedicated autocommit ``ac`` connection,
+    independent of alembic's transaction.
     """
     for col in _JSON_COLUMNS:
-        orig = _column_meta(bind, _TABLE, col)
+        orig = _column_meta(ac, _TABLE, col)
         if orig is None:
             # Column absent (non-standard DB) — nothing to convert.
             continue
         tmp = f"{col}_{tmp_suffix}"
-        _add_temp_column(bind, tmp, cast)
-        _backfill(bind, col, tmp, cast)
-        _swap(bind, col, tmp, f"{col}{_OLD_SUFFIX}")
-        _finalize(bind, col, orig)
+        _add_temp_column(ac, tmp, cast)
+        _backfill(ac, col, tmp, cast)
+        _swap(ac, col, tmp, f"{col}{_OLD_SUFFIX}")
+        _finalize(ac, col, orig)
+
+
+def _autocommit_bind() -> Connection:
+    """Return a fresh autocommit connection from alembic's engine.
+
+    Alembic wraps each migration in ``context.begin_transaction()``; calling
+    ``commit`` on that connection closes the migration transaction so the next
+    statement fails. A dedicated autocommit connection (``isolation_level=
+    "AUTOCOMMIT"``, psycopg2 sync) is independent of that transaction, so each
+    per-statement commit is genuine and the migration stays resumable.
+    """
+    bind = op.get_bind()
+    ac = bind.engine.connect()
+    return ac.execution_options(isolation_level="AUTOCOMMIT")
 
 
 def upgrade() -> None:
     # Postgres-only: plain ``json`` -> ``jsonb`` cast. SQLite uses the ORM model
-    # (generic JSON), so skip on non-Postgres dialects.
-    bind = op.get_bind()
-    if bind.dialect.name != "postgresql":
-        return
-    _convert(bind, tmp_suffix="jsonb", cast="jsonb")
+    # (generic JSON), so skip on non-Postgres dialects. Run all statements on a
+    # dedicated autocommit connection so alembic's migration transaction stays
+    # intact (it records the version row) while each DDL/DML commit is real.
+    ac = _autocommit_bind()
+    try:
+        if ac.dialect.name != "postgresql":
+            return
+        _convert(ac, tmp_suffix="jsonb", cast="jsonb")
+    finally:
+        ac.close()
 
 
 def downgrade() -> None:
-    bind = op.get_bind()
-    if bind.dialect.name != "postgresql":
-        return
-    _convert(bind, tmp_suffix="json", cast="json")
+    ac = _autocommit_bind()
+    try:
+        if ac.dialect.name != "postgresql":
+            return
+        _convert(ac, tmp_suffix="json", cast="json")
+    finally:
+        ac.close()
