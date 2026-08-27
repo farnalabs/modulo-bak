@@ -1305,6 +1305,7 @@ class TestSsoDbResolution:
 
         session = _mock_session(scalar=SimpleNamespace(id=uuid.uuid4()))
         await _set_default_rls_org(session)
+        session.execute.assert_awaited()
 
     async def test_lookup_provider_by_client_id(self) -> None:
         from modulo.auth.sso import _lookup_provider_by_client_id
@@ -1325,6 +1326,7 @@ class TestSsoDbResolution:
 
         session = _mock_session()
         await apply_group_mappings(session, MagicMock(), uuid.uuid4(), ["g1"], ["not-a-dict"])  # type: ignore[list-item]
+        session.execute.assert_not_called()
 
     async def test_apply_group_mappings_skips_invalid_team_id(self) -> None:
         from modulo.auth.sso import apply_group_mappings
@@ -1337,6 +1339,7 @@ class TestSsoDbResolution:
             ["g1"],
             [{"idp_group": "g1", "team_id": "not-a-uuid"}],
         )
+        session.execute.assert_not_called()
 
     async def test_resolve_oidc_provider_from_db(self) -> None:
         from modulo.auth.sso import _resolve_oidc_provider

@@ -171,11 +171,11 @@ class TestLookupProviderHelpers:
 
 class TestOidcProviderParsingEdges:
     def test_empty_string_returns_empty(self) -> None:
-        assert _parse_oidc_providers(_override(modulo_oidc_providers="")) == []
+        assert not _parse_oidc_providers(_override(modulo_oidc_providers=""))
 
     def test_non_array_logs_and_returns_empty(self) -> None:
         providers = _parse_oidc_providers(_override(modulo_oidc_providers=json.dumps({"provider_id": "x"})))
-        assert providers == []
+        assert not providers
 
     def test_require_json_object_rejects_non_string_key(self) -> None:
         with pytest.raises(ValueError, match="non-string key"):
