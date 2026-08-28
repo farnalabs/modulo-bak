@@ -508,12 +508,13 @@ jobs:
           # (Dockerfile.fly COPYs it to /release.sh, matching the [release]
           # command in fly.toml).
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
+          # positional command: --command is ignored without --shell (flyctl) - the machine ran bare bash forever (2026-08-27).
+          # --json captures the launched machine id so it can be verified before the swap.
           RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
-            --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x --memory 1024 --json 2>/dev/null || \
-            fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
-              --entrypoint /bin/bash --command "/release.sh" \
-              --vm-size shared-cpu-1x --memory 1024)"
+            --entrypoint /bin/bash \
+            --vm-size shared-cpu-1x --memory 1024 \
+            --json \
+            "/release.sh")"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
@@ -1155,12 +1156,13 @@ jobs:
           # (Dockerfile.fly COPYs it to /release.sh, matching the [release]
           # command in fly.toml).
           echo "Launching pre-deploy migration machine from ${PREMIGRATE_IMAGE_REF} ..."
+          # positional command: --command is ignored without --shell (flyctl) - the machine ran bare bash forever (2026-08-27).
+          # --json captures the launched machine id so it can be verified before the swap.
           RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
-            --entrypoint /bin/bash --command "/release.sh" \
-            --vm-size shared-cpu-1x --memory 1024 --json 2>/dev/null || \
-            fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
-              --entrypoint /bin/bash --command "/release.sh" \
-              --vm-size shared-cpu-1x --memory 1024)"
+            --entrypoint /bin/bash \
+            --vm-size shared-cpu-1x --memory 1024 \
+            --json \
+            "/release.sh")"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
