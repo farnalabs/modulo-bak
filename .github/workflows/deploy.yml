@@ -520,39 +520,64 @@ jobs:
           # Genuine launch failures (bad image ref) still exit non-zero and
           # are caught below; the state poll after discovery is the real
           # verification.
-          # --json captures the launched machine id so it can be verified before the swap.
+          # `--json` is NOT a supported flag on `fly machine run` in the flyctl
+          # version the deploy step installs (v0.4.87): cobra rejects the unknown
+          # flag and the command exits non-zero, which would abort EVERY deploy.
+          # flyctl instead prints the launched id on a stable human line
+          # (" Machine ID: <id>") at create time, so we capture the raw output
+          # and parse that below.
           RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
             --entrypoint /bin/bash \
             --vm-size shared-cpu-1x --memory 1024 \
             --detach \
-            --json \
             "/release.sh")"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
           fi
 
-          # Capture the machine ID directly from the launch output (flyctl
-          # prints it at create time) instead of re-listing machines and
-          # matching by image. The list-based match is racy (config.image can
-          # be normalized or briefly absent right after launch) and has been
-          # failing intermittently, aborting the whole deploy even though the
-          # migration machine is up.
-          MID="$(printf '%s' "$RUN_OUTPUT" | python3 -c '
-          import json, re, sys
-          text = sys.stdin.read()
+          # Parse the machine id from the launch output (primary path). If the
+          # direct parse misses (e.g. the flyctl output format drifted), fall
+          # back to the bounded polled discovery that lists machines and matches
+          # by image prefix - the previous behaviour - so a single parse miss
+          # can never silently abort the deploy.
+          MID="$(printf '%s' "$RUN_OUTPUT" | python3 deploy/fly/extract_machine_id.py)"
+          if [ -z "$MID" ]; then
+            DISCOVERY_ATTEMPTS=12
+            DISCOVERY_INTERVAL_SEC=5
+            discovery_attempt=0
+            while [ "$discovery_attempt" -lt "$DISCOVERY_ATTEMPTS" ]; do
+              discovery_attempt=$(( discovery_attempt + 1 ))
+              MID="$(fly machine list --app staging-modulo --json 2>/dev/null | python3 -c '
+          import json, os, sys
+          image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
           try:
-              d = json.loads(text)
-              if isinstance(d, dict) and d.get("id"):
-                  sys.stdout.write(d["id"])
-                  sys.exit(0)
+              machines = json.load(sys.stdin)
+          except Exception:
+              machines = []
+          pre = set()
+          try:
+              with open("/tmp/premigrate-preexisting.txt") as f:
+                  pre = {line.strip() for line in f if line.strip()}
           except Exception:
               pass
-          m = re.search(r"Machine\s+ID:\s*([A-Za-z0-9]+)", text)
-          if m:
-              sys.stdout.write(m.group(1))
-              sys.exit(0)
+          for m in machines:
+              mid = m.get("id")
+              cfg = m.get("config") or {}
+              mimage = cfg.get("image") or m.get("image") or ""
+              if mid and image and mimage.startswith(image) and mid not in pre:
+                  print(mid)
+                  break
           ')"
+              if [ -n "$MID" ]; then
+                break
+              fi
+              if [ "$discovery_attempt" -lt "$DISCOVERY_ATTEMPTS" ]; then
+                echo "Pre-migrate machine not identified yet (attempt ${discovery_attempt}/${DISCOVERY_ATTEMPTS}); retrying in ${DISCOVERY_INTERVAL_SEC}s ..."
+                sleep "$DISCOVERY_INTERVAL_SEC"
+              fi
+            done
+          fi
           if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
@@ -1212,39 +1237,64 @@ jobs:
           # Genuine launch failures (bad image ref) still exit non-zero and
           # are caught below; the state poll after discovery is the real
           # verification.
-          # --json captures the launched machine id so it can be verified before the swap.
+          # `--json` is NOT a supported flag on `fly machine run` in the flyctl
+          # version the deploy step installs (v0.4.87): cobra rejects the unknown
+          # flag and the command exits non-zero, which would abort EVERY deploy.
+          # flyctl instead prints the launched id on a stable human line
+          # (" Machine ID: <id>") at create time, so we capture the raw output
+          # and parse that below.
           RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
             --entrypoint /bin/bash \
             --vm-size shared-cpu-1x --memory 1024 \
             --detach \
-            --json \
             "/release.sh")"
           if [ $? -ne 0 ]; then
             echo "::error::Pre-deploy migration machine failed to launch - failing the run so the deploy is aborted; fix the root cause (no silent fallback to release-command migration)."
             exit 1
           fi
 
-          # Capture the machine ID directly from the launch output (flyctl
-          # prints it at create time) instead of re-listing machines and
-          # matching by image. The list-based match is racy (config.image can
-          # be normalized or briefly absent right after launch) and has been
-          # failing intermittently, aborting the whole deploy even though the
-          # migration machine is up.
-          MID="$(printf '%s' "$RUN_OUTPUT" | python3 -c '
-          import json, re, sys
-          text = sys.stdin.read()
+          # Parse the machine id from the launch output (primary path). If the
+          # direct parse misses (e.g. the flyctl output format drifted), fall
+          # back to the bounded polled discovery that lists machines and matches
+          # by image prefix - the previous behaviour - so a single parse miss
+          # can never silently abort the deploy.
+          MID="$(printf '%s' "$RUN_OUTPUT" | python3 deploy/fly/extract_machine_id.py)"
+          if [ -z "$MID" ]; then
+            DISCOVERY_ATTEMPTS=12
+            DISCOVERY_INTERVAL_SEC=5
+            discovery_attempt=0
+            while [ "$discovery_attempt" -lt "$DISCOVERY_ATTEMPTS" ]; do
+              discovery_attempt=$(( discovery_attempt + 1 ))
+              MID="$(fly machine list --app app-modulo --json 2>/dev/null | python3 -c '
+          import json, os, sys
+          image = os.environ.get("PREMIGRATE_IMAGE_REF", "")
           try:
-              d = json.loads(text)
-              if isinstance(d, dict) and d.get("id"):
-                  sys.stdout.write(d["id"])
-                  sys.exit(0)
+              machines = json.load(sys.stdin)
+          except Exception:
+              machines = []
+          pre = set()
+          try:
+              with open("/tmp/premigrate-preexisting.txt") as f:
+                  pre = {line.strip() for line in f if line.strip()}
           except Exception:
               pass
-          m = re.search(r"Machine\s+ID:\s*([A-Za-z0-9]+)", text)
-          if m:
-              sys.stdout.write(m.group(1))
-              sys.exit(0)
+          for m in machines:
+              mid = m.get("id")
+              cfg = m.get("config") or {}
+              mimage = cfg.get("image") or m.get("image") or ""
+              if mid and image and mimage.startswith(image) and mid not in pre:
+                  print(mid)
+                  break
           ')"
+              if [ -n "$MID" ]; then
+                break
+              fi
+              if [ "$discovery_attempt" -lt "$DISCOVERY_ATTEMPTS" ]; then
+                echo "Pre-migrate machine not identified yet (attempt ${discovery_attempt}/${DISCOVERY_ATTEMPTS}); retrying in ${DISCOVERY_INTERVAL_SEC}s ..."
+                sleep "$DISCOVERY_INTERVAL_SEC"
+              fi
+            done
+          fi
           if [ -z "$MID" ]; then
             echo "::error::Could not identify the pre-deploy migration machine after launch - failing the run so the deploy is aborted (migration completion cannot be verified before the swap)."
             exit 1
