@@ -75,7 +75,7 @@ route, so it is tracked here rather than in the manifest registry.
 ## Known Gaps
 
 - **No BDD feature files.** The guard is covered by the dedicated unit
-  suite ``backend/tests/unit/core/test_ssrf.py`` (41 scenarios incl. the
+  suite ``backend/tests/unit/core/test_ssrf.py`` (73 test functions incl. the
   DNS-rebinding pinned-transport tests); there are no pytest-bdd features
   for it.
 - **Pinning rides a private httpcore seam.** ``_PinnedAsyncNetworkBackend``

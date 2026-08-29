@@ -23,7 +23,7 @@ status: covered
 # Secrets Backend
 
 The pluggable at-rest secret store for credential material (connector
-credentials, model-backend API keys, notification endpooints and OTel export
+credentials, model-backend API keys, notification endpoints and OTel export
 keys). The ``SecretsBackend`` ABC exposes async ``get_secret`` / ``set_secret``
 / ``delete_secret``; the factory selects ``fernet`` (default, Fernet-encrypted
 rows in the ``secrets`` table), ``vault`` (HashiCorp Vault) or ``aws`` (Secrets
@@ -66,7 +66,7 @@ rather than in the manifest registry.
       decays to the old key, ``re_encrypt_*`` re-wraps plaintext under the new
       key, and ``rotate_all_encrypted_data`` re-encrypts every encrypted store
       (secrets table, connector instances, model backends, notification
-      endpooints, OTel config, checkpoints / checkpoint blobs / writes),
+      endpoints, OTel config, checkpoints / checkpoint blobs / writes),
       returning per-store counts
 
 ## Known Gaps
