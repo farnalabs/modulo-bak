@@ -943,6 +943,7 @@ export default {
       "run_count": "1 run | {count} runs",
       "previous": "Previous",
       "next": "Next",
+      "page_label": "Page {page}",
       "failed_to_load_runs": "Failed to load runs: {detail}",
       "status_filter": "Status",
       "trigger_type_filter": "Trigger Type",
