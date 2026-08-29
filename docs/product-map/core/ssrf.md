@@ -89,7 +89,7 @@ route, so it is tracked here rather than in the manifest registry.
 - 2026-08-27: **improve-architecture (product-map walk)** — entry added to
   close the feature-graph gap for a shipped infra-only surface whose tests
   and call sites were previously invisible to the product map. Behaviours
-  verified against ``backend/src/modulo/core/ssrf.py`` and the 41-test
+  verified against ``backend/src/modulo/core/ssrf.py`` and the 73-test-function
   ``backend/tests/unit/core/test_ssrf.py`` suite; consumers confirmed in
   ``admin_sso.py``, ``notifications.py``, ``observability.py``,
   ``error_forwarder_config.py``, ``library_sync/client.py`` and the ADR 025
