@@ -17,8 +17,6 @@ Revises: 0150_add_router_no_match_status
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import sqlalchemy as sa
 from alembic import op
 

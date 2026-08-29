@@ -11,9 +11,6 @@ Revises: 0151_fix_constraints
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
-import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0152_dismissed_by_user_id_index"
