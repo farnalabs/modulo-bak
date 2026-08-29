@@ -905,7 +905,7 @@ def build_graph_from_json(
     for node_def in nodes:
         raw_fns[str(node_def["id"])] = _build_raw_node_fn(
             node_def,
-            timeout=node_def.get("timeout_seconds") or pipeline_node_timeout_seconds,
+            timeout=node_def.get("timeout_seconds", pipeline_node_timeout_seconds),
             session_factory=session_factory,
             single_sandbox_node=single_sandbox_node,
         )

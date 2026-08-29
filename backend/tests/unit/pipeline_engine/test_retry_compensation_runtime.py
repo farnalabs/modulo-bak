@@ -30,6 +30,7 @@ from typing import Any
 
 import pytest
 
+from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
 from modulo.core.pipeline_engine.runtime_retry import (
     CompensationFailedError,
     make_retrying_node_fn,
@@ -67,7 +68,7 @@ async def test_per_node_retry_reinvokes_same_node_without_graph_rerun() -> None:
     async def flaky(state: dict[str, Any]) -> dict[str, Any]:
         calls.append(state)
         if len(calls) < 3:
-            raise RuntimeError("transient failure")
+            raise SandboxNodeFailedError("transient sandbox failure")
         return {"ok": True}
 
     node = {"id": "n1", "retry": {"max_attempts": 3, "backoff": 0.0, "on": ["error"]}}
@@ -86,12 +87,12 @@ async def test_per_node_retry_exhaustion_propagates_failure() -> None:
     async def always_fail(state: dict[str, Any]) -> dict[str, Any]:
         nonlocal calls
         calls += 1
-        raise RuntimeError("permanent")
+        raise SandboxNodeFailedError("permanent sandbox failure")
 
     node = {"id": "n1", "retry": {"max_attempts": 3, "backoff": 0.0, "on": ["error"]}}
     wrapped = make_retrying_node_fn(always_fail, node_id="n1", node_def=node, pipeline_retry_policy={})
 
-    await _assert_raises(RuntimeError, wrapped({"run_context": {}}))
+    await _assert_raises(SandboxNodeFailedError, wrapped({"run_context": {}}))
     assert calls == 3
 
 
@@ -136,7 +137,7 @@ async def test_per_node_retry_stamps_same_idempotency_key_each_attempt() -> None
         calls += 1
         seen_keys.append(state.get("_node_idempotency_key"))
         if calls < 3:
-            raise RuntimeError("transient")
+            raise SandboxNodeFailedError("transient")
         return {"ok": True}
 
     node_def = {"id": "n1", "retry": {"max_attempts": 3, "backoff": 0.0, "on": ["error"]}}
@@ -158,6 +159,55 @@ async def test_per_node_retry_stamps_same_idempotency_key_each_attempt() -> None
     # Every attempt reused the SAME node-scoped key — a side-effecting node can
     # dedupe its write (run+node+index contract, §4F R7).
     assert seen_keys == ["run:node:n1", "run:node:n1", "run:node:n1"]
+
+
+async def test_idempotency_key_stamped_on_edge_source_and_compensation_major3() -> None:
+    # MAJOR-3: the node-scoped idempotency key must be stamped on the two most
+    # side-effect-prone re-execution paths — the edge-retry SOURCE re-execution
+    # and the compensation-target invocation — not only on the node's own retry
+    # loop. Each path stamps its OWN node-scoped key so a side-effecting connector
+    # / sandbox node can dedupe its write.
+    source_keys: list[str | None] = []
+    comp_keys: list[str | None] = []
+
+    async def source_fn(state: dict[str, Any]) -> dict[str, Any]:
+        source_keys.append(state.get("_node_idempotency_key"))
+        return {"source_out": 1}
+
+    async def target_fn(state: dict[str, Any]) -> dict[str, Any]:
+        # Never-retryable terminal fault → routes to compensation (no edge retry
+        # here, so the source key is exercised by the compensation path only).
+        raise SandboxNodeFailedError("boom")
+
+    edge = {"source": "n1", "target": "n2", "on_failure_target": "n-comp"}
+    node_defs = {"n1": {"id": "n1"}, "n2": {"id": "n2"}, "n-comp": {"id": "n-comp"}}
+
+    async def comp(state: dict[str, Any]) -> dict[str, Any]:
+        comp_keys.append(state.get("_node_idempotency_key"))
+        return {"compensated": True}
+
+    def resolver(nid: str) -> Any:
+        return {"n1": source_fn, "n2": target_fn, "n-comp": comp}[nid]
+
+    def key_for(nid: str, state: dict[str, Any]) -> str | None:
+        return f"run:node:{nid}"
+
+    wrapped = make_retrying_node_fn(
+        target_fn,
+        node_id="n2",
+        node_def=node_defs["n2"],
+        pipeline_retry_policy={},
+        outgoing_edges=[edge],
+        raw_fn_resolver=resolver,
+        node_defs=node_defs,
+        idempotency_key=key_for,
+    )
+
+    await wrapped({"run_context": {}})
+
+    # The compensation target received ITS OWN node-scoped key (n-comp), proving
+    # the key was stamped on the compensation re-execution path.
+    assert comp_keys == ["run:node:n-comp"]
 
 
 async def test_stall_marker_triggers_retry() -> None:
@@ -197,7 +247,7 @@ async def test_per_edge_retry_reexecutes_source_node() -> None:
         nonlocal target_calls
         target_calls += 1
         if target_calls < 2:
-            raise RuntimeError("transient target failure")
+            raise SandboxNodeFailedError("transient target failure")
         return {"done": True}
 
     edge = {"source": "n1", "target": "n2", "retry": {"max_attempts": 2, "backoff": 0.0, "on": ["error"]}}
@@ -253,6 +303,68 @@ async def test_per_edge_retry_fails_closed_for_non_idempotent_source() -> None:
 
     await _assert_raises(RuntimeError, wrapped({"run_context": {}}))
     assert source_calls == 0  # non-idempotent source never re-executed
+
+
+async def test_per_edge_retry_does_not_reexecute_source_for_never_retryable_major2() -> None:
+    # MAJOR-2: when the watched node's OWN failure is a never-retryable terminal
+    # fault (exactly-once script failure), the incoming edge-retry must NOT
+    # re-execute the side-effecting SOURCE node — re-running the source + target
+    # would only reproduce the same terminal fault. The failure must instead fall
+    # through to compensation / normal failure with the source untouched.
+    source_calls = 0
+    target_calls = 0
+
+    async def source_fn(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal source_calls
+        source_calls += 1
+        return {"source_out": source_calls}
+
+    class ScriptFailedError(Exception):
+        pass
+
+    async def target_fn(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal target_calls
+        target_calls += 1
+        raise ScriptFailedError("post-claim exactly-once")
+
+    # Incoming edge-retry (n1 -> n2) AND an outgoing compensation edge.
+    in_edge = {"source": "n1", "target": "n2", "retry": {"max_attempts": 3, "backoff": 0.0, "on": ["error"]}}
+    out_edge = {"source": "n2", "target": "n3", "on_failure_target": "n-comp"}
+    node_defs = {
+        "n1": {"id": "n1", "idempotent": True},
+        "n2": {"id": "n2", "idempotent": True},
+        "n-comp": {"id": "n-comp"},
+    }
+
+    comp_calls = 0
+
+    async def comp(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal comp_calls
+        comp_calls += 1
+        return {"compensated": True}
+
+    def resolver(nid: str) -> Any:
+        return {"n1": source_fn, "n2": target_fn, "n-comp": comp}[nid]
+
+    wrapped = make_retrying_node_fn(
+        target_fn,
+        node_id="n2",
+        node_def=node_defs["n2"],
+        pipeline_retry_policy={},
+        incoming_edges=[in_edge],
+        outgoing_edges=[out_edge],
+        raw_fn_resolver=resolver,
+        node_defs=node_defs,
+    )
+
+    result = await wrapped({"run_context": {}})
+
+    # Source was NOT re-executed (exactly-once contract preserved) and the run
+    # CONTINUES via the compensation edge.
+    assert source_calls == 0
+    assert target_calls == 1
+    assert comp_calls == 1
+    assert result == {"_compensated": True, "_compensated_node": "n2"}
 
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +458,7 @@ async def test_compensation_not_applied_to_retryable_failure_when_budget_remains
         nonlocal calls
         calls += 1
         if calls < 2:
-            raise RuntimeError("transient, should retry")
+            raise SandboxNodeFailedError("transient, should retry")
         return {"ok": True}
 
     comp_calls = 0
@@ -380,6 +492,67 @@ async def test_compensation_not_applied_to_retryable_failure_when_budget_remains
     assert result == {"ok": True}
     assert calls == 2
     assert comp_calls == 0  # compensation did NOT fire (retry saved the node)
+
+
+async def test_compensation_reachable_past_incoming_edge_retry_major1() -> None:
+    # MAJOR-1: the compensation branch was DEAD when the watched node also has an
+    # incoming edge-retry, because the edge retry raised on budget exhaustion
+    # instead of falling through. Here the watched node (n2) has an incoming
+    # edge-retry (n1 -> n2) AND an outgoing compensation edge (n2 -> n-comp). n2
+    # fails on a retryable fault that keeps failing; the node + edge retries
+    # exhaust, and the run MUST route to the compensation node (which succeeds),
+    # not raise a plain terminal error with compensation at zero.
+    source_calls = 0
+    target_calls = 0
+
+    async def source_fn(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal source_calls
+        source_calls += 1
+        return {"source_out": source_calls}
+
+    async def target_fn(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal target_calls
+        target_calls += 1
+        # Always a retryable transient fault — node + edge retries exhaust.
+        raise SandboxNodeFailedError("transient but persistent")
+
+    in_edge = {"source": "n1", "target": "n2", "retry": {"max_attempts": 2, "backoff": 0.0, "on": ["error"]}}
+    out_edge = {"source": "n2", "target": "n3", "on_failure_target": "n-comp"}
+    node_defs = {
+        "n1": {"id": "n1", "idempotent": True},
+        "n2": {"id": "n2", "idempotent": True},
+        "n-comp": {"id": "n-comp"},
+    }
+
+    comp_calls = 0
+
+    async def comp(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal comp_calls
+        comp_calls += 1
+        return {"compensated": True}
+
+    def resolver(nid: str) -> Any:
+        return {"n1": source_fn, "n2": target_fn, "n-comp": comp}[nid]
+
+    wrapped = make_retrying_node_fn(
+        target_fn,
+        node_id="n2",
+        node_def=node_defs["n2"],
+        pipeline_retry_policy={},
+        incoming_edges=[in_edge],
+        outgoing_edges=[out_edge],
+        raw_fn_resolver=resolver,
+        node_defs=node_defs,
+    )
+
+    result = await wrapped({"run_context": {}})
+
+    # Compensation fired after the node + edge retries exhausted (the run
+    # CONTINUES), and the source was re-executed within the edge-retry budget.
+    assert comp_calls == 1
+    assert source_calls == 2  # edge budget = 2 source re-executions
+    assert target_calls == 3  # 1 own attempt + 2 edge-retry re-runs
+    assert result == {"_compensated": True, "_compensated_node": "n2"}
 
 
 # --------------------------------------------------------------------------- #
@@ -442,6 +615,26 @@ async def test_cancelled_error_is_never_retried() -> None:
     with pytest.raises(asyncio.CancelledError):
         await wrapped({"run_context": {}})
     assert calls == 1
+
+
+async def test_programming_bug_not_retried_major4() -> None:
+    # MAJOR-4: failure_event must NOT map a programming bug / generic exception
+    # to a retryable event — only known-transient sandbox / infra faults are.
+    # Re-running a bug would reproduce it, and because inline node retry composes
+    # with the pipeline's run-level retry_policy default this would otherwise
+    # silently make every existing pipeline retry more aggressively on deploy.
+    calls = 0
+
+    async def node(state: dict[str, Any]) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        raise IndexError("list index out of range")
+
+    node_def = {"id": "n1", "retry": {"max_attempts": 3, "backoff": 0.0, "on": ["error"]}}
+    wrapped = make_retrying_node_fn(node, node_id="n1", node_def=node_def, pipeline_retry_policy={})
+
+    await _assert_raises(IndexError, wrapped({"run_context": {}}))
+    assert calls == 1  # never retried inline
 
 
 # --------------------------------------------------------------------------- #

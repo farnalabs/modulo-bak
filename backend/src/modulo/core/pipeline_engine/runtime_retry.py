@@ -48,7 +48,10 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from langgraph.errors import NodeCancelledError
+
 from modulo.core.pipeline_engine import retry_compensation as rc
+from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
 from modulo.core.pipeline_engine.retry_compensation import NodeRetryPolicy
 
 _log = logging.getLogger(__name__)
@@ -95,21 +98,41 @@ def _is_never_retryable(exc: BaseException) -> bool:
     return isinstance(exc, asyncio.CancelledError) or type(exc).__name__ in _NEVER_RETRYABLE_NAMES
 
 
+# Transient error classes whose node body is SAFE to re-execute inline (a retry
+# can dedupe / re-attempt without causing a double side effect). A programming
+# bug (``IndexError`` / ``ValueError`` / generic ``RuntimeError``) is NOT in this
+# set, so ``failure_event`` returns ``None`` for it — a bug must NOT be silently
+# retried on deploy. This is a *conscious* decision (FAR-402 MAJOR-4): the inline
+# node retry composes with the pipeline's run-level ``retry_policy`` default
+# (``resolve_node_retry``), so an over-broad mapping would make EVERY existing
+# pipeline that sets ``retry_policy`` retry far more aggressively the moment this
+# ships. ``TimeoutError`` maps to the dedicated ``"timeout"`` event; the
+# retryable ``SandboxNodeFailedError`` family (and the transient
+# ``NodeCancelledError``) map to ``"error"``.
+_TRANSIENT_ERROR_CLASSES: tuple[type[BaseException], ...] = (SandboxNodeFailedError, NodeCancelledError)
+
+
 def failure_event(exc: BaseException) -> str | None:
     """Classify a node-body exception to a retryable ``retry`` event, or None.
 
-    Returns ``"timeout"`` for a ``TimeoutError``, ``"error"`` for a transient
-    sandbox / infrastructure failure (``SandboxNodeFailedError`` and its
-    retryable subclasses) or any generic non-terminal exception, and ``None``
-    for a never-retryable terminal fault. Internal cancellation is not retried.
+    Returns ``"timeout"`` for a ``TimeoutError`` and ``"error"`` for a known
+    transient sandbox / infrastructure failure (``SandboxNodeFailedError`` and
+    its retryable subclasses, plus the transient ``NodeCancelledError``). Any
+    other exception — including programming bugs like ``IndexError`` and generic
+    ``RuntimeError`` — maps to ``None`` (never retry inline): re-running a bug
+    would only reproduce it, and because the inline node retry composes with the
+    pipeline's run-level ``retry_policy`` default an over-broad mapping would
+    silently make every existing pipeline retry more aggressively on deploy.
+    Internal cancellation (``asyncio.CancelledError``) is never retried.
     """
     if _is_never_retryable(exc):
         return None
     if isinstance(exc, TimeoutError):
         return "timeout"
-    # SandboxNodeFailedError & subclasses, NodeCancelledError (transient
-    # cancellation), and generic unexpected failures all map to "error".
-    return "error"
+    if isinstance(exc, _TRANSIENT_ERROR_CLASSES):
+        return "error"
+    # Anything else (programming bugs, generic exceptions) is non-retryable.
+    return None
 
 
 def _stall_event(output: Any) -> bool:
@@ -222,26 +245,58 @@ def make_retrying_node_fn(
         source_id = rc._string_or_default(edge.get("source", edge.get("source_node_id")))
         return rc.node_is_fail_closed(node_defs.get(source_id))
 
-    async def _node_key(state: dict[str, Any]) -> str | None:
-        return idempotency_key(node_id, state) if idempotency_key is not None else None
+    async def _invoke_with_key(
+        fn: Callable[[dict[str, Any]], Any],
+        key_node_id: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke a node callable, stamping the node-scoped idempotency key first.
 
-    async def _invoke_raw(state: dict[str, Any]) -> dict[str, Any]:
-        # Stamp the node-scoped idempotency key onto a copy of the state so a
-        # side-effecting node can dedupe its write across retry attempts.
-        key = await _node_key(state)
+        The key is stamped onto a COPY of ``state`` (never the caller's snapshot)
+        so a side-effecting node can dedupe its write across retry/edge/
+        compensation re-executions. This is the single choke point that wires the
+        documented ``_NODE_IDEMPOTENCY_KEY`` guarantee onto EVERY re-execution
+        path — the node's own retry, the per-edge SOURCE re-execution, the
+        edge-retry target re-run, and the compensation-target invocation
+        (FAR-402 MAJOR-3). The runtime provides ``idempotency_key`` so it can read
+        the run identity from ``state``.
+        """
+        key = idempotency_key(key_node_id, state) if idempotency_key is not None else None
         if key is not None:
             state = dict(state)
             state[_NODE_IDEMPOTENCY_KEY] = key
-        return await _await_result(raw_fn, state)
+        return await _await_result(fn, state)
 
-    async def _edge_retry(state: dict[str, Any]) -> dict[str, Any] | None:
+    async def _invoke_raw(state: dict[str, Any]) -> dict[str, Any]:
+        # Stamp the node-scoped idempotency key before the node body runs so a
+        # side-effecting node can dedupe its write across retry attempts.
+        return await _invoke_with_key(raw_fn, node_id, state)
+
+    async def _edge_retry(state: dict[str, Any], failed_event: str | None) -> dict[str, Any] | None:
         """Re-execute an incoming edge's SOURCE node; return the re-run result.
 
         Per-edge retry fires ONLY when the node's own retry budget is exhausted
         and an incoming edge declares a transition ``retry``. It re-executes the
         SOURCE node (not the target). Fail-closed: a non-idempotent source is
         never re-executed.
+
+        ``failed_event`` is the retry event of the watched node's OWN failure (the
+        exception that landed us here). It is classified BEFORE any source is
+        re-executed (FAR-402 MAJOR-2): if the watched node failed on a
+        never-retryable terminal fault (e.g. ``ScriptFailedError``), re-executing
+        the source and re-running the target would only reproduce the same
+        exactly-once fault — so we fall through to compensation / normal failure
+        WITHOUT re-running a side-effecting source.
+
+        When the edge budget is exhausted (or the edge failure is non-retryable)
+        the edge is skipped and the next incoming edge is tried; if no eligible
+        edge produces a result we return ``None`` so ``_wrapped`` proceeds to
+        compensation (FAR-402 MAJOR-1 — the trailing fall-through must be live,
+        not dead code behind a raised exception).
         """
+        # Never-retryable watched-node failure → do NOT re-run the source.
+        if failed_event is None:
+            return None
         for edge in incoming_edges:
             if not rc.edge_retry_reattempts_source(edge):
                 continue
@@ -255,28 +310,28 @@ def make_retrying_node_fn(
                 continue
             edge_policy = rc.parse_edge_retry(edge.get("retry")) or effective_policy
             attempts = 0
-            last_exc: BaseException | None = None
-            # Re-execute the source, then re-run THIS node against the fresh
-            # source output. The edge budget bounds the source re-executions.
+            # Re-execute the source (with its own idempotency key), then re-run
+            # THIS node against the fresh source output. The edge budget bounds
+            # the source re-executions.
             while attempts < edge_policy.max_attempts:
                 attempts += 1
                 try:
                     await _sleep(attempts, edge_policy)
-                    src_out = await _await_result(source_fn, state)
+                    src_out = await _invoke_with_key(source_fn, source_id, state)
                     merged = dict(state)
                     if isinstance(src_out, dict):
                         merged.update(src_out)
-                    return await _await_result(raw_fn, merged)
+                    return await _invoke_with_key(raw_fn, node_id, merged)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    last_exc = exc
                     event = failure_event(exc)
                     if event is None or not rc.node_retries_on(edge_policy, event):
                         break
-            if last_exc is not None:
-                raise last_exc
-            return None
+            # Edge budget exhausted / non-retryable → fall through to the next
+            # edge, or to compensation / normal failure. Do NOT raise here, or the
+            # compensation branch becomes unreachable (FAR-402 MAJOR-1).
+            continue
         return None
 
     async def _wrapped(state: dict[str, Any]) -> dict[str, Any]:
@@ -308,7 +363,10 @@ def make_retrying_node_fn(
                     await _sleep(attempts, effective_policy)
                     continue
                 # Per-edge retry: node-retry exhausted → re-execute the source.
-                edge_result = await _edge_retry(state)
+                # Pass the watched node's own failure event so the edge retry can
+                # skip a side-effecting source re-execution for a never-retryable
+                # terminal fault (FAR-402 MAJOR-2).
+                edge_result = await _edge_retry(state, event)
                 if edge_result is not None:
                     return edge_result
                 # Compensation edge: terminal failure with an on_failure_target.
@@ -317,7 +375,7 @@ def make_retrying_node_fn(
                     comp_fn = raw_fn_resolver(comp_target)
                     if comp_fn is not None:
                         try:
-                            await _await_result(comp_fn, state)
+                            await _invoke_with_key(comp_fn, comp_target, state)
                             return _compensated_marker(node_id)
                         except asyncio.CancelledError:
                             raise
