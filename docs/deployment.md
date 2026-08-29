@@ -307,8 +307,9 @@ Modulo supports three deployment modes depending on your needs.
 
 ### Standalone (single-user, local)
 
-```
+```bash
 git clone https://github.com/farnalabs/modulo   # or install the farnalabs-modulo package
+cd backend
 uv sync
 MODULO_DB=sqlite uv run uvicorn modulo.api.main:app --port 8000
 ```
