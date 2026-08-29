@@ -22,6 +22,7 @@ the pre-trigger query:
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from collections.abc import Generator
@@ -201,9 +202,12 @@ class TestCanonicalPayloadHash:
         assert canonical_payload_hash(left) == canonical_payload_hash(right)
 
     def test_unicode_escapes_normalised(self) -> None:
-        # "\u00e9" in a parsed dict is the same Python str as "é" — both
-        # serialize identically, so the hash is encoding-independent.
-        assert canonical_payload_hash({"name": "caf\u00e9"}) == canonical_payload_hash({"name": "café"})
+        # A raw webhook body may spell "é" as "\u00e9". json.loads decodes the
+        # escape to the same Python str as a literal "é", so the canonical hash
+        # must be identical regardless of which encoding the sender used.
+        assert canonical_payload_hash({"name": "caf\u00e9"}) == canonical_payload_hash(
+            json.loads('{"name": "caf\\u00e9"}')
+        )
 
     def test_different_payloads_differ(self) -> None:
         assert canonical_payload_hash({"event": "push", "ref": "main"}) != canonical_payload_hash(
