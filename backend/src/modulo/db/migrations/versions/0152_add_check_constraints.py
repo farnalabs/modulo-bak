@@ -91,7 +91,7 @@ def upgrade() -> None:
     )
     op.create_check_constraint("ck_error_group_count", "error_groups", "count >= 0")
     op.create_check_constraint("ck_daily_run_count_run_count", "org_daily_run_counts", "run_count >= 0")
-    op.create_check_constraint("ck_audit_event_event_count", "audit_events", "event_count >= 0")
+    op.create_check_constraint("ck_audit_event_event_count", "audit_chain_heads", "event_count >= 0")
     op.create_check_constraint("ck_journey_run_count", "journeys", "run_count >= 0")
     op.create_check_constraint("ck_cost_component_sort_order", "cost_components", "sort_order >= 0")
     op.create_check_constraint(
@@ -137,7 +137,7 @@ def downgrade() -> None:
     )
     op.drop_constraint("ck_cost_component_sort_order", "cost_components", type_="check")
     op.drop_constraint("ck_journey_run_count", "journeys", type_="check")
-    op.drop_constraint("ck_audit_event_event_count", "audit_events", type_="check")
+    op.drop_constraint("ck_audit_event_event_count", "audit_chain_heads", type_="check")
     op.drop_constraint("ck_daily_run_count_run_count", "org_daily_run_counts", type_="check")
     op.drop_constraint("ck_error_group_count", "error_groups", type_="check")
     op.drop_constraint(
