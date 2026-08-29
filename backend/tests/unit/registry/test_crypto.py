@@ -271,7 +271,7 @@ class TestPEMCryptoV2:
     def test_sign_rejects_malformed_pem(self):
         from modulo.registry.crypto import sign
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Could not deserialize key data"):
             sign("-----BEGIN PRIVATE KEY-----\ngarbage\n-----END PRIVATE KEY-----", b"data")
 
     def test_verify_rejects_non_ed25519_public_key(self):
