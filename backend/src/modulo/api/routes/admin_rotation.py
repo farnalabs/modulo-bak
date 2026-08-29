@@ -98,6 +98,20 @@ async def rotate_key(
 
         old_key = req.old_fernet_key or settings.fernet_key
 
+        # Rotation runs cross-org on the modulo_system (BYPASSRLS) role. If that
+        # role is not provisioned (MODULO_SYSTEM_DATABASE_URL empty) the system
+        # session factory silently falls back to the NOBYPASSRLS app role, which
+        # makes the rotation a zero-row no-op. Refuse loudly rather than
+        # re-introduce the exact silent failure this fix addresses.
+        if not settings.modulo_system_database_url:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Fernet key rotation is unavailable: the modulo_system role is "
+                    "not provisioned (MODULO_SYSTEM_DATABASE_URL is unset)."
+                ),
+            )
+
         global _rotation_in_progress
         if _rotation_in_progress:
             raise HTTPException(
@@ -216,6 +230,31 @@ async def _run_rotation_background(
     RLS and is the same cross-org mechanism used by the retention/system crons.
     """
     global _rotation_in_progress, _last_rotation_result
+
+    # Defensive guard: if the modulo_system role is unprovisioned, the system
+    # factory silently falls back to the NOBYPASSRLS app role and the rotation
+    # becomes a zero-row no-op (the exact bug this fix prevents). Refuse loudly
+    # instead of reporting a hollow "completed" with 0 rows.
+    settings = get_settings()
+    if not settings.modulo_system_database_url:
+        _log.error(
+            "rotation.system_role_unprovisioned",
+            extra={
+                "reason": (
+                    "MODULO_SYSTEM_DATABASE_URL unset — refusing to rotate on the "
+                    "NOBYPASSRLS app role (would silently no-op on RLS-scoped tables)"
+                )
+            },
+        )
+        _last_rotation_result = {
+            "status": "failed",
+            "error": (
+                "modulo_system role unprovisioned (MODULO_SYSTEM_DATABASE_URL unset); "
+                "rotation refused to avoid a silent no-op."
+            ),
+        }
+        _rotation_in_progress = False
+        return
 
     try:
         async with _make_system_session_factory()() as session, session.begin():
