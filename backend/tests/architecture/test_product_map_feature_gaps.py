@@ -168,14 +168,51 @@ _CITATION_FIELDS = ("code", "unit-tests", "bdd", "adr")
 _BDD_ROOT = REPO_ROOT / "backend" / "tests" / "bdd"
 
 
+def _resolve_dir_arg(text: str, module: Path, name: str) -> Path | None:
+    """Resolve a variable that a step module passes to ``scenarios()`` as a directory.
+
+    Handles the two forms seen in the suite:
+
+    - a plain string literal, e.g. ``_features_dir = "tests/bdd/features/events"``
+    - a ``Path(__file__).resolve().parent[.parent...] / "a" / "b"`` expression, e.g.
+      ``_features_dir = str(Path(__file__).resolve().parent.parent / "features" / "events")``
+
+    Returns the resolved directory, or ``None`` when the assignment cannot be
+    resolved (so the caller simply skips it rather than producing a false negative).
+    """
+    assign = re.search(rf"\b{name}\s*=\s*([^\n;]+)", text)
+    if assign is None:
+        return None
+    rhs = assign.group(1).strip()
+    quoted = re.findall(r'["\']([^"\']+)["\']', rhs)
+    if not quoted:
+        return None
+    if "__file__" in rhs or "Path(" in rhs:
+        parents = len(re.findall(r"\.parent", rhs))
+        directory = module
+        for _ in range(parents):
+            directory = directory.parent
+    else:
+        directory = module.parent
+    for segment in quoted:
+        directory = directory / segment
+    return directory.resolve()
+
+
 def _registered_bdd_features() -> set[Path]:
     """Every ``.feature`` file wired to a ``scenarios(...)`` load call.
 
     pytest-bdd feature files only execute when a step module loads them via
-    ``scenarios("...")`` (or an inline ``scenarios`` inside a ``contextlib``
-    suppress). Step modules live both under ``backend/tests/bdd/steps/`` and as
-    siblings of their features under ``backend/tests/bdd/features/*/``; each ref
-    resolves relative to the module that declares it.
+    ``scenarios("...")`` (string-literal feature path) or via a directory
+    registration such as ``scenarios(_features_dir)`` (where ``_features_dir``
+    points at a features directory - e.g. ``test_sse_event_bus.py`` loads every
+    ``.feature`` under ``backend/tests/bdd/features/events/`` this way).
+
+    Both forms are detected: string-literal paths resolve relative to the module
+    that declares them, and directory arguments register every ``.feature`` file
+    found beneath the resolved directory. This keeps the coverage assertion in
+    ``test_bdd_citations_are_registered_coverage`` free of false positives for
+    directory-loaded features.
     """
     registered: set[Path] = set()
     if not _BDD_ROOT.is_dir():
@@ -189,6 +226,14 @@ def _registered_bdd_features() -> set[Path]:
             target = (module.parent / ref).resolve()
             if target.is_file():
                 registered.add(target)
+        for name in re.findall(r"scenarios\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", text):
+            if name == "scenarios":
+                continue
+            directory = _resolve_dir_arg(text, module, name)
+            if directory is None or not directory.is_dir():
+                continue
+            for feature in directory.rglob("*.feature"):
+                registered.add(feature.resolve())
     return registered
 
 
