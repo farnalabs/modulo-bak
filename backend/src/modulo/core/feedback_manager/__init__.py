@@ -224,7 +224,7 @@ async def _get_or_create_feedback_record(
         account_id=account_id,
         rejection_reason=rejection_reason,
         rejected_output=rejected_output,
-        producing_node_id=node_id,
+        producing_node_id=UUID(node_id),
         feedback_status="correcting",
         feedback_handler_type="human",
     )
@@ -397,7 +397,7 @@ class FeedbackManager:
             account_id=account_id,
             rejection_reason=stripped_reason,
             rejected_output=rejected_output,
-            producing_node_id=producing_node_id,
+            producing_node_id=UUID(producing_node_id),
             producing_agent_id=producing_agent_id,
             feedback_status="pending",
             feedback_handler_type=feedback_handler_type,
@@ -858,7 +858,7 @@ class FeedbackManager:
         idem_key = build_idempotency_key(
             org_id=self._org_id,
             run_id=record.run_id,
-            node_id=record.producing_node_id,
+            node_id=str(record.producing_node_id),
             correction_id=correction.id,
             redacted_input=redacted_input,
         )

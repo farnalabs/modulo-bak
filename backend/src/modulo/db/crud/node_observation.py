@@ -42,7 +42,7 @@ async def observe_node(
         id=uuid.uuid4(),
         organisation_id=organisation_id,
         run_id=run_id,
-        node_id=node_id,
+        node_id=uuid.UUID(node_id),
         human_observed_by=observed_by,
         human_observed_at=datetime.now(UTC),
     )

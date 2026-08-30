@@ -41,6 +41,8 @@ from modulo.db.models.base import Base
 from modulo.db.models.run import Run
 from modulo.db.models.run_evidence import RunEvidence
 
+_NODE_A = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -440,7 +442,7 @@ class TestRunEvidenceProbe:
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
         assert rows[0].run_id == run_id
-        assert rows[0].node_id == "node-a"
+        assert rows[0].node_id == _NODE_A
         assert rows[0].evidence_state == "verified_empty"
 
     async def test_has_work_any_positive_wins(self, sqlite_factory) -> None:
@@ -693,7 +695,7 @@ class TestSandboxProviderUnavailablePaths:
                 provider=provider,
                 session_factory=sqlite_factory,
                 run_id=uuid.uuid4(),
-                node_id="node-a",
+                node_id=str(_NODE_A),
             )
         )
         assert result == EvidenceResult.unverifiable
@@ -717,7 +719,7 @@ class TestSandboxProviderUnavailablePaths:
                     provider=_CancellingProvider(),
                     session_factory=sqlite_factory,
                     run_id=uuid.uuid4(),
-                    node_id="node-a",
+                    node_id=str(_NODE_A),
                 )
             )
 
@@ -793,7 +795,7 @@ class TestReconcileNoopEvidence:
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
         assert rows[0].run_id == run_id
-        assert rows[0].node_id == "node-a"
+        assert rows[0].node_id == _NODE_A
 
     async def test_skips_runs_that_already_have_evidence(self, sqlite_factory) -> None:
         run_id = uuid.uuid4()
@@ -949,7 +951,7 @@ class TestEvidenceEnabled:
             provider=object(),  # type: ignore[arg-type]  # never touched when disabled
             session_factory=object(),  # type: ignore[arg-type]
             run_id=uuid.uuid4(),
-            node_id="node-a",
+            node_id=str(_NODE_A),
         )
         assert result == EvidenceResult.unverifiable
 

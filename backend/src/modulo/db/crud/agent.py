@@ -64,7 +64,7 @@ async def create_agent(
         max_input_length=max_input_length,
         library_id=library_id,
         prompt_always_visible=prompt_always_visible,
-        template_id=template_id,
+        template_id=uuid.UUID(template_id) if template_id is not None else None,
         agent_command=agent_command,
         required_environment_capabilities=required_environment_capabilities or [],
     )

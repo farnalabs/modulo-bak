@@ -75,6 +75,7 @@ def downgrade() -> None:
         "run_evidence",
         "node_id",
         type_=sa.String(length=255),
+        postgresql_using="node_id::text",
         existing_type=sa.Uuid(),
         existing_nullable=False,
     )
@@ -85,6 +86,7 @@ def downgrade() -> None:
         "node_observations",
         "node_id",
         type_=sa.String(length=255),
+        postgresql_using="node_id::text",
         existing_type=sa.Uuid(),
         existing_nullable=False,
     )
@@ -94,6 +96,7 @@ def downgrade() -> None:
         "feedback_records",
         "producing_node_id",
         type_=sa.String(length=255),
+        postgresql_using="producing_node_id::text",
         existing_type=sa.Uuid(),
         existing_nullable=False,
     )
@@ -101,6 +104,7 @@ def downgrade() -> None:
         "agents",
         "template_id",
         type_=sa.String(length=255),
+        postgresql_using="template_id::text",
         existing_type=sa.Uuid(),
         existing_nullable=True,
     )

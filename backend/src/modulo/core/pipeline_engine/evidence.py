@@ -392,7 +392,7 @@ async def write_evidence_row(
             session.add(
                 RunEvidence(
                     run_id=run_id,
-                    node_id=node_id,
+                    node_id=UUID(node_id),
                     evidence_state=evidence_state,
                     evidence_detail=evidence_detail,
                 )
