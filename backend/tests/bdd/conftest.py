@@ -1022,15 +1022,19 @@ def _shared_teams_client(state: dict[str, Any], mock_session) -> Any:
     steps build their own client configured for the current org role.
     """
     role = state.get("org_role", "admin")
-    return next(
-        _make_test_client(
-            mock_session,
-            username="testuser",
-            organisation_id=ORG_ID,
-            account_id=USER_ID,
-            org_role=role,
-        )
+    gen = _make_test_client(
+        mock_session,
+        username="testuser",
+        organisation_id=ORG_ID,
+        account_id=USER_ID,
+        org_role=role,
     )
+    # Keep the generator alive for the scenario: its ``finally`` clears
+    # ``app.dependency_overrides``, so discarding it (via ``next(...)``) lets the
+    # GC run the cleanup before the request is made, dropping the auth override
+    # and making every call fall through to real auth (401).
+    state.setdefault("_client_generators", []).append(gen)
+    return next(gen)
 
 
 @when(
