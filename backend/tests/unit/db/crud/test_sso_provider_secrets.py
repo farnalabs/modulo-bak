@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
 
 from modulo.auth.secret_storage import DecryptionError, decode_stored_secret
 from modulo.db.crud.sso_provider import (
@@ -193,6 +194,74 @@ async def test_create_provider_global_dedupe_two_orgs_same_name() -> None:
     assert provider_a.provider_id == "okta"
     assert provider_b.provider_id == "okta-2"
     assert provider_a.provider_id != provider_b.provider_id
+
+
+async def test_create_provider_global_dedupe_real_system_session() -> None:
+    """Regression test for the autobegin bug (FAR-464 CHANGES_REQUESTED #1).
+
+    When MODULO_SYSTEM_DATABASE_URL is set, ``create_provider`` runs the global
+    slug scan on the modulo_system session, which is built with autobegin=False.
+    The previous code called ``_unique_provider_id`` without an explicit
+    transaction, raising ``InvalidRequestError`` and 503-ing the admin create
+    endpoint. AsyncMock-based tests cannot catch this because the mock never
+    enforces real autobegin semantics — so this test uses a REAL in-transaction
+    system session (autobegin=False) backed by SQLite to prove cross-org dedupe
+    works without the autobegin error.
+    """
+    key = Fernet.generate_key().decode()
+    eng: AsyncEngine = create_async_engine(
+        "sqlite+aiosqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+    )
+    from modulo.db.models.sso_provider import SsoProvider
+
+    async with eng.begin() as conn:
+        await conn.run_sync(lambda sync_conn: SsoProvider.__table__.create(sync_conn, checkfirst=True))
+
+    # The system session mirrors the real modulo_system factory (autobegin=False);
+    # the app session uses the default autobegin=True but is begun explicitly.
+    app_maker = async_sessionmaker(eng, expire_on_commit=False)
+    sys_maker = async_sessionmaker(eng, expire_on_commit=False, autobegin=False)
+
+    org_a = uuid.uuid4()
+    org_b = uuid.uuid4()
+
+    app_session = app_maker()
+    system_session = sys_maker()
+    async with app_session.begin():
+        app_session.add(
+            SsoProvider(
+                id=uuid.uuid4(),
+                organisation_id=org_a,
+                provider_type="oidc",
+                name="Okta",
+                provider_id="okta",
+            )
+        )
+        await app_session.flush()
+
+    with (
+        patch(
+            "modulo.db.crud.sso_provider.get_settings",
+            return_value=SimpleNamespace(modulo_system_database_url="sqlite+aiosqlite:///system"),
+        ),
+        patch("modulo.db.crud.sso_provider.append_audit_event", new_callable=AsyncMock),
+    ):
+        async with app_session.begin():
+            provider = await create_provider(
+                app_session,
+                provider_type="oidc",
+                name="Okta",
+                fernet_key=key,
+                org_id=org_b,
+                system_session=system_session,
+            )
+
+    # org_b's "Okta" must be globally deduped against org_a's "okta" -> okta-2.
+    assert provider.provider_id == "okta-2"
+
+    await app_session.close()
+    await system_session.close()
+    await eng.dispose()
 
 
 async def test_create_provider_falls_back_to_app_session_scan() -> None:

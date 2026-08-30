@@ -166,7 +166,20 @@ async def create_provider(
                 scan_session = system_session
         except Exception:
             logger.warning("sso_provider.settings_unavailable", exc_info=True)
-    pid = await _unique_provider_id(scan_session, pid, org_id)
+
+    if scan_session is system_session:
+        # The modulo_system session factory is built with autobegin=False, so the
+        # slug scan needs an explicit transaction — the read paths
+        # (_read_system_oidc_provider, _get_enabled_saml_global, ...) all wrap
+        # their system reads in `async with system_session.begin():`. Without it,
+        # session.execute() raises InvalidRequestError and the admin create
+        # endpoint 503s whenever MODULO_SYSTEM_DATABASE_URL is set. The app
+        # session already has a transaction begun by the caller, so it is used
+        # directly.
+        async with scan_session.begin():
+            pid = await _unique_provider_id(scan_session, pid, org_id)
+    else:
+        pid = await _unique_provider_id(scan_session, pid, org_id)
 
     provider = SsoProvider(
         provider_type=provider_type,

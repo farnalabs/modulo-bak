@@ -357,7 +357,12 @@ async def oidc_get_authorize_url(
     raw_state = str(uuid.uuid4())
     signed = sign_state(f"{provider_id}:{raw_state}", settings.secret_key)
 
-    scope = " ".join(scopes) if scopes else "openid email profile"
+    if isinstance(scopes, list):
+        scope = " ".join(scopes) if scopes else "openid email profile"
+    elif isinstance(scopes, str):
+        scope = scopes.strip() or "openid email profile"
+    else:
+        scope = "openid email profile"
     params = urllib.parse.urlencode(
         {
             "client_id": client_id,

@@ -622,6 +622,62 @@ class TestOidcGetAuthorizeUrl:
             assert "response_type=code" in url
             assert len(raw_state) > 0
 
+    async def test_env_scopes_string_not_character_joined(self) -> None:
+        """FAR-464 CHANGES_REQUESTED #3: env-var providers may carry ``scopes`` as a
+        plain string. ``" ".join`` on a string would splat it into single characters
+        ('o p e ...'); the scope must be passed through verbatim."""
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override(
+            modulo_oidc_providers=json.dumps(
+                [
+                    {
+                        "provider_id": "google",
+                        "client_id": "google-client-id",
+                        "client_secret": "google-client-secret",
+                        "discovery_url": "https://accounts.google.com/.well-known/openid-configuration",
+                        "scopes": "openid email profile",
+                    }
+                ]
+            )
+        )
+        session = _mock_session()
+        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            }
+
+            url, _ = await oidc_get_authorize_url("google", settings, "http://localhost/cb", session, session)
+
+            assert "scope=openid+email+profile" in url
+
+    async def test_env_scopes_list_joined(self) -> None:
+        """Env-var providers may also carry ``scopes`` as a list — still joined safely."""
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override(
+            modulo_oidc_providers=json.dumps(
+                [
+                    {
+                        "provider_id": "google",
+                        "client_id": "google-client-id",
+                        "client_secret": "google-client-secret",
+                        "discovery_url": "https://accounts.google.com/.well-known/openid-configuration",
+                        "scopes": ["openid", "email"],
+                    }
+                ]
+            )
+        )
+        session = _mock_session()
+        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            }
+
+            url, _ = await oidc_get_authorize_url("google", settings, "http://localhost/cb", session, session)
+
+            assert "scope=openid+email" in url
+
 
 # ---------------------------------------------------------------------------
 # OIDC callback — full flow
@@ -1065,6 +1121,36 @@ class TestSamlRoutesExtended:
                 follow_redirects=False,
             )
             assert resp.status_code == 401
+
+    def test_saml_metadata_served_for_db_provider_when_env_flag_off(self, client: TestClient) -> None:
+        """FAR-464 CHANGES_REQUESTED #2: a DB-configured SAML provider is self-sufficient,
+        so /saml/metadata must serve even when modulo_saml_enabled is False — matching
+        saml_login/saml_acs which resolve the DB provider without the env flag."""
+        _override_settings(
+            modulo_license_key="lic-123",
+            modulo_saml_enabled=False,
+        )
+
+        db_provider = SimpleNamespace(entity_id="urn:db-saml")
+        with patch("modulo.api.routes.sso._get_enabled_saml_global", new_callable=AsyncMock) as m:
+            m.return_value = db_provider
+            resp = client.get("/api/v1/auth/saml/metadata", follow_redirects=False)
+
+        assert resp.status_code == 200
+        assert "urn:db-saml" in resp.text
+
+    def test_saml_metadata_rejected_when_no_db_provider_and_env_flag_off(self, client: TestClient) -> None:
+        """Preserves the pure-env-var contract: no DB provider AND flag off -> 400."""
+        _override_settings(
+            modulo_license_key="lic-123",
+            modulo_saml_enabled=False,
+        )
+
+        with patch("modulo.api.routes.sso._get_enabled_saml_global", new_callable=AsyncMock) as m:
+            m.return_value = None
+            resp = client.get("/api/v1/auth/saml/metadata", follow_redirects=False)
+
+        assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
