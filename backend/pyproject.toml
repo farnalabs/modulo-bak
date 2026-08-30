@@ -192,12 +192,20 @@ select = [
     # requires, plus zero-violation families that would otherwise drift in.
     "G001", "G002", "G003", "G004", "G201",
     "PERF101", "PERF203", "PERF402", "PERF403",
-    "PT020", "PT021",
+    "PT020", "PT021", "PT027",
     "Q000", "Q003",
     "ICN",
     "FA",
     "NPY",
     "RUF100",
+    # --- Second wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.15.20: `ruff check . --extend-select <codes>
+    # --statistics`). These mirror the repo-root ruff.toml gate. ---
+    "PLC3002", "PLR0206", "PLR1711", "PLR1722", "PLR5501",
+    "PLW0120", "PLW0127", "PLW0131", "PLW0211", "PLW0642",
+    "PLW2901",
+    "PYI025",
+    "UP032",
 ]
 ignore = [
     "S101",     # assert allowed in tests
@@ -339,7 +347,10 @@ dev = [
     "pre-commit>=4.6.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "pytest-bdd>=7.2.0",
+    # Pinned to the pytest-9.1 fix for the _register_fixture(nodeid=...) deprecation
+    # (pytest-dev/pytest-bdd#823): no PyPI release carries it yet (8.1.0 is latest).
+    # Replace with a >=8.1.1 PyPI pin once the fix is released.
+    "pytest-bdd @ git+https://github.com/pytest-dev/pytest-bdd@60f6625b71b5552af02a4830e3d520f5ab6838e4",
     "pytest-cov>=7.1.0",
     "pytest-playwright>=0.8.0",
     "pytest-timeout>=2.4.0",

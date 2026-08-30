@@ -28,12 +28,18 @@ class Settings(BaseSettings):
     fernet_key_old: str = Field(default="")
     redis_url: str = Field("redis://localhost:6379/0")
     modulo_ws_token_ttl_seconds: int = Field(60)
+    modulo_access_token_minutes: int = Field(default=15, ge=5, le=1440)
     debug: bool = Field(False)
 
     # Alpha auth — at least one of these must be non-empty for login to work.
     modulo_admin_password: str = Field("")
     # Multi-user format: "user1:$2b$12$hash,user2:$2b$12$hash"
     modulo_users: str = Field("")
+    # Gated demo-org seed framework (FAR-450). When True, the FastAPI boot
+    # lifespan seeds the organisations listed in
+    # ``modulo.core.seed_data.demo_data.DEMO_ORGS`` with per-org signed licenses.
+    # False by default — nothing seeds unless an operator opts in.
+    modulo_seed_demo_orgs: bool = Field(False)
 
     modulo_public_url: str = Field("http://localhost:8000")
     modulo_license_key: str = Field("")
@@ -767,7 +773,12 @@ def break_glass_boot_findings(settings: Settings) -> list[tuple[bool, str]]:
         )
 
     if enabled and not has_url:
-        findings.append((True, "MODULO_BREAK_GLASS_ENABLED=true but MODULO_BREAK_GLASS_DATABASE_URL is empty"))
+        findings.append(
+            (
+                True,
+                "MODULO_BREAK_GLASS_ENABLED=true but MODULO_BREAK_GLASS_DATABASE_URL is empty",
+            )
+        )
     elif not has_url:
         findings.append(
             (
