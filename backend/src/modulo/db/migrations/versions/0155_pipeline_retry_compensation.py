@@ -1,14 +1,19 @@
 """Register ``compensation_failed``/``unknown`` run statuses + P5 columns (FAR-402 P5).
 
-Revision ID: 0151_pipeline_retry_compensation
-Revises: 0150_add_router_no_match_status
+Revision ID: 0155_pipeline_retry_compensation
+Revises: 0154_add_web_vital_events_time_index
 Create Date: 2026-08-26
 
 Renumber note: this migration was authored as ``0150_pipeline_retry_compensation``
-but collided with main's ``0150_add_router_no_match_status`` (FAR-402 P1 / FAR-415),
-which also landed on main. It is renumbered to ``0151`` and re-parented onto
-``0150_add_router_no_match_status`` so the graph stays a single linear chain with
-``0151`` chained off main's head.
+and has been renumbered twice as main advanced underneath it. It first collided
+with main's ``0150_add_router_no_match_status`` (FAR-402 P1 / FAR-415) and was
+renumbered to ``0151``; that in turn collided with main's ``0151_fix_constraints``
+(improve-database). Main's chain has since grown
+``0151_fix_constraints`` -> ``0152_dismissed_by_user_id_index`` ->
+``0153_add_numeric_check_constraints`` -> ``0154_add_web_vital_events_time_index``,
+so this migration is now numbered ``0155`` and re-parented onto main's real head
+``0154_add_web_vital_events_time_index``, keeping the graph a single linear chain
+with ``0155`` as the sole head.
 
 Implements the FAR-402 P5 (FAR-419) failure/retry + compensation data-model
 deltas:
@@ -42,8 +47,8 @@ deltas:
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0151_pipeline_retry_compensation"
-down_revision = "0150_add_router_no_match_status"
+revision = "0155_pipeline_retry_compensation"
+down_revision = "0154_add_web_vital_events_time_index"
 branch_labels = None
 depends_on = None
 

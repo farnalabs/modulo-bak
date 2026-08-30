@@ -256,8 +256,8 @@ _COMPENSATION_FAILED = "compensation_failed"
 _UNKNOWN = "unknown"
 
 
-def _migration_0150():
-    return importlib.import_module("modulo.db.migrations.versions.0151_pipeline_retry_compensation")
+def _migration_0155():
+    return importlib.import_module("modulo.db.migrations.versions.0155_pipeline_retry_compensation")
 
 
 def test_compensation_failed_registered_in_vocabularies() -> None:
@@ -291,8 +291,8 @@ def test_unknown_still_writable_alongside_compensation_failed() -> None:
     assert _UNKNOWN in ACTIVE_RUN_STATUSES
 
 
-def test_migration_0150_extends_constraint_consistently() -> None:
-    migration = _migration_0150()
+def test_migration_0155_extends_constraint_consistently() -> None:
+    migration = _migration_0155()
     # The ADD statement includes the two new statuses; the OLD one does not.
     assert _COMPENSATION_FAILED in migration._ADD_NEW
     assert _UNKNOWN in migration._ADD_NEW
