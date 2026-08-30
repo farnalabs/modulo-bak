@@ -78,6 +78,47 @@ def test_post_approval_non_merge_commit_is_stale():
     assert "1 non-merge" in reason
 
 
+def test_missing_commit_date_fails_closed():
+    # A non-merge commit with a MISSING committer date cannot be verified, so it
+    # must fail closed (stale) rather than be silently treated as valid.
+    commits = [
+        {
+            "sha": "fix",
+            "parents": [{"sha": "p0"}],
+            "commit": {"committer": {}},  # no "date"
+        },
+    ]
+    verdict, reason = guard.decide([_approved(APPROVE_AT)], commits, "head")
+    assert verdict == "stale"
+    assert "non-merge" in reason
+
+    # Also cover a commit with a literal None committer date.
+    commits_none = [
+        {
+            "sha": "fix",
+            "parents": [{"sha": "p0"}],
+            "commit": {"committer": {"date": None}},
+        },
+    ]
+    verdict2, _reason2 = guard.decide([_approved(APPROVE_AT)], commits_none, "head")
+    assert verdict2 == "stale"
+
+
+def test_malformed_commit_date_fails_closed():
+    # A non-merge commit with a malformed (unparseable) committer date cannot be
+    # verified, so it must fail closed (stale) rather than be silently skipped.
+    commits = [
+        {
+            "sha": "fix",
+            "parents": [{"sha": "p0"}],
+            "commit": {"committer": {"date": "not-a-timestamp"}},
+        },
+    ]
+    verdict, reason = guard.decide([_approved(APPROVE_AT)], commits, "head")
+    assert verdict == "stale"
+    assert "non-merge" in reason
+
+
 def test_pre_approval_non_merge_commit_is_ok():
     commits = [
         _commit("old", 1, BEFORE),  # non-merge but before approval

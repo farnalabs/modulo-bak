@@ -89,13 +89,16 @@ def decide(reviews, commits, head_sha: str | None = None):
             continue  # merge commits keep the approval valid
         cd = (c.get("commit") or {}).get("committer", {}).get("date")
         if not cd:
+            # Missing committer date -> unverifiable -> fail closed (stale),
+            # matching the reviews side and the documented contract.
+            stale += 1
             continue
-        ce = None
         try:
             ce = _parse_iso(cd)
         except Exception:
-            ce = None
-        if ce is None:
+            # Malformed committer date -> unverifiable -> fail closed (stale),
+            # matching the reviews side and the documented contract.
+            stale += 1
             continue
         if ce > approve_epoch:
             stale += 1
