@@ -81,7 +81,7 @@ def test_collect_definitions_class_methods(tmp_path: Path) -> None:
 
 
 def test_collect_definitions_missing_file_is_empty(tmp_path: Path) -> None:
-    assert sns._collect_definitions(tmp_path / "nope.py") == set()
+    assert not sns._collect_definitions(tmp_path / "nope.py")
 
 
 # --- _resolves_definitions --------------------------------------------------
