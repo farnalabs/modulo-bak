@@ -557,41 +557,84 @@ regression that silently weakens the suite:
    import sleep`` bare-name spelling is deliberately not matched because a local
    ``sleep`` helper (e.g. an asyncio-driven retry) cannot be distinguished
    statically
-  - *self-referential membership* — ``assert x in [x]`` / ``assert x not in
-     (x,)`` / ``assert x in {x}`` / ``assert x in {x: 'v'}`` where the container
-     literal embeds the same (pure) expression as the membership operand. In
-     ordinary Python semantics ``x == x`` holds, so ``in`` ALWAYS PASSES and
-     ``not in`` ALWAYS FAILS no matter what the operand evaluates to — the
-     verdict is reported green (or red) without exercising any distinct value,
-     the membership twin of the self-comparison lens (with the same IEEE-754
-     NaN caveat: ``float('nan') in [float('nan')]`` is ``False``, but identical
-     operands can still never exercise distinct values). Dict literals compare
-     against their *keys*. Calls/comprehensions as the operand or element are
-     deliberately excluded — those may carry side effects or non-determinism
+- *self-referential membership* — ``assert x in [x]`` / ``assert x not in
+  (x,)`` / ``assert x in {x}`` / ``assert x in {x: 'v'}`` where the container
+  literal embeds the same (pure) expression as the membership operand. In
+  ordinary Python semantics ``x == x`` holds, so ``in`` ALWAYS PASSES and
+  ``not in`` ALWAYS FAILS no matter what the operand evaluates to — the
+  verdict is reported green (or red) without exercising any distinct value,
+  the membership twin of the self-comparison lens (with the same IEEE-754
+  NaN caveat: ``float('nan') in [float('nan')]`` is ``False``, but identical
+  operands can still never exercise distinct values). Dict literals compare
+  against their *keys*. Calls/comprehensions as the operand or element are
+  deliberately excluded — those may carry side effects or non-determinism
    - *duplicate elements in a membership container literal* — ``assert x in
-     (A, A)`` / ``assert x not in [1, 1]`` where a list/tuple/set literal used
-     as a membership container holds the same (pure) expression twice. The
-     check behaves identically to the container with that occurrence removed,
-     so the duplicate advertises N alternatives while only N-1 ever matter — a
-     copy-paste trap that a reader (and a mutation-testing run) believes adds
-     an input to the matrix. The membership twin of the duplicate-parametrize
-     lens; calls/comprehensions are excluded
+  (A, A)`` / ``assert x not in [1, 1]`` where a list/tuple/set literal used
+  as a membership container holds the same (pure) expression twice. The
+  check behaves identically to the container with that occurrence removed,
+  so the duplicate advertises N alternatives while only N-1 ever matter — a
+  copy-paste trap that a reader (and a mutation-testing run) believes adds
+  an input to the matrix. The membership twin of the duplicate-parametrize
+  lens; calls/comprehensions are excluded
    - *redundant boolean operands* — ``assert x and x`` / ``assert x or x`` /
-     ``assert a == b or a == b`` where a single ``and``/``or`` expression
-     repeats the same (pure) operand. ``x or x`` collapses to ``x`` and ``x and
-     x`` collapses to ``x`` — idempotent absorption — so the compound is dead
-     weight that reports the same verdict the single operand would, and the
-     repeated spelling is almost always a copy-paste leftover. Only *identical*
-     operands are flagged (the complementary lens owns ``x and not x``);
-     calls/comprehensions are excluded
+  ``assert a == b or a == b`` where a single ``and``/``or`` expression
+  repeats the same (pure) operand. ``x or x`` collapses to ``x`` and ``x and
+  x`` collapses to ``x`` — idempotent absorption — so the compound is dead
+  weight that reports the same verdict the single operand would, and the
+  repeated spelling is almost always a copy-paste leftover. Only *identical*
+  operands are flagged (the complementary lens owns ``x and not x``);
+  calls/comprehensions are excluded
    - *point-collapsed range chain* — ``assert lo <= x <= lo`` /
-     ``assert depth >= n >= depth`` where an ordering chain's first and last
-     operands are the same (pure) expression. The chain forces the interior
-     value to equal that endpoint — ``lo <= x <= lo`` can only hold when
-     ``x == lo`` — so what reads as a range/bounds assertion is degenerately
-     collapsed to an equality that never spans an interval, almost always a
-     typo for two *distinct* bounds (``lo <= x <= hi``). Calls/comprehensions
-     are excluded
+  ``assert depth >= n >= depth`` where an ordering chain's first and last
+  operands are the same (pure) expression. The chain forces the interior
+  value to equal that endpoint — ``lo <= x <= lo`` can only hold when
+  ``x == lo`` — so what reads as a range/bounds assertion is degenerately
+  collapsed to an equality that never spans an interval, almost always a
+  typo for two *distinct* bounds (``lo <= x <= hi``). Calls/comprehensions
+  are excluded
+- an ``assert`` placed in a ``finally:`` clause — an assertion that only runs
+  during unwinding either masks the failure that triggered the unwind (an
+  ``AssertionError`` raised from ``finally`` *replaces* the exception
+  propagating out of ``try``/``except``, discarding the original traceback a
+  reader needs to find the real regression) or verifies nothing that a check
+  on the normal path could not express more clearly. This is the unwind-twin
+  of the assert-inside-``except`` lens: there the assert masks the exception
+  that dispatched the handler, here it masks whatever exception the
+  ``finally`` is unwinding past. Move the check to the normal path (after the
+  ``try``/``except``/``else``/``finally`` block) or into the ``except``
+  handler that owns the failure being asserted, so an assertion failure names
+  the real error instead of replacing it
+- a *name-spelled* ``except BaseException:`` handler — the bare ``except:``
+  spelling is already owned by the bare-except lens, but naming
+  ``BaseException`` explicitly is the same swallow wearing a mask:
+  ``BaseException`` is the base of ``KeyboardInterrupt``/``SystemExit``/
+  ``GeneratorExit`` as well as ``Exception``, so a handler that names it
+  catches the control-flow signals a test can never want, silently converting
+  an interrupt during a hang into a false green. The tuple twin
+  (``except (ValueError, BaseException):``) is covered too; ``except
+  Exception:`` and tuples of concrete exceptions are the sanctioned narrow
+  form and are left alone
+- an unbounded ``while`` loop with a statically-foldable constant-true
+  condition (``while True:``, ``while 1:``, ...) in test-support code — a
+  loop whose condition is a language-level constant can never become false on
+  its own and terminates only via a ``break`` targeting it or a
+  ``return``/``raise`` unwinding the enclosing function, so one with none of
+  those reachable is an infinite loop: it hangs CI indefinitely the way an
+  unbounded subprocess or thread join does, and the failure is opaque (the
+  runner just stops). Add an explicit ``break`` on a completion condition, or
+  drive the loop with a real (non-constant) guard. Loops whose condition is a
+  name, call, or comparison are left alone — those can change through side
+  effects
+- ``@pytest.mark.skip``/``@pytest.mark.skipif``/``@pytest.mark.xfail`` (and the
+  bare imported ``@skip``/``@skipif``/``@xfail`` twins) applied to a
+  ``@pytest.fixture`` function — pytest only honours selection markers on
+  *collected test items*, and a fixture is not one, so the marker is silently
+  ignored: a ``skipif`` that was meant to gate the tests built from the
+  fixture never triggers, and the coverage loss is invisible because nothing
+  reports the marker as dead. This is the fixture twin of the
+  ``unconditional-skip-marker`` lens, which deliberately leaves fixtures
+  alone. Hoist the gate into the fixture body (``pytest.skip(...)`` inside an
+  ``if``), where it takes effect when the fixture is requested
 - ``asyncio.wait_for(...)`` / ``asyncio.wait(...)`` without a timeout bound —
   ``asyncio.wait_for(coro)`` with no ``timeout`` argument, or an explicit
   ``timeout=None`` (the API default, meaning "wait forever"), suspends until
@@ -7296,6 +7339,99 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
         assert not _unconditional_skip_marker_violations(tree), f"lens should NOT flag:\n{source}"
 
 
+_SELECTION_MARKERS = frozenset({"skip", "skipif", "xfail"})
+"""Selection/outcome marker names that are silently ignored when applied to a
+fixture. ``@pytest.mark.parametrize`` is deliberately NOT in the set: pytest
+honours parametrize on a fixture (that is how parametrized fixtures work), and
+``@pytest.mark.asyncio``/``@pytest.mark.anyio`` are behaviour markers, not
+selection markers, so they are left to the async-decorator lenses."""
+
+
+def _selection_marker_on_fixture_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``@pytest.fixture``-decorated
+    function that also carries a selection marker — ``@pytest.mark.skip``,
+    ``@pytest.mark.skipif``, ``@pytest.mark.xfail``, or the bare imported
+    ``@skip``/``@skipif``/``@xfail`` spellings.
+
+    pytest only honours selection markers on *collected test items*; a fixture
+    is not collected as an item, so the marker is silently ignored: the tests
+    that request the fixture run unconditionally no matter what condition the
+    ``skipif`` was meant to gate, and nothing in the run reports the marker as
+    dead. Both spellings are covered — the ``@pytest.mark.*`` chain (via
+    ``_is_mark_decorator``) and the bare imported decorator — because a custom
+    ``@skip``/``@xfail`` decorator stacked on a fixture is the same silent
+    no-op either way. ``@pytest.mark.parametrize`` is deliberately left alone
+    (legitimate on fixtures, see ``_SELECTION_MARKERS``), as is a module-level
+    ``pytestmark = pytest.mark.skip`` deselecting the whole module.
+    """
+    found: list[tuple[int, str]] = []
+
+    def _selection_name(dec: ast.AST) -> str | None:
+        name = _decorator_name(dec)
+        if name in _SELECTION_MARKERS:
+            return name
+        if _is_mark_decorator(dec):
+            if isinstance(dec, ast.Call):
+                dec = dec.func
+            if isinstance(dec, ast.Attribute) and dec.attr in _SELECTION_MARKERS:
+                return dec.attr
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        is_fixture = any(_decorator_name(dec) == "fixture" for dec in node.decorator_list)
+        if not is_fixture:
+            continue
+        for dec in node.decorator_list:
+            name = _selection_name(dec)
+            if name is None:
+                continue
+            marker_repr = ast.unparse(dec)
+            found.append(
+                (
+                    dec.lineno,
+                    f"@pytest.mark.{name} on a @pytest.fixture function {node.name!r} — "
+                    "pytest only honours selection markers on collected test items, so this "
+                    "marker is silently ignored: the tests using the fixture run regardless of "
+                    f"the {name} condition. Hoist the gate into the fixture body with "
+                    f"pytest.skip(...) instead ({marker_repr})",
+                )
+            )
+    return found
+
+
+def test_no_selection_markers_on_fixtures():
+    """A ``@pytest.mark.skip``/``skipif``/``xfail`` (or bare ``@skip``/``@skipif``/
+    ``@xfail``) stacked on a ``@pytest.fixture`` function is silently ignored:
+    pytest only honours selection markers on *collected test items*, and a
+    fixture is never collected as one. A ``skipif`` that was meant to gate the
+    tests built from the fixture therefore never triggers — a true condition
+    still runs the tests, and nothing in the run reports the marker as dead —
+    while a reader believes the conditional skip is in force. It is the fixture
+    twin of the ``unconditional-skip-marker`` lens, which deliberately leaves
+    fixtures alone, and the ``skip-without-reason``/``constant-condition-skip``
+    siblings check *reason*/*condition*, not whether the marker is even on a
+    test. Move the gate into the fixture body (``pytest.skip(...)`` behind the
+    real ``if``), where it fires when the fixture is requested."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _selection_marker_on_fixture_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} selection marker(s) on a @pytest.fixture function.\n"
+        "pytest only honours skip/skipif/xfail on collected test items — a fixture is never one,\n"
+        "so the marker is silently ignored and a skipif that was meant to gate the tests built\n"
+        "from the fixture never fires. Hoist the gate into the fixture body with\n"
+        "pytest.skip(...) behind the real if, where it takes effect when the fixture is\n"
+        "requested.\n" + "\n".join(violations)
+    )
+
+
 def _bound_method_truthiness_violations(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(lineno, detail)`` for every ``assert obj.attr`` /
     ``assert not obj.attr`` whose attribute is a *method* — evidenced by the
@@ -7356,6 +7492,85 @@ def test_no_bound_method_truthiness_asserts():
         "reference is a silent false-green (or, under 'not', always fails). Add the calling ()\n"
         "so the assertion actually exercises the method's return value." + "\n".join(violations)
     )
+
+
+def test_selection_marker_on_fixture_lens_flags_silent_noops():
+    """Synthetic positive/negative control for the selection-marker-on-fixture
+    lens: it must flag ``@pytest.mark.skip``/``skipif``/``xfail`` (called and
+    bare, ``@pytest.fixture`` and ``@pytest_asyncio.fixture``, module-level
+    fixture too, bare ``@skipif``/``@xfail`` imported spellings) stacked on a
+    fixture, and ignore the same markers on tests/classes, ``@pytest.mark.
+    parametrize`` on a fixture (legitimate), behaviour markers such as
+    ``@pytest.mark.asyncio`` on a fixture, and a module-level
+    ``pytestmark = pytest.mark.skip``."""
+    positive_sources = [
+        "@pytest.fixture\n@pytest.mark.skip\ndef fx():\n    return 1\n",
+        "@pytest.fixture\n@pytest.mark.skip(reason='why')\ndef fx():\n    return 1\n",
+        "@pytest.fixture\n@pytest.mark.skipif(not pkg, reason='no pkg')\ndef fx():\n    return 1\n",
+        (
+            "@pytest.fixture(scope='session')\n"
+            "@pytest.mark.skipif(sys.platform == 'win32', reason='win')\n"
+            "def fx():\n"
+            "    return 1\n"
+        ),
+        "@pytest_asyncio.fixture\n@pytest.mark.xfail(reason='known bug')\ndef afx():\n    return 1\n",
+        "@pytest.fixture\n@skipif(not openssl_available, reason='no ssl')\ndef fx():\n    return 1\n",
+        "@pytest.fixture\n@xfail(reason='flaky')\nasync def afx():\n    return 1\n",
+        (
+            "import pytest\n"
+            "\n"
+            "class TestFoo:\n"
+            "    @pytest.fixture\n"
+            "    @pytest.mark.skip(reason='legacy')\n"
+            "    def fx(self):\n"
+            "        return 1\n"
+        ),
+        (
+            "import pytest\n"
+            "\n"
+            "fx_value = None\n"
+            "\n"
+            "@pytest.fixture\n"
+            "@pytest.mark.skipif(True, reason='temp')\n"
+            "def fx():\n"
+            "    global fx_value\n"
+            "    return fx_value\n"
+        ),
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _selection_marker_on_fixture_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "@pytest.fixture\n@pytest.mark.parametrize('x', [1, 2])\ndef fx(x):\n    return x\n",
+        "@pytest.fixture\n@pytest.mark.asyncio\nasync def afx():\n    return 1\n",
+        "@pytest.fixture\ndef fx():\n    return 1\n",
+        "@pytest.mark.skip(reason='legacy')\ndef test_foo():\n    assert x\n",
+        "@pytest.mark.skipif(not pkg, reason='no pkg')\ndef test_foo():\n    assert x\n",
+        "@pytest.mark.xfail(reason='known bug')\ndef test_foo():\n    assert x\n",
+        "pytestmark = pytest.mark.skip(reason='whole module dormant')\ndef test_foo():\n    assert x\n",
+        (
+            "import pytest\n"
+            "\n"
+            "@pytest.mark.skip(reason='legacy')\n"
+            "class TestFoo:\n"
+            "    def test_bar(self):\n"
+            "        assert x\n"
+        ),
+        (
+            "import pytest\n"
+            "\n"
+            "def make_fx():\n"
+            "    @pytest.mark.skipif(True, reason='x')\n"
+            "    def inner():\n"
+            "        return 1\n"
+            "    return inner\n"
+        ),
+        "@pytest.fixture\n@something_else\ndef fx():\n    return 1\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _selection_marker_on_fixture_violations(tree), f"lens should NOT flag:\n{source}"
 
 
 def test_bound_method_lens_flags_missing_call_parens():
