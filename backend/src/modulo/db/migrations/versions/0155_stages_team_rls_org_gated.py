@@ -1,7 +1,7 @@
 """Org-gate the ``rls_team_isolation`` policy on ``lifecycle_map_stages`` (cross-org leak).
 
-Revision ID: 0151_stages_team_rls_org_gated
-Revises: 0150_add_router_no_match_status
+Revision ID: 0155_stages_team_rls_org_gated
+Revises: 0154_add_web_vital_events_time_index
 Create Date: 2026-08-26
 
 The original v2 ``stages`` table (created in 0003 and protected by an
@@ -44,8 +44,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0151_stages_team_rls_org_gated"
-down_revision: str | None = "0150_add_router_no_match_status"
+revision: str = "0155_stages_team_rls_org_gated"
+down_revision: str | None = "0154_add_web_vital_events_time_index"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
@@ -86,6 +86,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     if op.get_context().dialect.name != "postgresql":
         return
-    # Restore the pre-0151 state: lifecycle_map_stages keeps only its
+    # Restore the pre-0155 state: lifecycle_map_stages keeps only its
     # rls_org_isolation policy (this migration never touched it).
     op.execute(f"DROP POLICY IF EXISTS rls_team_isolation ON public.{_TABLE}")
