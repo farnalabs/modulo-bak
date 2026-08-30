@@ -1,7 +1,8 @@
 """Integration test for migrations 0155-0157 (FK sweep, CHECKs, UUID promotion).
 
-Runs the real Alembic ``upgrade`` chain 0155 -> 0156 -> 0157 against a live
-Postgres (testcontainers) and proves the review-requested safety properties:
+Runs the real Alembic ``upgrade`` chain 0155 -> 0156 -> 0157 against a *fresh*
+live Postgres (its own testcontainer, built from scratch) and proves the
+review-requested safety properties:
 
   * CHECK constraints (0156) and foreign keys (0155) are added ``NOT VALID``
     then ``VALIDATE``-d, so a populated table never aborts the upgrade on
@@ -10,10 +11,14 @@ Postgres (testcontainers) and proves the review-requested safety properties:
   * The UUID promotion (0157) preserves a well-formed UUID string across the
     ``USING col::uuid`` cast, and its downgrade reverts with ``USING col::text``
     (the missing downgrade cast that would otherwise raise on ``uuid -> varchar``).
+  * 0157 promotes the four columns to native ``uuid`` (the ``compare_metadata``
+    gate requires the ORM and the migrated schema to agree on the type, and the
+    ORM already declares these as ``Uuid``).
 
-We use a synthetic table for the cast assertion so the test never mutates the
-real migrated schema, and run the real migration chain to prove the NOT VALID
-pattern applies cleanly on a populated database.
+The test builds its own container rather than re-applying 0155-0157 on the
+already-migrated shared test DB: re-running the bare ``ADD CONSTRAINT`` statements
+against a schema that already has them raises ``duplicate_object``. A freshly
+built schema proves the chain applies cleanly.
 """
 
 import uuid
@@ -25,6 +30,7 @@ from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
+from testcontainers.postgresql import PostgresContainer
 
 pytestmark = [pytest.mark.integration]
 
@@ -45,18 +51,70 @@ def _alembic_config(db_url: str) -> Config:
     return config
 
 
-async def test_0153_0154_0155_upgrade_applies_with_not_valid_constraints(migrated_db_url, monkeypatch) -> None:
-    db_url = migrated_db_url
+def _with_credentials(database_url: str, user: str, password: str) -> str:
+    from urllib.parse import quote
+
+    prefix, _, rest = database_url.partition("://")
+    host_part, _, db = rest.partition("/")
+    host = host_part.split("@")[-1]
+    return f"{prefix}://{quote(user)}:{quote(password)}@{host}/{db}"
+
+
+@pytest.fixture
+def fresh_migration_db(monkeypatch):
+    """A freshly migrated DB built from scratch for migration-chain assertions.
+
+    Spins up its own Postgres container (independent of the shared session DB),
+    provisions the migration roles, runs ``alembic upgrade`` to ``_HEAD``, and
+    tears the container down afterwards. This lets the test prove the 0155-0157
+    chain applies cleanly without disturbing other integration tests.
+    """
+    pg = PostgresContainer("postgres:16-alpine")
+    pg.start()
+    raw = pg.get_connection_url().replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    async def _provision():
+        eng = create_async_engine(raw)
+        async with eng.connect() as conn:
+            await conn.execute(text('DROP ROLE IF EXISTS "modulo_migrate"'))
+            await conn.execute(text('DROP ROLE IF EXISTS "modulo_breakglass"'))
+            await conn.execute(text('DROP ROLE IF EXISTS "modulo_app"'))
+            await conn.execute(text("CREATE ROLE modulo_migrate NOSUPERUSER NOLOGIN BYPASSRLS"))
+            await conn.execute(text("CREATE ROLE modulo_breakglass LOGIN BYPASSRLS PASSWORD 'bgpass'"))
+            await conn.execute(text("CREATE ROLE modulo_app NOSUPERUSER NOBYPASSRLS LOGIN PASSWORD 'apppass'"))
+            await conn.commit()
+        await eng.dispose()
+
+    asyncio_run(_provision())
+
+    app_url = _with_credentials(raw, "modulo_app", "apppass")
+    bg_url = _with_credentials(raw, "modulo_breakglass", "bgpass")
+    config = _alembic_config(raw)
+    with monkeypatch.context() as m:
+        m.setenv("DATABASE_URL", raw)
+        m.setenv("DATABASE_ADMIN_URL", raw)
+        m.setenv("MODULO_BREAK_GLASS_DATABASE_URL", bg_url)
+        from modulo.db.bootstrap_role import bootstrap_roles
+
+        asyncio_run(bootstrap_roles(raw, app_url))
+        command.upgrade(config, _HEAD)
+        asyncio_run(bootstrap_roles(raw, app_url))
+        yield raw
+    pg.stop()
+
+
+def asyncio_run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+async def test_0155_0156_0157_upgrade_on_fresh_schema(fresh_migration_db, monkeypatch) -> None:
+    db_url = fresh_migration_db
     monkeypatch.setenv("DATABASE_URL", db_url)
-    config = _alembic_config(db_url)
     engine = create_async_engine(db_url, poolclass=NullPool)
 
     try:
-        # Reset to just before the FK/CHECK/UUID migrations, then apply the chain.
-        async with engine.begin() as conn:
-            await conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": _PRE_0154})
-        command.upgrade(config, _HEAD)
-
         # 0156 CHECK constraints exist on the production tables after the chain.
         async with engine.connect() as conn:
             check_names = (
@@ -88,14 +146,25 @@ async def test_0153_0154_0155_upgrade_applies_with_not_valid_constraints(migrate
                 .all()
             )
         assert "org_api_keys_run_id_fkey" in fk_names, fk_names
+
+        # 0157 promoted run_evidence.node_id to native uuid, and the ORM already
+        # declares it as Uuid — so compare_metadata parity holds.
+        async with engine.connect() as conn:
+            evidence_type = (
+                await conn.execute(
+                    text(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_name = 'run_evidence' AND column_name = 'node_id'"
+                    )
+                )
+            ).scalar()
+        assert evidence_type == "uuid", f"run_evidence.node_id should be uuid, got {evidence_type!r}"
     finally:
-        async with engine.begin() as conn:
-            await conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": _HEAD})
         await engine.dispose()
 
 
-async def test_0155_uuid_promotion_round_trips(migrated_db_url, monkeypatch) -> None:
-    db_url = migrated_db_url
+async def test_0157_uuid_promotion_round_trips(fresh_migration_db, monkeypatch) -> None:
+    db_url = fresh_migration_db
     monkeypatch.setenv("DATABASE_URL", db_url)
     engine = create_async_engine(db_url, poolclass=NullPool)
 
@@ -109,14 +178,14 @@ async def test_0155_uuid_promotion_round_trips(migrated_db_url, monkeypatch) -> 
         )
 
     try:
-        # Apply the exact 0155 cast: String(255) -> Uuid USING node_id::uuid.
+        # Apply the exact 0157 cast: String(255) -> Uuid USING node_id::uuid.
         async with engine.begin() as conn:
             await conn.execute(text("ALTER TABLE t_uuidpromo_promo ALTER COLUMN node_id TYPE uuid USING node_id::uuid"))
         async with engine.connect() as conn:
             got = (await conn.execute(text("SELECT node_id FROM t_uuidpromo_promo WHERE id IS NOT NULL"))).scalar()
         assert got == well_formed, f"uuid string must survive the ::uuid cast, got {got!r}"
 
-        # And the 0155 downgrade cast: Uuid -> String(255) USING node_id::text.
+        # And the 0157 downgrade cast: Uuid -> String(255) USING node_id::text.
         async with engine.begin() as conn:
             await conn.execute(
                 text("ALTER TABLE t_uuidpromo_promo ALTER COLUMN node_id TYPE varchar(255) USING node_id::text")

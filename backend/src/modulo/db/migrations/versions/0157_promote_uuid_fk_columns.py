@@ -11,24 +11,82 @@ Four columns store UUID primary keys of other tables as ``String(255)``:
 * ``feedback_records.producing_node_id`` -> nodes.id
 * ``agents.template_id``         -> composite_templates.id
 
-Storing UUIDs as text loses type safety and index efficiency and prevents a real
-FK. The conversion uses ``USING col::uuid`` so existing well-formed UUID values
-are preserved. The two PK/unique-involved columns are dropped and recreated
-around the type change.
+Storing UUIDs as text loses type safety and index efficiency. The conversion
+uses ``USING col::uuid`` so existing well-formed UUID values are preserved. The
+two PK/unique-involved columns are dropped and recreated around the type change.
+
+Deploy-safety — pre-flight UUID scan
+------------------------------------
+A single historical row holding a non-UUID value would otherwise hard-abort the
+upgrade at ``ALTER TYPE`` with a cryptic PostgreSQL error and no escape hatch.
+Before any type change we scan every affected column for values that are not a
+canonical UUID and abort *before* mutating the schema, reporting the exact
+offending rows (table, column, value) so operators get a precise quarantine
+list instead of a failed deploy. The columns are ``NOT NULL`` so we cannot
+silently NULL offenders; surfacing them for triage is the safe, non-destructive
+choice. (A real ``FOREIGN KEY`` on these columns is intentionally deferred: it
+would reject the synthetic node UUIDs that today's integration tests write, and
+is tracked separately once those tests are migrated to maintain referential
+integrity.)
 """
 
 from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy import text
 
 revision: str = "0157_promote_uuid_fk_columns"
 down_revision: str | None = "0156_add_check_constraints"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
+# Columns promoted from String(255) to Uuid. Scanned for non-UUID values before
+# the type change.
+_PREFLIGHT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("run_evidence", "node_id"),
+    ("node_observations", "node_id"),
+    ("feedback_records", "producing_node_id"),
+    ("agents", "template_id"),
+)
+
+# Canonical UUID textual form, used by the pre-flight scan to detect rows that
+# would fail the ``USING col::uuid`` cast.
+_UUID_RE = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+def _scan_offending_uuids() -> None:
+    """Abort with a precise report if any promoted column holds a non-UUID value.
+
+    Runs *before* any type change so a bad historical row produces an actionable
+    error (which rows, which column) rather than a cryptic ``ALTER TYPE`` failure
+    mid-upgrade with no offender list.
+    """
+    offenders: list[tuple[str, str, str]] = []
+    bind = op.get_bind()
+    for table, column in _PREFLIGHT_COLUMNS:
+        rows = bind.execute(
+            text(
+                f"SELECT {column}::text FROM {table} "  # noqa: S608
+                f"WHERE {column} IS NOT NULL AND {column}::text !~ :re LIMIT 50"
+            ),
+            {"re": _UUID_RE},
+        )
+        for (value,) in rows:
+            offenders.append((table, column, str(value)))
+
+    if offenders:
+        report = "\n".join(f"  - {t}.{c} = {v!r}" for t, c, v in offenders)
+        raise RuntimeError(
+            "Migration 0157 aborted: the following rows store a non-UUID value in "
+            "a column being promoted to uuid. Quarantine/repair these rows before "
+            f"re-running the upgrade:\n{report}"
+        )
+
 
 def upgrade() -> None:
+    _scan_offending_uuids()
+
     op.drop_constraint("pk_run_evidence_run_node", "run_evidence", type_="primary")
     op.alter_column(
         "run_evidence",
