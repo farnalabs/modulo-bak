@@ -426,7 +426,7 @@ class TestSamlMetadataUrlFetch:
     async def test_fetches_metadata_from_url(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         provider = SimpleNamespace(
             metadata_xml=None,
             metadata_url="https://idp.example.com/metadata",
@@ -453,7 +453,7 @@ class TestSamlMetadataUrlFetch:
     async def test_raises_when_metadata_url_blocked(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         provider = SimpleNamespace(
             metadata_xml=None,
             metadata_url="http://169.254.169.254/metadata",
@@ -472,7 +472,7 @@ class TestSamlMetadataUrlFetch:
 
 class TestSamlAuthUrlError:
     async def test_raises_when_handler_fails(self) -> None:
-        settings = _override(modulo_saml_enabled=False, modulo_license_key="")
+        settings = _override(modulo_saml_enabled=True)
         provider = SimpleNamespace(
             metadata_xml=SAMPLE_SAML_METADATA,
             metadata_url=None,

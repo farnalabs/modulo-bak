@@ -64,9 +64,11 @@ async def get_provider_by_provider_id(session: AsyncSession, provider_id: str) -
 
     Pre-auth SSO routes have no user/org context, so providers are resolved
     globally (consistent with the existing env-var, global behaviour). Self-hosted
-    Modulo is single-org.
+    Modulo is single-org. ``provider_id`` is only unique per-org, so cap to one
+    row to avoid a MultipleResultsFound crash if the same slug exists in more
+    than one org.
     """
-    result = await session.execute(select(SsoProvider).where(SsoProvider.provider_id == provider_id))
+    result = await session.execute(select(SsoProvider).where(SsoProvider.provider_id == provider_id).limit(1))
     return result.scalar_one_or_none()
 
 

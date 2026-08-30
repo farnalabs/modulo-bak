@@ -1245,7 +1245,7 @@ class TestSamlGetAuthUrlDb:
     async def test_uses_db_saml_provider(self) -> None:
         from modulo.auth.sso import saml_get_auth_url
 
-        settings = _override(modulo_saml_enabled=False, modulo_license_key="")
+        settings = _override(modulo_saml_enabled=True)
         provider = SimpleNamespace(
             metadata_xml=self.SAMPLE_IDP_METADATA,
             metadata_url=None,
@@ -1534,7 +1534,7 @@ class TestSsoDbResolution:
     async def test_resolve_saml_config_from_db_metadata_xml(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         session = _mock_session()
         provider = _db_saml_provider(metadata_xml="<md:EntityDescriptor entityID='x'/>")
         with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider):
@@ -1546,7 +1546,7 @@ class TestSsoDbResolution:
     async def test_resolve_saml_config_db_metadata_url_fetch(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         session = _mock_session()
         provider = _db_saml_provider(metadata_url="https://idp.example.com/metadata")
         client = AsyncMock()
@@ -1569,7 +1569,7 @@ class TestSsoDbResolution:
     async def test_resolve_saml_config_db_metadata_url_ssrf_rejected(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         session = _mock_session()
         provider = _db_saml_provider(metadata_url="http://169.254.169.254/metadata")
         with (
@@ -1586,7 +1586,7 @@ class TestSsoDbResolution:
     async def test_resolve_saml_config_db_missing_metadata_raises(self) -> None:
         from modulo.auth.sso import _resolve_saml_config
 
-        settings = _override()
+        settings = _override(modulo_saml_enabled=True)
         session = _mock_session()
         provider = _db_saml_provider(metadata_xml=None, metadata_url=None)
         with (
@@ -1594,3 +1594,57 @@ class TestSsoDbResolution:
             pytest.raises(ValueError, match="missing IdP metadata"),
         ):
             await _resolve_saml_config(session, settings)
+
+    async def test_resolve_saml_config_db_respects_enable_toggle(self) -> None:
+        """A DB-configured SAML provider must NOT sign users in when SAML is disabled.
+
+        The DB is the source of truth for *configuration*, but the deployment
+        enable toggle (MODULO_SAML_ENABLED) remains the master gate, consistent
+        with the env path and the /saml/metadata route.
+        """
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override(modulo_saml_enabled=False)
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_xml="<md:EntityDescriptor entityID='x'/>")
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider),
+            pytest.raises(ValueError, match="SAML is not enabled"),
+        ):
+            await _resolve_saml_config(session, settings)
+
+    async def test_resolve_saml_config_db_respects_license_gate(self) -> None:
+        """A DB-configured SAML provider must require a Team license key."""
+        from modulo.auth.sso import _resolve_saml_config
+
+        settings = _override(modulo_saml_enabled=True, modulo_license_key="")
+        session = _mock_session()
+        provider = _db_saml_provider(metadata_xml="<md:EntityDescriptor entityID='x'/>")
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=provider),
+            pytest.raises(ValueError, match="SAML requires a license key"),
+        ):
+            await _resolve_saml_config(session, settings)
+
+
+class TestScopeCoercion:
+    def test_coerce_scopes_handles_none(self) -> None:
+        from modulo.auth.sso import _coerce_scopes
+
+        assert _coerce_scopes(None) is None
+
+    def test_coerce_scopes_passes_through_list(self) -> None:
+        from modulo.auth.sso import _coerce_scopes
+
+        assert _coerce_scopes(["openid", "email"]) == ["openid", "email"]
+
+    def test_coerce_scopes_decodes_json_string(self) -> None:
+        from modulo.auth.sso import _coerce_scopes
+
+        assert _coerce_scopes('["openid", "email"]') == ["openid", "email"]
+
+    def test_coerce_scopes_splits_plain_string(self) -> None:
+        from modulo.auth.sso import _coerce_scopes
+
+        # A raw env string must not become a single space-joined mega-scope.
+        assert _coerce_scopes("openid email profile") == ["openid", "email", "profile"]

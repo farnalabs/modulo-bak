@@ -252,7 +252,7 @@ async def _resolve_oidc_provider(
             db_provider.client_id,
             decode_stored_secret(db_provider.client_secret, settings.fernet_key) if db_provider.client_secret else None,
             discovery_url,
-            json.loads(db_provider.scopes) if db_provider.scopes else None,
+            _coerce_scopes(db_provider.scopes),
             db_provider,
         )
 
@@ -264,9 +264,36 @@ async def _resolve_oidc_provider(
         provider["client_id"],
         provider["client_secret"],
         provider["discovery_url"],
-        provider.get("scopes"),
+        _coerce_scopes(provider.get("scopes")),
         None,
     )
+
+
+def _coerce_scopes(value: object) -> list[str] | None:
+    """Normalise an OIDC scopes value into a list (or None).
+
+    Accepts ``None`` (no scopes), a ``list`` (already normal), or a JSON string
+    (the DB-stored form, but also guards against a raw env string slipping
+    through). A non-JSON string falls back to whitespace-splitting so a single
+    space-joined scope like ``"openid email"`` is not treated as one giant
+    scope by ``" ".join(scopes)`` at authorisation-time.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except (json.JSONDecodeError, TypeError):
+            return stripped.split()
+        if isinstance(parsed, list):
+            return [str(v) for v in parsed]
+        return [str(parsed)]
+    return None
 
 
 async def oidc_get_authorize_url(
@@ -552,6 +579,16 @@ async def _resolve_saml_config(
     """
     db_saml = await get_enabled_saml_provider(session)
     if db_saml is not None:
+        # The DB is the source of truth for SAML *configuration* (IdP metadata,
+        # entity id, etc.), but the deployment-level SAML enable toggle and the
+        # Team-license gate remain env-controlled. This keeps the DB path
+        # consistent with the env path below (and the /saml/metadata route):
+        # a DB-configured provider must not sign users in when SAML is disabled
+        # or unlicensed — that would be a licensing/security regression.
+        if not settings.modulo_saml_enabled:
+            raise ValueError("SAML is not enabled")
+        if not settings.modulo_license_key:
+            raise ValueError("SAML requires a license key (Team feature)")
         idp_metadata = db_saml.metadata_xml or None
         if not idp_metadata and db_saml.metadata_url:
             try:
