@@ -314,7 +314,7 @@ refuses to start without them:
 |----------|---------|-----------------|
 | `DATABASE_URL` | SQLAlchemy async DB URL for the application database | `sqlite+aiosqlite:///./modulo.db` for the local SQLite file below |
 | `SECRET_KEY` | 32+ byte random string used to sign JWTs | `$(openssl rand -base64 48)` |
-| `FERNET_KEY` | 44-char base64 Fernet key used to encrypt stored connector credentials | `$(openssl rand -base64 48)` (base64-encoded 32-byte key) |
+| `FERNET_KEY` | 44-char base64 Fernet key used to encrypt stored connector credentials | `$(openssl rand -base64 32)` (base64-encoded 32-byte key) |
 
 The command below sets all three inline, so it is runnable as written. `MODULO_ADMIN_PASSWORD`
 seeds the initial admin user (optional but recommended for first login); `MODULO_DB=sqlite`
@@ -326,7 +326,7 @@ cd backend
 uv sync
 DATABASE_URL=sqlite+aiosqlite:///./modulo.db \
   SECRET_KEY=$(openssl rand -base64 48) \
-  FERNET_KEY=$(openssl rand -base64 48) \
+  FERNET_KEY=$(openssl rand -base64 32) \
   MODULO_ADMIN_PASSWORD=changeme \
   MODULO_DB=sqlite \
   uv run uvicorn modulo.api.main:app --port 8000
