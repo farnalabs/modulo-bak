@@ -1088,6 +1088,9 @@ class TestAdminCreateUserAudit:
         assert kwargs["resource_id"] == account.id
         assert kwargs["payload_json"]["target_user_id"] == str(account.id)
         assert kwargs["payload_json"]["org_role"] == "runner"
+        # FAR-460: an admin-minted credential must be replaced by its owner on
+        # first sign-in. Mirror the reset path — the create path must set the flag.
+        assert account.must_change_password is True
 
     def test_create_user_audit_write_is_fail_open(self, client: TestClient) -> None:
         account = _fake_lifecycle_account()
