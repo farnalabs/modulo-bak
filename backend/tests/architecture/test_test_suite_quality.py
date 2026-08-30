@@ -1926,10 +1926,16 @@ def _call_has_constant_args(call: ast.Call) -> bool:
     literals can never exercise distinct inputs — ``f({'a': 1}) ==
     f({'a': 1})`` is as vacuous as ``x == x``, just with more ceremony. Method
     calls (``obj.method(...)``) are never considered: the receiver holds state.
+
+    A zero-argument call (``get_time() == get_time()``, ``uuid4() ==
+    uuid4()``) is deliberately NOT considered constant: the lens cannot tell a
+    deterministic identity from a non-deterministic value without
+    interprocedural analysis, and such comparisons are legitimate determinism
+    checks (they CAN fail), so an empty arg list returns False.
     """
     args = list(call.args) + [kw.value for kw in call.keywords]
     if not args:
-        return True
+        return False
     for arg in args:
         for n in ast.walk(arg):
             if isinstance(
@@ -1966,9 +1972,12 @@ def _self_comparison_tautologies(tree: ast.AST) -> list[tuple[int, str]]:
         if isinstance(left, ast.Call):
             # Identical bare-name calls with constant-literal args only — a
             # determinism check of a constant, which never exercises distinct
-            # inputs. Calls with variable args (``f(x) == f(x)``) and method
-            # calls (``obj.method(a) == obj.method(a)``) stay unflagged: the
-            # former is a legitimate purity check, the latter depends on state.
+            # inputs. Calls with variable args (``f(x) == f(x)``), zero-arg
+            # calls (``get_time() == get_time()``, ``uuid4() == uuid4()``), and
+            # method calls (``obj.method(a) == obj.method(a)``) stay unflagged:
+            # the first two are legitimate determinism checks the lens cannot
+            # prove redundant without interprocedural analysis, and the last
+            # depends on receiver state.
             if not isinstance(left.func, ast.Name):
                 continue
             if not isinstance(node.ops[0], (ast.Eq, ast.NotEq, ast.Is, ast.IsNot)):
@@ -2058,6 +2067,11 @@ def test_self_comparison_lens_flags_tautologies():
         "def test_foo():\n    assert get_time() < get_time()\n",
         "def test_foo():\n    assert fn(1) == fn(2)\n",
         "def test_foo():\n    assert h({'name': 'café'}) == h(json.loads('{\"name\": \"\\\\u00e9\"}'))\n",
+        # Zero-arg calls are legitimate determinism checks the lens cannot prove
+        # redundant without interprocedural analysis (get_time()/uuid4()/randint()
+        # CAN yield distinct values), so they must stay unflagged.
+        "def test_foo():\n    assert get_time() == get_time()\n",
+        "def test_foo():\n    assert uuid4() != uuid4()\n",
     ]
     for source in negative_sources:
         tree = ast.parse(source)

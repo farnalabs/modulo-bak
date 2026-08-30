@@ -22,7 +22,6 @@ the pre-trigger query:
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from collections.abc import Generator
@@ -201,13 +200,17 @@ class TestCanonicalPayloadHash:
         right = {"a": [1, 2], "b": {"c": "x"}}
         assert canonical_payload_hash(left) == canonical_payload_hash(right)
 
-    def test_unicode_escapes_normalised(self) -> None:
-        # A raw webhook body may spell "é" as "\u00e9". json.loads decodes the
-        # escape to the same Python str as a literal "é", so the canonical hash
-        # must be identical regardless of which encoding the sender used.
-        assert canonical_payload_hash({"name": "caf\u00e9"}) == canonical_payload_hash(
-            json.loads('{"name": "caf\\u00e9"}')
-        )
+    def test_unicode_content_participates_in_hash(self) -> None:
+        # canonical_payload_hash serializes with ensure_ascii=False, so the
+        # actual unicode codepoints participate in the digest: two payloads that
+        # differ only in a non-ASCII character MUST hash differently (a
+        # constant-returning hash would wrongly collapse them — this assertion
+        # is therefore non-vacuous). The encoding-independence of the dedup key
+        # (a literal "é" vs a JSON "\u00e9" raw body) is resolved by json.loads
+        # ABOVE this seam — canonical_payload_hash only ever receives an already
+        # parsed dict, so that property is not observable through this function
+        # and is intentionally not asserted here.
+        assert canonical_payload_hash({"name": "café"}) != canonical_payload_hash({"name": "cafe"})
 
     def test_different_payloads_differ(self) -> None:
         assert canonical_payload_hash({"event": "push", "ref": "main"}) != canonical_payload_hash(
