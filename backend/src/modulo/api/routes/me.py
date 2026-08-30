@@ -123,12 +123,16 @@ async def change_password(
 ) -> dict[str, str]:
     try:
         async with session.begin():
-            # Scope the transaction to the user's org UP FRONT so the
-            # token_families operations below (list/blacklist) run org-scoped
-            # rather than relying on a fail-open RLS policy when the org
-            # context is not yet set.
-            await set_rls_org(session, current_user.organisation_id)
-
+            # NOTE: do NOT scope the transaction to the user's org up front.
+            # ``token_families`` retains a fail-open ``rls_org_isolation`` policy
+            # (the null-context branch returns every row when ``app.organisation_id``
+            # is unset), so leaving the org context unset here makes
+            # ``list_families_for_account`` / ``blacklist_family`` operate on ALL of
+            # the account's token families across every org — which is exactly the
+            # correct, fail-closed behaviour for credential change: every refresh
+            # token family for the account must be revoked, regardless of which org
+            # it was minted under. Scoping to the current org would silently leave
+            # cross-org / NULL-org families live (a token-invalidation gap).
             account = await get_account_by_id(session, current_user.account_id)
             if account is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_ACCOUNT_NOT_FOUND)
@@ -167,11 +171,12 @@ async def change_password(
 
             # Audit is fail-open-with-alert: the password change ALWAYS commits;
             # a failed audit write is loudly logged and never rolls back the change.
-            # The org context is already set at the top of the transaction, so
-            # the audit event below is org-scoped without a redundant re-set.
+            # Establish the org context now (the token-family ops above ran with it
+            # unset on purpose) so the strict ``audit_events`` insert is org-scoped.
             try:
                 from modulo.core.audit_logger import append_audit_event
 
+                await set_rls_org(session, current_user.organisation_id)
                 await append_audit_event(
                     session,
                     org_id=current_user.organisation_id,
