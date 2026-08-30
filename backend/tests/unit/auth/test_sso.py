@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from modulo.api.dependencies import _get_engine, get_db_session, get_plan_context
+from modulo.api.dependencies import _get_engine, get_db_session, get_plan_context, get_system_db_session
 from modulo.api.routes.sso import router as sso_router
 from modulo.auth.sso import (
     parse_oidc_providers,
@@ -74,6 +74,7 @@ def client() -> Generator[TestClient, None, None]:
 
     _app.dependency_overrides[get_settings] = lambda: _override()
     _app.dependency_overrides[get_db_session] = _override_session
+    _app.dependency_overrides[get_system_db_session] = _override_session
     _app.dependency_overrides[_get_engine] = lambda: MagicMock()
     _app.dependency_overrides[get_plan_context] = lambda: DbPlanContext(FeatureFlagRegistry(current_tier="team"))
     try:
@@ -262,7 +263,9 @@ class TestSamlMetadataParsing:
             mock_db.return_value = None
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
 
-            url, _req_id = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs", session)
+            url, _req_id = await saml_get_auth_url(
+                settings, "https://modulo.example.com/api/v1/auth/saml/acs", session, session
+            )
             assert "idp.example.com" in url
             assert "SAMLRequest" in url
 
@@ -587,7 +590,7 @@ class TestOidcGetAuthorizeUrl:
         settings = _override()
         session = _mock_session()
         with pytest.raises(ValueError, match="not configured"):
-            await oidc_get_authorize_url("nonexistent", settings, "http://localhost/callback", session)
+            await oidc_get_authorize_url("nonexistent", settings, "http://localhost/callback", session, session)
 
     async def test_raises_when_discovery_missing_authz_endpoint(self) -> None:
         from modulo.auth.sso import oidc_get_authorize_url
@@ -598,7 +601,7 @@ class TestOidcGetAuthorizeUrl:
             mock_disc.return_value = {"token_endpoint": "https://example.com/token"}
 
             with pytest.raises(ValueError, match="No authorization_endpoint"):
-                await oidc_get_authorize_url("google", settings, "http://localhost/callback", session)
+                await oidc_get_authorize_url("google", settings, "http://localhost/callback", session, session)
 
     async def test_returns_url_and_state(self) -> None:
         from modulo.auth.sso import oidc_get_authorize_url
@@ -610,7 +613,9 @@ class TestOidcGetAuthorizeUrl:
                 "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
             }
 
-            url, raw_state = await oidc_get_authorize_url("google", settings, "http://localhost/callback", session)
+            url, raw_state = await oidc_get_authorize_url(
+                "google", settings, "http://localhost/callback", session, session
+            )
 
             assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth")
             assert "client_id=google-client-id" in url
@@ -673,6 +678,7 @@ class TestOidcProcessCallback:
                 signed,
                 settings,
                 session,
+                session,
                 "http://localhost/callback",
             )
 
@@ -688,7 +694,9 @@ class TestOidcProcessCallback:
         session = _mock_session()
 
         with pytest.raises(ValueError, match="CSRF"):
-            await oidc_process_callback("code", "tampered-state", settings, session, "http://localhost/callback")
+            await oidc_process_callback(
+                "code", "tampered-state", settings, session, session, "http://localhost/callback"
+            )
 
     async def test_raises_when_provider_not_found_after_state_check(self) -> None:
         from modulo.auth.sso import oidc_process_callback
@@ -698,7 +706,7 @@ class TestOidcProcessCallback:
         signed = sign_state("ghost:state", settings.secret_key)
 
         with pytest.raises(ValueError, match="not found"):
-            await oidc_process_callback("code", signed, settings, session, "http://localhost/callback")
+            await oidc_process_callback("code", signed, settings, session, session, "http://localhost/callback")
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +723,7 @@ class TestSamlGetAuthUrl:
         with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db:
             mock_db.return_value = None
             with pytest.raises(ValueError, match="SAML is not enabled"):
-                await saml_get_auth_url(settings, "http://localhost/acs", session)
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
     async def test_raises_when_no_license(self) -> None:
         from modulo.auth.sso import saml_get_auth_url
@@ -725,7 +733,7 @@ class TestSamlGetAuthUrl:
         with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db:
             mock_db.return_value = None
             with pytest.raises(ValueError, match="requires a license"):
-                await saml_get_auth_url(settings, "http://localhost/acs", session)
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
     async def test_raises_when_no_metadata_source(self) -> None:
         from modulo.auth.sso import saml_get_auth_url
@@ -742,7 +750,7 @@ class TestSamlGetAuthUrl:
             mock_db.return_value = None
             mock_fetch.side_effect = ValueError("SAML IdP metadata not configured")
             with pytest.raises(ValueError, match="metadata not configured"):
-                await saml_get_auth_url(settings, "http://localhost/acs", session)
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
 
 class TestSamlProcessResponse:
@@ -785,7 +793,7 @@ class TestSamlProcessResponse:
         settings = _override(modulo_saml_enabled=False)
         session = _mock_session()
         with pytest.raises(ValueError, match="SAML is not enabled"):
-            await saml_process_response("response", settings, session)
+            await saml_process_response("response", settings, session, session)
 
     async def test_raises_when_no_license(self) -> None:
         from modulo.auth.sso import saml_process_response
@@ -793,7 +801,7 @@ class TestSamlProcessResponse:
         settings = _override(modulo_license_key="", modulo_saml_enabled=True)
         session = _mock_session()
         with pytest.raises(ValueError, match="requires a license"):
-            await saml_process_response("response", settings, session)
+            await saml_process_response("response", settings, session, session)
 
     async def test_raises_when_no_assertion(self) -> None:
         from modulo.auth.sso import saml_process_response
@@ -809,7 +817,7 @@ class TestSamlProcessResponse:
         with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
             with pytest.raises(ValueError, match="SAML response validation failed"):
-                await saml_process_response(empty_response, settings, session)
+                await saml_process_response(empty_response, settings, session, session)
 
     async def test_full_success_flow(self) -> None:
         from modulo.auth.saml_handler import ModuloSamlAuth
@@ -845,7 +853,7 @@ class TestSamlProcessResponse:
                 "token_type": "bearer",
             }
 
-            result = await saml_process_response(encoded, settings, session)
+            result = await saml_process_response(encoded, settings, session, session)
 
             assert result["access_token"] == "at-saml"
             mock_jit.assert_awaited_once_with(
@@ -914,7 +922,7 @@ class TestSamlProcessResponse:
         with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
             with pytest.raises(ValueError, match="Destination does not match"):
-                await saml_process_response(encoded, settings, session)
+                await saml_process_response(encoded, settings, session, session)
 
 
 class TestSamlFetchIdpMetadata:
@@ -1141,7 +1149,7 @@ class TestOidcGetAuthorizeUrlDb:
             mock_disc.return_value = {
                 "authorization_endpoint": "https://example.auth0.com/authorize",
             }
-            url, _ = await oidc_get_authorize_url("auth0", settings, "http://localhost/cb", session)
+            url, _ = await oidc_get_authorize_url("auth0", settings, "http://localhost/cb", session, session)
             assert "client_id=db-client-id" in url
             assert "example.auth0.com/authorize" in url
             assert "scope=openid+email" in url
@@ -1199,7 +1207,9 @@ class TestOidcProcessCallbackDb:
                 "token_type": "bearer",
             }
 
-            result = await oidc_process_callback("auth-code", signed, settings, session, "http://localhost/callback")
+            result = await oidc_process_callback(
+                "auth-code", signed, settings, session, session, "http://localhost/callback"
+            )
 
             assert result["access_token"] == "at-db"
             mock_ex.assert_awaited_once_with(
@@ -1251,6 +1261,140 @@ class TestSamlGetAuthUrlDb:
             entity_id="https://idp.example.com",
         )
         session = _mock_session(scalar=provider)
-        url, _ = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs", session)
+        url, _ = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs", session, session)
         assert "idp.example.com" in url
         assert "SAMLRequest" in url
+
+
+# ---------------------------------------------------------------------------
+# System-scoped (modulo_system role) provider resolution — FAR-464 option (a)
+# ---------------------------------------------------------------------------
+
+
+class TestSystemSessionProviderResolution:
+    def _oidc_provider(self, org_id: uuid.UUID) -> SimpleNamespace:
+        return SimpleNamespace(
+            provider_type="oidc",
+            enabled=True,
+            client_id="db-client-id",
+            client_secret="db-client-secret",
+            discovery_url="https://example.auth0.com/.well-known/openid-configuration",
+            scopes=None,
+            group_mappings=[],
+            organisation_id=org_id,
+        )
+
+    async def test_system_session_resolves_non_first_org_provider(self) -> None:
+        """A provider in a NON-first org is resolved through the system session.
+
+        The system session (``modulo_system``, BYPASSRLS) returns the provider
+        regardless of org, so the resolution is instance-global — it must NOT
+        fall back to the app session (which would pin to the first org).
+        """
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session(scalar=provider)
+        app_session = _mock_session()
+
+        with patch("modulo.auth.sso._set_default_rls_org", new_callable=AsyncMock) as mock_default_org:
+            client_id, _client_secret, discovery_url, _scopes, db_provider = await _resolve_oidc_provider(
+                "auth0", system_session, app_session, settings
+            )
+
+        assert db_provider is provider
+        assert db_provider.organisation_id == org_id
+        assert client_id == "db-client-id"
+        assert discovery_url == "https://example.auth0.com/.well-known/openid-configuration"
+        mock_default_org.assert_not_awaited()
+
+    async def test_oidc_callback_uses_resolved_provider_org_for_jit(self) -> None:
+        """The resolved (system) provider's organisation_id drives JIT placement.
+
+        The app session is RLS-scoped to the resolved provider's org and that
+        org is passed as ``default_org_id`` so the user is provisioned into it.
+        """
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session(scalar=provider)
+        app_session = _mock_session()
+        signed = sign_state("auth0:raw-state", settings.secret_key)
+        id_token = (
+            base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+            + "."
+            + base64.urlsafe_b64encode(b'{"email":"user@example.com","name":"Test User","sub":"abc"}')
+            .rstrip(b"=")
+            .decode()
+            + "."
+            + "sig"
+        )
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+            patch("modulo.auth.sso.set_rls_org", new_callable=AsyncMock) as mock_set_rls,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "https://oauth2.example.com/token",
+                "jwks_uri": "https://oauth2.example.com/certs",
+                "issuer": "https://example.auth0.com",
+            }
+            mock_ex.return_value = {"id_token": id_token}
+            mock_verify.return_value = {
+                "email": "user@example.com",
+                "name": "Test User",
+                "sub": "abc",
+            }
+            mock_jit.return_value = (MagicMock(), org_id, "runner")
+            mock_tok.return_value = {
+                "access_token": "at-db",
+                "refresh_token": "rt-db",
+                "token_type": "bearer",
+            }
+
+            await oidc_process_callback(
+                "auth-code", signed, settings, system_session, app_session, "http://localhost/callback"
+            )
+
+        mock_set_rls.assert_awaited_once_with(app_session, org_id)
+        mock_jit.assert_awaited_once_with(
+            app_session,
+            settings,
+            "user@example.com",
+            "Test User",
+            "oidc",
+            "auth0:abc",
+            default_org_id=org_id,
+        )
+        mock_tok.assert_awaited_once()
+
+    async def test_app_session_fallback_when_system_resolves_none(self) -> None:
+        """Single-org fallback: when the system read returns nothing the app session is used.
+
+        The system role may be unprovisioned (returns zero rows), or the
+        provider may genuinely be absent — in either case the resolver falls
+        back to the app session scoped to the first org before the env path.
+        """
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session()
+        app_session = _mock_session(scalar=provider)
+
+        with patch("modulo.auth.sso._set_default_rls_org", new_callable=AsyncMock) as mock_default_org:
+            _client_id, _cs, _du, _scopes, db_provider = await _resolve_oidc_provider(
+                "auth0", system_session, app_session, settings
+            )
+
+        assert db_provider is provider
+        mock_default_org.assert_awaited_once_with(app_session)

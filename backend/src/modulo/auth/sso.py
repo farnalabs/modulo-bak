@@ -70,6 +70,26 @@ async def _set_default_rls_org(session: AsyncSession) -> None:
         await set_rls_org(session, org.id)
 
 
+async def _scope_app_session_org(
+    app_session: AsyncSession,
+    db_provider: SsoProvider | None,
+) -> uuid.UUID | None:
+    """Scope the app session RLS for JIT writes and return the ``default_org_id``.
+
+    The app session runs as ``modulo_app`` (NOBYPASSRLS), so the JIT writes
+    (Account / OrgMembership) must be RLS-scoped to the org the user is being
+    provisioned into. When a DB provider was resolved (its ``organisation_id``
+    is the org owning that provider), scope to it and return it as the default
+    org. Otherwise fall back to the first-org single-org behaviour (``None``
+    tells ``jit_provision_user`` to resolve the first org itself).
+    """
+    if db_provider is not None and db_provider.organisation_id is not None:
+        await set_rls_org(app_session, db_provider.organisation_id)
+        return db_provider.organisation_id
+    await _set_default_rls_org(app_session)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # JIT account provisioning
 # ---------------------------------------------------------------------------
@@ -228,19 +248,46 @@ async def issue_sso_tokens(
 # ---------------------------------------------------------------------------
 
 
+async def _read_system_oidc_provider(
+    system_session: AsyncSession | None,
+    provider_id: str,
+) -> SsoProvider | None:
+    """Global (cross-org) OIDC provider read via the ``modulo_system`` role.
+
+    Returns ``None`` when the system role is unprovisioned (falls back to the
+    regular engine running as ``modulo_app`` NOBYPASSRLS, which returns zero
+    rows) or the provider genuinely does not exist.
+    """
+    if system_session is None:
+        return None
+    async with system_session.begin():
+        return await get_provider_by_provider_id(system_session, provider_id)
+
+
 async def _resolve_oidc_provider(
     provider_id: str,
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None,
     settings: Settings,
 ) -> tuple[str | None, str | None, str | None, list[str] | str | None, SsoProvider | None]:
-    """Resolve OIDC IdP config, DB-first then env fallback.
+    """Resolve OIDC IdP config: system (global) read, then app single-org, then env.
+
+    The pre-auth SSO routes have no user/org claim. Provider config is
+    instance-global (not tenant data), so the primary read goes through the
+    ``modulo_system`` role (BYpassRLS) which sees every org. When the system
+    read returns nothing (system role unprovisioned -> zero rows, or the
+    provider genuinely absent), we fall back to the app session scoped to the
+    first org (single-org self-hosted behaviour) before the env-var fallback.
 
     Returns ``(client_id, client_secret, discovery_url, scopes, db_provider)``.
     ``db_provider`` is the ``SsoProvider`` row when the config came from the DB
     (used for JIT org placement and SSRF validation); ``None`` for the env path.
     Returns all-``None`` when the provider is not configured at all.
     """
-    db_provider = await get_provider_by_provider_id(session, provider_id)
+    db_provider = await _read_system_oidc_provider(system_session, provider_id)
+    if db_provider is None and app_session is not None:
+        await _set_default_rls_org(app_session)
+        db_provider = await get_provider_by_provider_id(app_session, provider_id)
     if db_provider is not None and db_provider.provider_type == "oidc" and db_provider.enabled:
         discovery_url = db_provider.discovery_url
         if discovery_url:
@@ -273,16 +320,19 @@ async def oidc_get_authorize_url(
     provider_id: str,
     settings: Settings,
     redirect_uri: str,
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None = None,
 ) -> tuple[str, str]:
     """Build the OIDC authorization URL and return (url, raw_state).
 
     Resolves IdP config from the sso_providers DB table first (preferred, since
     the admin UI writes there); falls back to env-var providers for backward
-    compatibility.
+    compatibility. Provider resolution uses the system session (``modulo_system``
+    role, instance-global) so multi-org deployments resolve the correct provider
+    regardless of org; the app session is used only for the single-org fallback.
     """
     client_id, _client_secret, discovery_url, scopes, _db_provider = await _resolve_oidc_provider(
-        provider_id, session, settings
+        provider_id, system_session, app_session, settings
     )
 
     if client_id is None:
@@ -321,10 +371,17 @@ async def oidc_process_callback(
     code: str,
     state: str,
     settings: Settings,
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None,
     redirect_uri: str,
 ) -> dict[str, str]:
-    """Exchange auth code for tokens, JIT provision account, return JWT pair."""
+    """Exchange auth code for tokens, JIT provision account, return JWT pair.
+
+    Provider resolution uses the system session (``modulo_system`` role,
+    instance-global) so the correct provider is resolved across orgs. JIT
+    provisioning writes via the app session, RLS-scoped to the resolved
+    provider's org (or the first-org fallback for the env/single-org path).
+    """
     state_data = verify_state(state, settings.secret_key)
     if not state_data:
         _log.warning(
@@ -335,7 +392,7 @@ async def oidc_process_callback(
     provider_id = state_data.split(":", 1)[0] if ":" in state_data else state_data
 
     client_id, client_secret, discovery_url, _scopes, db_provider = await _resolve_oidc_provider(
-        provider_id, session, settings
+        provider_id, system_session, app_session, settings
     )
 
     if client_id is None:
@@ -389,15 +446,19 @@ async def oidc_process_callback(
     name = claims.get("name", "") or claims.get("preferred_username", "") or email.split("@")[0]
     sso_subject = f"{provider_id}:{claims.get('sub', email)}"
 
+    if app_session is None:
+        raise RuntimeError("No app session available for OIDC JIT provisioning")
+
+    default_org_id = await _scope_app_session_org(app_session, db_provider)
     try:
         account, org_id, org_role = await jit_provision_user(
-            session,
+            app_session,
             settings,
             email,
             name,
             "oidc",
             sso_subject,
-            default_org_id=db_provider.organisation_id if db_provider is not None else None,
+            default_org_id=default_org_id,
         )
     except RuntimeError as exc:
         raise ValueError(str(exc)) from None
@@ -407,11 +468,11 @@ async def oidc_process_callback(
         raw_groups = []
     idp_groups: list[str] = raw_groups
     if idp_groups:
-        db_provider_for_groups = await _lookup_provider_by_client_id(session, client_id, org_id)
+        db_provider_for_groups = await _lookup_provider_by_client_id(app_session, client_id, org_id)
         if db_provider_for_groups is not None and db_provider_for_groups.group_mappings:
-            await apply_group_mappings(session, account, org_id, idp_groups, db_provider_for_groups.group_mappings)
+            await apply_group_mappings(app_session, account, org_id, idp_groups, db_provider_for_groups.group_mappings)
 
-    return await issue_sso_tokens(account, org_id, org_role, session, settings)
+    return await issue_sso_tokens(account, org_id, org_role, app_session, settings)
 
 
 def _parse_oidc_providers(settings: Settings) -> list[dict[str, str]]:
@@ -534,11 +595,31 @@ def _decode_id_token_claims(id_token: str) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 
 
+async def _read_system_saml_provider(system_session: AsyncSession | None) -> SsoProvider | None:
+    """Global (cross-org) SAML provider read via the ``modulo_system`` role.
+
+    Returns ``None`` when the system role is unprovisioned (returns zero rows)
+    or no enabled SAML provider exists. Pre-auth SAML is a single-provider flow,
+    so the first enabled provider globally is the one used.
+    """
+    if system_session is None:
+        return None
+    async with system_session.begin():
+        return await get_enabled_saml_provider(system_session)
+
+
 async def _resolve_saml_config(
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None,
     settings: Settings,
 ) -> tuple[str, str, str | None, str | None, SsoProvider | None]:
-    """Resolve SAML IdP config, DB-first then env fallback.
+    """Resolve SAML IdP config: system (global) read, then app single-org, then env.
+
+    The pre-auth SAML routes have no user/org claim. IdP config is
+    instance-global, so the primary read goes through the ``modulo_system`` role
+    (BYPASSRLS) which sees every org. When the system read returns nothing, fall
+    back to the app session scoped to the first org (single-org self-hosted
+    behaviour) before the env-var fallback.
 
     Returns ``(idp_metadata_xml, entity_id, sp_private_key, sp_x509_cert,
     db_provider)``. ``entity_id`` is ``db_saml.entity_id or
@@ -550,7 +631,10 @@ async def _resolve_saml_config(
     with explicit error handling; the env path is unchanged for backward
     compatibility (unit tests use example.com).
     """
-    db_saml = await get_enabled_saml_provider(session)
+    db_saml = await _read_system_saml_provider(system_session)
+    if db_saml is None and app_session is not None:
+        await _set_default_rls_org(app_session)
+        db_saml = await get_enabled_saml_provider(app_session)
     if db_saml is not None:
         idp_metadata = db_saml.metadata_xml or None
         if not idp_metadata and db_saml.metadata_url:
@@ -594,7 +678,8 @@ async def _resolve_saml_config(
 async def saml_get_auth_url(
     settings: Settings,
     acs_url: str,
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None = None,
 ) -> tuple[str, str]:
     """Generate a SAML AuthnRequest using python3-saml and return (IdP redirect URL, _).
 
@@ -602,11 +687,14 @@ async def saml_get_auth_url(
     and encoding. The second return value (request_id) is no longer used by the
     caller but kept for API compatibility.
 
-    Resolves IdP config from the sso_providers DB table first (preferred, since
+    Resolves IdP config through the sso_providers DB table first (preferred, since
     the admin UI writes there); falls back to env-var config for backward
-    compatibility.
+    compatibility. Provider resolution uses the system session (``modulo_system``
+    role, instance-global) so multi-org deployments resolve the correct IdP.
     """
-    idp_metadata, entity_id, sp_key, sp_cert, _db_saml = await _resolve_saml_config(session, settings)
+    idp_metadata, entity_id, sp_key, sp_cert, _db_saml = await _resolve_saml_config(
+        system_session, app_session, settings
+    )
     handler = ModuloSamlAuth(
         entity_id=entity_id,
         acs_url=acs_url,
@@ -664,7 +752,8 @@ def _validate_saml_response_destination(saml_response: str, acs_url: str) -> Non
 async def saml_process_response(
     saml_response: str,
     settings: Settings,
-    session: AsyncSession,
+    system_session: AsyncSession | None,
+    app_session: AsyncSession | None,
 ) -> dict[str, str]:
     """Validate a SAML Response using python3-saml and issue tokens.
 
@@ -675,9 +764,13 @@ async def saml_process_response(
 
     Resolves IdP metadata from the sso_providers DB table first (preferred, since
     the admin UI writes there); falls back to env-var config for backward
-    compatibility.
+    compatibility. Provider resolution uses the system session (``modulo_system``
+    role, instance-global); JIT provisioning writes via the app session,
+    RLS-scoped to the resolved provider's org (or first-org fallback).
     """
-    idp_metadata, entity_id, sp_key, sp_cert, db_saml = await _resolve_saml_config(session, settings)
+    idp_metadata, entity_id, sp_key, sp_cert, db_saml = await _resolve_saml_config(
+        system_session, app_session, settings
+    )
 
     try:
         _, idp_entity_id = _saml_parse_idp_metadata(idp_metadata)
@@ -714,15 +807,19 @@ async def saml_process_response(
     )
     sso_subject = f"saml:{idp_entity_id}:{name_id}"
 
+    if app_session is None:
+        raise RuntimeError("No app session available for SAML JIT provisioning")
+
+    default_org_id = await _scope_app_session_org(app_session, db_saml)
     try:
         account, org_id, org_role = await jit_provision_user(
-            session,
+            app_session,
             settings,
             email,
             display_name,
             "saml",
             sso_subject,
-            default_org_id=db_saml.organisation_id if db_saml is not None else None,
+            default_org_id=default_org_id,
         )
     except RuntimeError as exc:
         raise ValueError(str(exc)) from None
@@ -734,12 +831,12 @@ async def saml_process_response(
             saml_groups = [g.strip() for g in raw.split(",") if g.strip()]
             break
     if saml_groups:
-        db_provider = await _lookup_provider_by_entity_id(session, idp_entity_id, org_id)
+        db_provider = await _lookup_provider_by_entity_id(app_session, idp_entity_id, org_id)
         if db_provider is not None and db_provider.group_mappings:
-            await apply_group_mappings(session, account, org_id, saml_groups, db_provider.group_mappings)
+            await apply_group_mappings(app_session, account, org_id, saml_groups, db_provider.group_mappings)
 
     try:
-        return await issue_sso_tokens(account, org_id, org_role, session, settings)
+        return await issue_sso_tokens(account, org_id, org_role, app_session, settings)
     except RuntimeError as exc:
         raise ValueError(str(exc)) from None
 

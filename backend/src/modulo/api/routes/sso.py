@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.api.constants import MSG_FEATURE_NOT_AVAILABLE, MSG_UNEXPECTED_ERROR_NO_PERIOD
 from modulo.api.db_error_handling import handle_db_errors
-from modulo.api.dependencies import get_db_session, require_feature
+from modulo.api.dependencies import get_db_session, get_system_db_session, require_feature
 from modulo.auth.sso import (
     _set_default_rls_org,
     oidc_get_authorize_url,
@@ -54,33 +54,72 @@ class SsoProvidersResponse(BaseModel):
     saml: bool
 
 
+async def _list_enabled_oidc_global(
+    system_session: AsyncSession | None,
+    app_session: AsyncSession,
+) -> list[Any]:
+    """List enabled OIDC providers via the system session (global), then app fallback.
+
+    The system session (``modulo_system`` role, BYPASSRLS) sees every org's
+    providers; when it returns nothing (role unprovisioned -> zero rows), fall
+    back to the app session scoped to the first org (single-org behaviour).
+    """
+    providers: list[Any] = []
+    if system_session is not None:
+        async with system_session.begin():
+            providers = await list_enabled_oidc_providers(system_session)
+    if not providers:
+        await _set_default_rls_org(app_session)
+        providers = await list_enabled_oidc_providers(app_session)
+    return providers
+
+
+async def _get_enabled_saml_global(
+    system_session: AsyncSession | None,
+    app_session: AsyncSession,
+) -> Any:
+    """Return an enabled SAML provider via the system session (global), then app fallback."""
+    provider: Any = None
+    if system_session is not None:
+        async with system_session.begin():
+            provider = await get_enabled_saml_provider(system_session)
+    if provider is None:
+        await _set_default_rls_org(app_session)
+        provider = await get_enabled_saml_provider(app_session)
+    return provider
+
+
 @router.get("/sso/providers")
 @handle_db_errors("sso.sso_providers")
 async def sso_providers(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> SsoProvidersResponse:
     """List configured SSO providers (OIDC) and whether SAML is enabled.
 
     OIDC providers are merged from the sso_providers DB table (preferred) and
-    the env-var fallback, deduplicated by provider_id. SAML is enabled if any
-    enabled SAML provider exists in the DB, or if env-var SAML is fully
-    configured (enabled + license + metadata).
+    the env-var fallback, deduplicated by provider_id. The DB read goes through
+    the system session (``modulo_system`` role, instance-global) so the login
+    page reflects every org's enabled providers; when the system read returns
+    nothing (unprovisioned role), fall back to the app session scoped to the
+    first org (single-org self-hosted behaviour). SAML is enabled if any enabled
+    SAML provider exists in the DB, or if env-var SAML is fully configured
+    (enabled + license + metadata).
     """
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            db_providers = await list_enabled_oidc_providers(session)
-            db_ids = {p.provider_id for p in db_providers}
-            oidc_list = [{"provider_id": p.provider_id} for p in db_providers if p.provider_id]
+            oidc_providers = await _list_enabled_oidc_global(system_session, session)
+            db_ids = {p.provider_id for p in oidc_providers}
+            oidc_list = [{"provider_id": p.provider_id} for p in oidc_providers if p.provider_id]
 
             for env_provider in parse_oidc_providers(settings):
                 env_id = env_provider["provider_id"]
                 if env_id not in db_ids:
                     oidc_list.append({"provider_id": env_id})
 
-            db_saml = await get_enabled_saml_provider(session)
+            db_saml = await _get_enabled_saml_global(system_session, session)
             db_saml_ok = db_saml is not None and bool(db_saml.metadata_xml or db_saml.metadata_url)
             saml_enabled = db_saml_ok or (
                 settings.modulo_saml_enabled
@@ -114,6 +153,7 @@ async def oidc_login(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> Any:
     """Redirect the user to the OIDC provider's authorization page."""
     public_url = settings.modulo_public_url.rstrip("/")
@@ -121,8 +161,7 @@ async def oidc_login(
 
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri, session)
+            auth_url, _ = await oidc_get_authorize_url(provider, settings, redirect_uri, system_session, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except HTTPException:
@@ -139,6 +178,7 @@ async def oidc_callback(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> RedirectResponse:
     """Handle the OIDC provider's callback (authorization code exchange).
 
@@ -158,8 +198,7 @@ async def oidc_callback(
 
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            tokens = await oidc_process_callback(code, state, settings, session, redirect_uri)
+            tokens = await oidc_process_callback(code, state, settings, system_session, session, redirect_uri)
     except ValueError as exc:
         _log.warning(
             "OIDC callback failed for provider %s: %s",
@@ -207,6 +246,7 @@ async def saml_login(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> Any:
     """Redirect the user to the SAML IdP for authentication."""
     public_url = settings.modulo_public_url.rstrip("/")
@@ -214,8 +254,7 @@ async def saml_login(
 
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            auth_url, _ = await saml_get_auth_url(settings, acs_url, session)
+            auth_url, _ = await saml_get_auth_url(settings, acs_url, system_session, session)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from None
     except ProgrammingError as exc:
@@ -249,6 +288,7 @@ async def saml_acs(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> RedirectResponse:
     """Handle the SAML Assertion Consumer Service POST from the IdP.
 
@@ -265,8 +305,7 @@ async def saml_acs(
 
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            tokens = await saml_process_response(raw_saml, settings, session)
+            tokens = await saml_process_response(raw_saml, settings, system_session, session)
     except ValueError as exc:
         _log.warning("SAML ACS failed: %s", exc, exc_info=True)
         raise HTTPException(
@@ -304,6 +343,7 @@ async def saml_metadata(
     _: object = require_feature("sso"),
     settings: Settings = Depends(get_settings),
     session: AsyncSession = Depends(get_db_session),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> str:
     """Return SP metadata XML for SAML IdP configuration."""
     if not settings.modulo_saml_enabled:
@@ -314,8 +354,7 @@ async def saml_metadata(
 
     try:
         async with session.begin():
-            await _set_default_rls_org(session)
-            db_saml = await get_enabled_saml_provider(session)
+            db_saml = await _get_enabled_saml_global(system_session, session)
             entity_id = (db_saml.entity_id if db_saml is not None else None) or settings.modulo_saml_entity_id
 
             public_url = settings.modulo_public_url.rstrip("/")
