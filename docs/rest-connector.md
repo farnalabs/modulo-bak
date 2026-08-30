@@ -1,9 +1,9 @@
 # REST Connector
 
 The generic REST connector (`ConnectorType.REST`) lets a Modulo pipeline make
-an arbitrary HTTP request to an external system configured by the operator –
-no per-vendor client. It is the FAR-401 "point Modulo at any external system"
-implementation: a declarative, templated HTTP call.
+an arbitrary HTTP request to an external system configured by the operator,
+with no per-vendor client. It is the FAR-401 "point Modulo at any external
+system" implementation: a declarative, templated HTTP call.
 
 Because it is **verb-agnostic**, the connector does not infer meaning from the
 HTTP verb. You declare the method; the node surface fixes the access-control
