@@ -62,7 +62,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import jinja2
-import jmespath
 from jinja2.sandbox import SandboxedEnvironment
 from langchain_core.messages import HumanMessage
 from langgraph.types import interrupt
@@ -86,8 +85,13 @@ from modulo.core.node_output_split import (
     resolve_node_contract_output,
 )
 from modulo.core.pipeline_engine.decorator import cancellable_node
+from modulo.core.pipeline_engine.errors import RouterNoMatchError
 from modulo.core.pipeline_engine.event_broker import RunEventBroker, get_registry
 from modulo.core.pipeline_engine.input_truncation import truncate_input
+from modulo.core.pipeline_engine.jmespath_eval import (
+    compile_jmespath,
+    evaluate_jmespath_condition,
+)
 from modulo.core.pipeline_engine.sandbox_mode import _validate_sandbox_mode_config
 from modulo.core.run_context.autonomy import (
     effective_autonomy_level,
@@ -257,6 +261,8 @@ class OutputSchemaValidationError(ValueError):
     """
 
 
+# Single source of truth for JMESPath guard truthiness — `bool(result)`.
+# Test-pinned in tests/unit/pipeline_engine/test_conditional_transitions.py.
 _is_truthy = bool
 
 # Cap for the stored artifact stdout/stderr blobs. 512KB keeps storage bounded
@@ -287,6 +293,23 @@ _NO_OUTPUT_STDOUT_TAIL = 1024
 _NO_OUTPUT_RAW_SNIPPET = 512
 
 _OUTPUT_READ_TIMEOUT = 30.0  # max seconds to wait for sandbox output after command times out
+# FAR-487: the E2B sandbox LIFETIME must outlast the runner's command timeout.
+# Both used to be set from the same ``sandbox_timeout`` value, so the platform
+# killed the sandbox (``endAt``) at the same instant the runner's command
+# timeout fired. In that race the SDK's command event stream closes first and
+# ``handle.wait()`` resolves a zero-exit CommandResult (no exit event ever
+# arrives — the process died with the sandbox), so the runner took the
+# "completed, exit 0" path and then tried to read /home/user/output.json from
+# a DEAD sandbox: the read raised, ``output_json`` stayed None, and the node
+# failed as "Sandbox agent produced no parseable output.json (exit code 0)" —
+# 15+ production PR-Reviewer runs on 2026-08-29. The grace window makes the
+# runner's OWN timeout path (clean kill + correct stall/timeout
+# classification) win the race deterministically.
+# FAR-489: this MUST be an int. The E2B create API (Go) unmarshals
+# ``NewSandbox.timeout`` into an int32 — a float payload ("360.0") is
+# rejected with HTTP 400 and every sandbox create fails instantly. The
+# int() cast at the create call site is the load-bearing guard; keep both.
+_SANDBOX_LIFETIME_GRACE_S = 120
 _DECORATOR_GRACE = 5.0  # scheduling + finally-block margin for decorator safety net
 # FAR-188 (QA round 1): the raw-output retention DB write is bounded to fit
 # inside the node decorator's grace budget (_DECORATOR_GRACE = 5.0s) so a hung
@@ -691,6 +714,34 @@ def _bounded_tail(text: str, limit: int) -> str:
     return f"...[truncated {len(text) - limit} chars]...\n{text[-limit:]}"
 
 
+def _classify_no_output_cause(*, read_error: str, read_raw: str) -> str:
+    """Name WHY output.json was unparseable (FAR-487).
+
+    The runner reads AND parses output.json inside ONE try block, so a JSON
+    parse failure surfaces here as a ``JSONDecodeError`` read error with the
+    raw bytes still captured. Classification order: a parse failure of bytes
+    that were read (invalid JSON), a missing-file read error, any other read
+    failure (dead sandbox, network), a successful read whose bytes parse to
+    JSON null. The schema-rejection case is a DIFFERENT code path (validated
+    dicts) and is not classified here. Returns "" when the evidence cannot
+    classify.
+    """
+    if read_error:
+        if "JSONDecodeError" in read_error:
+            return "output.json was written but is NOT valid JSON"
+        if "NotFound" in read_error or "FileNotFound" in read_error:
+            return "output.json was MISSING (the agent never wrote it)"
+        return f"output.json could not be read ({read_error[:200]})"
+    if read_raw:
+        try:
+            parsed = json.loads(read_raw)
+        except (ValueError, TypeError):
+            return "output.json was written but is NOT valid JSON"
+        if parsed is None:
+            return "output.json was JSON null"
+    return ""
+
+
 def _build_no_output_message(
     *,
     exit_code: int,
@@ -698,12 +749,15 @@ def _build_no_output_message(
     stderr_raw: str,
     sandbox_id: str | None,
     read_raw: str = "",
+    read_error: str = "",
     log_tail: str = "",
 ) -> str:
     """Compose the FAR-197 diagnostic for an unparseable/missing output.json.
 
     A compact, bounded message: a prefix naming the exit code and sandbox id,
-    then bounded tails ordered by diagnostic value — the best-effort E2B log
+    then a cause line naming WHY the output was unparseable (missing file /
+    unreadable / invalid JSON — FAR-487), then bounded tails ordered by
+    diagnostic value — the best-effort E2B log
     tail FIRST (the only place the kill reason lives), then the captured agent
     stderr and stdout (agent errors typically sit at the END of stderr), and
     any raw bytes read back from output.json (the invalid-JSON case) LAST.
@@ -721,6 +775,9 @@ def _build_no_output_message(
     log_tail = str(log_tail)
 
     parts = [f"Sandbox agent produced no parseable output.json (exit code {exit_code})"]
+    cause = _classify_no_output_cause(read_error=read_error, read_raw=read_raw)
+    if cause:
+        parts.append(cause)
     if isinstance(sandbox_id, str) and sandbox_id:
         parts.append(f"sandbox id: {sandbox_id}")
     log_tail_cap = _bounded_tail(log_tail, _NO_OUTPUT_LOG_TAIL)
@@ -759,10 +816,7 @@ _TOKENIZED_GIT_URL_PATTERN = _re.compile(r"(https?://)[^@\s/]+@")
 # access keys, shared from the sensitive_mask canonical list.
 _TOKEN_VALUE_PATTERN = _re.compile(
     r"(x-access-token:|gh[pous]_|github_pat_|Bearer\s+|token=)[^\s\"'<>]+"
-    + r"|"
-    + GITHUB_PAT_PATTERN.pattern
-    + r"|"
-    + AWS_ACCESS_KEY_PATTERN.pattern
+    r"|" + GITHUB_PAT_PATTERN.pattern + r"|" + AWS_ACCESS_KEY_PATTERN.pattern
 )
 
 
@@ -1680,6 +1734,65 @@ def make_node_fn(
     return _node
 
 
+def make_router_node_fn(
+    router_config: dict[str, Any],
+    *,
+    node_id: str | None = None,
+) -> Callable[[dict[str, Any]], str]:
+    """Build a LangGraph *routing* function for a Router node (FAR-402 P1 / F2-A).
+
+    Evaluates ordered ``rules`` ``{guard (JMESPath), target}`` against state,
+    first-match-wins. An explicit ``default`` rule maps to its target. LLM
+    routing mode (``mode == "classifier"``) matches the ``_llm_next_node`` state
+    value against each rule's ``label`` (falling back to the default rule).
+
+    The function reuses the shared JMESPath evaluator
+    (:func:`evaluate_jmespath_condition`) — the same engine the existing
+    conditional-edge compile path uses — so Router lowers onto that machinery.
+    Every other branching primitive shares one truthiness rule.
+
+    When no rule matches and there is no ``default`` rule, raises
+    :class:`RouterNoMatchError` so the executor terminalizes the run with the
+    ``router_no_match`` status (a terminal, non-failure outcome). Compile-time
+    default-rule enforcement (see :func:`_validate_router_config`) is the
+    primary guard; this runtime raise is the backstop for a mis-configured
+    graph that slipped past validation.
+    """
+    rules: list[dict[str, Any]] = list(router_config.get("rules", []))
+    classifier_mode: bool = router_config.get("mode") == "classifier"
+
+    # Store (guard_expr, target) tuples. The guards are evaluated through the
+    # shared JMESPath evaluator so Router and the conditional-edge compile path
+    # share ONE truthiness rule.
+    rule_targets: list[tuple[str | None, str | None]] = []
+    default_target: str | None = None
+    for rule in rules:
+        target = rule.get("target") or rule.get("target_port")
+        if rule.get("default"):
+            default_target = target
+            continue
+        rule_targets.append((rule.get("guard"), target))
+
+    def _router(state: dict[str, Any]) -> str:
+        for guard, target in rule_targets:
+            if target is not None and evaluate_jmespath_condition(state, guard):
+                return target
+        if classifier_mode:
+            label = state.get("_llm_next_node")
+            if label is not None:
+                for rule in rules:
+                    if rule.get("label") == label:
+                        matched: str | None = rule.get("target") or rule.get("target_port")
+                        if matched is not None:
+                            return matched
+        if default_target:
+            return default_target
+        raise RouterNoMatchError(node_id=node_id)
+
+    _router.__name__ = f"router_{node_id}" if node_id else "router"
+    return _router
+
+
 async def _invoke_backend(
     hub: Any,
     backend_id: uuid.UUID,
@@ -1975,13 +2088,14 @@ def _hitl_gate_condition_skip(gate_id: str, condition_expr: str | None, state: d
     """Evaluate the conditional-gate JMESPath expression; skip artifact when falsy."""
     if condition_expr:
         try:
-            compiled = jmespath.compile(condition_expr)
-        except jmespath.exceptions.JMESPathError:
+            compiled = compile_jmespath(condition_expr)
+        except ValueError:
             _log.exception("hitl_gate.invalid_condition", extra={"condition": condition_expr})
             raise ValueError(f"Invalid HITL gate condition expression: {condition_expr}") from None
         result = compiled.search(state)
-        if not _is_truthy(result):
-            # Condition falsy — skip the gate entirely.
+        if not bool(result):
+            # Condition falsy — skip the gate entirely. Preserve the raw result
+            # in the artifact (mirrors the pre-refactor behaviour).
             return _build_hitl_gate_artifact(
                 gate_id, "condition_skipped", condition=condition_expr, condition_result=result
             )
@@ -2562,8 +2676,12 @@ async def resolve_env_var_refs(
     """Resolve ``{{ secrets.KEY }}`` references in env var values.
 
     Non-reference values pass through unchanged. ``{{ secrets.KEY }}`` values
-    are resolved via *resolver*; a missing secret resolves to ``""`` and logs a
-    warning (legacy behaviour), never raising.
+    are resolved via *resolver*; an UNRESOLVED reference (resolver returns
+    None) is OMITTED from the returned dict with a warning naming the key
+    (FAR-480). It is never resolved to an empty string: an empty value would
+    still reach the sandbox envs dict and CLOBBER the system-injected default
+    (e.g. the host GITHUB_TOKEN), silently breaking the sandbox credential.
+    Never raises.
     """
     resolved: dict[str, str] = {}
     for key, value in env_vars.items():
@@ -2572,10 +2690,14 @@ async def resolve_env_var_refs(
             secret_key = m.group(1)
             resolved_value = await resolver(secret_key)
             if resolved_value is None:
-                _log.warning("env_var.secret_ref_not_found", extra={"key": key, "secret_key": secret_key})
-                resolved[key] = ""
-            else:
-                resolved[key] = resolved_value
+                _log.warning(
+                    "env_var.secret_ref_not_found: env var %s references secret %r "
+                    "which could not be resolved — key omitted from sandbox envs",
+                    key,
+                    secret_key,
+                )
+                continue
+            resolved[key] = resolved_value
         else:
             resolved[key] = value
     return resolved
@@ -2786,6 +2908,11 @@ async def _sandbox_resolve_secret_ref(
     rotation on every run. Returns None if the key is not in the vault
     (does NOT fall back to the process environment to prevent secret
     exfiltration via pipeline references).
+
+    FAR-480: the unresolvable-context paths (no session_factory, missing or
+    invalid org_id) log a warning naming the secret key — they used to be
+    silent, which made an unresolved ``{{ secrets.X }}`` env ref invisible in
+    production until the sandbox failed on the missing credential.
     """
     if session_factory is not None:
         org_uuid: uuid.UUID | None = None
@@ -2810,6 +2937,18 @@ async def _sandbox_resolve_secret_ref(
                 pass  # not in vault -> return None
             except Exception:
                 _log.exception("env_var.secret_resolve_error", extra={"secret_key": secret_key})
+        else:
+            _log.warning(
+                "env_var.secret_ref_no_org_context: secret %r cannot be resolved from the "
+                "org vault (run org_id is missing or invalid) — ref will be omitted from sandbox envs",
+                secret_key,
+            )
+    else:
+        _log.warning(
+            "env_var.secret_ref_no_db_context: secret %r cannot be resolved from the "
+            "org vault (no DB session factory on this execution path) — ref will be omitted from sandbox envs",
+            secret_key,
+        )
     return None
 
 
@@ -3937,9 +4076,12 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
     scoped_state = dict(state)
     scoped_state["run_context"] = scoped_run_context
 
-    run_id: str = str(state.get("_run_id", ""))
-    pipeline_id: str = str(state.get("_pipeline_id", ""))
-    org_id: str = str(state.get("_org_id", ""))
+    _run_id = state.get("_run_id")
+    _pipeline_id = state.get("_pipeline_id")
+    _org_id = state.get("_org_id")
+    run_id: str = str(_run_id) if _run_id is not None else ""
+    pipeline_id: str = str(_pipeline_id) if _pipeline_id is not None else ""
+    org_id: str = str(_org_id) if _org_id is not None else ""
 
     # FAR-296 mode split: llm mode renders the prompt + agent_command through
     # the SandboxedEnvironment; script mode runs script_command VERBATIM —
@@ -4278,7 +4420,17 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
                 sandbox = await asyncio.wait_for(
                     AsyncSandbox.create(
                         template=template_id,
-                        timeout=sandbox_timeout,
+                        # FAR-487: lifetime STRICTLY greater than the command
+                        # timeout (+ _SANDBOX_LIFETIME_GRACE_S) so the platform
+                        # endAt kill can never preempt the runner's own timeout
+                        # path — a mid-command sandbox death fabricated a
+                        # zero-exit completion and misreported the failure as
+                        # "no parseable output.json (exit code 0)".
+                        # FAR-489: int() — the e2b SDK's attrs model does NOT
+                        # coerce a float, and E2B's Go server rejects
+                        # "1320.0" with 400 (int32 unmarshal), instantly
+                        # failing every sandbox create.
+                        timeout=int(sandbox_timeout + _SANDBOX_LIFETIME_GRACE_S),
                         allow_internet_access=(egress_policy not in ("deny_all", "selected")),
                         # deny_all/selected -> no internet; default/None ->
                         # internet allowed (e2b default). IMPORTANT
@@ -4851,6 +5003,7 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
                             stderr_raw=agent_stderr_raw,
                             sandbox_id=_sandbox_id,
                             read_raw=raw_output,
+                            read_error=output_read_error,
                             log_tail=_no_output_log_tail,
                         )
                     )
@@ -4861,6 +5014,7 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
                         stderr_raw=agent_stderr_raw,
                         sandbox_id=_sandbox_id,
                         read_raw=raw_output,
+                        read_error=output_read_error,
                         log_tail=_no_output_log_tail,
                     ),
                     node_id=node_id,
@@ -4910,7 +5064,7 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
         if isinstance(output_schema_json, dict) and isinstance(output_json, dict):
             try:
                 _validate_against_schema(output_json, output_schema_json)
-            except ValueError:
+            except ValueError as _schema_exc:
                 _log.exception(
                     "sandbox_agent.schema_validation_failed",
                     extra={"node_id": node_id},
@@ -4926,7 +5080,7 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
                     # generic ``schema_validation_failure`` code is SHARED
                     # with LLM-mode/manual paths and must stay retryable.
                     raise ScriptInvalidOutputError(
-                        f"Script-mode output failed schema validation for node '{node_id}'"
+                        f"Script-mode output failed schema validation for node '{node_id}': {_schema_exc}"
                     ) from None
                 elapsed = time.monotonic() - start_time
                 _cost_estimate_usd = _compute_sandbox_cost(elapsed, output_json)
@@ -4934,7 +5088,11 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
                     node_id=node_id,
                     output=_SandboxNodeOutput(
                         status="failed",
-                        summary="Output failed schema validation",
+                        # FAR-487: name the rejected field so an operator can
+                        # align the agent's output shape (e.g. a synthesized
+                        # failed-output) with what the schema accepts —
+                        # without loosening the schema itself.
+                        summary=f"Output failed schema validation: {_schema_exc}",
                         exit_code=exit_code,
                         wall_clock_time_ms=int(elapsed * 1000),
                         cost_estimate_usd=_cost_estimate_usd,
@@ -5472,8 +5630,12 @@ def make_sandbox_agent_fn(
 
     env_vars values may reference secrets with ``{{ secrets.KEY }}``. These are
     resolved at run time from the org vault (when a ``session_factory`` is
-    provided) and fall back to the process environment, so secret rotation
-    takes effect on the next run and secrets never enter the compiled graph.
+    provided), so secret rotation takes effect on the next run and secrets
+    never enter the compiled graph. There is NO process-environment fallback
+    (anti-exfiltration). An unresolved reference is OMITTED from the sandbox
+    envs with a warning (FAR-480) — never resolved to an empty string, which
+    would clobber the system-injected default (e.g. the host GITHUB_TOKEN) and
+    silently break the sandbox credential.
     """
     config = _build_sandbox_node_config(
         node_def,

@@ -9,8 +9,8 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from jsonschema import Draft202012Validator, ValidationError  # type: ignore[import-untyped]
-from jsonschema.exceptions import SchemaError as JsSchemaError  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator, ValidationError
+from jsonschema.exceptions import SchemaError as JsSchemaError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
@@ -65,6 +65,20 @@ _CODE_SCHEMA_UPDATE = "schema.update"
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/schemas", tags=["schemas"])
+
+
+async def _assert_owns_schema(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> "Schema":
+    """Load a schema by id and assert the caller's org owns it.
+
+    The application session is RLS-enforced (the app role is not BYPASSRLS), but
+    we assert ownership explicitly to give consistent 404s on non-Postgres
+    backends that rely on the ORM tenant filter. Raises 404 (not 403) to avoid
+    leaking existence.
+    """
+    schema = await get_schema(session, schema_id)
+    if schema is None or schema.organisation_id != principal.organisation_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+    return schema
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +353,7 @@ async def get_schema_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if schema is None:
+    if schema is None or schema.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
     return SchemaResponse.model_validate(schema)
 
@@ -356,6 +370,7 @@ async def update_schema_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await update_schema(session, schema_id, updates)
     except IntegrityError:
         logger.exception("schemas.update_integrity")
@@ -401,6 +416,7 @@ async def deprecate_schema_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await deprecate_schema(session, schema_id)
     except IntegrityError:
         logger.exception("schemas.deprecate_schema_endpoint")
@@ -455,7 +471,8 @@ async def move_schema_to_folder_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            schema = await move_schema_to_folder(session, schema_id, req.folder_id)
+            await _assert_owns_schema(session, schema_id, principal)
+            schema = await move_schema_to_folder(session, schema_id, req.folder_id, principal.organisation_id)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -484,6 +501,7 @@ async def delete_schema_endpoint(
         try:
             async with session.begin():
                 await set_rls_org(session, principal.organisation_id)
+                await _assert_owns_schema(session, schema_id, principal)
                 deleted = await delete_schema(session, schema_id, force=force)
         except SchemaDeletionProtectedError as exc:
             raise HTTPException(
@@ -542,7 +560,7 @@ async def list_schema_versions_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             schema = await get_schema(session, schema_id)
-            if schema is None:
+            if schema is None or schema.organisation_id != principal.organisation_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
             result = await list_schema_versions(session, schema_id, page=page, page_size=page_size)
     except IntegrityError:
@@ -595,9 +613,7 @@ async def create_schema_version_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            schema = await get_schema(session, schema_id)
-            if schema is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+            await _assert_owns_schema(session, schema_id, principal)
             sv = await create_schema_version(
                 session,
                 org_id=principal.organisation_id,
@@ -681,7 +697,7 @@ async def get_schema_version_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if sv is None:
+    if sv is None or sv.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema version not found")
     return SchemaVersionResponse.model_validate(sv)
 
@@ -704,6 +720,19 @@ class SchemaFieldListResponse(BaseModel):
     fields: list[SchemaFieldResponse]
 
 
+async def _load_latest_definition(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> Any:
+    """Load the latest version of a schema, asserting the caller owns it."""
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        schema = await get_schema(session, schema_id)
+        if schema is None or schema.organisation_id != principal.organisation_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+        sv = await _get_latest_version(session, schema_id)
+        if sv is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema has no versions")
+    return sv
+
+
 @router.get("/{schema_id}/fields")
 @handle_db_errors("schemas.list_schema_fields_endpoint")
 async def list_schema_fields_endpoint(
@@ -718,14 +747,7 @@ async def list_schema_fields_endpoint(
     name, type, description, and required status.
     """
     try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            schema = await get_schema(session, schema_id)
-            if schema is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
-            sv = await _get_latest_version(session, schema_id)
-            if sv is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema has no versions")
+        sv = await _load_latest_definition(session, schema_id, principal)
     except IntegrityError:
         logger.exception("schemas.list_schema_fields_endpoint")
         raise HTTPException(
@@ -836,6 +858,51 @@ async def _sample_connector_records(
             ) from None
 
 
+async def _resolve_model_backend(
+    mh: Any,
+    mbs: Any,
+    secrets_backend: Any,
+    *,
+    init_log: str,
+    init_detail: str,
+    empty_detail: str,
+    get_log: str,
+    get_detail: str,
+) -> tuple[Any, uuid.UUID]:
+    """Initialise a ``ModelBackendHub`` and return ``(backend, backend_id)``.
+
+    Maps initialisation and selection failures to informative HTTP errors so
+    schema inference and generation routes stay thin.
+    """
+    try:
+        await mh.initialise(mbs.items, secrets_backend=secrets_backend)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(init_log)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=init_detail,
+        ) from None
+    if not mh.backend_ids:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=empty_detail,
+        )
+    backend_id = next(iter(mh.backend_ids))
+    try:
+        backend = await mh.get(backend_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(get_log)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=get_detail,
+        ) from None
+    return backend, backend_id
+
+
 async def _infer_definition(
     settings: Settings,
     mbs: Any,
@@ -845,32 +912,16 @@ async def _infer_definition(
     """Run LLM schema inference and return ``(definition_json, backend_id)``."""
     secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
     async with ModelBackendHub() as mh:
-        try:
-            await mh.initialise(mbs.items, secrets_backend=secrets_backend)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.infer.backend_init_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to initialise model backend for inference.",
-            ) from None
-        if not mh.backend_ids:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No model backends available for inference.",
-            )
-        first_backend_id = next(iter(mh.backend_ids))
-        try:
-            backend = await mh.get(first_backend_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.infer.backend_get_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Selected model backend is unavailable.",
-            ) from None
+        backend, first_backend_id = await _resolve_model_backend(
+            mh,
+            mbs,
+            secrets_backend,
+            init_log="schemas.infer.backend_init_failed",
+            init_detail="Failed to initialise model backend for inference.",
+            empty_detail="No model backends available for inference.",
+            get_log="schemas.infer.backend_get_failed",
+            get_detail="Selected model backend is unavailable.",
+        )
 
         service = SchemaInferenceService(backend, connector_type=connector_type)
         try:
@@ -1018,32 +1069,16 @@ async def _generate_schema(
     """Run LLM schema generation and return ``(definition_json, backend_id)``."""
     secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
     async with ModelBackendHub() as mh:
-        try:
-            await mh.initialise(mbs.items, secrets_backend=secrets_backend)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.generate.backend_init_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to initialise model backend for generation.",
-            ) from None
-        if not mh.backend_ids:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No model backends available for generation.",
-            )
-        first_backend_id = next(iter(mh.backend_ids))
-        try:
-            backend = await mh.get(first_backend_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.generate.backend_get_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Selected model backend is unavailable.",
-            ) from None
+        backend, first_backend_id = await _resolve_model_backend(
+            mh,
+            mbs,
+            secrets_backend,
+            init_log="schemas.generate.backend_init_failed",
+            init_detail="Failed to initialise model backend for generation.",
+            empty_detail="No model backends available for generation.",
+            get_log="schemas.generate.backend_get_failed",
+            get_detail="Selected model backend is unavailable.",
+        )
 
         service = SchemaGenerationService(backend)
         try:
@@ -1158,19 +1193,22 @@ async def _load_migration_versions(
     principal: TenantPrincipal,
     req: SchemaMigrationRequest,
 ) -> tuple[Any, Any]:
-    """Load the latest source and target schema versions within a transaction."""
+    """Load the latest source and target schema versions within a transaction.
+
+    The application session is RLS-enforced (the app role is not BYPASSRLS), so we
+    must set the org context before querying. We additionally assert explicitly
+    that the caller's org owns both the source and target schema before touching
+    any versions (avoiding a cross-org read, and giving consistent 404s on
+    non-Postgres backends that rely on the ORM tenant filter).
+    """
     async with session.begin():
         await set_rls_org(session, principal.organisation_id)
-        from_schema = await get_schema(session, req.from_schema_id)
-        if from_schema is None:
-            raise HTTPException(status_code=404, detail="Source schema not found")
+        await _assert_owns_schema(session, req.from_schema_id, principal)
         from_sv = await _get_latest_version(session, req.from_schema_id)
         if from_sv is None:
             raise HTTPException(status_code=404, detail="Source schema has no versions")
 
-        to_schema = await get_schema(session, req.to_schema_id)
-        if to_schema is None:
-            raise HTTPException(status_code=404, detail="Target schema not found")
+        await _assert_owns_schema(session, req.to_schema_id, principal)
         to_sv = await _get_latest_version(session, req.to_schema_id)
         if to_sv is None:
             raise HTTPException(status_code=404, detail="Target schema has no versions")
@@ -1399,17 +1437,23 @@ class SchemaValidateResponse(BaseModel):
     errors: list[SchemaValidationError]
 
 
+def _step_json_path(target: Any, part: str) -> Any:
+    """Walk one path segment, returning ``None`` when the location is absent."""
+    if isinstance(target, dict):
+        return target.get(part, {})
+    if isinstance(target, list):
+        try:
+            return target[int(part)]
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
 def _json_path_exists(target: Any, parts: list[str]) -> bool:
     """Return whether ``parts`` resolves to an existing location in ``target``."""
     for part in parts:
-        if isinstance(target, dict):
-            target = target.get(part, {})
-        elif isinstance(target, list):
-            try:
-                target = target[int(part)]
-            except (ValueError, IndexError):
-                return False
-        else:
+        target = _step_json_path(target, part)
+        if target is None:
             return False
     return True
 

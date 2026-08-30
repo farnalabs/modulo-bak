@@ -83,7 +83,7 @@ export interface OptionItem {
   name: string;
 }
 
-export const DEFAULT_FILTERS: AnalyticsFilters = {
+const DEFAULT_FILTERS: AnalyticsFilters = {
   timespan: "7d",
   groupBy: "day",
   dimension: null,
@@ -115,6 +115,7 @@ export const RUN_STATUSES = [
   "eval_failed",
   "stalled",
   "budget_exceeded",
+  "router_no_match",
 ] as const;
 
 export const TIMESPANS: AnalyticsTimespanOption[] = [
@@ -467,7 +468,7 @@ export function formatMeasureValue(
   }
 }
 
-export function deriveEarliestDate(buckets: AnalyticsBucket[] | null | undefined): string | null {
+function deriveEarliestDate(buckets: AnalyticsBucket[] | null | undefined): string | null {
   if (!Array.isArray(buckets) || buckets.length === 0) return null;
   for (const b of buckets) {
     if (b.count > 0 || b.total_cost_usd != null || b.total_tokens != null) return b.date;
