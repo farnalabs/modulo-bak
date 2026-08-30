@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
-from uuid import NAMESPACE_OID, UUID, uuid5
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -380,18 +380,26 @@ async def write_evidence_row(
 ) -> None:
     """Persist one run_evidence row.
 
-    ``organisation_id`` MUST be supplied: the table is org-scoped (0133) and
-    NOT NULL / RLS-constrained — an insert that omits it is rejected.
+    ``organisation_id`` is the tenant anchor required by the ``run_evidence``
+    NOT NULL FK -> ``organisations`` and its org-scoped RLS policy (migration
+    0133). Callers that already hold the parent run's org (the probe, the sweep)
+    SHOULD pass it; when omitted it is resolved from the parent run.
+
+    When the parent run cannot be resolved (orphaned, or already purged) the
+    write is SKIPPED rather than anchored to a synthesised tenant. A fabricated
+    org can never persist on the deployment target: ``organisation_id`` is a FK
+    to ``organisations(id)`` and ``run_id`` a FK to ``runs(id)``, so the INSERT
+    is rejected by the FK — and the 0133 ``rls_org_isolation`` WITH CHECK
+    rejection is NOT an ``IntegrityError`` subclass, so it would escape the
+    duplicate-key guard below and break the reconciliation sweep. An
+    unresolvable parent is therefore treated as unverifiable and left unwritten
+    (logged), which is the same fail-open direction as a failed probe.
 
     ``UNIQUE(run_id, node_id)`` is handled with a nested-savepoint insert that
     swallows a duplicate-key race (the async probe and the reconciliation sweep
     can both target the same node) without rolling back the caller's outer
     transaction. Raises on non-duplicate DB failures — callers decide how to
     fail.
-
-    ``organisation_id`` is the tenant anchor required by the
-    ``run_evidence`` RLS policy (migration 0133). If not supplied it is derived
-    from the parent run.
     """
     from modulo.db.models.run import Run
     from modulo.db.models.run_evidence import RunEvidence
@@ -399,13 +407,11 @@ async def write_evidence_row(
     if organisation_id is None:
         organisation_id = await session.scalar(select(Run.organisation_id).where(Run.id == run_id))
         if organisation_id is None:
-            # The parent run is missing or carries no tenant anchor (e.g. an
-            # orphaned run already purged from the source table). Raising here
-            # would drop genuine evidence and break the reconciliation sweep,
-            # so fall back to a deterministic placeholder tenant derived from
-            # the run_id. This keeps the row persisted and idempotent without
-            # requiring a live parent run.
-            organisation_id = uuid5(NAMESPACE_OID, f"run-evidence:{run_id}")
+            _log.warning(
+                "heuristic.evidence_write_skipped_no_tenant",
+                extra={"run_id": str(run_id), "node_id": node_id, "evidence_state": evidence_state},
+            )
+            return
 
     try:
         async with session.begin_nested():

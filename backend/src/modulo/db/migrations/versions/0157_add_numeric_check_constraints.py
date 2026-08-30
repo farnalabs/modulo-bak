@@ -9,13 +9,19 @@ assumes but never enforced:
 
 * ``pass_threshold`` / ``minimum_delta`` are fractions in [0, 1].
 * ``variant_groups.run_count`` >= 0, ``max_concurrent_runs`` > 0.
-* ``team.daily_spend_limit`` and ``eval_suite_runs.claimed_cost`` >= 0 (NULL ok).
+* ``team.daily_spend_limit`` and ``suite_runs.claimed_cost`` >= 0 (NULL ok).
 * ``spend_anomalies.percent_above`` >= 0.
 * ``eval_results`` must reference exactly one of ``run_id`` / ``suite_run_id``.
 
 These mirror the range CHECKs added in 0153 and are validated against the
 live table (rows that already violate will make the ALTER fail, surfacing
 bad data rather than silently accepting it).
+
+Each ADD CONSTRAINT is guarded by a ``pg_constraint`` existence check (the same
+idempotency property 0153 gets from its ``DO $$ IF NOT EXISTS`` blocks), so a
+partially-applied run — one constraint added, a later one rejected by
+pre-existing bad data — can be re-run without failing on the constraints that
+already exist.
 """
 
 from __future__ import annotations
@@ -75,6 +81,15 @@ _CHECKS = [
 def upgrade() -> None:
     bind = op.get_bind()
     for name, table, condition in _CHECKS:
+        # Idempotent like 0153's pg_constraint guard: a partial re-run (an earlier
+        # constraint added, a later one rejected by pre-existing bad data) must not
+        # then fail with "constraint already exists".
+        already_present = bind.execute(
+            text("SELECT 1 FROM pg_constraint WHERE conname = :name"),
+            {"name": name},
+        ).scalar_one_or_none()
+        if already_present is not None:
+            continue
         bind.execute(text(f'ALTER TABLE public."{table}" ADD CONSTRAINT {name} CHECK ({condition});'))
 
 
