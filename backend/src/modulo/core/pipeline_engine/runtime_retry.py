@@ -253,13 +253,19 @@ def make_retrying_node_fn(
         """Invoke a node callable, stamping the node-scoped idempotency key first.
 
         The key is stamped onto a COPY of ``state`` (never the caller's snapshot)
-        so a side-effecting node can dedupe its write across retry/edge/
+        so a side-effecting node CAN dedupe its write across retry/edge/
         compensation re-executions. This is the single choke point that wires the
-        documented ``_NODE_IDEMPOTENCY_KEY`` guarantee onto EVERY re-execution
-        path — the node's own retry, the per-edge SOURCE re-execution, the
-        edge-retry target re-run, and the compensation-target invocation
-        (FAR-402 MAJOR-3). The runtime provides ``idempotency_key`` so it can read
-        the run identity from ``state``.
+        documented ``_NODE_IDEMPOTENCY_KEY`` signal onto EVERY re-execution path —
+        the node's own retry, the per-edge SOURCE re-execution, the edge-retry
+        target re-run, and the compensation-target invocation (FAR-402 MAJOR-3).
+
+        NOTE: the key is a BEST-EFFORT signal, not a hard guarantee. No core
+        connector / sandbox node currently READS it, so stamping alone does not
+        by itself prevent a double write — the real safety against re-running a
+        side-effecting node is the author-declared ``idempotent=false``
+        fail-closed path (resolve_node_retry returns a no-retry policy). A
+        consumer that actually skips an already-done write is a future landing;
+        until then the wording here is intentionally a signal, not a promise.
         """
         key = idempotency_key(key_node_id, state) if idempotency_key is not None else None
         if key is not None:

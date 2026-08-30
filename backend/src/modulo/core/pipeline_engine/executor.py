@@ -2517,6 +2517,26 @@ class PipelineExecutor:
         if not self._checkpointer_conn_string:
             raise RuntimeError("Cannot resume without a checkpointer configured")
 
+        # FAR-402 P5: wire the per-node retry / per-edge retry / compensation
+        # wrapper onto resume so a checkpoint-resumed run carries the SAME retry
+        # behaviour as a fresh run of the same pipeline. Previously the resume
+        # path compiled WITHOUT the wrapper (and hashed with
+        # compute_port_topology_hash), so a resumed run executed with NO per-node
+        # retry / per-edge retry / compensation while a fresh run of the identical
+        # pipeline had them — a silent divergence the reviewer flagged as blocking.
+        # The pipeline retry policy folds into the compile-cache hash so a graph
+        # compiled on the execute() path (with the policy) is reused here, and a
+        # pipeline with no policy produces the identical base hash (backward
+        # compatible).
+        pipeline_retry_policy_resume: dict[str, Any] = {}
+        _raw_resume_policy = getattr(pipeline, "retry_policy", None)
+        if isinstance(_raw_resume_policy, dict):
+            pipeline_retry_policy_resume = _raw_resume_policy
+        _resume_run_ref = rc.build_run_ref(str(pipeline_id), int(getattr(run, "run_number", 0) or 0))
+
+        def _resume_node_idempotency_key(node_id: str, _state: dict[str, Any]) -> str | None:
+            return rc.node_idempotency_key(run_ref=_resume_run_ref, node_ref=node_id)
+
         compiled = get_or_compile(
             pipeline_id,
             snapshot_id,
@@ -2525,9 +2545,11 @@ class PipelineExecutor:
                 session_factory=self._session_factory,
                 org_id=org_id,
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+                pipeline_retry_policy=pipeline_retry_policy_resume,
+                node_idempotency_key=_resume_node_idempotency_key,
             ),
             pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
-            graph_struct_hash=compute_port_topology_hash(graph_json),
+            graph_struct_hash=compute_retry_aware_topology_hash(graph_json, pipeline_retry_policy_resume),
         )
 
         config = {"configurable": {"thread_id": thread_id}}
