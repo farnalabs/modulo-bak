@@ -525,7 +525,7 @@ def test_migration_is_reversible_single_head() -> None:
 
 
 def test_single_migration_head() -> None:
-    """Exactly one migration chains off each predecessor, and the head is 0155."""
+    """Exactly one migration chains off each predecessor, and the head is 0154."""
     import glob
     import re
 
@@ -640,12 +640,9 @@ def test_single_migration_head() -> None:
     # 0154_add_web_vital_events_time_index chains off 0153.
     chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_numeric_check_constraints"]
     assert [_basename(p) for p in chaining_off_0153] == ["0154_add_web_vital_events_time_index.py"]
-    # 0155_stages_team_rls_org_gated (this PR: org-gated RLS for stages) chains off 0154.
+    # Nothing chains off 0154 -> it is the single head.
     chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_web_vital_events_time_index"]
-    assert [_basename(p) for p in chaining_off_0154] == ["0155_stages_team_rls_org_gated.py"]
-    # Nothing chains off 0155 -> it is the single head.
-    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_stages_team_rls_org_gated"]
-    assert chaining_off_0155 == []
+    assert chaining_off_0154 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
