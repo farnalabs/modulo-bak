@@ -523,7 +523,7 @@ class TestRunEvidenceProbe:
             session.add(_complete_run(run_id, org_id, outputs_json={}, telemetry={}))
             await session.flush()
             await write_evidence_row(
-                session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=None
+                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="verified_empty", evidence_detail=None
             )
         async with sqlite_factory() as session, session.begin():
             row = (await session.execute(select(RunEvidence))).scalars().one()
@@ -544,7 +544,7 @@ class TestRunEvidenceProbe:
         run_id = uuid.uuid4()
         async with sqlite_factory() as session, session.begin():
             await write_evidence_row(
-                session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=None
+                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="verified_empty", evidence_detail=None
             )
         async with sqlite_factory() as session, session.begin():
             rows = (await session.execute(select(RunEvidence))).scalars().all()
