@@ -193,13 +193,6 @@ async def backfill_facts(session: Any, day: date) -> int:
         ),
         else_=None,
     )
-    # Graph-derived fields from the snapshot's ``graph_json`` (the serialised
-    # pipeline graph: a dict with a ``nodes`` list). ``graph_json`` is ``jsonb``
-    # on Postgres (promoted from ``json`` by migration 0147) and the generic
-    # ``json`` type on SQLite/MariaDB, so the matching ``jsonb_*`` / ``json_*``
-    # functions must be selected per dialect; all three degrade to defaults when
-    # the graph is malformed/absent — backfilled rows must NEVER carry NULL here
-    # (NULL facts on backfilled rows are a bug).
     # ``graph_json`` is ``json`` on SQLite/MariaDB and promoted to ``jsonb`` on
     # Postgres by migration 0147 — but the promotion is non-blocking and the ORM
     # model keeps the generic ``JSON`` type, so the column type is not guaranteed
