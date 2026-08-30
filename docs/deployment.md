@@ -307,11 +307,29 @@ Modulo supports three deployment modes depending on your needs.
 
 ### Standalone (single-user, local)
 
+Three environment variables are **required** and have no default — the app
+refuses to start without them:
+
+| Variable | Purpose | How to generate |
+|----------|---------|-----------------|
+| `DATABASE_URL` | SQLAlchemy async DB URL for the application database | `sqlite+aiosqlite:///./modulo.db` for the local SQLite file below |
+| `SECRET_KEY` | 32+ byte random string used to sign JWTs | `$(openssl rand -base64 48)` |
+| `FERNET_KEY` | 44-char base64 Fernet key used to encrypt stored connector credentials | `$(openssl rand -base64 48)` (base64-encoded 32-byte key) |
+
+The command below sets all three inline, so it is runnable as written. `MODULO_ADMIN_PASSWORD`
+seeds the initial admin user (optional but recommended for first login); `MODULO_DB=sqlite`
+selects the SQLite backend so no separate database server is needed.
+
 ```bash
 git clone https://github.com/farnalabs/modulo   # or install the farnalabs-modulo package
 cd backend
 uv sync
-DATABASE_URL=sqlite+aiosqlite:///./modulo.db SECRET_KEY=$(openssl rand -base64 48) FERNET_KEY=$(openssl rand -base64 48) MODULO_ADMIN_PASSWORD=changeme MODULO_DB=sqlite uv run uvicorn modulo.api.main:app --port 8000
+DATABASE_URL=sqlite+aiosqlite:///./modulo.db \
+  SECRET_KEY=$(openssl rand -base64 48) \
+  FERNET_KEY=$(openssl rand -base64 48) \
+  MODULO_ADMIN_PASSWORD=changeme \
+  MODULO_DB=sqlite \
+  uv run uvicorn modulo.api.main:app --port 8000
 ```
 
 | Component | How it runs |
