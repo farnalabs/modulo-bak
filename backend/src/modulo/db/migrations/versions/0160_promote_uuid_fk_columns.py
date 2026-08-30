@@ -67,7 +67,7 @@ def _scan_offending_uuids() -> None:
     for table, column in _PREFLIGHT_COLUMNS:
         rows = bind.execute(
             text(
-                f"SELECT {column}::text FROM {table} "  # noqa: S608
+                f"SELECT {column}::text FROM {table} "  # noqa: S608  # nosec B608
                 f"WHERE {column} IS NOT NULL AND {column}::text !~ :re LIMIT 50"
             ),
             {"re": _UUID_RE},
