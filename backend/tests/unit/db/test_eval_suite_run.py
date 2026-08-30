@@ -640,9 +640,12 @@ def test_single_migration_head() -> None:
     # 0154_add_web_vital_events_time_index (this PR) chains off 0153 and is the head.
     chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_numeric_check_constraints"]
     assert [_basename(p) for p in chaining_off_0153] == ["0154_add_web_vital_events_time_index.py"]
-    # Nothing chains off 0154 -> it is the single head.
+    # 0155_sso_provider_id (FAR-457/FAR-464) chains off 0154 and is the head.
     chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_web_vital_events_time_index"]
-    assert chaining_off_0154 == []
+    assert [_basename(p) for p in chaining_off_0154] == ["0155_sso_provider_id.py"]
+    # Nothing chains off 0155 -> it is the single head.
+    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_sso_provider_id"]
+    assert chaining_off_0155 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
