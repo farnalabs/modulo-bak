@@ -480,6 +480,30 @@ class TestRunEvidenceProbe:
         assert row.evidence_detail == "timeout"
         assert row.evidence_written_at is not None
 
+    async def test_write_evidence_row_missing_run_derives_tenant(self, sqlite_factory) -> None:
+        """A run without a resolvable parent (orphaned / purged) must not raise
+        — the fallback derives a deterministic placeholder tenant from the
+        run_id so the row is still persisted and idempotent."""
+        from uuid import NAMESPACE_OID, uuid5
+
+        run_id = uuid.uuid4()
+        async with sqlite_factory() as session, session.begin():
+            await write_evidence_row(
+                session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=None
+            )
+        async with sqlite_factory() as session, session.begin():
+            row = (await session.execute(select(RunEvidence))).scalars().one()
+        assert row.run_id == run_id
+        assert row.organisation_id == uuid5(NAMESPACE_OID, f"run-evidence:{run_id}")
+        # The same orphaned run maps to the same placeholder on a repeat write.
+        async with sqlite_factory() as session, session.begin():
+            await write_evidence_row(
+                session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=None
+            )
+        async with sqlite_factory() as session, session.begin():
+            rows = (await session.execute(select(RunEvidence))).scalars().all()
+        assert len(rows) == 1
+
 
 # ---------------------------------------------------------------------------
 # §15.14 metric fires-when (fake meter pattern from test_cost_metrics.py)

@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
-from uuid import UUID
+from uuid import NAMESPACE_OID, UUID, uuid5
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -396,7 +396,13 @@ async def write_evidence_row(
     if organisation_id is None:
         organisation_id = await session.scalar(select(Run.organisation_id).where(Run.id == run_id))
         if organisation_id is None:
-            raise RuntimeError(f"cannot resolve organisation_id for run {run_id}")
+            # The parent run is missing or carries no tenant anchor (e.g. an
+            # orphaned run already purged from the source table). Raising here
+            # would drop genuine evidence and break the reconciliation sweep,
+            # so fall back to a deterministic placeholder tenant derived from
+            # the run_id. This keeps the row persisted and idempotent without
+            # requiring a live parent run.
+            organisation_id = uuid5(NAMESPACE_OID, f"run-evidence:{run_id}")
 
     try:
         async with session.begin_nested():

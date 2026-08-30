@@ -56,7 +56,7 @@ _CHECKS = [
     ),
     (
         "ck_eval_suite_runs_claimed_cost",
-        "eval_suite_runs",
+        "suite_runs",
         "claimed_cost IS NULL OR claimed_cost >= 0",
     ),
     (
