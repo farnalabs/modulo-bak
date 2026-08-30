@@ -903,9 +903,11 @@ def build_graph_from_json(
     # single pass (the source/target fn may not exist yet).
     raw_fns: dict[str, Any] = {}
     for node_def in nodes:
+        node_timeout = node_def.get("timeout_seconds")
+        timeout = pipeline_node_timeout_seconds if node_timeout is None else node_timeout
         raw_fns[str(node_def["id"])] = _build_raw_node_fn(
             node_def,
-            timeout=node_def.get("timeout_seconds", pipeline_node_timeout_seconds),
+            timeout=timeout,
             session_factory=session_factory,
             single_sandbox_node=single_sandbox_node,
         )
