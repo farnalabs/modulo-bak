@@ -21,6 +21,7 @@ unit-tests:
   - backend/tests/unit/pipeline_engine/test_node_runner_hitl.py
 bdd:
   - backend/tests/bdd/features/hitl/claim.feature
+  - backend/tests/bdd/features/hitl/approval_gate.feature
   - backend/tests/bdd/features/hitl/approve.feature
   - backend/tests/bdd/features/hitl/reject.feature
   - backend/tests/bdd/features/hitl/modify_then_approve.feature
@@ -106,3 +107,8 @@ may decide.
   Behaviours verified against `api/routes/hitl.py`, `core/hitl_manager/*`,
   `core/run_context/autonomy.py`, and the HITL unit/BDD suites. Status:
   covered.
+- 2026-08-30: **duplicate-entry reconciliation** — a parallel product-map walk
+  had added a second `feat-hitl` tracker at `configure/hitl.md`, breaking the
+  one-entry-per-feature invariant. This entry is the superset and is retained;
+  the duplicate's only unique citation (`hitl/approval_gate.feature`) was folded
+  into `bdd:` here. Status: covered.

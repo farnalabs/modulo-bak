@@ -138,10 +138,16 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 > features still lack a behaviour-tracker entry here and are therefore absent from the
 > feature graph's human-readable layer: `feat-auth`, `feat-connectors` (behaviours are
 > tracked inline in `manifest.yaml`), `feat-costs`, `feat-dashboard`, `feat-environments`,
-> `feat-evals`, `feat-feedback`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
-> `feat-mcp`, `feat-model-backends`, `feat-notifications`, `feat-onboarding`, `feat-org`,
-> `feat-pipelines`, `feat-plugins`, `feat-remy`, `feat-router`, `feat-runs`, `feat-runtime`,
+> `feat-feedback`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
+> `feat-model-backends`, `feat-notifications`, `feat-onboarding`, `feat-org`,
+> `feat-pipelines`, `feat-plugins`, `feat-remy`, `feat-runs`, `feat-runtime`,
 > `feat-schemas`, `feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-teams`.
+
+### Admin
+- [feat-product-analytics](admin/product-analytics.md) => PRD N/A
+
+### Analytics
+- [feat-analytics](analytics/analytics.md) => PRD N/A
 
 ### Audit
 - [feat-audit](audit/audit-trail.md) => PRD N/A
@@ -164,6 +170,7 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 ### Improve
 - [feat-evals](improve/evals.md) => PRD N/A
+- [feat-variants](improve/variants.md) => PRD N/A
 
 ### Infra
 - [feat-infra-health](infra/health-checks.md) => PRD N/A
@@ -175,24 +182,6 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 ### Observability
 - [feat-observability](observability/observability.md) => PRD N/A
-
-### Monitor
-- [feat-observability](monitor/observability.md) => PRD N/A
-
-### Build & runs
-- [feat-analytics](analytics/analytics.md) => PRD N/A
-
-### Configure
-- [feat-guardrails](configure/guardrails.md) => PRD 7.4
-- [feat-hitl](configure/hitl.md) => PRD 7.3
-- [feat-triggers](configure/triggers.md) => PRD 6.1
-
-### Improve
-- [feat-variants](improve/variants.md) => PRD N/A
-
-### Audit & Admin
-- [feat-audit](audit/audit-log.md) => PRD 9.3
-- [feat-product-analytics](admin/product-analytics.md) => PRD N/A
 
 ### Teams
 - [feat-teams-org-entity](teams/org-entity.md) => PRD 9.1, 6.2
