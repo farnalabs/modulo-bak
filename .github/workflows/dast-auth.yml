@@ -54,6 +54,7 @@ jobs:
           uv run --no-build --no-sync python /tmp/gen_openapi.py
           TARGET="${{ github.event.inputs.target_url || 'https://staging.modulo.run' }}"
           mkdir -p "$GITHUB_WORKSPACE/zap-report"
+          chmod 777 "$GITHUB_WORKSPACE/zap-report"
           python3 -c "import json; p=json.load(open('/tmp/modulo_openapi.json')); p['servers']=[{'url':\"$TARGET\"}]; json.dump(p, open('$GITHUB_WORKSPACE/zap-report/modulo_openapi_target.json','w')); print('servers injected, paths=', len(p['paths']))"
 
       - name: Login and run authenticated ZAP API scan
