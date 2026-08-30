@@ -538,17 +538,53 @@ jobs:
               continue
             fi
 
-            # SHA-pin guard (FAR-455): the approving review must target the CURRENT PR
-            # head oid. A review approved against an OLDER commit_id must never grant
-            # merge for a newer head — otherwise a force-push/merge after the approval
+            # SHA-pin guard (FAR-455): the approving review must cover the CURRENT PR
+            # head. A review approved against an OLDER head must never grant merge for
+            # newer unreviewed code — otherwise a force-push/merge after the approval
             # silently auto-merges unreviewed code (a TOCTOU on the approval itself).
+            #
+            # We use a TIMESTAMP-based staleness check rather than strict commit_id
+            # equality, for two reasons (see PR #2089 review):
+            #   (1) GitHub's reviews API can report a review's commit_id as the
+            #       head-at-read-time rather than head-at-review-time (observed on
+            #       #1386), so an equality check can falsely pass the very TOCTOU it
+            #       exists to block.
+            #   (2) Strict equality wrongly voids the approval on MERGE-ONLY head moves
+            #       (merging origin/main in), which the repo's review policy does NOT
+            #       treat as invalidating approval.
+            # We therefore block ONLY when a NON-MERGE commit (single parent) was
+            # committed AFTER the approval's submitted_at — i.e. real code landed after
+            # the approval. Merge-only pushes (>=2 parents) keep the approval valid.
             HEAD_OID=$(gh pr view "$NUM" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
-            LATEST_APPROVE_COMMIT=$(gh api "repos/${{ github.repository }}/pulls/$NUM/reviews" 2>/dev/null \
-              | jq -r '[.[] | select(.state == "APPROVED")] | last | .commit_id // empty' 2>/dev/null || echo "")
-            if [ -z "$HEAD_OID" ] || [ -z "$LATEST_APPROVE_COMMIT" ] || [ "$HEAD_OID" != "$LATEST_APPROVE_COMMIT" ]; then
-              echo "  PR #$NUM approving review commit_id ($LATEST_APPROVE_COMMIT) != head oid ($HEAD_OID) -- skipping merge (treat as not-approved)"
+            if [ -z "$HEAD_OID" ]; then
+              echo "  PR #$NUM could not resolve head oid -- skipping merge (fail closed)"
               continue
             fi
+            # Paginate (a PR with >30 reviews, e.g. a bot re-review flood, can omit the
+            # latest APPROVED review from a single page -- observed as a deadlock risk).
+            HEAD_COMMITTER_DATE=$(gh api "repos/${{ github.repository }}/commits/$HEAD_OID" --jq '.commit.committer.date' 2>/dev/null || echo "")
+            HEAD_PARENTS=$(gh api "repos/${{ github.repository }}/commits/$HEAD_OID" --jq '.parents | length' 2>/dev/null || echo "0")
+            # Reviews are returned oldest-first; pick the LAST APPROVED one.
+            APPROVE_JSON=$(gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/reviews?per_page=100" 2>/dev/null \
+              | jq -c '[.[] | select(.state == "APPROVED")] | last | {submitted_at: (.submitted_at // empty), commit_id: (.commit_id // empty)}' 2>/dev/null || echo "")
+            if [ -z "$APPROVE_JSON" ]; then
+              echo "  PR #$NUM no APPROVED review found -- skipping merge (treat as not-approved)"
+              continue
+            fi
+            APPROVE_SUBMITTED=$(echo "$APPROVE_JSON" | jq -r '.submitted_at // empty' 2>/dev/null || echo "")
+            APPROVE_COMMIT=$(echo "$APPROVE_JSON" | jq -r '.commit_id // empty' 2>/dev/null || echo "")
+            if [ -z "$HEAD_COMMITTER_DATE" ] || [ -z "$APPROVE_SUBMITTED" ]; then
+              echo "  PR #$NUM could not resolve timestamps (head=$HEAD_COMMITTER_DATE, approve=$APPROVE_SUBMITTED) -- skipping merge (fail closed)"
+              continue
+            fi
+            HEAD_EPOCH=$(date -d "$HEAD_COMMITTER_DATE" +%s 2>/dev/null || echo "0")
+            APPROVE_EPOCH=$(date -d "$APPROVE_SUBMITTED" +%s 2>/dev/null || echo "0")
+            if [ "$HEAD_PARENTS" = "1" ] && [ "$HEAD_EPOCH" -gt "$APPROVE_EPOCH" ]; then
+              echo "  PR #$NUM head ($HEAD_OID) is a non-merge commit committed after approval ($APPROVE_SUBMITTED) -- skipping merge (approval stale, TOCTOU guard)"
+              continue
+            fi
+            # Non-merge head committed at/before approval, or a merge-only push: approval still valid.
+            echo "  PR #$NUM SHA-pin guard OK (approve commit_id=$APPROVE_COMMIT, head parents=$HEAD_PARENTS)"
 
             if gh pr merge --squash "$NUM" 2>&1; then
               echo "    PR #$NUM merged --"
