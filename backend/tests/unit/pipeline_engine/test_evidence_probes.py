@@ -520,6 +520,7 @@ class TestRunEvidenceProbe:
         from uuid import NAMESPACE_OID, uuid5
 
         run_id = uuid.uuid4()
+        expected_placeholder_tenant = uuid5(NAMESPACE_OID, f"run-evidence:{run_id}")
         async with sqlite_factory() as session, session.begin():
             await write_evidence_row(
                 session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=None
@@ -527,7 +528,7 @@ class TestRunEvidenceProbe:
         async with sqlite_factory() as session, session.begin():
             row = (await session.execute(select(RunEvidence))).scalars().one()
         assert row.run_id == run_id
-        assert row.organisation_id == uuid5(NAMESPACE_OID, f"run-evidence:{run_id}")
+        assert row.organisation_id == expected_placeholder_tenant
         # The same orphaned run maps to the same placeholder on a repeat write.
         async with sqlite_factory() as session, session.begin():
             await write_evidence_row(
