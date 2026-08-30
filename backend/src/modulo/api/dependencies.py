@@ -604,7 +604,9 @@ def get_or_create_system_engine() -> AsyncEngine:
                 pool_pre_ping=True,
                 pool_size=20,
                 max_overflow=10,
-                connect_args={"ssl": False, "statement_cache_size": 0},
+                pool_recycle=3600,
+                pool_timeout=30,
+                connect_args={"ssl": False, "statement_cache_size": 0, "timeout": 10},
             )
         else:
             logger.warning(

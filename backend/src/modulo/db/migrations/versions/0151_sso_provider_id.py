@@ -1,4 +1,4 @@
-"""Add provider_id slug column to sso_providers (FAR-457).
+"""Add provider_id slug column to sso_providers (FAR-457; FAR-464 option a).
 
 Revision ID: 0151_sso_provider_id
 Revises: 0150_add_router_no_match_status
@@ -7,14 +7,22 @@ Create Date: 2026-08-26
 The admin SSO UI writes providers to the sso_providers table, but the runtime
 OIDC/SAML flows only read IdP config from env vars. This adds a `provider_id`
 slug column (the URL key used at /api/v1/auth/oidc/{provider_id}/login) and a
-partial unique index (organisation_id, provider_id) so the runtime can resolve
-IdP config from the DB first, falling back to env vars for backward compat.
+partial UNIQUE index on ``provider_id`` so the runtime can resolve IdP config
+from the DB first, falling back to env vars for backward compat.
+
+The index is GLOBAL (module 0151; FAR-464 option a), not per-org, because
+pre-auth SSO provider resolution runs system-scoped and resolves a provider by
+its ``provider_id`` slug with ``scalar_one_or_none()`` — a per-org unique index
+permits two orgs to both define ``provider_id='okta'``, which would make that
+global read return both rows and crash with ``MultipleResultsFound``. A single
+globally-unique slug therefore must be enforced across ALL orgs so the
+system-session resolution is deterministic.
 
 Existing rows are backfilled: the slug is derived from `name`, trimmed of
 non-alphanumerics, defaulted to `sso`, truncated to 58 chars, and de-duplicated
-per organisation with a ``-N`` suffix so the unique index can never abort on a
-same-name collision (the suffix always fits ``String(64)``). The column is
-nullable so the unique index can stay partial.
+ACROSS ALL ORGS with a ``-N`` suffix so the global unique index can never abort
+on a collision (the suffix always fits ``String(64)``). The column is nullable
+so the unique index can stay partial.
 """
 
 from __future__ import annotations
@@ -47,8 +55,8 @@ def _backfill_sqlite(bind: Any) -> None:
     """Collision-safe provider_id backfill for SQLite (no regexp_replace/DO block).
 
     Walks the rows, deriving the slug from `name` and appending ``-N`` while a
-    ``(organisation_id, provider_id)`` collision exists in the row's own
-    organisation (per-org dedupe, matching the partial unique index).
+    GLOBAL ``(provider_id)`` collision exists anywhere in the table (dedupe
+    across ALL orgs, matching the global partial unique index).
     """
     rows = bind.execute(
         sa.text("SELECT id, organisation_id, name FROM sso_providers WHERE provider_id IS NULL")
@@ -59,10 +67,8 @@ def _backfill_sqlite(bind: Any) -> None:
         n = 2
         while (
             bind.execute(
-                sa.text(
-                    "SELECT 1 FROM sso_providers WHERE organisation_id = :org AND provider_id = :pid AND id <> :row_id"
-                ),
-                {"org": row.organisation_id, "pid": candidate, "row_id": row.id},
+                sa.text("SELECT 1 FROM sso_providers WHERE provider_id = :pid AND id <> :row_id"),
+                {"pid": candidate, "row_id": row.id},
             ).first()
             is not None
         ):
@@ -95,7 +101,7 @@ def upgrade() -> None:
             IF base = '' THEN base := 'sso'; END IF;
             base := left(base, 58);
             cand := base; n := 2;
-            WHILE EXISTS (SELECT 1 FROM sso_providers WHERE organisation_id = r.organisation_id AND provider_id = cand AND id <> r.id) LOOP
+            WHILE EXISTS (SELECT 1 FROM sso_providers WHERE provider_id = cand AND id <> r.id) LOOP
               cand := base || '-' || n; n := n + 1;
             END LOOP;
             UPDATE sso_providers SET provider_id = cand WHERE id = r.id;
@@ -108,14 +114,14 @@ def upgrade() -> None:
 
     if is_pg:
         op.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS uq_sso_providers_org_provider_id "
-            "ON sso_providers (organisation_id, provider_id) WHERE provider_id IS NOT NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_sso_providers_provider_id "
+            "ON sso_providers (provider_id) WHERE provider_id IS NOT NULL"
         )
     else:
         op.create_index(
-            "uq_sso_providers_org_provider_id",
+            "uq_sso_providers_provider_id",
             "sso_providers",
-            ["organisation_id", "provider_id"],
+            ["provider_id"],
             unique=True,
             sqlite_where=sa.text("provider_id IS NOT NULL"),
         )
@@ -127,5 +133,5 @@ def downgrade() -> None:
     if is_pg:
         op.execute("SET search_path TO public")
 
-    op.drop_index("uq_sso_providers_org_provider_id", table_name="sso_providers")
+    op.drop_index("uq_sso_providers_provider_id", table_name="sso_providers")
     op.drop_column("sso_providers", "provider_id")

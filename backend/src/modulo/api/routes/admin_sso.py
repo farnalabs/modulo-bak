@@ -13,7 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.api.constants import MSG_FEATURE_NOT_AVAILABLE, MSG_INTERNAL_SERVER_ERROR, MSG_RESOURCE_ALREADY_EXISTS
 from modulo.api.db_error_handling import handle_db_errors
-from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_feature, require_permission
+from modulo.api.dependencies import (
+    deny_break_glass_mint,
+    get_db_session,
+    get_system_db_session,
+    require_feature,
+    require_permission,
+)
 from modulo.api.middleware.sensitive_mask import SensitiveValue
 from modulo.auth.jwt import TenantPrincipal
 from modulo.core.ssrf import validate_outbound_url_async
@@ -168,6 +174,7 @@ async def create_provider_endpoint(
     current_user: TenantPrincipal = require_permission(_CODE_SSO_MANAGE),
     session: AsyncSession = Depends(get_db_session),
     settings: Settings = Depends(get_settings),
+    system_session: AsyncSession = Depends(get_system_db_session),
 ) -> SsoProviderResponse:
     try:
         async with session.begin():
@@ -190,13 +197,14 @@ async def create_provider_endpoint(
                 fernet_key=settings.fernet_key,
                 org_id=current_user.organisation_id,
                 actor_user_id=current_user.account_id,
+                system_session=system_session,
             )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except IntegrityError as exc:
         _log.warning("SSO provider create conflict: %s", exc, exc_info=True)
         detail = str(exc).lower()
-        if "provider_id" in detail or "uq_sso_providers_org_provider_id" in detail:
+        if "provider_id" in detail or "uq_sso_providers_provider_id" in detail:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="An SSO provider with this provider ID already exists.",

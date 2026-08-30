@@ -106,8 +106,20 @@ async def jit_provision_user(
 ) -> tuple[Account, uuid.UUID, str]:
     """Find or create an Account + OrgMembership for an SSO-authenticated identity.
 
-    Returns (account, org_id, org_role).
+    Returns (account, org_id, org_role). The target org is resolved BEFORE any
+    ``create_account`` write so a zero-org deployment (env-path JIT, no provider
+    org) raises a clean ``RuntimeError`` ("No organisation exists") instead of
+    letting a raw RLS-scoped INSERT fail with a 500.
     """
+    if default_org_id is not None:
+        org_id = default_org_id
+    else:
+        result = await session.execute(select(Organisation).order_by(Organisation.created_at).limit(1))
+        org = result.scalar_one_or_none()
+        if org is None:
+            raise RuntimeError("No organisation exists — cannot JIT provision account")
+        org_id = org.id
+
     account = await get_account_by_email(session, email)
     if account is not None:
         account.sso_subject = sso_subject
@@ -127,15 +139,6 @@ async def jit_provision_user(
             "sso.jit_provisioned",
             extra={"email": email, "auth_provider": auth_provider, "sso_subject": sso_subject},
         )
-
-    if default_org_id is not None:
-        org_id = default_org_id
-    else:
-        result = await session.execute(select(Organisation).order_by(Organisation.created_at).limit(1))
-        org = result.scalar_one_or_none()
-        if org is None:
-            raise RuntimeError("No organisation exists — cannot JIT provision account")
-        org_id = org.id
 
     existing = await get_membership_by_account_and_org(session, account.id, org_id)
     if existing is None:
