@@ -1,7 +1,7 @@
 """web_vital_events — add (organisation_id, recorded_at) time-range index.
 
-Revision ID: 0152_add_web_vital_events_time_index
-Revises: 0151_add_numeric_check_constraints
+Revision ID: 0154_add_web_vital_events_time_index
+Revises: 0153_add_numeric_check_constraints
 Create Date: 2026-08-27
 
 The metrics dashboard queries ``web_vital_events`` by organisation (enforced
@@ -24,8 +24,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0152_add_web_vital_events_time_index"
-down_revision: str | None = "0151_add_numeric_check_constraints"
+revision: str = "0154_add_web_vital_events_time_index"
+down_revision: str | None = "0153_add_numeric_check_constraints"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
