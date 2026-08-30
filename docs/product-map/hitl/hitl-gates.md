@@ -21,13 +21,9 @@ unit-tests:
   - backend/tests/unit/pipeline_engine/test_node_runner_hitl.py
 bdd:
   - backend/tests/bdd/features/hitl/claim.feature
-  - backend/tests/bdd/features/hitl/approval_gate.feature
   - backend/tests/bdd/features/hitl/approve.feature
   - backend/tests/bdd/features/hitl/reject.feature
-  - backend/tests/bdd/features/hitl/modify_then_approve.feature
   - backend/tests/bdd/features/hitl/deliver_manual.feature
-  - backend/tests/bdd/features/hitl/human_only_gate.feature
-  - backend/tests/bdd/features/hitl/overdue_warning.feature
   - backend/tests/bdd/features/hitl/manual_node.feature
   - backend/tests/bdd/features/hitl/feedback_handler.feature
   - backend/tests/bdd/features/teams/team_hitl_gate.feature
@@ -109,6 +105,8 @@ may decide.
   covered.
 - 2026-08-30: **duplicate-entry reconciliation** — a parallel product-map walk
   had added a second `feat-hitl` tracker at `configure/hitl.md`, breaking the
-  one-entry-per-feature invariant. This entry is the superset and is retained;
-  the duplicate's only unique citation (`hitl/approval_gate.feature`) was folded
-  into `bdd:` here. Status: covered.
+  one-entry-per-feature invariant. This entry is the superset and is retained.
+  The duplicate's only unique citation (`hitl/approval_gate.feature`) was *not*
+  folded into `bdd:` here: that feature file ships but no step module registers
+  it via `scenarios(...)`, so citing it would claim BDD coverage for scenarios
+  that never execute. Status: covered.

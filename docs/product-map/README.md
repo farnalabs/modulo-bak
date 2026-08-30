@@ -134,16 +134,11 @@ Fresh entries for these features are added to the graph below as behaviour track
 Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 `manifest.yaml`) are tracked here as well, keyed by their `feat-*` id.
 
-> **Known gap (2026-08-27 product-map walk):** the following registered manifest
-> features still lack a behaviour-tracker entry here and are therefore absent from the
-> feature graph's human-readable layer: `feat-analytics`, `feat-auth`,
-> `feat-connectors` (behaviours are tracked inline in `manifest.yaml`), `feat-costs`,
-> `feat-dashboard`, `feat-environments`, `feat-evals`, `feat-feedback`, `feat-guardrails`,
-> `feat-lifecycle-maps`, `feat-library`, `feat-license`, `feat-model-backends`,
-> `feat-notifications`, `feat-observability`, `feat-onboarding`, `feat-org`,
-> `feat-pipelines`, `feat-plugins`, `feat-product-analytics`, `feat-remy`, `feat-runs`,
-> `feat-runtime`, `feat-schemas`, `feat-sso`, `feat-system-config`, `feat-system-orgs`,
-> `feat-teams`, `feat-variants`.
+> **Known gaps:** registered manifest features that still lack a behaviour-tracker
+> entry here are listed once, at the end of this file — see
+> [Known graph gaps](#known-graph-gaps). Keeping a single list stops the two copies
+> drifting apart (they did: the older inline copy still named features whose trackers
+> had already landed in the index below).
 
 ### Admin
 - [feat-product-analytics](admin/product-analytics.md) => PRD N/A
@@ -230,9 +225,7 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 Registered manifest features with no `docs/product-map/` behaviour-tracker yet (the
 graph stays honest about what remains untracked; each improve-architecture product-map
-walk closes a batch): `feat-analytics`, `feat-auth`, `feat-connectors`,
-`feat-environments`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
-`feat-model-backends`, `feat-notifications`, `feat-observability`, `feat-org`,
-`feat-pipelines`, `feat-product-analytics`, `feat-runtime`, `feat-schemas`,
-`feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-teams`, `feat-variants` —
-20 registered features remain untracked after this walk.
+walk closes a batch): `feat-auth`, `feat-connectors` (behaviours are tracked inline in
+`manifest.yaml`), `feat-environments`, `feat-lifecycle-maps`, `feat-org`,
+`feat-runtime`, `feat-sso`, `feat-system-config`, `feat-system-orgs` —
+9 registered features remain untracked after this walk.
