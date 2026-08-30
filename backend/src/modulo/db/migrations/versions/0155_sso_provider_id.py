@@ -1,7 +1,7 @@
 """Add provider_id slug column to sso_providers (FAR-457; FAR-464 option a).
 
-Revision ID: 0151_sso_provider_id
-Revises: 0150_add_router_no_match_status
+Revision ID: 0155_sso_provider_id
+Revises: 0154_add_web_vital_events_time_index
 Create Date: 2026-08-26
 
 The admin SSO UI writes providers to the sso_providers table, but the runtime
@@ -10,7 +10,7 @@ slug column (the URL key used at /api/v1/auth/oidc/{provider_id}/login) and a
 partial UNIQUE index on ``provider_id`` so the runtime can resolve IdP config
 from the DB first, falling back to env vars for backward compat.
 
-The index is GLOBAL (module 0151; FAR-464 option a), not per-org, because
+The index is GLOBAL (module 0155; FAR-464 option a), not per-org, because
 pre-auth SSO provider resolution runs system-scoped and resolves a provider by
 its ``provider_id`` slug with ``scalar_one_or_none()`` — a per-org unique index
 permits two orgs to both define ``provider_id='okta'``, which would make that
@@ -34,8 +34,8 @@ from typing import Any
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0151_sso_provider_id"
-down_revision: str | None = "0150_add_router_no_match_status"
+revision: str = "0155_sso_provider_id"
+down_revision: str | None = "0154_add_web_vital_events_time_index"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
