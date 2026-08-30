@@ -7628,9 +7628,7 @@ def _raises_body_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
                 _collect_body_asserts(stmt.body, exc_repr)
                 _collect_body_asserts(stmt.orelse, exc_repr)
             elif isinstance(stmt, ast.With):
-                inner_is_raises = any(
-                    _is_raises_context_only(item.context_expr) is not None for item in stmt.items
-                )
+                inner_is_raises = any(_is_raises_context_only(item.context_expr) is not None for item in stmt.items)
                 if not inner_is_raises:
                     _collect_body_asserts(stmt.body, exc_repr)
             elif isinstance(stmt, ast.Match):
