@@ -156,6 +156,7 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 ### Improve
 - [feat-evals](improve/evals.md) => PRD N/A
+- [feat-feedback](improve/feedback.md) => PRD 8.20
 
 ### Infra
 - [feat-infra-health](infra/health-checks.md) => PRD N/A
@@ -181,10 +182,6 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 ### Configure
 - [feat-remy](configure/remy.md) => PRD 8.23
 
-### Improve
-- [feat-evals](improve/evals.md) => PRD 8.17, 8.20
-- [feat-feedback](improve/feedback.md) => PRD 8.20
-
 ### Admin
 - [feat-plugins](admin/plugins.md) => PRD N/A
 
@@ -192,10 +189,9 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 Registered manifest features with no `docs/product-map/` behaviour-tracker yet (the
 graph stays honest about what remains untracked; each improve-architecture product-map
-walk closes a batch): `feat-analytics`, `feat-audit`, `feat-connectors`,
-`feat-environments`, `feat-guardrails`, `feat-hitl`, `feat-library`, `feat-license`,
-`feat-lifecycle-maps`, `feat-mcp`, `feat-model-backends`, `feat-notifications`,
-`feat-observability`, `feat-org`, `feat-pipelines`, `feat-product-analytics`,
-`feat-router`, `feat-runtime`, `feat-schemas`, `feat-sso`, `feat-system-config`,
-`feat-system-orgs`, `feat-teams`, `feat-triggers`, `feat-variants`, `feat-auth` — 26
-registered features remain untracked after this walk.
+walk closes a batch): `feat-analytics`, `feat-auth`, `feat-connectors`,
+`feat-environments`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
+`feat-model-backends`, `feat-notifications`, `feat-observability`, `feat-org`,
+`feat-pipelines`, `feat-product-analytics`, `feat-runtime`, `feat-schemas`,
+`feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-teams`, `feat-variants` —
+20 registered features remain untracked after this walk.
