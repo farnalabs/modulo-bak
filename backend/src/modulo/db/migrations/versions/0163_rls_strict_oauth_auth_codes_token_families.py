@@ -1,12 +1,15 @@
 """Close vestigial fail-open RLS on oauth_authorization_codes / oauth_token_families.
 
-Revision ID: 0159_rls_strict_oauth_auth_codes_token_families
-Revises: 0158_rls_strict_parameter_schemas_sets
+Revision ID: 0163_rls_strict_oauth_auth_codes_token_families
+Revises: 0162_rls_strict_parameter_schemas_sets
 Create Date: 2026-08-27
 
 Renumber note: originally ``0152_rls_strict_oauth_auth_codes_token_families`` chained
-off the RLS parameter-schemas migration, but main advanced through ``0151``-``0157``,
-so this is renumbered to ``0159`` and re-parented onto ``0158_rls_strict_parameter_schemas_sets``.
+off the RLS parameter-schemas migration, but main advanced through ``0151``-``0158_sso_provider_id``
+-> ``0159_pipeline_retry_compensation`` -> ``0160_run_idempotency_key`` ->
+``0161_accounts_must_change_password`` -> ``0162_rls_strict_parameter_schemas_sets``,
+so this is renumbered to ``0163`` and re-parented onto ``0162_rls_strict_parameter_schemas_sets``
+(the end of the queued PR stack).
 
 RLS audit: ``oauth_authorization_codes`` and ``oauth_token_families`` carried a
 ``rls_org_isolation`` policy with a vestigial fail-open branch::
@@ -35,8 +38,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0159_rls_strict_oauth_auth_codes_token_families"
-down_revision: str | None = "0158_rls_strict_parameter_schemas_sets"
+revision: str = "0163_rls_strict_oauth_auth_codes_token_families"
+down_revision: str | None = "0162_rls_strict_parameter_schemas_sets"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

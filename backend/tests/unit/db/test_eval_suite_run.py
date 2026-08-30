@@ -667,15 +667,27 @@ def test_single_migration_head() -> None:
     # 0157_add_numeric_check_constraints (main) chains off 0156_add_soft_delete_partial_uniques.
     chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_soft_delete_partial_uniques"]
     assert [_basename(p) for p in chaining_off_0156] == ["0157_add_numeric_check_constraints.py"]
-    # 0158_rls_strict_parameter_schemas_sets (RLS fail-open close, this PR) chains off 0157.
+    # 0158_sso_provider_id (main) chains off 0157.
     chaining_off_0157 = [p for p in revisions if parents[p] == "0157_add_numeric_check_constraints"]
-    assert [_basename(p) for p in chaining_off_0157] == ["0158_rls_strict_parameter_schemas_sets.py"]
-    # 0159_rls_strict_oauth_auth_codes_token_families (RLS fail-open close, this PR) chains off 0158 and is the head.
-    chaining_off_0158 = [p for p in revisions if parents[p] == "0158_rls_strict_parameter_schemas_sets"]
-    assert [_basename(p) for p in chaining_off_0158] == ["0159_rls_strict_oauth_auth_codes_token_families.py"]
-    # Nothing chains off 0159 -> it is the single head.
-    chaining_off_0159 = [p for p in revisions if parents[p] == "0159_rls_strict_oauth_auth_codes_token_families"]
-    assert chaining_off_0159 == []
+    assert [_basename(p) for p in chaining_off_0157] == ["0158_sso_provider_id.py"]
+    # 0159_pipeline_retry_compensation (FAR-402 P5) chains off 0158_sso_provider_id.
+    chaining_off_0158 = [p for p in revisions if parents[p] == "0158_sso_provider_id"]
+    assert [_basename(p) for p in chaining_off_0158] == ["0159_pipeline_retry_compensation.py"]
+    # 0160_run_idempotency_key (FAR-438) chains off 0159.
+    chaining_off_0159 = [p for p in revisions if parents[p] == "0159_pipeline_retry_compensation"]
+    assert [_basename(p) for p in chaining_off_0159] == ["0160_run_idempotency_key.py"]
+    # 0161_accounts_must_change_password (FAR-460) chains off 0160.
+    chaining_off_0160 = [p for p in revisions if parents[p] == "0160_run_idempotency_key"]
+    assert [_basename(p) for p in chaining_off_0160] == ["0161_accounts_must_change_password.py"]
+    # 0162_rls_strict_parameter_schemas_sets (this PR, RLS fail-open close) chains off 0161.
+    chaining_off_0161 = [p for p in revisions if parents[p] == "0161_accounts_must_change_password"]
+    assert [_basename(p) for p in chaining_off_0161] == ["0162_rls_strict_parameter_schemas_sets.py"]
+    # 0163_rls_strict_oauth_auth_codes_token_families (this PR, RLS fail-open close) chains off 0162 and is the head.
+    chaining_off_0162 = [p for p in revisions if parents[p] == "0162_rls_strict_parameter_schemas_sets"]
+    assert [_basename(p) for p in chaining_off_0162] == ["0163_rls_strict_oauth_auth_codes_token_families.py"]
+    # Nothing chains off 0163 -> it is the single head.
+    chaining_off_0163 = [p for p in revisions if parents[p] == "0163_rls_strict_oauth_auth_codes_token_families"]
+    assert chaining_off_0163 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
