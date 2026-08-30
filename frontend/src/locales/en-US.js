@@ -2188,7 +2188,8 @@ export default {
       "generate_password": "Generate",
       "credentials": "Credentials",
       "credential_body_reset": "A temporary password has been generated for {email}. Share it with them - they will be prompted to change it on their next login.",
-      "credential_body_created": "The password for new user {email} is shown below. Copy it now and share it with them - they will be prompted to set their own on first sign-in."
+      "credential_body_created": "The password for new user {email} is shown below. Copy it now and share it with them - they will be prompted to set their own on first sign-in.",
+      "empty_state_description": "Users will appear here once they are created by an admin."
     },
     "SettingsTeamsView": {
       "failed_to_load_teams": "Failed to load teams:",

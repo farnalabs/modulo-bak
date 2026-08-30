@@ -17,7 +17,7 @@
     <EmptyState
       v-else-if="users.length === 0"
       :title="$t('views.AdminUsersView.no_users_found')"
-      description="Users will appear here once they are created by an admin."
+      :description="$t('views.AdminUsersView.empty_state_description')"
     />
 
     <div v-else class="table-wrapper overflow-x-auto">
