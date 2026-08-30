@@ -167,6 +167,8 @@ _CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_claim_update(
     *,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a pipeline run.
@@ -273,7 +275,7 @@ async def claim_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_claim_update(claim_token=claim_token),
+                build_claim_update(_stale_seconds=window, _claim_cap=cap, claim_token=claim_token),
                 _claim_params(run_id, org_id, window, cap, claim_token),
             )
             claimed = result.fetchone() is not None
@@ -1676,6 +1678,8 @@ _RESUME_CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_resume_claim_update(
     *,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a resumed HITL run.
@@ -1753,7 +1757,7 @@ async def claim_resume_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_resume_claim_update(claim_token=claim_token),
+                build_resume_claim_update(_stale_seconds=stale_seconds, _claim_cap=cap, claim_token=claim_token),
                 _resume_claim_params(run_id, org_id, stale_seconds, cap, claim_token),
             )
             claimed = result.fetchone() is not None
