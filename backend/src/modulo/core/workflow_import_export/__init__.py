@@ -50,7 +50,7 @@ DEFAULT_SCHEMA_VERSION = "1.0"
 _IMPORTED_SUFFIX = "(imported)"
 DEFAULT_NODE_TIMEOUT = 300
 _MAX_NAME_RETRIES = 5
-VALID_EDGE_TYPES: frozenset[str] = frozenset({"normal", "reject", "conditional"})
+VALID_EDGE_TYPES: frozenset[str] = frozenset({"normal", "reject", "conditional", "loop"})
 
 # ---------------------------------------------------------------------------
 # Shared value objects
@@ -1549,6 +1549,7 @@ async def _materialize_edges(
             source_node_id=source_id,
             target_node_id=target_id,
             edge_type=edge_type,
+            condition_expression=ed.get("condition_expression"),
             hitl_gate_config=ed.get("hitl_gate_config"),
             source_port=ed.get("source_port", "out"),
             target_port=ed.get("target_port", "in"),

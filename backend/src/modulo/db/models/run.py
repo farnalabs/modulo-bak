@@ -39,7 +39,16 @@ if TYPE_CHECKING:
 # across the codebase (crud/run, cron_helpers, analytics) import these instead
 # of re-declaring their own tuples.
 TERMINAL_STATUSES: frozenset[str] = frozenset(
-    {"complete", "failed", "cancelled", "eval_failed", "stalled", "budget_exceeded", "cost_ceiling_exceeded"}
+    {
+        "complete",
+        "failed",
+        "cancelled",
+        "eval_failed",
+        "stalled",
+        "budget_exceeded",
+        "router_no_match",
+        "cost_ceiling_exceeded",
+    }
 )
 
 # Non-terminal (active) run statuses — a run that still holds a slot. A pending
@@ -75,12 +84,12 @@ class _GenRandomUuid(expression.FunctionElement[str]):
 
 
 @compiles(_GenRandomUuid)
-def _compile_postgres_default(_element: _GenRandomUuid, compiler: SQLCompiler, **kw: Any) -> str:
+def _compile_postgres_default(_element: _GenRandomUuid, _compiler: SQLCompiler, **kw: Any) -> str:
     return "gen_random_uuid()::text"
 
 
 @compiles(_GenRandomUuid, "sqlite")
-def _compile_sqlite_default(_element: _GenRandomUuid, compiler: SQLCompiler, **kw: Any) -> str:
+def _compile_sqlite_default(_element: _GenRandomUuid, _compiler: SQLCompiler, **kw: Any) -> str:
     return "lower(hex(randomblob(16)))"
 
 
@@ -95,7 +104,7 @@ class Run(OrgScoped):
         CheckConstraint(
             "status IN ('pending', 'running', 'awaiting_human', 'claimed', "
             "'complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded', "
-            "'cost_ceiling_exceeded')",
+            "'router_no_match', 'cost_ceiling_exceeded')",
             name="ck_runs_status",
         ),
         UniqueConstraint("organisation_id", "run_number", name="uq_runs_org_run_number"),

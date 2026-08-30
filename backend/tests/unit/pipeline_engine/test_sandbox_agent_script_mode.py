@@ -169,7 +169,7 @@ def _graph_validator_valid(node: dict[str, Any]) -> bool:
 
 
 @pytest.mark.parametrize(
-    "mode,prompt,command,output_schema",
+    ("mode", "prompt", "command", "output_schema"),
     _MATRIX_CELLS,
     ids=lambda v: str(v),
 )
@@ -1247,7 +1247,7 @@ async def test_e2b_rate_limit_retry_is_cancellable():
     create = AsyncMock(side_effect=RateLimitException("rate limited"))
 
     async def _cancelling_sleep(_seconds: float) -> None:
-        raise asyncio.CancelledError()
+        raise asyncio.CancelledError
 
     with (
         patch("e2b.AsyncSandbox.create", new=create),

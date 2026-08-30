@@ -599,7 +599,7 @@ class CapabilityScope(BaseModel):
 
 class PipelineGraphNode(BaseModel):
     id: uuid.UUID
-    node_type: Literal["agent", "manual", "composite", "sandbox_agent", "join"] = "agent"
+    node_type: Literal["agent", "manual", "composite", "sandbox_agent", "router", "hitl", "join"] = "agent"
     agent_id: uuid.UUID | None = None
     position: GraphPosition
     connector_binding: ConnectorBinding | None = None
@@ -709,6 +709,19 @@ class PipelineGraphNode(BaseModel):
         default_factory=list,
         description="Filesystem detector: globs of sandbox paths whose change counts as activity.",
     )
+    # FAR-402 P1 (F2-A Router / F2-D HITL): per-node configuration carried on
+    # the node and compiled by the pipeline engine.
+    router_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Router node config: {mode, rules:[{guard (JMESPath), target|target_port}|{default, target}]}. "
+        "Required for node_type='router'.",
+    )
+    hitl_config: dict[str, Any] | None = Field(
+        default=None,
+        description="HITL node config (mode, form_schema_ref, reject_target, claim_team_id, claim_expiry_min, "
+        "human_only, eval_before_interrupt, required_team_id, overdue_threshold_minutes, eval_condition, "
+        "condition). Compiles to the existing synthetic-gate path. Required for node_type='hitl'.",
+    )
     # FAR-402 P3 / FAR-417: scatter (fan-out). A property on an agent /
     # sandbox_agent / composite node (NOT a new node_type). When set, the node
     # splits its `split` source port into N parallel branches. The compile step
@@ -746,6 +759,8 @@ class PipelineGraphNode(BaseModel):
             "composite": self._validate_composite_node,
             "sandbox_agent": self._validate_sandbox_agent_node,
             "agent": self._validate_agent_node,
+            "router": self._validate_router_node,
+            "hitl": self._validate_hitl_node,
             "join": self._validate_join_node,
         }
         node_validators[self.node_type]()
@@ -790,6 +805,26 @@ class PipelineGraphNode(BaseModel):
             raise ValueError("Manual nodes require an output schema")
         if self.label is None:
             raise ValueError("Manual nodes require a label")
+
+    def _validate_router_node(self) -> None:
+        # The heavy validation (default-rule enforcement) happens at compile
+        # time in the pipeline engine; here we just require a router_config.
+        if self.router_config is None:
+            raise ValueError("Router nodes require a router_config")
+        rules = (self.router_config or {}).get("rules") or []
+        if not rules:
+            raise ValueError("Router nodes require at least one rule")
+        for rule in rules:
+            if rule.get("default"):
+                continue
+            if not (rule.get("target") or rule.get("target_port")):
+                raise ValueError("Each non-default Router rule requires a target/target_port")
+
+    def _validate_hitl_node(self) -> None:
+        # HITL nodes produce output like a normal (manual/agent) node and gate
+        # their outgoing edges. Require a hitl_config describing the gate.
+        if self.hitl_config is None:
+            raise ValueError("HITL nodes require a hitl_config")
 
     def _validate_composite_node(self) -> None:
         if self.composite_ref is None:
@@ -933,7 +968,7 @@ class PipelineGraphEdge(BaseModel):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     source_node_id: uuid.UUID
     target_node_id: uuid.UUID
-    edge_type: str = Field(pattern="^(normal|reject|conditional)$")
+    edge_type: str = Field(pattern="^(normal|reject|conditional|loop)$")
     hitl_gate_config: HitlGateConfig | None = None
     condition_expression: str | None = Field(
         default=None,
@@ -1433,6 +1468,71 @@ async def _validate_graph_save(
     ]
 
 
+def _extract_agent_command_sync_updates(nodes: list[dict[str, Any]]) -> dict[uuid.UUID, str]:
+    """FAR-488a: first-carried ``agent_command`` per distinct bound agent.
+
+    A node WITHOUT an ``agent_id`` needs no sync (its node-level command always
+    stands at snapshot time — ``_apply_agent_fields`` only materializes bound
+    agents). A node carrying no usable ``agent_command`` value has nothing to
+    sync. When several nodes bind the SAME agent, the FIRST node's command wins
+    (deterministic; snapshot materialization applies one row value to every
+    node bound to that agent, so per-node divergence is not representable).
+    """
+    updates: dict[uuid.UUID, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        raw_agent_id = node.get("agent_id")
+        command = node.get("agent_command")
+        if raw_agent_id is None or not isinstance(command, str) or not command:
+            continue
+        try:
+            agent_id = uuid.UUID(str(raw_agent_id))
+        except (TypeError, ValueError):
+            continue
+        updates.setdefault(agent_id, command)
+    return updates
+
+
+async def _sync_agent_row_commands(
+    session: AsyncSession,
+    *,
+    org_id: uuid.UUID,
+    nodes: list[dict[str, Any]],
+) -> int:
+    """FAR-488a: sync a PATCHed node ``agent_command`` into the bound Agent row.
+
+    At snapshot time ``_apply_agent_fields`` overwrites a bound node's
+    ``agent_command`` with the Agent row's non-NULL value, while the graph PATCH
+    used to persist node-level commands to ``graph_nodes_json`` only — so an
+    operator's PATCH read back correctly but every run silently executed the
+    stale Agent-row command (FAR-488 incident, 2026-08-29). Syncing the row
+    inside the SAME transaction as the graph write makes "what you PATCH is
+    what runs" hold.
+
+    Deliberate skip cases: a node without ``agent_id`` (nothing bound — the
+    node value already stands); an Agent row with a NULL ``agent_command``
+    (the node value already stands at snapshot time); an incoming command
+    equal to the row value (no-op). Returns the number of Agent rows updated.
+    """
+    updates = _extract_agent_command_sync_updates(nodes)
+    if not updates:
+        return 0
+    result = await session.execute(select(Agent).where(Agent.id.in_(list(updates)), Agent.organisation_id == org_id))
+    changed = 0
+    for agent in result.scalars():
+        incoming = updates.get(agent.id)
+        if incoming is None or agent.agent_command is None or agent.agent_command == incoming:
+            continue
+        logger.info(
+            "pipeline.graph.agent_command_synced",
+            extra={"agent_id": str(agent.id), "organisation_id": str(org_id)},
+        )
+        agent.agent_command = incoming
+        changed += 1
+    return changed
+
+
 @router.patch("/{pipeline_id}/graph")
 @handle_db_errors("pipelines.replace_graph")
 async def replace_pipeline_graph_endpoint(
@@ -1487,6 +1587,10 @@ async def replace_pipeline_graph_endpoint(
                 is_guardrail_admin=_is_guardrail_admin(principal),
             )
             if graph is not None:
+                # FAR-488a: keep the bound Agent rows in step with node-level
+                # agent_command PATCHes INSIDE the same transaction, so the
+                # next snapshot materializes the command the operator saved.
+                await _sync_agent_row_commands(session, org_id=principal.organisation_id, nodes=node_data)
                 issues = await _validate_graph_save(
                     session,
                     org_id=principal.organisation_id,
@@ -1666,6 +1770,9 @@ async def _apply_graph_update(
     )
     if graph is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
+    # FAR-488a: same Agent-row sync as the PATCH /graph endpoint — a graph
+    # replacement shipped inside a PATCH update payload must also run.
+    await _sync_agent_row_commands(session, org_id=org_id, nodes=node_data)
 
 
 def _raise_active_runs_conflict(exc: PipelineHasActiveRunsError) -> None:
@@ -2861,7 +2968,7 @@ async def _save_graph(
     hitl-gate-removal-guard-plan.md v19 / FAR-309 PR A review).
     """
     edge_dicts = [_edge_to_dict(e) if hasattr(e, "source_node_id") else dict(e) for e in edges]
-    return await replace_pipeline_graph(
+    graph = await replace_pipeline_graph(
         session,
         pipeline_id=pipeline_id,
         org_id=org_id,
@@ -2872,3 +2979,9 @@ async def _save_graph(
         account_id=account_id,
         is_guardrail_admin=is_guardrail_admin,
     )
+    if graph is not None:
+        # FAR-488a: node-conversion saves go through here too — keep the same
+        # "what you save is what runs" Agent-row sync (a no-op when the node
+        # commands already mirror the bound Agent rows).
+        await _sync_agent_row_commands(session, org_id=org_id, nodes=nodes)
+    return graph
