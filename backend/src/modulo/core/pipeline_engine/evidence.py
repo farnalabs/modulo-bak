@@ -392,7 +392,7 @@ async def write_evidence_row(
             session.add(
                 RunEvidence(
                     run_id=run_id,
-                    node_id=UUID(node_id),
+                    node_id=node_id if isinstance(node_id, UUID) else UUID(node_id),
                     evidence_state=evidence_state,
                     evidence_detail=evidence_detail,
                 )
@@ -727,7 +727,7 @@ async def reconcile_noop_evidence(
             evidence_rows = await session.execute(
                 select(RunEvidence.run_id, RunEvidence.node_id).where(RunEvidence.run_id.in_([run.id for run in runs]))
             )
-            existing = {(row.run_id, row.node_id) for row in evidence_rows.all()}
+            existing = {(row.run_id, str(row.node_id)) for row in evidence_rows.all()}
 
     for run in runs:
         summary["scanned"] += 1
