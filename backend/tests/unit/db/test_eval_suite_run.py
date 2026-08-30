@@ -640,21 +640,30 @@ def test_single_migration_head() -> None:
     # 0154_add_web_vital_events_time_index (main) chains off 0153.
     chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_numeric_check_constraints"]
     assert [_basename(p) for p in chaining_off_0153] == ["0154_add_web_vital_events_time_index.py"]
-    # 0155_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0154.
+    # 0155_add_hot_query_indexes (main) chains off 0154.
     chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_web_vital_events_time_index"]
-    assert [_basename(p) for p in chaining_off_0154] == ["0155_add_missing_foreign_keys.py"]
-    # 0156_add_check_constraints chains off 0155.
-    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_add_missing_foreign_keys"]
-    assert [_basename(p) for p in chaining_off_0155] == ["0156_add_check_constraints.py"]
-    # 0157_promote_uuid_fk_columns chains off 0156.
-    chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_check_constraints"]
-    assert [_basename(p) for p in chaining_off_0156] == ["0157_promote_uuid_fk_columns.py"]
-    # 0158_add_hot_query_indexes chains off 0157.
-    chaining_off_0157 = [p for p in revisions if parents[p] == "0157_promote_uuid_fk_columns"]
-    assert [_basename(p) for p in chaining_off_0157] == ["0158_add_hot_query_indexes.py"]
-    # Nothing chains off 0158 -> it is the single head.
-    chaining_off_0158 = [p for p in revisions if parents[p] == "0158_add_hot_query_indexes"]
-    assert chaining_off_0158 == []
+    assert [_basename(p) for p in chaining_off_0154] == ["0155_add_hot_query_indexes.py"]
+    # 0156_add_soft_delete_partial_uniques (main) chains off 0155.
+    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_add_hot_query_indexes"]
+    assert [_basename(p) for p in chaining_off_0155] == ["0156_add_soft_delete_partial_uniques.py"]
+    # 0157_add_numeric_check_constraints (main) chains off 0156 and is the head.
+    chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_soft_delete_partial_uniques"]
+    assert [_basename(p) for p in chaining_off_0156] == ["0157_add_numeric_check_constraints.py"]
+    # 0158_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0157.
+    chaining_off_0157 = [p for p in revisions if parents[p] == "0157_add_numeric_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0157] == ["0158_add_missing_foreign_keys.py"]
+    # 0159_add_check_constraints chains off 0158.
+    chaining_off_0158 = [p for p in revisions if parents[p] == "0158_add_missing_foreign_keys"]
+    assert [_basename(p) for p in chaining_off_0158] == ["0159_add_check_constraints.py"]
+    # 0160_promote_uuid_fk_columns chains off 0159.
+    chaining_off_0159 = [p for p in revisions if parents[p] == "0159_add_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0159] == ["0160_promote_uuid_fk_columns.py"]
+    # 0161_add_hot_query_indexes chains off 0160 and is the head.
+    chaining_off_0160 = [p for p in revisions if parents[p] == "0160_promote_uuid_fk_columns"]
+    assert [_basename(p) for p in chaining_off_0160] == ["0161_add_hot_query_indexes.py"]
+    # Nothing chains off 0161 -> it is the single head.
+    chaining_off_0161 = [p for p in revisions if parents[p] == "0161_add_hot_query_indexes"]
+    assert chaining_off_0161 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

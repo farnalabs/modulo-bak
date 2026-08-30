@@ -37,7 +37,7 @@ pytestmark = [pytest.mark.integration]
 BACKEND_ROOT = Path(__file__).parents[3]  # backend/
 
 _PRE_0154 = "0154_add_web_vital_events_time_index"
-_HEAD = "0157_promote_uuid_fk_columns"
+_HEAD = "0160_promote_uuid_fk_columns"
 
 
 def _alembic_config(db_url: str) -> Config:
