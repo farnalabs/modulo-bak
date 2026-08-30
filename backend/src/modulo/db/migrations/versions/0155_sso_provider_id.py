@@ -17,10 +17,12 @@ unique index can stay partial.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy import text
 
 revision: str = "0155_sso_provider_id"
 down_revision: str | None = "0154_add_web_vital_events_time_index"
@@ -58,7 +60,32 @@ def upgrade() -> None:
         """
         )
     else:
-        op.execute("UPDATE sso_providers SET provider_id = COALESCE(lower(name), 'sso') WHERE provider_id IS NULL")
+        # Mirror the Postgres DO-block: slugify to a URL-safe, 58-char base and
+        # de-duplicate collisions per org with ``-N`` suffixes so the unique
+        # index (below) never fails on a name > 64 chars or two same-named
+        # providers. The Postgres path truncates + dedups; sqlite must match or
+        # dev/test migrations blow up on valid pre-existing data.
+        rows = bind.execute(
+            text("SELECT id, organisation_id, name FROM sso_providers WHERE provider_id IS NULL")
+        ).fetchall()
+        # Seed the used-set with any pre-existing (non-null) slugs so newly
+        # derived slugs don't collide with what's already there.
+        existing = bind.execute(
+            text("SELECT organisation_id, provider_id FROM sso_providers WHERE provider_id IS NOT NULL")
+        ).fetchall()
+        used: dict[object, set[str]] = {}
+        for org_id, pid in existing:
+            used.setdefault(org_id, set()).add(pid)
+        for rid, org_id, name in rows:
+            base = re.sub(r"[^a-zA-Z0-9]+", "-", name or "").strip("-").lower() or "sso"
+            base = base[:58]
+            cand = base
+            n = 2
+            while cand in used.get(org_id, set()):
+                cand = f"{base}-{n}"
+                n += 1
+            used.setdefault(org_id, set()).add(cand)
+            bind.execute(text("UPDATE sso_providers SET provider_id = :pid WHERE id = :rid"), {"pid": cand, "rid": rid})
 
     if is_pg:
         op.execute(
@@ -66,11 +93,9 @@ def upgrade() -> None:
             "ON sso_providers (organisation_id, provider_id) WHERE provider_id IS NOT NULL"
         )
     else:
-        op.create_index(
-            "uq_sso_providers_org_provider_id",
-            "sso_providers",
-            ["organisation_id", "provider_id"],
-            unique=True,
+        op.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_sso_providers_org_provider_id "
+            "ON sso_providers (organisation_id, provider_id) WHERE provider_id IS NOT NULL"
         )
 
 

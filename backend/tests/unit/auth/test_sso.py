@@ -22,6 +22,7 @@ from modulo.auth.sso import (
     verify_state,
 )
 from modulo.core.feature_flags import DbPlanContext, FeatureFlagRegistry
+from modulo.db.models.sso_provider import SsoProvider
 from modulo.settings import Settings, get_settings
 
 _VALID_32 = "a" * 32
@@ -226,6 +227,43 @@ class TestSsoProvidersEndpoint:
         _override_settings(modulo_license_key="", modulo_saml_enabled=True)
         resp = client.get("/api/v1/auth/sso/providers")
         assert resp.status_code == 402
+
+
+class TestSamlEnableGateConsistency:
+    """The login button (``sso/providers`` ``saml`` flag) must agree with the
+    runtime gate in ``_resolve_saml_config``: a DB-configured SAML provider must
+    NOT surface the button when SAML is disabled or unlicensed, otherwise the
+    button would 400 on ``/saml/login`` (FAR-457 review).
+    """
+
+    @staticmethod
+    def _db_saml() -> SsoProvider:
+        return SsoProvider(
+            id=uuid.uuid4(),
+            provider_type="saml",
+            name="IdP",
+            organisation_id=uuid.uuid4(),
+            enabled=True,
+            metadata_xml="<md:EntityDescriptor entityID='x'/>",
+        )
+
+    def test_db_provider_hidden_when_saml_disabled(self, client: TestClient) -> None:
+        _override_settings(modulo_license_key="test-license", modulo_saml_enabled=False)
+        with patch(
+            "modulo.api.routes.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=self._db_saml()
+        ):
+            resp = client.get("/api/v1/auth/sso/providers")
+        assert resp.status_code == 200
+        assert resp.json()["saml"] is False
+
+    def test_db_provider_shown_when_enabled_and_licensed(self, client: TestClient) -> None:
+        _override_settings(modulo_license_key="test-license", modulo_saml_enabled=True)
+        with patch(
+            "modulo.api.routes.sso.get_enabled_saml_provider", new_callable=AsyncMock, return_value=self._db_saml()
+        ):
+            resp = client.get("/api/v1/auth/sso/providers")
+        assert resp.status_code == 200
+        assert resp.json()["saml"] is True
 
 
 # ---------------------------------------------------------------------------

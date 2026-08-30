@@ -661,6 +661,7 @@ async def _seed_sso_providers(settings: Settings) -> None:
             return
 
         required_fields = ("provider_id", "client_id", "client_secret", "discovery_url")
+        seen_provider_ids: set[str] = set()
         for entry in entries:
             if not isinstance(entry, dict) or any(key not in entry for key in required_fields):
                 safe_entry = (
@@ -669,10 +670,20 @@ async def _seed_sso_providers(settings: Settings) -> None:
                 logger.warning("startup.sso_provider_skipped", extra={"entry": str(safe_entry)})
                 continue
 
+            provider_id = entry["provider_id"]
+            if provider_id in seen_provider_ids:
+                # The new (organisation_id, provider_id) unique index would
+                # raise IntegrityError on a duplicate, aborting the whole seed
+                # transaction. Dedupe defensively so one bad entry can't break
+                # startup for every provider.
+                logger.warning("startup.sso_provider_duplicate_provider_id", extra={"provider_id": provider_id})
+                continue
+            seen_provider_ids.add(provider_id)
+
             provider = SsoProvider(
                 provider_type="oidc",
                 name=entry.get("provider_id", entry.get("name", "Imported OIDC Provider")),
-                provider_id=entry["provider_id"],
+                provider_id=provider_id,
                 client_id=entry["client_id"],
                 client_secret=encrypt_stored_secret(entry["client_secret"], settings.fernet_key),
                 discovery_url=entry["discovery_url"],

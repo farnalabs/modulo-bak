@@ -81,7 +81,19 @@ async def sso_providers(
                     oidc_list.append({"provider_id": env_id})
 
             db_saml = await get_enabled_saml_provider(session)
-            db_saml_ok = db_saml is not None and bool(db_saml.metadata_xml or db_saml.metadata_url)
+            # The DB is the source of truth for SAML *configuration*, but the
+            # deployment-level SAML enable toggle and the Team-license gate
+            # remain the master gate (consistent with _resolve_saml_config and
+            # the /saml/metadata route). A DB-configured provider must not make
+            # the login button appear when SAML is disabled or unlicensed —
+            # otherwise the button would 400 on /saml/login, a regression vs the
+            # old env-only flow. Hence the env gates are AND-ed into db_saml_ok.
+            db_saml_ok = (
+                db_saml is not None
+                and bool(db_saml.metadata_xml or db_saml.metadata_url)
+                and settings.modulo_saml_enabled
+                and bool(settings.modulo_license_key)
+            )
             saml_enabled = db_saml_ok or (
                 settings.modulo_saml_enabled
                 and bool(settings.modulo_license_key)
