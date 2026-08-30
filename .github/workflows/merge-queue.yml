@@ -552,19 +552,22 @@ jobs:
             #   (2) Strict equality wrongly voids the approval on MERGE-ONLY head moves
             #       (merging origin/main in), which the repo's review policy does NOT
             #       treat as invalidating approval.
-            # We therefore block ONLY when a NON-MERGE commit (single parent) was
+            # We therefore block when ANY NON-MERGE commit (single parent) in the PR was
             # committed AFTER the approval's submitted_at — i.e. real code landed after
-            # the approval. Merge-only pushes (>=2 parents) keep the approval valid.
+            # the approval. We walk the FULL commit list (not just HEAD): a post-approval
+            # fix commit hidden behind a later merge (HEAD becomes a 2-parent merge) must
+            # still be flagged. Merge-only pushes (every commit >=2 parents) keep the
+            # approval valid, and any API failure fails CLOSED (skip, never merge).
             HEAD_OID=$(gh pr view "$NUM" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
             if [ -z "$HEAD_OID" ]; then
               echo "  PR #$NUM could not resolve head oid -- skipping merge (fail closed)"
               continue
             fi
-            # Paginate (a PR with >30 reviews, e.g. a bot re-review flood, can omit the
-            # latest APPROVED review from a single page -- observed as a deadlock risk).
-            HEAD_COMMITTER_DATE=$(gh api "repos/${{ github.repository }}/commits/$HEAD_OID" --jq '.commit.committer.date' 2>/dev/null || echo "")
-            HEAD_PARENTS=$(gh api "repos/${{ github.repository }}/commits/$HEAD_OID" --jq '.parents | length' 2>/dev/null || echo "0")
-            # Reviews are returned oldest-first; pick the LAST APPROVED one.
+            # Reviews are returned oldest-first; pick the LAST APPROVED one. Paginate:
+            # a PR with >100 reviews (bot re-review flood) could omit the latest APPROVED
+            # review from a single page. We never rely on the review's commit_id for the
+            # decision (it is unstable - observed reading back as the newer head on #1386) -
+            # only for the log line.
             APPROVE_JSON=$(gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/reviews?per_page=100" 2>/dev/null \
               | jq -c '[.[] | select(.state == "APPROVED")] | last | {submitted_at: (.submitted_at // empty), commit_id: (.commit_id // empty)}' 2>/dev/null || echo "")
             if [ -z "$APPROVE_JSON" ]; then
@@ -573,18 +576,42 @@ jobs:
             fi
             APPROVE_SUBMITTED=$(echo "$APPROVE_JSON" | jq -r '.submitted_at // empty' 2>/dev/null || echo "")
             APPROVE_COMMIT=$(echo "$APPROVE_JSON" | jq -r '.commit_id // empty' 2>/dev/null || echo "")
-            if [ -z "$HEAD_COMMITTER_DATE" ] || [ -z "$APPROVE_SUBMITTED" ]; then
-              echo "  PR #$NUM could not resolve timestamps (head=$HEAD_COMMITTER_DATE, approve=$APPROVE_SUBMITTED) -- skipping merge (fail closed)"
+            if [ -z "$APPROVE_SUBMITTED" ]; then
+              echo "  PR #$NUM could not resolve approval timestamp -- skipping merge (fail closed)"
               continue
             fi
-            HEAD_EPOCH=$(date -d "$HEAD_COMMITTER_DATE" +%s 2>/dev/null || echo "0")
-            APPROVE_EPOCH=$(date -d "$APPROVE_SUBMITTED" +%s 2>/dev/null || echo "0")
-            if [ "$HEAD_PARENTS" = "1" ] && [ "$HEAD_EPOCH" -gt "$APPROVE_EPOCH" ]; then
-              echo "  PR #$NUM head ($HEAD_OID) is a non-merge commit committed after approval ($APPROVE_SUBMITTED) -- skipping merge (approval stale, TOCTOU guard)"
+            APPROVE_EPOCH=$(date -d "$APPROVE_SUBMITTED" +%s 2>/dev/null || echo "-1")
+
+            # Walk the FULL PR commit list (paginated) in ONE call. Flag ANY single-parent
+            # (non-merge) commit whose committer date is AFTER the approval's submitted_at.
+            # The previous HEAD-only check was bypassable: a contributor could push a
+            # post-approval fix commit F, then `git pull origin main` and push the resulting
+            # merge M - HEAD becomes M (2 parents) so the guard passed, yet unreviewed F was
+            # still in the tree. Mirrors the proven walk in .github/scripts/pr-review-dedup.py.
+            # Parent count and committer date come from the SAME response, so a partial API
+            # failure cannot weaken the gate; a failed fetch or evaluation skips the merge
+            # (fail closed), never fails open.
+            COMMITS_JSON=$(gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/commits?per_page=100" 2>/dev/null || echo "")
+            if [ -z "$COMMITS_JSON" ]; then
+              echo "  PR #$NUM could not resolve commit list -- skipping merge (fail closed)"
               continue
             fi
-            # Non-merge head committed at/before approval, or a merge-only push: approval still valid.
-            echo "  PR #$NUM SHA-pin guard OK (approve commit_id=$APPROVE_COMMIT, head parents=$HEAD_PARENTS)"
+            STALE_COUNT=$(echo "$COMMITS_JSON" | jq -c --argjson approve "$APPROVE_EPOCH" '
+              [ .[]
+                | select((.parents | length) == 1)
+                | select((.commit.committer.date // "") as $d
+                  | ($d | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) > $approve)
+              ] | length' 2>/dev/null || echo "-1")
+            if [ -z "$STALE_COUNT" ] || [ "$STALE_COUNT" = "-1" ]; then
+              echo "  PR #$NUM commit-list evaluation failed -- skipping merge (fail closed)"
+              continue
+            fi
+            if [ "$STALE_COUNT" -gt 0 ] 2>/dev/null; then
+              echo "  PR #$NUM has $STALE_COUNT non-merge commit(s) committed after approval ($APPROVE_SUBMITTED) -- skipping merge (approval stale, TOCTOU guard)"
+              continue
+            fi
+            # No post-approval non-merge code (merge-only head moves keep approval valid).
+            echo "  PR #$NUM SHA-pin guard OK (approve commit_id=$APPROVE_COMMIT, head=$HEAD_OID)"
 
             if gh pr merge --squash "$NUM" 2>&1; then
               echo "    PR #$NUM merged --"
