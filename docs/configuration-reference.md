@@ -363,6 +363,9 @@ above (or an explicit non-loopback `base_url`) before they will connect:
 | SonarQube | `http://localhost:9000` |
 | 1Password Connect | `http://localhost:8080` |
 | TeamCity | `http://localhost:8111` |
+| Jenkins | `http://localhost:8080` |
+| n8n | `http://localhost:5678` |
+| Grafana | `http://localhost:3000` |
 
 Without the opt-in, these fail with a `ValueError` naming the blocked address and
 the exact variable to set; connector health checks surface the same text as an

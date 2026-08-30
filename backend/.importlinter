@@ -150,3 +150,7 @@ ignore_imports =
     modulo.connectors.azure_key_vault -> modulo.core.ssrf
     modulo.connectors.azure_pipelines -> modulo.core.ssrf
     modulo.connectors.azure_repos -> modulo.core.ssrf
+    modulo.connectors.confluence -> modulo.core.ssrf
+    modulo.connectors.grafana -> modulo.core.ssrf
+    modulo.connectors.jenkins -> modulo.core.ssrf
+    modulo.connectors.n8n -> modulo.core.ssrf

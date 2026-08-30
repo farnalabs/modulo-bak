@@ -21,6 +21,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import validate_outbound_url
 
 _logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ class JenkinsConnector(ConnectorBase):
         return {"Authorization": f"Basic {encoded}"}
 
     def _client(self) -> httpx.AsyncClient:
+        validate_outbound_url(self._base_url)
         return httpx.AsyncClient(
             base_url=self._base_url,
             headers=self._auth_header(),

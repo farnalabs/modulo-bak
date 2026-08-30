@@ -124,6 +124,8 @@ class AzurePipelinesConnector(ConnectorBase):
             return HealthResult(ok=False, detail="Azure Pipelines API timeout")
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Azure Pipelines API connection error")
+        except ValueError as exc:
+            return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(
         self,

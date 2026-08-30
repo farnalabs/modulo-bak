@@ -3,10 +3,10 @@
 Blocks private/link-local/cloud-metadata/CGNAT ranges via DNS resolution.
 Loopback is blocked by default but allowlistable: a self-hosted deployment can
 opt into localhost model backends and localhost-default connectors (Trivy,
-SonarQube, TeamCity, 1Password) by allowlisting the loopback ranges. Used by
-notification endpoints, SSO test connections, observability test, error-forwarder
-test paths, every ``base_url``-bearing connector, and the OpenAI-compatible model
-backends.
+SonarQube, TeamCity, 1Password, Jenkins, n8n, Grafana) by allowlisting the
+loopback ranges. Used by notification endpoints, SSO test connections,
+observability test, error-forwarder test paths, every ``base_url``-bearing
+connector, and the OpenAI-compatible model backends.
 
 Operating ``SSRF_ALLOW_PRIVATE_RANGES``
 --------------------------------------

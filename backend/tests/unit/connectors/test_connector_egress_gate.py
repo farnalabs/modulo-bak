@@ -25,6 +25,8 @@ import pytest
 
 import modulo.core.ssrf as ssrf
 from modulo.connectors.azure_key_vault import AzureKeyVaultConnector
+from modulo.connectors.azure_pipelines import AzurePipelinesConnector
+from modulo.connectors.azure_repos import AzureReposConnector
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery
 from modulo.connectors.gitea import GiteaConnector
 from modulo.connectors.gitlab import GitLabConnector
@@ -187,3 +189,29 @@ def test_public_base_url_still_builds_a_client(monkeypatch) -> None:
     monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["93.184.216.34"])
     connector = TrivyConnector(token=TOKEN, base_url="https://scanner.example.com")
     assert connector._client() is not None
+
+
+@pytest.mark.parametrize(
+    "connector_factory",
+    [
+        lambda: AzurePipelinesConnector(token=TOKEN, organization="org", project="p"),
+        lambda: AzureReposConnector(token=TOKEN, organization="org"),
+    ],
+)
+async def test_azure_connectors_refuse_blocked_egress(connector_factory, monkeypatch) -> None:
+    """Azure DevOps connectors build their client against ``dev.azure.com``.
+
+    They are gated in code (validate_outbound_url in ``_client``), but the host is
+    a constant, so the literal-IP cases above cannot exercise it. Force the
+    resolver to answer with a private address and confirm the gate fails closed:
+    ``_client()`` raises and ``health_check`` reports unhealthy.
+    """
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["10.1.2.3"])
+
+    connector = connector_factory()
+    with pytest.raises(ValueError, match="private/internal"):
+        connector._client()
+
+    result = await connector.health_check()
+    assert result.ok is False
+    assert "10.1.2.3" in result.detail
