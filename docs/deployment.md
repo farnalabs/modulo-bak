@@ -311,7 +311,7 @@ Modulo supports three deployment modes depending on your needs.
 git clone https://github.com/farnalabs/modulo   # or install the farnalabs-modulo package
 cd backend
 uv sync
-MODULO_DB=sqlite uv run uvicorn modulo.api.main:app --port 8000
+DATABASE_URL=sqlite+aiosqlite:///./modulo.db SECRET_KEY=$(openssl rand -base64 48) FERNET_KEY=$(openssl rand -base64 48) MODULO_ADMIN_PASSWORD=changeme MODULO_DB=sqlite uv run uvicorn modulo.api.main:app --port 8000
 ```
 
 | Component | How it runs |
