@@ -56,7 +56,7 @@ def _node_has_regex_eval(node_name: str, eval_name: str, ctx) -> None:
     _reset_ctx(ctx, "regex", eval_name, node_name)
 
 
-@given(parsers.parse('node "{node_name}" has an llm_judge eval "{eval_name}"'))
+@given(parsers.parse('node "{node_name}" has an llm_judge scorer eval "{eval_name}"'))
 def _node_has_llm_judge_eval(node_name: str, eval_name: str, ctx) -> None:
     _reset_ctx(ctx, "llm_judge", eval_name, node_name)
 
@@ -101,7 +101,7 @@ def _node_outputs(output_json: str, ctx) -> None:
     ctx["eval_output"] = json.loads(output_json)
 
 
-@when(parsers.parse("the llm_judge callable returns {result_json}"))
+@when(parsers.parse("the llm_judge scorer callable returns {result_json}"))
 def _llm_judge_callable_returns(result_json: str, ctx) -> None:
     ctx["llm_judge_result"] = json.loads(result_json)
     ctx["use_llm_judge_callable"] = True
