@@ -41,6 +41,9 @@ from modulo.db.models.base import Base
 from modulo.db.models.run import Run
 from modulo.db.models.run_evidence import RunEvidence
 
+# The run_evidence table is org-scoped (0133); unit tests run on SQLite where
+# RLS is absent but the NOT NULL organisation_id must still be supplied.
+_TEST_ORG = uuid.uuid4()
 _NODE_A = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
 
 # ---------------------------------------------------------------------------
@@ -433,7 +436,11 @@ class TestRunEvidenceProbe:
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
         run_id = uuid.uuid4()
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id=str(_NODE_A)
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
         assert provider.git_calls == [(run_id, str(_NODE_A))]
@@ -448,24 +455,44 @@ class TestRunEvidenceProbe:
     async def test_has_work_any_positive_wins(self, sqlite_factory) -> None:
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.has_work)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.has_work
 
     async def test_unverifiable_never_flags(self, sqlite_factory) -> None:
         provider = FakeEvidenceProvider(EvidenceResult.unverifiable, EvidenceResult.unverifiable)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
 
     async def test_race_on_conflict_do_nothing(self, sqlite_factory) -> None:
         run_id = uuid.uuid4()
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
-        await run_evidence_probe(provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id=str(_NODE_A))
+        await run_evidence_probe(
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
+        )
         # A second write (the reconciliation sweep racing the async probe) must
         # not raise on the UNIQUE(run_id, node_id) constraint.
-        await run_evidence_probe(provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id=str(_NODE_A))
+        await run_evidence_probe(
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
+        )
         async with sqlite_factory() as session, session.begin():
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
@@ -474,7 +501,12 @@ class TestRunEvidenceProbe:
         run_id = uuid.uuid4()
         async with sqlite_factory() as session, session.begin():
             await write_evidence_row(
-                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="unverifiable", evidence_detail="timeout"
+                session,
+                run_id=run_id,
+                node_id=str(_NODE_A),
+                evidence_state="unverifiable",
+                evidence_detail="timeout",
+                organisation_id=_TEST_ORG,
             )
         async with sqlite_factory() as session, session.begin():
             row = (await session.execute(select(RunEvidence))).scalars().one()
@@ -595,7 +627,11 @@ class TestHeuristicMetrics:
         _stub_meter(monkeypatch, fake_meter)
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
         hist = fake_meter.histogram("modulo_heuristic_probe_latency")
@@ -621,7 +657,11 @@ class TestHeuristicMetrics:
                 return EvidenceResult.verified_empty
 
         result = await run_evidence_probe(
-            provider=_SlowProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=_SlowProvider(),
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
         hist = fake_meter.histogram("modulo_heuristic_probe_latency")
@@ -696,6 +736,7 @@ class TestSandboxProviderUnavailablePaths:
                 session_factory=sqlite_factory,
                 run_id=uuid.uuid4(),
                 node_id=str(_NODE_A),
+                organisation_id=_TEST_ORG,
             )
         )
         assert result == EvidenceResult.unverifiable
@@ -720,6 +761,7 @@ class TestSandboxProviderUnavailablePaths:
                     session_factory=sqlite_factory,
                     run_id=uuid.uuid4(),
                     node_id=str(_NODE_A),
+                    organisation_id=_TEST_ORG,
                 )
             )
 
@@ -810,7 +852,12 @@ class TestReconcileNoopEvidence:
             )
             await session.flush()
             await write_evidence_row(
-                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="verified_empty", evidence_detail=""
+                session,
+                run_id=run_id,
+                node_id=str(_NODE_A),
+                evidence_state="verified_empty",
+                evidence_detail="",
+                organisation_id=_TEST_ORG,
             )
 
         provider = FakeEvidenceProvider(EvidenceResult.has_work, EvidenceResult.has_work)
@@ -952,6 +999,7 @@ class TestEvidenceEnabled:
             session_factory=object(),  # type: ignore[arg-type]
             run_id=uuid.uuid4(),
             node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
 
@@ -966,7 +1014,11 @@ class TestRunEvidenceProbeErrorPaths:
                 return EvidenceResult.verified_empty
 
         result = await run_evidence_probe(
-            provider=_BrokenProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=_BrokenProvider(),
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
         async with sqlite_factory() as session, session.begin():
@@ -982,7 +1034,11 @@ class TestRunEvidenceProbeErrorPaths:
                 raise RuntimeError("db down")
 
         result = await run_evidence_probe(
-            provider=provider, session_factory=_BrokenFactory(), run_id=uuid.uuid4(), node_id=str(_NODE_A)
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
 
@@ -996,5 +1052,9 @@ class TestRunEvidenceProbeErrorPaths:
 
         with pytest.raises(asyncio.CancelledError):
             await run_evidence_probe(
-                provider=_CancelProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id=str(_NODE_A)
+                provider=_CancelProvider(),
+                session_factory=sqlite_factory,
+                run_id=uuid.uuid4(),
+                node_id=str(_NODE_A),
+                organisation_id=_TEST_ORG,
             )
