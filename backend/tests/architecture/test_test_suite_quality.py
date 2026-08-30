@@ -1469,9 +1469,13 @@ def _empty_bytes_tautologies(tree: ast.AST) -> list[tuple[int, str]]:
       should read ``assert x`` (the literal twin of the ``bytes()`` call-form
       lens, which cannot see ``b""`` because it parses as an ``ast.Constant``
       rather than a call)
-    - membership ``in b""`` / ``not in b""`` — an empty bytes can never contain
-      anything, so ``in`` always FAILS and ``not in`` always PASSES regardless
-      of the operand
+    - membership against ``b""`` — an empty bytes can never contain anything,
+      so ``x in b""`` always FAILS and ``x not in b""`` always PASSES; but the
+      check is *asymmetric*: ``b"" in x`` is always True (the empty sequence is a
+      subsequence of every ``bytes`` value), so ``b"" in x`` always PASSES and
+      ``b"" not in x`` always FAILS. The verdict therefore depends on which side
+      the empty literal sits on (element vs container), and must not be derived
+      from the operator alone.
 
     Equality uses the same exclusions as the empty-string/tuple lenses: a bare
     name is left alone (it may bind ``None``), and a ``.get(...)`` lookup is
@@ -1510,20 +1514,32 @@ def _empty_bytes_tautologies(tree: ast.AST) -> list[tuple[int, str]]:
                 found.append((node.lineno, f"asserts value {op_name} b'' — prefer '{prefer}'"))
                 break
         elif isinstance(op, (ast.In, ast.NotIn)):
-            for operand, literal in sides:
-                if not _is_empty_bytes(literal):
-                    continue
-                if isinstance(operand, ast.Constant):
-                    continue
-                op_name = "in" if isinstance(op, ast.In) else "not in"
+            # `in`/`not in` are asymmetric: `A in B` asks whether A is a member of
+            # B. The left operand is the *element* and the comparator is the
+            # *container*. The empty literal flips the verdict depending on which
+            # side it occupies, so we must not derive the verdict from `op` alone.
+            element_is_empty = _is_empty_bytes(test.left)
+            container_is_empty = _is_empty_bytes(test.comparators[0])
+            if not (element_is_empty or container_is_empty):
+                continue
+            # The other operand must not itself be a literal constant — literal-vs-
+            # literal membership is owned by the literal-comparison lens.
+            other = test.comparators[0] if element_is_empty else test.left
+            if isinstance(other, ast.Constant):
+                continue
+            op_name = "in" if isinstance(op, ast.In) else "not in"
+            if element_is_empty:
+                # b"" in x is always True; b"" not in x is always False.
+                verdict = "always PASSES" if isinstance(op, ast.In) else "always FAILS"
+            else:
+                # x in b"" is always False; x not in b"" is always True.
                 verdict = "always FAILS" if isinstance(op, ast.In) else "always PASSES"
-                found.append(
-                    (
-                        node.lineno,
-                        f"asserts value {op_name} b'' — {verdict} (an empty bytes can never contain anything)",
-                    )
+            found.append(
+                (
+                    node.lineno,
+                    f"asserts value {op_name} b'' — {verdict} (an empty bytes can never contain anything)",
                 )
-                break
+            )
     return found
 
 
@@ -1574,9 +1590,22 @@ def test_empty_bytes_tautology_lens_flags_fixed_outcomes():
         "def test_foo():\n    assert b'' not in haystack\n",
         "def test_foo():\n    assert result.blob[:1] == b''\n",
     ]
+    # Membership sources mapped to their *correct* verdict (element-side empty
+    # literal flips the In/NotIn outcome relative to container-side empty).
+    positive_verdicts = {
+        "def test_foo():\n    assert needle in b''\n": "always FAILS",
+        "def test_foo():\n    assert needle not in b''\n": "always PASSES",
+        "def test_foo():\n    assert b'' not in haystack\n": "always FAILS",
+    }
     for source in positive_sources:
         tree = ast.parse(source)
-        assert _empty_bytes_tautologies(tree), f"lens should flag:\n{source}"
+        findings = _empty_bytes_tautologies(tree)
+        assert findings, f"lens should flag:\n{source}"
+        if source in positive_verdicts:
+            expected = positive_verdicts[source]
+            assert any(expected in detail for _, detail in findings), (
+                f"lens should report '{expected}' for:\n{source}\n got: {findings}"
+            )
 
     negative_sources = [
         "def test_foo():\n    assert x == b''\n",
