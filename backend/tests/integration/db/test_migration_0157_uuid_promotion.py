@@ -1,13 +1,13 @@
-"""Integration test for migrations 0153-0155 (FK sweep, CHECKs, UUID promotion).
+"""Integration test for migrations 0155-0157 (FK sweep, CHECKs, UUID promotion).
 
-Runs the real Alembic ``upgrade`` chain 0153 -> 0154 -> 0155 against a live
+Runs the real Alembic ``upgrade`` chain 0155 -> 0156 -> 0157 against a live
 Postgres (testcontainers) and proves the review-requested safety properties:
 
-  * CHECK constraints (0154) and foreign keys (0153) are added ``NOT VALID``
+  * CHECK constraints (0156) and foreign keys (0155) are added ``NOT VALID``
     then ``VALIDATE``-d, so a populated table never aborts the upgrade on
     pre-existing offending rows at ``ADD`` time (the bug class 0151 already
-    avoids, and which 0153/0154 originally replicated).
-  * The UUID promotion (0155) preserves a well-formed UUID string across the
+    avoids, and which 0155/0156 originally replicated).
+  * The UUID promotion (0157) preserves a well-formed UUID string across the
     ``USING col::uuid`` cast, and its downgrade reverts with ``USING col::text``
     (the missing downgrade cast that would otherwise raise on ``uuid -> varchar``).
 
@@ -30,8 +30,8 @@ pytestmark = [pytest.mark.integration]
 
 BACKEND_ROOT = Path(__file__).parents[3]  # backend/
 
-_PRE_0153 = "0152_dismissed_by_user_id_index"
-_HEAD = "0155_promote_uuid_fk_columns"
+_PRE_0154 = "0154_add_web_vital_events_time_index"
+_HEAD = "0157_promote_uuid_fk_columns"
 
 
 def _alembic_config(db_url: str) -> Config:
@@ -54,10 +54,10 @@ async def test_0153_0154_0155_upgrade_applies_with_not_valid_constraints(migrate
     try:
         # Reset to just before the FK/CHECK/UUID migrations, then apply the chain.
         async with engine.begin() as conn:
-            await conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": _PRE_0153})
+            await conn.execute(text("UPDATE alembic_version SET version_num = :v"), {"v": _PRE_0154})
         command.upgrade(config, _HEAD)
 
-        # 0154 CHECK constraints exist on the production tables after the chain.
+        # 0156 CHECK constraints exist on the production tables after the chain.
         async with engine.connect() as conn:
             check_names = (
                 (
@@ -73,7 +73,7 @@ async def test_0153_0154_0155_upgrade_applies_with_not_valid_constraints(migrate
             )
         assert "ck_run_claim_count" in check_names, check_names
 
-        # 0153 foreign keys exist after the chain (added NOT VALID + VALIDATE).
+        # 0155 foreign keys exist after the chain (added NOT VALID + VALIDATE).
         async with engine.connect() as conn:
             fk_names = (
                 (

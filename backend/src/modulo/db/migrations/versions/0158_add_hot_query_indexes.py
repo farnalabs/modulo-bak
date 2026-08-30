@@ -1,7 +1,7 @@
 """Add hot-path composite / partial indexes on runs and triggers.
 
-Revision ID: 0156_add_hot_query_indexes
-Revises: 0155_promote_uuid_fk_columns
+Revision ID: 0158_add_hot_query_indexes
+Revises: 0157_promote_uuid_fk_columns
 Create Date: 2026-08-29
 
 * ``ix_runs_org_status`` — ``runs(organisation_id, status)``. RLS forces
@@ -23,8 +23,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0156_add_hot_query_indexes"
-down_revision: str | None = "0155_promote_uuid_fk_columns"
+revision: str = "0158_add_hot_query_indexes"
+down_revision: str | None = "0157_promote_uuid_fk_columns"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
