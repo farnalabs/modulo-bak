@@ -36,6 +36,14 @@ class TrivyConnector(ConnectorBase):
 
     Supported write resources:
       "scan"     — trigger an artifact scan  (POST /trivy/v1/artifact)
+
+    NOTE — the default ``base_url`` is loopback, which the outbound SSRF guard
+    blocks unless the operator opts in with
+    ``SSRF_ALLOW_PRIVATE_RANGES=127.0.0.0/8,::1/128`` (both entries: ``localhost``
+    resolves to IPv4 and IPv6 on dual-stack hosts). Without the opt-in, building
+    the client raises ``ValueError`` naming the blocked address, and
+    ``health_check`` reports it as unhealthy. See
+    ``docs/configuration-reference.md`` → "Outbound Egress Guard (SSRF)".
     """
 
     def __init__(self, token: str = "", base_url: str = "http://localhost:8080") -> None:  # nosec B107

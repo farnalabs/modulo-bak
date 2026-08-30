@@ -71,8 +71,10 @@ class AzureReposConnector(ConnectorBase):
 
     async def health_check(self) -> HealthResult:
         """Verify API access by fetching the authenticated user's profile."""
-        validate_outbound_url(self._base_url)
         try:
+            # Inside the try: a blocked base_url must be REPORTED as unhealthy by
+            # the ValueError handler below, never raised out of a health check.
+            validate_outbound_url(self._base_url)
             async with httpx.AsyncClient(headers=self._headers(), timeout=30) as client:
                 r = await client.get(
                     "https://app.vssps.visualstudio.com/_apis/profile/profiles/me",

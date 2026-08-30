@@ -697,6 +697,11 @@ class GitLabConnector(ConnectorBase):
             return HealthResult(ok=True, detail=detail)
         except httpx.RequestError as e:
             return HealthResult(ok=False, detail=str(e))
+        except ValueError as e:
+            # The outbound SSRF guard in ``_client`` rejects a private/internal
+            # base_url by raising. A health check must REPORT that as unhealthy
+            # (with the remediation text the guard produced), never propagate it.
+            return HealthResult(ok=False, detail=str(e)[:200])
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         match q.resource:
