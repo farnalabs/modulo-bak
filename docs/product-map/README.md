@@ -157,9 +157,6 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 - [feat-pipelines-pipeline-diff-rollback](pipelines/pipeline-diff-rollback.md) => PRD 8.13
 - [feat-router (Router & HITL nodes)](pipelines/router-hitl-nodes.md) => PRD N/A
 
-### Triggers
-- [feat-triggers](triggers/triggers.md) => PRD N/A
-
 ### Observability
 - [feat-observability](observability/observability.md) => PRD N/A
 
