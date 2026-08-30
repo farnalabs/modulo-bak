@@ -136,12 +136,14 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 > **Known gap (2026-08-27 product-map walk):** the following registered manifest
 > features still lack a behaviour-tracker entry here and are therefore absent from the
-> feature graph's human-readable layer: `feat-auth`, `feat-connectors` (behaviours are
-> tracked inline in `manifest.yaml`), `feat-costs`, `feat-dashboard`, `feat-environments`,
-> `feat-feedback`, `feat-library`, `feat-license`, `feat-lifecycle-maps`,
-> `feat-model-backends`, `feat-notifications`, `feat-onboarding`, `feat-org`,
-> `feat-pipelines`, `feat-plugins`, `feat-remy`, `feat-runs`, `feat-runtime`,
-> `feat-schemas`, `feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-teams`.
+> feature graph's human-readable layer: `feat-analytics`, `feat-auth`,
+> `feat-connectors` (behaviours are tracked inline in `manifest.yaml`), `feat-costs`,
+> `feat-dashboard`, `feat-environments`, `feat-evals`, `feat-feedback`, `feat-guardrails`,
+> `feat-lifecycle-maps`, `feat-library`, `feat-license`, `feat-model-backends`,
+> `feat-notifications`, `feat-observability`, `feat-onboarding`, `feat-org`,
+> `feat-pipelines`, `feat-plugins`, `feat-product-analytics`, `feat-remy`, `feat-runs`,
+> `feat-runtime`, `feat-schemas`, `feat-sso`, `feat-system-config`, `feat-system-orgs`,
+> `feat-teams`, `feat-variants`.
 
 ### Admin
 - [feat-product-analytics](admin/product-analytics.md) => PRD N/A
@@ -175,15 +177,33 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 ### Infra
 - [feat-infra-health](infra/health-checks.md) => PRD N/A
 
-### Pipelines
+### Schema & Data
+- [feat-schemas](schemas/schemas.md) => PRD N/A
+
+### Build & Pipelines
+- [feat-pipelines](pipelines/pipelines.md) => PRD N/A
 - [feat-pipelines-pipeline-versioning](pipelines/snapshot-versioning.md) => PRD 8.13
 - [feat-pipelines-pipeline-diff-rollback](pipelines/pipeline-diff-rollback.md) => PRD 8.13
 - [feat-router (Router & HITL nodes)](pipelines/router-hitl-nodes.md) => PRD N/A
+
+### Configure
+- [feat-model-backends](configure/model-backends.md) => PRD N/A
+- [feat-mcp](configure/mcp.md) => PRD N/A
+
+### Notifications
+- [feat-notifications](notifications/notifications.md) => PRD N/A
+
+### Library
+- [feat-library](library/library.md) => PRD N/A
+
+### Licensing
+- [feat-license](licensing/license.md) => PRD N/A
 
 ### Observability
 - [feat-observability](observability/observability.md) => PRD N/A
 
 ### Teams
+- [feat-teams](teams/teams.md) => PRD N/A
 - [feat-teams-org-entity](teams/org-entity.md) => PRD 9.1, 6.2
 
 ### Triggers
