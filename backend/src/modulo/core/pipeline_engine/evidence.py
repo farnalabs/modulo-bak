@@ -376,6 +376,7 @@ async def write_evidence_row(
     node_id: str,
     evidence_state: str,
     evidence_detail: str | None,
+    organisation_id: UUID | None = None,
 ) -> None:
     """Persist one run_evidence row.
 
@@ -384,13 +385,24 @@ async def write_evidence_row(
     can both target the same node) without rolling back the caller's outer
     transaction. Raises on non-duplicate DB failures — callers decide how to
     fail.
+
+    ``organisation_id`` is the tenant anchor required by the
+    ``run_evidence`` RLS policy (migration 0133). If not supplied it is derived
+    from the parent run.
     """
+    from modulo.db.models.run import Run
     from modulo.db.models.run_evidence import RunEvidence
+
+    if organisation_id is None:
+        organisation_id = await session.scalar(select(Run.organisation_id).where(Run.id == run_id))
+        if organisation_id is None:
+            raise RuntimeError(f"cannot resolve organisation_id for run {run_id}")
 
     try:
         async with session.begin_nested():
             session.add(
                 RunEvidence(
+                    organisation_id=organisation_id,
                     run_id=run_id,
                     node_id=node_id,
                     evidence_state=evidence_state,
