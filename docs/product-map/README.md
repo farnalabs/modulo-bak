@@ -136,12 +136,12 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 
 > **Known gap (2026-08-27 product-map walk):** the following registered manifest
 > features still lack a behaviour-tracker entry here and are therefore absent from the
-> feature graph's human-readable layer: `feat-analytics`, `feat-audit`, `feat-auth`,
+> feature graph's human-readable layer: `feat-analytics`, `feat-auth`,
 > `feat-connectors` (behaviours are tracked inline in `manifest.yaml`), `feat-costs`,
 > `feat-dashboard`, `feat-environments`, `feat-evals`, `feat-feedback`, `feat-guardrails`,
-> `feat-hitl`, `feat-lifecycle-maps`, `feat-observability`, `feat-onboarding`, `feat-org`,
-> `feat-plugins`, `feat-product-analytics`, `feat-remy`, `feat-router`, `feat-runs`,
-> `feat-runtime`, `feat-sso`, `feat-system-config`, `feat-system-orgs`, `feat-triggers`,
+> `feat-lifecycle-maps`, `feat-observability`, `feat-onboarding`, `feat-org`,
+> `feat-plugins`, `feat-product-analytics`, `feat-remy`, `feat-runs`,
+> `feat-runtime`, `feat-sso`, `feat-system-config`, `feat-system-orgs`,
 > `feat-variants`.
 
 ### Audit
