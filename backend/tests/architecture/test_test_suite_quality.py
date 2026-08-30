@@ -556,15 +556,29 @@ TESTS = Path(__file__).resolve().parent.parent
 EXCLUDED_PACKAGES = {"load", "performance"}
 
 
+def _callable_name(node: ast.AST) -> str | None:
+    """Return the bare callable name behind ``node``.
+
+    Accepts either a call (``pytest.raises(...)`` -> ``raises``) or a bare
+    callable expression (``pytest.raises`` -> ``raises``, ``raises`` ->
+    ``raises``), so the ``node`` and ``node.func`` spellings of this lookup
+    collapse onto one implementation. Returns ``None`` for anything that is
+    neither an attribute nor a plain name (e.g. a subscript, or a call whose
+    callee is itself a call)."""
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+#: Domain-specific alias of :func:`_callable_name` that keeps decorator call
+#: sites readable; the extraction rules are identical.
 def _decorator_name(dec: ast.AST) -> str | None:
     """Return the bare name of a decorator (``pytest.fixture`` -> ``fixture``)."""
-    if isinstance(dec, ast.Call):
-        dec = dec.func
-    if isinstance(dec, ast.Attribute):
-        return dec.attr
-    if isinstance(dec, ast.Name):
-        return dec.id
-    return None
+    return _callable_name(dec)
 
 
 def _is_mark_decorator(dec: ast.AST) -> bool:
@@ -876,7 +890,7 @@ def test_no_assert_under_swallowing_except():
                         return True
                     if isinstance(stmt, ast.Call):
                         f = stmt.func
-                        name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+                        name = _callable_name(f)
                         if name in ("fail", "skip", "xfail"):
                             return True
                     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -923,7 +937,7 @@ def test_no_skip_without_reason():
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            name = _callable_name(func)
             if name in ("skip", "skipped") and not node.args and not node.keywords:
                 violations.append(f"  {path.relative_to(TESTS)}:{node.lineno}  pytest.skip() without reason")
         for node in ast.walk(tree):
@@ -933,7 +947,7 @@ def test_no_skip_without_reason():
                 if not isinstance(dec, ast.Call):
                     continue
                 f = dec.func
-                dname = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+                dname = _callable_name(f)
                 if dname not in ("skip", "xfail", "skipif"):
                     continue
                 if not any(k.arg == "reason" and k.value for k in dec.keywords):
@@ -1800,12 +1814,12 @@ def _noop_lens_verifies(node: ast.AST) -> bool:
                 if not isinstance(ctx, ast.Call):
                     continue
                 f = ctx.func
-                name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+                name = _callable_name(f)
                 if name in _RAISES_CONTEXT_NAMES:
                     return True
         if isinstance(sub, ast.Call):
             f = sub.func
-            name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+            name = _callable_name(f)
             if name in _FAIL_CALL_NAMES or name in _SCHEMATISEST_SELF_VALIDATING:
                 return True
             if name and "assert" in name:
@@ -4106,7 +4120,7 @@ def _constant_condition_skip_violations(tree: ast.AST) -> list[tuple[int, str]]:
         if not isinstance(marker, ast.Call):
             return None
         func = marker.func
-        name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+        name = _callable_name(func)
         if name not in ("skipif", "xfail"):
             return None
         for kw in marker.keywords:
@@ -4270,7 +4284,7 @@ def _broad_exception_catch_violations(tree: ast.AST) -> list[tuple[int, str]]:
         if not isinstance(node, ast.Call):
             continue
         f = node.func
-        name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+        name = _callable_name(f)
         if name not in _RAISES_CONTEXT_FUNCS:
             continue
         has_match = any(kw.arg == "match" for kw in node.keywords)
@@ -4311,7 +4325,7 @@ def _broad_exception_catch_violations(tree: ast.AST) -> list[tuple[int, str]]:
             if not isinstance(dec, ast.Call):
                 continue
             func = dec.func
-            dname = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+            dname = _callable_name(func)
             if dname != "xfail":
                 continue
             for kw in dec.keywords:
@@ -4435,7 +4449,7 @@ def _unentered_raises_context_violations(tree: ast.AST) -> list[tuple[int, str]]
         if not isinstance(value, ast.Call):
             continue
         f = value.func
-        name = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else None)
+        name = _callable_name(f)
         if name not in _RAISES_CONTEXT_FUNCS:
             continue
         if len(value.args) > 1:
@@ -6611,7 +6625,7 @@ def _skip_xfail_call(call: ast.Call) -> str | None:
     argument), whereas ``skip``/``xfail`` deselect unconditionally when called
     unconditionally."""
     func = call.func
-    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    name = _callable_name(func)
     return name if name in _SKIP_XFAIL_NAMES else None
 
 
@@ -6936,16 +6950,6 @@ def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]
     """
     found: list[tuple[int, str]] = []
 
-    def _context_manager_name(node: ast.AST) -> str | None:
-        if not isinstance(node, ast.Call):
-            return None
-        f = node.func
-        if isinstance(f, ast.Attribute):
-            return f"{f.attr}"
-        if isinstance(f, ast.Name):
-            return f.id
-        return None
-
     def _body_is_empty(body: list[ast.stmt]) -> bool:
         statements = [
             s
@@ -6966,7 +6970,9 @@ def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]
             continue
         with_item = node.items[0].context_expr
         lineno = node.lineno
-        name = _context_manager_name(with_item)
+        # Only a called context manager counts: a bare ``with pytest.raises:``
+        # (no call) is not a raises context, so it must not be flagged.
+        name = _callable_name(with_item) if isinstance(with_item, ast.Call) else None
         if name not in _RAISES_CONTEXT_FUNCS:
             continue
         if not _body_is_empty(node.body):
