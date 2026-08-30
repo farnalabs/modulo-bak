@@ -69,7 +69,7 @@ class TestCreateAndDecodeRefreshToken:
             token_sequence=0,
         )
         claims = decode_oauth_refresh_token(token, _SECRET_KEY)
-        assert claims.scopes == []
+        assert not claims.scopes
 
     def test_default_ttl_is_30_days(self) -> None:
         before = datetime.now(UTC)
@@ -150,6 +150,20 @@ class TestCreateAndDecodeRefreshToken:
             ({"token_sequence": None}, "token_sequence"),
             ({"token_sequence": "high"}, "token_sequence"),
         ],
+        ids=[
+            "purpose_not_refresh",
+            "sub_missing",
+            "sub_not_string",
+            "sub_empty",
+            "org_id_missing",
+            "org_id_not_uuid",
+            "account_id_missing",
+            "account_id_empty",
+            "token_family_missing",
+            "token_family_empty",
+            "token_sequence_missing",
+            "token_sequence_not_int",
+        ],
     )
     def test_decode_rejects_missing_or_malformed_claims(self, claims_overrides: dict[str, Any], match: str) -> None:
         base_claims: dict[str, Any] = {
@@ -183,7 +197,7 @@ class TestCreateAndDecodeRefreshToken:
             "exp": datetime.now(UTC) + timedelta(days=1),
         }
         token = pyjwt.encode(base_claims, _SECRET_KEY, algorithm="HS256")
-        assert decode_oauth_refresh_token(token, _SECRET_KEY).scopes == []
+        assert not decode_oauth_refresh_token(token, _SECRET_KEY).scopes
 
 
 # ---------------------------------------------------------------------------
