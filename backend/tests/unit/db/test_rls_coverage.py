@@ -125,8 +125,8 @@ _FAIL_OPEN_MARKERS = (
 
 # Migration file -> tables it must tighten to fail-closed.
 _STRICT_MIGRATIONS: dict[str, tuple[str, ...]] = {
-    "0155_rls_strict_parameter_schemas_sets": ("parameter_schemas", "parameter_sets"),
-    "0156_rls_strict_oauth_auth_codes_token_families": (
+    "0158_rls_strict_parameter_schemas_sets": ("parameter_schemas", "parameter_sets"),
+    "0159_rls_strict_oauth_auth_codes_token_families": (
         "oauth_authorization_codes",
         "oauth_token_families",
     ),

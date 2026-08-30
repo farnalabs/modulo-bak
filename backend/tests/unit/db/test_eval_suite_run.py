@@ -640,15 +640,24 @@ def test_single_migration_head() -> None:
     # 0154_add_web_vital_events_time_index chains off 0153.
     chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_numeric_check_constraints"]
     assert [_basename(p) for p in chaining_off_0153] == ["0154_add_web_vital_events_time_index.py"]
-    # 0155_rls_strict_parameter_schemas_sets (RLS fail-open close) chains off 0154 (merge renumber).
+    # 0155_add_hot_query_indexes (main) chains off 0154.
     chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_web_vital_events_time_index"]
-    assert [_basename(p) for p in chaining_off_0154] == ["0155_rls_strict_parameter_schemas_sets.py"]
-    # 0156_rls_strict_oauth_auth_codes_token_families (RLS fail-open close) chains off 0155.
-    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_rls_strict_parameter_schemas_sets"]
-    assert [_basename(p) for p in chaining_off_0155] == ["0156_rls_strict_oauth_auth_codes_token_families.py"]
-    # Nothing chains off 0156 -> it is the single head.
-    chaining_off_0156 = [p for p in revisions if parents[p] == "0156_rls_strict_oauth_auth_codes_token_families"]
-    assert chaining_off_0156 == []
+    assert [_basename(p) for p in chaining_off_0154] == ["0155_add_hot_query_indexes.py"]
+    # 0156_add_soft_delete_partial_uniques (main) chains off 0155_add_hot_query_indexes.
+    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_add_hot_query_indexes"]
+    assert [_basename(p) for p in chaining_off_0155] == ["0156_add_soft_delete_partial_uniques.py"]
+    # 0157_add_numeric_check_constraints (main) chains off 0156_add_soft_delete_partial_uniques.
+    chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_soft_delete_partial_uniques"]
+    assert [_basename(p) for p in chaining_off_0156] == ["0157_add_numeric_check_constraints.py"]
+    # 0158_rls_strict_parameter_schemas_sets (RLS fail-open close, this PR) chains off 0157.
+    chaining_off_0157 = [p for p in revisions if parents[p] == "0157_add_numeric_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0157] == ["0158_rls_strict_parameter_schemas_sets.py"]
+    # 0159_rls_strict_oauth_auth_codes_token_families (RLS fail-open close, this PR) chains off 0158 and is the head.
+    chaining_off_0158 = [p for p in revisions if parents[p] == "0158_rls_strict_parameter_schemas_sets"]
+    assert [_basename(p) for p in chaining_off_0158] == ["0159_rls_strict_oauth_auth_codes_token_families.py"]
+    # Nothing chains off 0159 -> it is the single head.
+    chaining_off_0159 = [p for p in revisions if parents[p] == "0159_rls_strict_oauth_auth_codes_token_families"]
+    assert chaining_off_0159 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

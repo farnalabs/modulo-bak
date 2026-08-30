@@ -1,14 +1,17 @@
 """Make parameter_schemas / parameter_sets RLS strict (fail-closed).
 
-Revision ID: 0155_rls_strict_parameter_schemas_sets
-Revises: 0154_add_web_vital_events_time_index
+Revision ID: 0158_rls_strict_parameter_schemas_sets
+Revises: 0157_add_numeric_check_constraints
 Create Date: 2026-08-27
 
 Renumber note: originally ``0151_rls_strict_parameter_schemas_sets`` chained off
 ``0150``, but main advanced through ``0151_fix_constraints`` -> ``0152_dismissed_by_user_id_index``
--> ``0153_add_numeric_check_constraints`` -> ``0154_add_web_vital_events_time_index``,
-so the ``0151``/``0152`` numeric prefixes collided. Renumbered to ``0155`` and
-re-parented onto main's head ``0154`` so the graph stays a single linear chain.
+-> ``0153_add_numeric_check_constraints`` -> ``0154_add_web_vital_events_time_index``
+-> ``0155_add_hot_query_indexes`` -> ``0156_add_soft_delete_partial_uniques``
+-> ``0157_add_numeric_check_constraints``, so the ``0151``/``0152`` and later
+``0155``/``0156`` numeric prefixes collided with main. Renumbered to ``0158`` and
+re-parented onto main's real head ``0157_add_numeric_check_constraints`` so the
+graph stays a single linear chain.
 
 RLS audit: ``parameter_schemas`` and ``parameter_sets`` were OR-ing a *strict*
 ``rls_org_isolation`` policy with a stacked permissive
@@ -34,8 +37,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0155_rls_strict_parameter_schemas_sets"
-down_revision: str | None = "0154_add_web_vital_events_time_index"
+revision: str = "0158_rls_strict_parameter_schemas_sets"
+down_revision: str | None = "0157_add_numeric_check_constraints"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
