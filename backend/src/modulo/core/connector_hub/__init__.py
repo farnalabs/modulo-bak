@@ -197,9 +197,8 @@ def _build_shared_redis_client(settings: Any) -> Any:
         # malformed/unsupported `redis_url` — a hard config error. Never degrade to
         # the local bucket (that would reconstruct the fleet-wide fail-open FAR-439
         # removed).
-        logger.error(
+        logger.exception(
             "Shared Redis client construction failed — fail-closed (no local-bucket fallback)",
-            exc_info=True,
         )
         raise SharedBudgetUnavailableError(
             f"shared rate-limit Redis client is configured but could not be constructed: {exc}"

@@ -333,7 +333,7 @@ async def get_connector_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while fetching connector.",
         ) from None
-    if ci is None:
+    if ci is None or ci.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_CONNECTOR_NOT_FOUND)
     return _to_response(ci)
 
@@ -364,7 +364,7 @@ async def connector_health_endpoint(
         await set_rls_org(session, principal.organisation_id)
         await set_rls_user_context(session, principal.account_id, principal.org_role)
         ci = await get_connector_instance(session, connector_id)
-    if ci is None:
+    if ci is None or ci.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found")
     try:
         secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
@@ -409,6 +409,8 @@ async def update_connector_endpoint(
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
             existing = await get_connector_instance(session, connector_id)
+            if existing is None or existing.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             if existing is not None and "config_json" in updates and updates["config_json"] is not None:
                 current_cfg = existing.config_json or {}
                 merged_cfg = dict(current_cfg)
@@ -466,7 +468,7 @@ async def update_connector_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="An unexpected error occurred while updating connector.",
         ) from None
-    if ci is None:
+    if ci is None or ci.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_CONNECTOR_NOT_FOUND)
     return _to_response(ci)
 
@@ -482,6 +484,9 @@ async def delete_connector_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
+            existing = await get_connector_instance(session, connector_id)
+            if existing is None or existing.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             deleted = await delete_connector_instance(session, connector_id)
     except IntegrityError:
         logger.exception(_CODE_CONNECTORS_DELETE_CONNECTOR_ENDPOINT)

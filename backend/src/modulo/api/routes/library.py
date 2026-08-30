@@ -725,7 +725,7 @@ async def export_pipeline_endpoint(
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
-            pipeline = await get_pipeline(session, pipeline_id)
+            pipeline = await get_pipeline(session, pipeline_id, organisation_id=principal.organisation_id)
             if pipeline is None:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1437,6 +1437,7 @@ def _add_pipeline_edges(
                 source_node_id=uuid.UUID(edge_data["source_node_id"]),
                 target_node_id=uuid.UUID(edge_data["target_node_id"]),
                 edge_type=edge_data["edge_type"],
+                condition_expression=edge_data.get("condition_expression"),
                 hitl_gate_config=edge_data.get("hitl_gate_config"),
                 source_port=edge_data.get("source_port", "out"),
                 target_port=edge_data.get("target_port", "in"),

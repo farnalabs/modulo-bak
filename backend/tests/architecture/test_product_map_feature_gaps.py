@@ -65,6 +65,21 @@ def _frontmatter_id(path: Path) -> str | None:
     return match.group(1)
 
 
+def _entry_frontmatter(path: Path) -> dict:
+    """Parse a behaviour-tracker entry's full YAML frontmatter block."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+    if end is None:
+        return {}
+    try:
+        loaded = yaml.safe_load("\n".join(lines[1:end]))
+    except yaml.YAMLError:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def _product_map_entry_paths() -> list[Path]:
     """Every behaviour-tracker entry (``*.md`` except the graph index)."""
     if not PRODUCT_MAP_DIR.is_dir():
@@ -134,6 +149,45 @@ def test_every_graph_entry_reachable_from_index():
         )
 
 
+#: Section markers of the graph root's two indexes (see README.md).
+_REGISTRY_INDEX_START = "## Index — manifest feature registry"
+_REGISTRY_INDEX_END = "## Index — feature graph entries"
+_REGISTRY_INDEX_TOKEN = "**{feature}**"
+
+
+def test_graph_root_registry_index_enumerates_every_manifest_feature():
+    """The graph root's "manifest feature registry" index lists every registered feature.
+
+    ``docs/product-map/README.md`` is the root of the feature graph. Its first
+    index is the human-readable mirror of the ``frontend/src/manifest.yaml``
+    ``features:`` registry; the README itself promises "Fresh entries for these
+    features are added to the graph below as behaviour trackers". A feature
+    registered in the manifest but missing from that index is invisible to a
+    reader navigating the graph — the product map ships it but its root does not
+    point at it (the ``feat-router`` gap this guard closes). The manifest
+    registry must be a strict subset of the index.
+    """
+    assert GRAPH_INDEX.is_file()
+    index_text = GRAPH_INDEX.read_text(encoding="utf-8")
+    assert _REGISTRY_INDEX_START in index_text, (
+        "graph root must declare the 'Index — manifest feature registry' section"
+    )
+    assert _REGISTRY_INDEX_END in index_text, "graph root must declare the 'Index — feature graph entries' section"
+    index_section = index_text.split(_REGISTRY_INDEX_START, 1)[1].split(_REGISTRY_INDEX_END, 1)[0]
+    missing = sorted(
+        feature
+        for feature in _manifest_features()
+        if _REGISTRY_INDEX_TOKEN.format(feature=feature) not in index_section
+    )
+    assert not missing, (
+        "manifest-registered features missing from the graph-root registry index "
+        "(add each to the 'Index — manifest feature registry' section of "
+        + GRAPH_INDEX.relative_to(REPO_ROOT).as_posix()
+        + " so the graph root enumerates the full product surface):\n"
+        + "\n".join(f"  {feature}" for feature in missing)
+    )
+
+
 def test_graph_entry_feature_ids_are_unique():
     """Product-map entries key on unique ``id`` frontmatter values."""
     seen: dict[str, Path] = {}
@@ -145,6 +199,39 @@ def test_graph_entry_feature_ids_are_unique():
         )
         assert entry_id not in seen, f"duplicate docs/product-map entry id {entry_id!r}"
         seen[entry_id] = entry
+
+
+#: Behaviour-tracker frontmatter fields whose values are repo-relative file paths.
+_CITATION_FIELDS = ("code", "unit-tests", "bdd", "adr")
+
+
+def test_entry_file_references_resolve():
+    """Every ``code:`` / ``unit-tests:`` / ``bdd:`` / ``adr:`` reference resolves.
+
+    The feature-graph contract (``docs/product-map/README.md``) points these
+    fields at the code paths, test files and BDD feature files that implement
+    each behaviour. A value that names a file that does not exist is a stale
+    citation: the entry either claims coverage someone deleted, or (the reverse
+    drift the snapshot entries suffered) under-reports a surface that lives in a
+    file it never names. A trailing-slash value names a directory. ``feat-*``
+    and task ids appear only in ``depends-on``/``delivery-tasks``, which are not
+    file fields and are deliberately not checked here.
+    """
+    missing: dict[str, list[str]] = {}
+    for entry in _product_map_entry_paths():
+        frontmatter = _entry_frontmatter(entry)
+        for field in _CITATION_FIELDS:
+            for ref in frontmatter.get(field) or []:
+                if not isinstance(ref, str) or not ref.strip():
+                    continue
+                resolved = REPO_ROOT / ref.rstrip("/")
+                if not resolved.is_file() and not resolved.is_dir():
+                    missing.setdefault(entry.relative_to(REPO_ROOT).as_posix(), []).append(f"{field}: {ref}")
+    assert not missing, (
+        "docs/product-map entries cite paths that do not exist in the repo"
+        " (stale code/bdd/unit-test coverage claims):\n"
+        + "\n".join(f"  {entry} -> {refs}" for entry, refs in sorted(missing.items()))
+    )
 
 
 def test_feature_references_resolve():
