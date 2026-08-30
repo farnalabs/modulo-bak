@@ -149,6 +149,45 @@ def test_every_graph_entry_reachable_from_index():
         )
 
 
+#: Section markers of the graph root's two indexes (see README.md).
+_REGISTRY_INDEX_START = "## Index — manifest feature registry"
+_REGISTRY_INDEX_END = "## Index — feature graph entries"
+_REGISTRY_INDEX_TOKEN = "**{feature}**"
+
+
+def test_graph_root_registry_index_enumerates_every_manifest_feature():
+    """The graph root's "manifest feature registry" index lists every registered feature.
+
+    ``docs/product-map/README.md`` is the root of the feature graph. Its first
+    index is the human-readable mirror of the ``frontend/src/manifest.yaml``
+    ``features:`` registry; the README itself promises "Fresh entries for these
+    features are added to the graph below as behaviour trackers". A feature
+    registered in the manifest but missing from that index is invisible to a
+    reader navigating the graph — the product map ships it but its root does not
+    point at it (the ``feat-router`` gap this guard closes). The manifest
+    registry must be a strict subset of the index.
+    """
+    assert GRAPH_INDEX.is_file()
+    index_text = GRAPH_INDEX.read_text(encoding="utf-8")
+    assert _REGISTRY_INDEX_START in index_text, (
+        "graph root must declare the 'Index — manifest feature registry' section"
+    )
+    assert _REGISTRY_INDEX_END in index_text, "graph root must declare the 'Index — feature graph entries' section"
+    index_section = index_text.split(_REGISTRY_INDEX_START, 1)[1].split(_REGISTRY_INDEX_END, 1)[0]
+    missing = sorted(
+        feature
+        for feature in _manifest_features()
+        if _REGISTRY_INDEX_TOKEN.format(feature=feature) not in index_section
+    )
+    assert not missing, (
+        "manifest-registered features missing from the graph-root registry index "
+        "(add each to the 'Index — manifest feature registry' section of "
+        + GRAPH_INDEX.relative_to(REPO_ROOT).as_posix()
+        + " so the graph root enumerates the full product surface):\n"
+        + "\n".join(f"  {feature}" for feature in missing)
+    )
+
+
 def test_graph_entry_feature_ids_are_unique():
     """Product-map entries key on unique ``id`` frontmatter values."""
     seen: dict[str, Path] = {}
@@ -164,6 +203,77 @@ def test_graph_entry_feature_ids_are_unique():
 
 #: Behaviour-tracker frontmatter fields whose values are repo-relative file paths.
 _CITATION_FIELDS = ("code", "unit-tests", "bdd", "adr")
+
+_BDD_ROOT = REPO_ROOT / "backend" / "tests" / "bdd"
+
+
+def _resolve_dir_arg(text: str, module: Path, name: str) -> Path | None:
+    """Resolve a variable that a step module passes to ``scenarios()`` as a directory.
+
+    Handles the two forms seen in the suite:
+
+    - a plain string literal, e.g. ``_features_dir = "tests/bdd/features/events"``
+    - a ``Path(__file__).resolve().parent[.parent...] / "a" / "b"`` expression, e.g.
+      ``_features_dir = str(Path(__file__).resolve().parent.parent / "features" / "events")``
+
+    Returns the resolved directory, or ``None`` when the assignment cannot be
+    resolved (so the caller simply skips it rather than producing a false negative).
+    """
+    assign = re.search(rf"\b{name}\s*=\s*([^\n;]+)", text)
+    if assign is None:
+        return None
+    rhs = assign.group(1).strip()
+    quoted = re.findall(r'["\']([^"\']+)["\']', rhs)
+    if not quoted:
+        return None
+    if "__file__" in rhs or "Path(" in rhs:
+        parents = len(re.findall(r"\.parent", rhs))
+        directory = module
+        for _ in range(parents):
+            directory = directory.parent
+    else:
+        directory = module.parent
+    for segment in quoted:
+        directory = directory / segment
+    return directory.resolve()
+
+
+def _registered_bdd_features() -> set[Path]:
+    """Every ``.feature`` file wired to a ``scenarios(...)`` load call.
+
+    pytest-bdd feature files only execute when a step module loads them via
+    ``scenarios("...")`` (string-literal feature path) or via a directory
+    registration such as ``scenarios(_features_dir)`` (where ``_features_dir``
+    points at a features directory - e.g. ``test_sse_event_bus.py`` loads every
+    ``.feature`` under ``backend/tests/bdd/features/events/`` this way).
+
+    Both forms are detected: string-literal paths resolve relative to the module
+    that declares them, and directory arguments register every ``.feature`` file
+    found beneath the resolved directory. This keeps the coverage assertion in
+    ``test_bdd_citations_are_registered_coverage`` free of false positives for
+    directory-loaded features.
+    """
+    registered: set[Path] = set()
+    if not _BDD_ROOT.is_dir():
+        return registered
+    for module in _BDD_ROOT.rglob("*.py"):
+        try:
+            text = module.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for ref in re.findall(r"scenarios\(\s*['\"]([^'\"]+\.feature)['\"]", text):
+            target = (module.parent / ref).resolve()
+            if target.is_file():
+                registered.add(target)
+        for name in re.findall(r"scenarios\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", text):
+            if name == "scenarios":
+                continue
+            directory = _resolve_dir_arg(text, module, name)
+            if directory is None or not directory.is_dir():
+                continue
+            for feature in directory.rglob("*.feature"):
+                registered.add(feature.resolve())
+    return registered
 
 
 def test_entry_file_references_resolve():
@@ -192,6 +302,40 @@ def test_entry_file_references_resolve():
         "docs/product-map entries cite paths that do not exist in the repo"
         " (stale code/bdd/unit-test coverage claims):\n"
         + "\n".join(f"  {entry} -> {refs}" for entry, refs in sorted(missing.items()))
+    )
+
+
+def test_bdd_citations_are_registered_coverage():
+    """Every ``bdd:`` feature-file citation is actually wired to a step module.
+
+    ``test_entry_file_references_resolve`` only proves a cited ``.feature`` file
+    exists on disk. A feature file that still ships but is no longer loaded by
+    any ``scenarios(...)`` call contributes nothing to the test run, yet keeps
+    the product map claiming BDD coverage for it — the silent drift direction.
+    This test makes the coverage claim strong: every ``bdd:`` citation pointing
+    under ``backend/tests/bdd/features/`` must resolve to a feature file that a
+    step module registers, so product-map BDD claims always describe tests that
+    actually execute (the stale-claim failure mode the 2026-08-26
+    snapshot-versioning pass fixed).
+    """
+    registered = _registered_bdd_features()
+    assert registered, "no BDD feature files are registered by any step module"
+
+    unregistered: dict[str, list[str]] = {}
+    for entry in _product_map_entry_paths():
+        frontmatter = _entry_frontmatter(entry)
+        for ref in frontmatter.get("bdd") or []:
+            if not isinstance(ref, str) or not ref.endswith(".feature"):
+                continue
+            resolved = (REPO_ROOT / ref).resolve()
+            if not resolved.is_relative_to(_BDD_ROOT.resolve()):
+                continue
+            if resolved not in registered:
+                unregistered.setdefault(entry.relative_to(REPO_ROOT).as_posix(), []).append(ref)
+    assert not unregistered, (
+        "bdd: citations under backend/tests/bdd/ that no step module loads — the"
+        " product map claims BDD coverage for feature files that never execute:\n"
+        + "\n".join(f"  {entry} -> {refs}" for entry, refs in sorted(unregistered.items()))
     )
 
 
