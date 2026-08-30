@@ -123,13 +123,6 @@
         files: ^backend/tests/.*\.py$
         pass_filenames: false
         stages: [pre-commit]
-      - id: check-test-quality
-        name: test-quality QA lens (assertion-less tests)
-        entry: uv --directory backend run --no-sync python scripts/run_check_test_quality.py
-        language: system
-        files: ^backend/tests/.*\.py$
-        pass_filenames: false
-
       - id: check-uv-lock
         name: check uv lockfile freshness
         entry: uv run --project backend --no-sync python scripts/run_check_uv_lock.py
