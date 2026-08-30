@@ -1,7 +1,7 @@
 """Add missing foreign-key constraints on internal reference columns.
 
-Revision ID: 0151_add_missing_foreign_keys
-Revises: 0150_add_router_no_match_status
+Revision ID: 0153_add_missing_foreign_keys
+Revises: 0152_dismissed_by_user_id_index
 Create Date: 2026-08-29
 
 These columns are clearly foreign keys (named ``*_id`` and referencing another
@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0151_add_missing_foreign_keys"
-down_revision: str | None = "0150_add_router_no_match_status"
+revision: str = "0153_add_missing_foreign_keys"
+down_revision: str | None = "0152_dismissed_by_user_id_index"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

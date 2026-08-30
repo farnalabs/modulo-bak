@@ -1,7 +1,7 @@
 """Add CHECK constraints for non-negative counters and enum vocabularies.
 
-Revision ID: 0152_add_check_constraints
-Revises: 0151_add_missing_foreign_keys
+Revision ID: 0154_add_check_constraints
+Revises: 0153_add_missing_foreign_keys
 Create Date: 2026-08-29
 
 Several columns are counters / bounded enums that should be enforced at the DB
@@ -26,8 +26,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0152_add_check_constraints"
-down_revision: str | None = "0151_add_missing_foreign_keys"
+revision: str = "0154_add_check_constraints"
+down_revision: str | None = "0153_add_missing_foreign_keys"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

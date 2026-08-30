@@ -625,24 +625,30 @@ def test_single_migration_head() -> None:
     # 0149_suite_run_trigger_kind (FAR-377, main) chains off 0148.
     chaining_off_0148 = [p for p in revisions if parents[p] == "0148_pipeline_snapshot_versioning_far420"]
     assert [_basename(p) for p in chaining_off_0148] == ["0149_suite_run_trigger_kind.py"]
-    # 0150_add_router_no_match_status chains off 0149.
+    # 0150_add_router_no_match_status (main) chains off 0149.
     chaining_off_0149 = [p for p in revisions if parents[p] == "0149_suite_run_trigger_kind"]
     assert [_basename(p) for p in chaining_off_0149] == ["0150_add_router_no_match_status.py"]
-    # 0151_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0150.
+    # 0151_fix_constraints (main) chains off 0150.
     chaining_off_0150 = [p for p in revisions if parents[p] == "0150_add_router_no_match_status"]
-    assert [_basename(p) for p in chaining_off_0150] == ["0151_add_missing_foreign_keys.py"]
-    # 0152_add_check_constraints chains off 0151.
-    chaining_off_0151 = [p for p in revisions if parents[p] == "0151_add_missing_foreign_keys"]
-    assert [_basename(p) for p in chaining_off_0151] == ["0152_add_check_constraints.py"]
-    # 0153_promote_uuid_fk_columns chains off 0152.
-    chaining_off_0152 = [p for p in revisions if parents[p] == "0152_add_check_constraints"]
-    assert [_basename(p) for p in chaining_off_0152] == ["0153_promote_uuid_fk_columns.py"]
-    # 0154_add_hot_query_indexes chains off 0153.
-    chaining_off_0153 = [p for p in revisions if parents[p] == "0153_promote_uuid_fk_columns"]
-    assert [_basename(p) for p in chaining_off_0153] == ["0154_add_hot_query_indexes.py"]
-    # Nothing chains off 0154 -> it is the single head.
-    chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_hot_query_indexes"]
-    assert chaining_off_0154 == []
+    assert [_basename(p) for p in chaining_off_0150] == ["0151_fix_constraints.py"]
+    # 0152_dismissed_by_user_id_index (main, file 0152_add_indexes.py) chains off 0151.
+    chaining_off_0151 = [p for p in revisions if parents[p] == "0151_fix_constraints"]
+    assert [_basename(p) for p in chaining_off_0151] == ["0152_add_indexes.py"]
+    # 0153_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0152.
+    chaining_off_0152 = [p for p in revisions if parents[p] == "0152_dismissed_by_user_id_index"]
+    assert [_basename(p) for p in chaining_off_0152] == ["0153_add_missing_foreign_keys.py"]
+    # 0154_add_check_constraints chains off 0153.
+    chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_missing_foreign_keys"]
+    assert [_basename(p) for p in chaining_off_0153] == ["0154_add_check_constraints.py"]
+    # 0155_promote_uuid_fk_columns chains off 0154.
+    chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0154] == ["0155_promote_uuid_fk_columns.py"]
+    # 0156_add_hot_query_indexes chains off 0155.
+    chaining_off_0155 = [p for p in revisions if parents[p] == "0155_promote_uuid_fk_columns"]
+    assert [_basename(p) for p in chaining_off_0155] == ["0156_add_hot_query_indexes.py"]
+    # Nothing chains off 0156 -> it is the single head.
+    chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_hot_query_indexes"]
+    assert chaining_off_0156 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:
