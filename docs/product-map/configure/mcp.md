@@ -20,8 +20,7 @@ unit-tests:
   - backend/tests/unit/test_mcp_structural_coverage.py
   - frontend/src/__tests__/SettingsMcpView.spec.ts
 bdd:
-  - backend/tests/bdd/features/mcp/onboarding.feature
-  - backend/tests/bdd/features/mcp/library_browse.feature
+   - backend/tests/bdd/features/mcp/library_browse.feature
   - backend/tests/bdd/features/mcp/trigger.feature
   - backend/tests/bdd/features/mcp/mcp_oauth.feature
   - backend/tests/bdd/steps/test_alpha_mcp.py
