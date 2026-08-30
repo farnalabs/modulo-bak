@@ -1,7 +1,7 @@
 """Add missing foreign-key constraints on internal reference columns.
 
-Revision ID: 0158_add_missing_foreign_keys
-Revises: 0157_add_numeric_check_constraints
+Revision ID: 0159_add_missing_foreign_keys
+Revises: 0158_sso_provider_id
 Create Date: 2026-08-29
 
 These columns are clearly foreign keys (named ``*_id`` and referencing another
@@ -25,8 +25,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0158_add_missing_foreign_keys"
-down_revision: str | None = "0157_add_numeric_check_constraints"
+revision: str = "0159_add_missing_foreign_keys"
+down_revision: str | None = "0158_sso_provider_id"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
