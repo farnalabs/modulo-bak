@@ -7345,6 +7345,22 @@ def test_no_selection_markers_on_fixtures():
     siblings check *reason*/*condition*, not whether the marker is even on a
     test. Move the gate into the fixture body (``pytest.skip(...)`` behind the
     real ``if``), where it fires when the fixture is requested."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _selection_marker_on_fixture_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} selection marker(s) on a @pytest.fixture function.\n"
+        "pytest only honours skip/skipif/xfail on collected test items — a fixture is never one,\n"
+        "so the marker is silently ignored and a skipif that was meant to gate the tests built\n"
+        "from the fixture never fires. Hoist the gate into the fixture body with\n"
+        "pytest.skip(...) behind the real if, where it takes effect when the fixture is\n"
+        "requested.\n" + "\n".join(violations)
+    )
 
 
 def _bound_method_truthiness_violations(tree: ast.AST) -> list[tuple[int, str]]:
@@ -7399,18 +7415,13 @@ def test_no_bound_method_truthiness_asserts():
         if tree is None:
             continue
         rel = path.relative_to(TESTS)
-        for lineno, detail in _selection_marker_on_fixture_violations(tree):
-            violations.append(f"  {rel}:{lineno}  {detail}")
         for lineno, detail in _bound_method_truthiness_violations(tree):
             violations.append(f"  {rel}:{lineno}  {detail}")
     assert not violations, (
-        f"Found {len(violations)} lens violation(s) (selection markers on fixtures and/or "
-        "truthiness asserts against a bare bound method).\n"
-        "pytest only honours skip/skipif/xfail on collected test items — a fixture is never one,\n"
-        "so the marker is silently ignored and a skipif that should gate the tests never fires.\n"
-        "And a bound method object is always truthy, so asserting the bare reference is a silent\n"
-        "false-green (or, under 'not', always fails). Add the calling () so the assertion actually\n"
-        "exercises the method's return value.\n" + "\n".join(violations)
+        f"Found {len(violations)} truthiness assert(s) against a bare bound method.\n"
+        "assert obj.method() — a bound method object is always truthy, so asserting the bare\n"
+        "reference is a silent false-green (or, under 'not', always fails). Add the calling ()\n"
+        "so the assertion actually exercises the method's return value." + "\n".join(violations)
     )
 
 
