@@ -85,7 +85,7 @@ def test_policy_from_pipeline_default_fail_closed_on_missing_vocabulary() -> Non
     for bad in (None, {}, {"on": "stall"}, {"max_retries": 0}, {"on": ["stall"], "max_retries": -1}):
         policy = rc._policy_from_pipeline_default(bad)
         assert policy.max_attempts == 1
-        assert policy.events == frozenset()
+        assert not policy.events
 
 
 def test_node_fail_closed_for_idempotent_false() -> None:
