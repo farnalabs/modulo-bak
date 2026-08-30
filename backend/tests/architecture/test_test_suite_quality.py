@@ -4222,11 +4222,15 @@ def test_constant_condition_skip_lens_flags_deterministic_skips():
 
 
 _RAISES_CONTEXT_FUNCS = frozenset({"raises", "warns"})
-"""``with`` context-manager names whose expected-exception argument is checked
-for broad classes. Custom helpers (``assert_raises``, ``rejects``, ...) are
-deliberately not matched: their signature does not necessarily take an
-exception class positionally, and only ``pytest.raises``/``pytest.warns``
-have the ``match=`` keyword that narrows an ``AssertionError`` expectation."""
+"""``pytest.raises``/``pytest.warns`` names, matched on the final name of the
+attribute chain (``pytest.raises`` -> ``raises``) or on a bare imported
+``raises(...)``/``warns(...)``. Custom helpers (``assert_raises``, ``rejects``,
+...) and aliases that rename the context manager are deliberately not matched:
+their signature does not necessarily take an exception class positionally, and
+only ``pytest.raises``/``pytest.warns`` have the ``match=`` keyword that
+narrows an ``AssertionError`` expectation. Shared by the lenses that inspect
+the call's expected-exception argument for broad classes and by the lens that
+checks the ``with``/``async with`` body is not empty."""
 
 _BROAD_EXCEPTION_CLASSES = frozenset({"Exception", "BaseException"})
 """Exception classes that can never be a *specific* expected error: ``Exception``
@@ -6897,14 +6901,6 @@ def test_unconditional_skip_marker_lens_flags_permanent_deselection():
         assert not _unconditional_skip_marker_violations(tree), f"lens should NOT flag:\n{source}"
 
 
-_RAISES_CONTEXT_WITH_NAMES = frozenset({"raises", "warns"})
-"""The ``with`` context-manager names that indicate a ``pytest.raises`` /
-``pytest.warns`` block — matched on the final name of the attribute chain
-(``pytest.raises`` -> ``raises``, ``pytest.warns`` -> ``warns``) or on a bare
-imported ``raises(...)``/``warns(...)``. Helper aliases that rename the
-context manager to something else are deliberately not implicated."""
-
-
 def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(lineno, detail)`` pairs for every ``with pytest.raises(...):`` /
     ``with pytest.warns(...):`` (or their ``async with`` twins, or a bare
@@ -6953,7 +6949,7 @@ def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]
         with_item = node.items[0].context_expr
         lineno = node.lineno
         name = _context_manager_name(with_item)
-        if name not in _RAISES_CONTEXT_WITH_NAMES:
+        if name not in _RAISES_CONTEXT_FUNCS:
             continue
         if not _body_is_empty(node.body):
             continue
