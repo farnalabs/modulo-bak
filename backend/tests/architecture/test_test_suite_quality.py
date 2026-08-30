@@ -2838,12 +2838,7 @@ def _is_mock_flagged_name(name: str) -> bool:
     spellings cover the suite's conventional double variable names
     (``mock_run``, ``mock_create``, ``_mock_canary``, ...)."""
     root = name.lower()
-    return (
-        root in ("mocker", "mocks")
-        or root.startswith("mock")
-        or root.startswith("_mock")
-        or root.endswith("_mock")
-    )
+    return root in ("mocker", "mocks") or root.startswith(("mock", "_mock")) or root.endswith("_mock")
 
 
 def _mock_container_expression(node: ast.AST) -> str | None:
@@ -2902,7 +2897,7 @@ def _mock_membership_probe_violations(tree: ast.AST) -> list[tuple[int, str]]:
         for sub in ast.walk(node.test):
             if not isinstance(sub, ast.Compare):
                 continue
-            for op, right in zip(sub.ops, sub.comparators):
+            for op, right in zip(sub.ops, sub.comparators, strict=True):
                 if not isinstance(op, (ast.In, ast.NotIn)):
                     continue
                 container = _mock_container_expression(right)
