@@ -10,6 +10,7 @@ Common issues, their causes, and resolutions.
 |---|---|---|---|
 | `SECRET_KEY not set` | Missing env var | Set `SECRET_KEY` (minimum 32 bytes) | `ValidationError: SECRET_KEY must be at least 32 bytes` |
 | `FERNET_KEY not set` | Missing env var | Set `FERNET_KEY` (base64-encoded, at least 32 bytes) | `ValidationError: FERNET_KEY must be at least 32 bytes` |
+| `Fernet key must be 32 url-safe base64-encoded bytes` | `FERNET_KEY` is long enough to pass the startup length check but does not decode to exactly 32 bytes | Regenerate the key with `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` (a 44-character value) | `ValueError: Fernet key must be 32 url-safe base64-encoded bytes.` |
 | `Cannot connect to Postgres` | DB not running, wrong `DATABASE_URL`, or network issue | Check `docker compose ps`, verify `DATABASE_URL` is correct, ensure Postgres is accepting connections | `sqlalchemy.exc.OperationalError: could not connect to server` |
 | `Alembic migration failed` | Version mismatch, branch migration, or `VARCHAR(32)` column width | Check `alembic_version` table exists with `VARCHAR(255)` for branch IDs; run `uv run alembic upgrade heads` | `alembic.util.exc.CommandError` or `psycopg2.errors.StringDataRightTruncationError` |
 | `Redis connection refused` | Redis not running or wrong `REDIS_URL` | Check `docker compose ps`, verify `REDIS_URL` | `redis.exceptions.ConnectionError: Error 10061` |
