@@ -6907,14 +6907,32 @@ def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]
     imported ``raises``/``warns``) whose body contains no executable
     statement — only ``pass``, ``...``, a docstring, or nothing at all.
 
-    A ``pytest.raises``/``pytest.warns`` context that never executes any code
-    inside its body is a silent false green: the ``with`` block claims to pin
-    down an expected exception or warning, but because no statement runs, the
-    context never observes anything and the test passes regardless of what the
-    code under test does. It is the empty-body twin of the unentered-raises
-    lens (where the context manager is never entered) and of the
-    no-op-test-body lens (which only governs whole ``test_*`` functions, not
-    individual ``with`` blocks).
+    Such a context is an unfinished test: the expectation is declared but the
+    code that is supposed to trigger it was never written, so the ``with``
+    block exercises nothing.
+
+    This is *not* a false green, and the distinction matters. Unlike the
+    unentered-raises lens — where ``pytest.raises(X)`` stands as a bare
+    statement, the context is never entered, and nothing is ever checked —
+    pytest itself fails an entered-but-empty context loudly with
+    ``Failed: DID NOT RAISE`` / ``Failed: DID NOT WARN`` the moment the test
+    runs. The lens is therefore a dead-code/incompleteness check, not a
+    false-green check.
+
+    It still earns its place because the guaranteed failure only surfaces if
+    the test actually executes. When it does not, the empty body is reported
+    green and no ``DID NOT RAISE`` is ever seen:
+
+    * behind ``@pytest.mark.skip``/``skipif`` — the body never runs (SKIPPED),
+    * behind ``@pytest.mark.xfail`` — the failure is absorbed and reported as
+      XFAIL, which reads as a pass,
+    * inside a branch or helper that is never reached at runtime.
+
+    Statically flagging the body also names the real defect ("the
+    code-under-test is missing") instead of leaving a reader to decode a
+    ``DID NOT RAISE`` at runtime. It complements the no-op-test-body lens,
+    which only governs whole ``test_*`` functions rather than individual
+    ``with`` blocks.
     """
     found: list[tuple[int, str]] = []
 
@@ -6957,8 +6975,10 @@ def _empty_raises_context_body_violations(tree: ast.AST) -> list[tuple[int, str]
             (
                 lineno,
                 f"{name}(...) with an empty body — no code runs inside the with block, so the "
-                "expected exception/warning is never actually exercised and the test passes "
-                "whether or not it occurs; put the code-under-test inside the 'with' body",
+                "expected exception/warning is never exercised. pytest fails this with 'DID NOT "
+                "RAISE'/'DID NOT WARN' whenever the test runs, and it is silently green when it "
+                "does not (skip/xfail/unreached code); put the code-under-test inside the "
+                "'with' body",
             )
         )
     return found
@@ -6968,11 +6988,15 @@ def test_no_empty_raises_context_bodies():
     """A ``pytest.raises``/``pytest.warns`` context (``with ...:`` or
     ``async with ...:``, attribute or bare-imported name) whose body contains
     no executable statement — only ``pass``, ``...``, a docstring, or nothing —
-    is a silent false green. The ``with`` block claims to pin down an expected
-    exception or warning but never runs any code, so it passes whether the code
-    under test raises the expected error, raises the wrong error, or raises
-    nothing at all. Put the actual code-under-test inside the ``with`` body so
-    the expectation is genuinely checked."""
+    is an unfinished test: the expectation is declared but the code meant to
+    trigger it is missing.
+
+    pytest fails such a context loudly (``DID NOT RAISE``/``DID NOT WARN``)
+    whenever the test runs, so this is dead scaffolding rather than a false
+    green. It is gated statically because that guaranteed failure never
+    surfaces when the body does not execute — behind ``skip``/``skipif``, behind
+    ``xfail`` (absorbed as XFAIL, which reads as a pass), or in unreached code.
+    Put the actual code-under-test inside the ``with`` body."""
     violations = []
     for path in _iter_test_modules():
         tree = _parse(path)
@@ -6983,13 +7007,14 @@ def test_no_empty_raises_context_bodies():
             violations.append(f"  {rel}:{lineno}  {detail}")
     assert not violations, (
         f"Found {len(violations)} pytest.raises/pytest.warns context(s) with an empty body.\n"
-        "A with-block that never runs any statement cannot check an exception/warning — the "
-        "test passes whether or not the code under test raises it. Move the code-under-test "
-        "inside the 'with' body.\n" + "\n".join(violations)
+        "A with-block that never runs any statement exercises no exception/warning: pytest fails "
+        "it with 'DID NOT RAISE'/'DID NOT WARN' when the test runs, and it is silently green when "
+        "it does not (skip/xfail/unreached code). Move the code-under-test inside the 'with' "
+        "body.\n" + "\n".join(violations)
     )
 
 
-def test_empty_raises_context_body_lens_flags_silent_false_greens():
+def test_empty_raises_context_body_lens_flags_unfinished_bodies():
     """Synthetic positive/negative control for the empty-raises-context-body
     lens: it must flag ``with``/``async with`` ``pytest.raises``/``pytest.warns``
     contexts (attribute and bare-imported name spellings) whose body is only
