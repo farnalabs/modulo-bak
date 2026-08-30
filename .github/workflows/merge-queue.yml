@@ -558,60 +558,38 @@ jobs:
             # fix commit hidden behind a later merge (HEAD becomes a 2-parent merge) must
             # still be flagged. Merge-only pushes (every commit >=2 parents) keep the
             # approval valid, and any API failure fails CLOSED (skip, never merge).
-            HEAD_OID=$(gh pr view "$NUM" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
-            if [ -z "$HEAD_OID" ]; then
-              echo "  PR #$NUM could not resolve head oid -- skipping merge (fail closed)"
-              continue
-            fi
-            # Reviews are returned oldest-first; pick the LAST APPROVED one. Paginate:
-            # a PR with >100 reviews (bot re-review flood) could omit the latest APPROVED
-            # review from a single page. We never rely on the review's commit_id for the
-            # decision (it is unstable - observed reading back as the newer head on #1386) -
-            # only for the log line.
-            APPROVE_JSON=$(gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/reviews?per_page=100" 2>/dev/null \
-              | jq -c '[.[] | select(.state == "APPROVED")] | last | {submitted_at: (.submitted_at // empty), commit_id: (.commit_id // empty)}' 2>/dev/null || echo "")
-            if [ -z "$APPROVE_JSON" ]; then
-              echo "  PR #$NUM no APPROVED review found -- skipping merge (treat as not-approved)"
-              continue
-            fi
-            APPROVE_SUBMITTED=$(echo "$APPROVE_JSON" | jq -r '.submitted_at // empty' 2>/dev/null || echo "")
-            APPROVE_COMMIT=$(echo "$APPROVE_JSON" | jq -r '.commit_id // empty' 2>/dev/null || echo "")
-            if [ -z "$APPROVE_SUBMITTED" ]; then
-              echo "  PR #$NUM could not resolve approval timestamp -- skipping merge (fail closed)"
-              continue
-            fi
-            APPROVE_EPOCH=$(date -d "$APPROVE_SUBMITTED" +%s 2>/dev/null || echo "-1")
-
-            # Walk the FULL PR commit list (paginated) in ONE call. Flag ANY single-parent
-            # (non-merge) commit whose committer date is AFTER the approval's submitted_at.
-            # The previous HEAD-only check was bypassable: a contributor could push a
-            # post-approval fix commit F, then `git pull origin main` and push the resulting
-            # merge M - HEAD becomes M (2 parents) so the guard passed, yet unreviewed F was
-            # still in the tree. Mirrors the proven walk in .github/scripts/pr-review-dedup.py.
-            # Parent count and committer date come from the SAME response, so a partial API
-            # failure cannot weaken the gate; a failed fetch or evaluation skips the merge
-            # (fail closed), never fails open.
-            COMMITS_JSON=$(gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/commits?per_page=100" 2>/dev/null || echo "")
-            if [ -z "$COMMITS_JSON" ]; then
-              echo "  PR #$NUM could not resolve commit list -- skipping merge (fail closed)"
-              continue
-            fi
-            STALE_COUNT=$(echo "$COMMITS_JSON" | jq -c --argjson approve "$APPROVE_EPOCH" '
-              [ .[]
-                | select((.parents | length) == 1)
-                | select((.commit.committer.date // "") as $d
-                  | ($d | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) > $approve)
-              ] | length' 2>/dev/null || echo "-1")
-            if [ -z "$STALE_COUNT" ] || [ "$STALE_COUNT" = "-1" ]; then
-              echo "  PR #$NUM commit-list evaluation failed -- skipping merge (fail closed)"
-              continue
-            fi
-            if [ "$STALE_COUNT" -gt 0 ] 2>/dev/null; then
-              echo "  PR #$NUM has $STALE_COUNT non-merge commit(s) committed after approval ($APPROVE_SUBMITTED) -- skipping merge (approval stale, TOCTOU guard)"
-              continue
-            fi
-            # No post-approval non-merge code (merge-only head moves keep approval valid).
-            echo "  PR #$NUM SHA-pin guard OK (approve commit_id=$APPROVE_COMMIT, head=$HEAD_OID)"
+             HEAD_OID=$(gh pr view "$NUM" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")
+             if [ -z "$HEAD_OID" ]; then
+               echo "  PR #$NUM could not resolve head oid -- skipping merge (fail closed)"
+               continue
+             fi
+             # SHA-pin TOCTOU guard. The decision is delegated to a versioned, unit-tested
+             # Python script (.github/scripts/merge-queue-approve-guard.py) instead of inline
+             # bash because (a) the reviews/commits lists are paginated via `gh api --paginate`
+             # and arrive as MULTIPLE concatenated JSON documents -- naive `jq` only sees the
+             # first page, which previously made STALE_COUNT multi-line and the guard FAIL OPEN
+             # on the >100-item large-PR path -- and (b) the timestamp walk is non-trivial and
+             # needs coverage (backend/tests/unit/scripts/test_merge_queue_approve_guard.py).
+             # The script merges ALL pages first, then blocks when ANY non-merge (single-parent)
+             # commit was committed AFTER the latest APPROVED review's submitted_at. Merge-only
+             # head moves keep the approval valid; any error fails CLOSED (stale -> skip), never
+             # fails open.
+             REVIEWS_FILE=$(mktemp)
+             COMMITS_FILE=$(mktemp)
+             gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/reviews?per_page=100" > "$REVIEWS_FILE" 2>/dev/null || true
+             gh api --paginate "repos/${{ github.repository }}/pulls/$NUM/commits?per_page=100" > "$COMMITS_FILE" 2>/dev/null || true
+             GUARD_OUT=$(python3 .github/scripts/merge-queue-approve-guard.py "$REVIEWS_FILE" "$COMMITS_FILE" "$HEAD_OID" 2>/dev/null) || true
+             rm -f "$REVIEWS_FILE" "$COMMITS_FILE"
+             if [ -z "$GUARD_OUT" ]; then
+               GUARD_OUT="stale|guard script produced no output - fail closed"
+             fi
+             GUARD_VERDICT="${GUARD_OUT%%|*}"
+             if [ "$GUARD_VERDICT" != "ok" ]; then
+               echo "  PR #$NUM SHA-pin guard: ${GUARD_OUT#*|} -- skipping merge (fail closed)"
+               continue
+             fi
+             # No post-approval non-merge code (merge-only head moves keep approval valid).
+             echo "  PR #$NUM ${GUARD_OUT#*|}"
 
             if gh pr merge --squash "$NUM" 2>&1; then
               echo "    PR #$NUM merged --"
