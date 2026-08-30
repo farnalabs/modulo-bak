@@ -116,6 +116,8 @@ class JenkinsConnector(ConnectorBase):
             return HealthResult(ok=False, detail="Jenkins API timeout")
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Jenkins API connection error")
+        except ValueError as exc:
+            return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(
         self,

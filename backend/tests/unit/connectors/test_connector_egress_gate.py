@@ -28,9 +28,13 @@ from modulo.connectors.azure_key_vault import AzureKeyVaultConnector
 from modulo.connectors.azure_pipelines import AzurePipelinesConnector
 from modulo.connectors.azure_repos import AzureReposConnector
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+from modulo.connectors.confluence import ConfluenceConnector
 from modulo.connectors.gitea import GiteaConnector
 from modulo.connectors.gitlab import GitLabConnector
+from modulo.connectors.grafana import GrafanaConnector
+from modulo.connectors.jenkins import JenkinsConnector
 from modulo.connectors.jira import JiraConnector
+from modulo.connectors.n8n import N8NConnector
 from modulo.connectors.onepassword import OnePasswordConnector
 from modulo.connectors.sentry import SentryConnector
 from modulo.connectors.sonarqube import SonarQubeConnector
@@ -79,6 +83,28 @@ CONNECTOR_NAMES = [
     "azure_key_vault",
 ]
 
+# The four connectors gated most recently (PR #2116): Jenkins, n8n, Grafana and
+# Confluence. They had NO prove-the-fix coverage before, which is how a
+# raising-health-check regression slipped through green CI. They are excluded
+# from the generic ``_build`` because Confluence derives its ``base_url`` from a
+# host ``instance`` rather than taking a ``base_url`` parameter directly.
+NEWLY_GATED = ["jenkins", "n8n", "grafana", "confluence"]
+
+
+def _build_newly_gated(name: str, blocked_url: str) -> Any:
+    """Construct a newly-gated connector pointed at ``blocked_url``."""
+    if name == "jenkins":
+        return JenkinsConnector(username=TOKEN, token=TOKEN, base_url=blocked_url)
+    if name == "n8n":
+        return N8NConnector(token=TOKEN, base_url=blocked_url)
+    if name == "grafana":
+        return GrafanaConnector(token=TOKEN, base_url=blocked_url)
+    if name == "confluence":
+        from urllib.parse import urlparse
+
+        return ConfluenceConnector(instance=urlparse(blocked_url).netloc, creds={"token": TOKEN})
+    raise AssertionError(f"unknown connector: {name}")
+
 
 @pytest.mark.parametrize("name", CONNECTOR_NAMES)
 @pytest.mark.parametrize("blocked_url", [LOOPBACK, PRIVATE, METADATA])
@@ -93,6 +119,34 @@ def test_client_refuses_blocked_base_url(name: str, blocked_url: str) -> None:
 async def test_health_check_reports_blocked_base_url(name: str) -> None:
     """A blocked base_url is an unhealthy result, never an exception."""
     connector = _build(name, LOOPBACK)
+    result = await connector.health_check()
+    assert result.ok is False
+    assert "127.0.0.1" in result.detail
+
+
+@pytest.mark.parametrize("name", NEWLY_GATED)
+@pytest.mark.parametrize("blocked_url", [LOOPBACK, PRIVATE, METADATA])
+def test_newly_gated_client_refuses_blocked_base_url(name: str, blocked_url: str) -> None:
+    """Jenkins/n8n/Grafana/Confluence ``_client()`` must raise on internal hosts.
+
+    Prove-the-fix: removing the ``validate_outbound_url`` call from any of these
+    four connectors makes this case fail, because ``_client()`` would otherwise
+    hand back a client aimed at a private/loopback/metadata address.
+    """
+    connector = _build_newly_gated(name, blocked_url)
+    with pytest.raises(ValueError, match="private/internal"):
+        connector._client()
+
+
+@pytest.mark.parametrize("name", NEWLY_GATED)
+async def test_newly_gated_health_check_reports_blocked_base_url(name: str) -> None:
+    """A blocked base_url is reported unhealthy, never raised (CHANGES_REQUESTED #1).
+
+    Jenkins previously let the ``validate_outbound_url`` ``ValueError`` escape its
+    ``health_check`` (502 instead of ``ok:false``). n8n/Grafana/Confluence catch it
+    already; Jenkins now does the same, and all four report ``ok:false``.
+    """
+    connector = _build_newly_gated(name, LOOPBACK)
     result = await connector.health_check()
     assert result.ok is False
     assert "127.0.0.1" in result.detail

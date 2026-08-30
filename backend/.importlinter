@@ -154,3 +154,4 @@ ignore_imports =
     modulo.connectors.grafana -> modulo.core.ssrf
     modulo.connectors.jenkins -> modulo.core.ssrf
     modulo.connectors.n8n -> modulo.core.ssrf
+    modulo.connectors.ci_runner.gitlab_ci -> modulo.core.ssrf
