@@ -265,7 +265,7 @@ class TestDeactivateSQL:
         status set is derived from TERMINAL_STATUSES (single source of truth)."""
         sql = ts._NO_DELIVERY_DEACTIVATE_SQL
         _terminal = (
-            "'budget_exceeded','cancelled','complete','cost_ceiling_exceeded',"
+            "'budget_exceeded','cancelled','compensation_failed','complete','cost_ceiling_exceeded',"
             "'eval_failed','failed','router_no_match','stalled'"
         )
         assert f"r.status IN ({_terminal})" in sql
