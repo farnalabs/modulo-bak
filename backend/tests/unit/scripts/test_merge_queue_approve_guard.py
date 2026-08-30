@@ -107,7 +107,8 @@ def test_single_page_parse(tmp_path):
     commits_file.write_text(json.dumps([_commit("fix", 1, AFTER)]))
     reviews = guard.load_concatenated(str(reviews_file))
     commits = guard.load_concatenated(str(commits_file))
-    assert len(reviews) == 1 and len(commits) == 1
+    assert len(reviews) == 1
+    assert len(commits) == 1
     verdict, _ = guard.decide(reviews, commits, "head")
     assert verdict == "stale"
 
