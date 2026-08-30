@@ -79,9 +79,10 @@ async def test_apply_group_mappings_non_dict_mapping() -> None:
     account = SimpleNamespace(id=uuid.uuid4())
     with (
         patch("modulo.auth.sso.get_membership_by_team_and_account", new_callable=AsyncMock, return_value=None),
-        patch("modulo.auth.sso.add_team_member", new_callable=AsyncMock),
+        patch("modulo.auth.sso.add_team_member", new_callable=AsyncMock) as add_mock,
     ):
         await apply_group_mappings(session, account, uuid.uuid4(), ["g"], ["not-a-dict"])
+    add_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -90,11 +91,11 @@ async def test_apply_group_mappings_non_dict_mapping() -> None:
 
 
 def test_parse_oidc_providers_empty() -> None:
-    assert _parse_oidc_providers(_override(modulo_oidc_providers="")) == []
+    assert not _parse_oidc_providers(_override(modulo_oidc_providers=""))
 
 
 def test_parse_oidc_providers_not_array() -> None:
-    assert _parse_oidc_providers(_override(modulo_oidc_providers=json.dumps(123))) == []
+    assert not _parse_oidc_providers(_override(modulo_oidc_providers=json.dumps(123)))
 
 
 # ---------------------------------------------------------------------------
@@ -387,9 +388,12 @@ async def test_callback_groups_not_a_list() -> None:
             new_callable=AsyncMock,
             return_value=(MagicMock(), uuid.uuid4(), "viewer"),
         ),
-        patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock, return_value={"access_token": "a"}),
+        patch(
+            "modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock, return_value={"access_token": "a"}
+        ) as issue_mock,
     ):
         await oidc_process_callback("code", signed, settings, session, session, "http://cb")
+    issue_mock.assert_called_once()
 
 
 async def test_callback_applies_group_mappings() -> None:

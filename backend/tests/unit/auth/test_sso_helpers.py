@@ -221,12 +221,12 @@ def test_decode_id_token_claims_valid():
 
 
 def test_decode_id_token_claims_wrong_parts():
-    assert sso_mod._decode_id_token_claims("not.a.jwt.token") == {}
+    assert not sso_mod._decode_id_token_claims("not.a.jwt.token")
 
 
 def test_decode_id_token_claims_bad_base64():
     # '!!' is not valid base64 urlsafe -> JSON decode fails -> {}
-    assert sso_mod._decode_id_token_claims("a.!!.c") == {}
+    assert not sso_mod._decode_id_token_claims("a.!!.c")
 
 
 # ---------------------------------------------------------------------------
@@ -253,8 +253,8 @@ def test_decode_saml_response_invalid():
 
 
 def test_validate_saml_destination_invalid_base64():
-    # _decode_saml_response raises -> ValueError swallowed -> returns
-    sso_mod._validate_saml_response_destination("!!!", "https://acs")
+    # _decode_saml_response raises -> ValueError swallowed -> returns None
+    assert sso_mod._validate_saml_response_destination("!!!", "https://acs") is None
 
 
 def test_validate_saml_destination_parse_error():
@@ -262,7 +262,7 @@ def test_validate_saml_destination_parse_error():
         patch("modulo.auth.sso._decode_saml_response", return_value=b"<bad"),
         patch("modulo.auth.sso.ElementTree.fromstring", side_effect=ElementTree.ParseError("boom")),
     ):
-        sso_mod._validate_saml_response_destination("abc", "https://acs")
+        assert sso_mod._validate_saml_response_destination("abc", "https://acs") is None
 
 
 def test_validate_saml_destination_missing_attr():
@@ -272,7 +272,7 @@ def test_validate_saml_destination_missing_attr():
         patch("modulo.auth.sso._decode_saml_response", return_value=b"<xml/>"),
         patch("modulo.auth.sso.ElementTree.fromstring", return_value=root),
     ):
-        sso_mod._validate_saml_response_destination("abc", "https://acs")
+        assert sso_mod._validate_saml_response_destination("abc", "https://acs") is None
 
 
 def test_validate_saml_destination_mismatch():
