@@ -628,12 +628,18 @@ def test_single_migration_head() -> None:
     # 0150_add_router_no_match_status (main) chains off 0149.
     chaining_off_0149 = [p for p in revisions if parents[p] == "0149_suite_run_trigger_kind"]
     assert [_basename(p) for p in chaining_off_0149] == ["0150_add_router_no_match_status.py"]
-    # 0151_sso_provider_id (FAR-457, SSO source-of-truth) chains off 0150.
+    # 0151_fix_constraints (improve-database CHECKs + partial slug) chains off 0150.
     chaining_off_0150 = [p for p in revisions if parents[p] == "0150_add_router_no_match_status"]
-    assert [_basename(p) for p in chaining_off_0150] == ["0151_sso_provider_id.py"]
-    # Nothing chains off 0151 -> it is the single head.
-    chaining_off_0151 = [p for p in revisions if parents[p] == "0151_sso_provider_id"]
-    assert chaining_off_0151 == []
+    assert [_basename(p) for p in chaining_off_0150] == ["0151_fix_constraints.py"]
+    # 0152_dismissed_by_user_id_index (improve-database FK index) chains off 0151.
+    chaining_off_0151 = [p for p in revisions if parents[p] == "0151_fix_constraints"]
+    assert [_basename(p) for p in chaining_off_0151] == ["0152_add_indexes.py"]
+    # 0153_sso_provider_id (FAR-457, SSO source-of-truth) chains off 0152.
+    chaining_off_0152 = [p for p in revisions if parents[p] == "0152_dismissed_by_user_id_index"]
+    assert [_basename(p) for p in chaining_off_0152] == ["0153_sso_provider_id.py"]
+    # Nothing chains off 0153 -> it is the single head.
+    chaining_off_0153 = [p for p in revisions if parents[p] == "0153_sso_provider_id"]
+    assert chaining_off_0153 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

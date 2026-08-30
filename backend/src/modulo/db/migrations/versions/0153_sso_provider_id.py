@@ -1,7 +1,7 @@
 """Add provider_id slug column to sso_providers (FAR-457).
 
-Revision ID: 0151_sso_provider_id
-Revises: 0150_add_router_no_match_status
+Revision ID: 0153_sso_provider_id
+Revises: 0152_dismissed_by_user_id_index
 Create Date: 2026-08-26
 
 The admin SSO UI writes providers to the sso_providers table, but the runtime
@@ -22,8 +22,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0151_sso_provider_id"
-down_revision: str | None = "0150_add_router_no_match_status"
+revision: str = "0153_sso_provider_id"
+down_revision: str | None = "0152_dismissed_by_user_id_index"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
