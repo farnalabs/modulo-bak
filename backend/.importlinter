@@ -154,4 +154,7 @@ ignore_imports =
     modulo.connectors.grafana -> modulo.core.ssrf
     modulo.connectors.jenkins -> modulo.core.ssrf
     modulo.connectors.n8n -> modulo.core.ssrf
+    # The GitLab CI runner takes its base_url from tenant connector config
+    # (connector_hub passes config['base_url'] straight through), so it is on the
+    # same external trust boundary as the connectors above and needs the guard.
     modulo.connectors.ci_runner.gitlab_ci -> modulo.core.ssrf

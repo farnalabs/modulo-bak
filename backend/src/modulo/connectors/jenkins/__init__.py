@@ -117,6 +117,9 @@ class JenkinsConnector(ConnectorBase):
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Jenkins API connection error")
         except ValueError as exc:
+            # The outbound SSRF guard in _client() rejects a private/internal
+            # base_url. Report it as unhealthy with the remediation text rather
+            # than letting it escape as a 502 from GET /connectors/{id}/health.
             return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(

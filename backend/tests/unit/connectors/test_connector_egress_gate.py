@@ -1,9 +1,20 @@
 """Prove the outbound SSRF gate on every ``base_url``-bearing connector.
 
+``CONNECTOR_NAMES`` is the coverage contract for the claim in
+``docs/configuration-reference.md`` that *all* ``base_url``-bearing connectors are
+gated, so every connector accepting a caller-supplied egress target belongs in
+that list — including the ``gitlab_ci`` CI runner, whose ``base_url`` the
+connector hub passes straight through from tenant config.
+
 Each connector validates its egress target in ``_client()`` (and, where the
 health check builds its own client, in ``health_check``). These tests assert the
 gate FAILS CLOSED: a private or loopback ``base_url`` must never produce a usable
 client, and a health check must report it as unhealthy instead of raising.
+
+The "report, never raise" half matters as much as the block itself: a connector
+whose ``health_check`` lets the guard's ``ValueError`` escape turns
+``GET /connectors/{id}/health`` into a 502 instead of an actionable ``ok:false``
+plus remediation detail.
 
 Two properties make these tests meaningful rather than tautological:
 
@@ -20,6 +31,7 @@ corresponding case here fails — that is the prove-the-fix contract.
 """
 
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 
@@ -28,6 +40,7 @@ from modulo.connectors.azure_key_vault import AzureKeyVaultConnector
 from modulo.connectors.azure_pipelines import AzurePipelinesConnector
 from modulo.connectors.azure_repos import AzureReposConnector
 from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+from modulo.connectors.ci_runner.gitlab_ci import GitLabCIRunner
 from modulo.connectors.confluence import ConfluenceConnector
 from modulo.connectors.gitea import GiteaConnector
 from modulo.connectors.gitlab import GitLabConnector
@@ -66,6 +79,18 @@ def _build(name: str, base_url: str) -> Any:
         "onepassword": lambda: OnePasswordConnector(token=TOKEN, base_url=base_url),
         "sentry": lambda: SentryConnector(token=TOKEN, organization="org", base_url=base_url),
         "azure_key_vault": lambda: AzureKeyVaultConnector(token=TOKEN, vault_url=base_url),
+        "jenkins": lambda: JenkinsConnector(username="user", token=TOKEN, base_url=base_url),
+        "n8n": lambda: N8NConnector(token=TOKEN, base_url=base_url),
+        "grafana": lambda: GrafanaConnector(token=TOKEN, base_url=base_url),
+        # Confluence derives base_url as https://<instance>, so the blocked host
+        # goes in as the instance rather than a full URL.
+        "confluence": lambda: ConfluenceConnector(
+            instance=urlparse(base_url).netloc,
+            creds={"token": TOKEN},
+        ),
+        # The gitlab_ci CI runner is on the same trust boundary: connector_hub
+        # passes config['base_url'] straight through from tenant config.
+        "gitlab_ci": lambda: GitLabCIRunner(token=TOKEN, base_url=base_url),
     }
     return builders[name]()
 
@@ -81,29 +106,15 @@ CONNECTOR_NAMES = [
     "onepassword",
     "sentry",
     "azure_key_vault",
+    # Gated in PR #2116. These had NO prove-the-fix coverage, which is how a
+    # raising-health-check regression reached green CI; they are listed here
+    # rather than in a parallel structure so every case above applies to them.
+    "jenkins",
+    "n8n",
+    "grafana",
+    "confluence",
+    "gitlab_ci",
 ]
-
-# The four connectors gated most recently (PR #2116): Jenkins, n8n, Grafana and
-# Confluence. They had NO prove-the-fix coverage before, which is how a
-# raising-health-check regression slipped through green CI. They are excluded
-# from the generic ``_build`` because Confluence derives its ``base_url`` from a
-# host ``instance`` rather than taking a ``base_url`` parameter directly.
-NEWLY_GATED = ["jenkins", "n8n", "grafana", "confluence"]
-
-
-def _build_newly_gated(name: str, blocked_url: str) -> Any:
-    """Construct a newly-gated connector pointed at ``blocked_url``."""
-    if name == "jenkins":
-        return JenkinsConnector(username=TOKEN, token=TOKEN, base_url=blocked_url)
-    if name == "n8n":
-        return N8NConnector(token=TOKEN, base_url=blocked_url)
-    if name == "grafana":
-        return GrafanaConnector(token=TOKEN, base_url=blocked_url)
-    if name == "confluence":
-        from urllib.parse import urlparse
-
-        return ConfluenceConnector(instance=urlparse(blocked_url).netloc, creds={"token": TOKEN})
-    raise AssertionError(f"unknown connector: {name}")
 
 
 @pytest.mark.parametrize("name", CONNECTOR_NAMES)
@@ -124,53 +135,37 @@ async def test_health_check_reports_blocked_base_url(name: str) -> None:
     assert "127.0.0.1" in result.detail
 
 
-@pytest.mark.parametrize("name", NEWLY_GATED)
-@pytest.mark.parametrize("blocked_url", [LOOPBACK, PRIVATE, METADATA])
-def test_newly_gated_client_refuses_blocked_base_url(name: str, blocked_url: str) -> None:
-    """Jenkins/n8n/Grafana/Confluence ``_client()`` must raise on internal hosts.
+LOCALHOST_DEFAULT_BUILDERS = {
+    "trivy": lambda: TrivyConnector(token=TOKEN),
+    "sonarqube": lambda: SonarQubeConnector(token=TOKEN),
+    "teamcity": lambda: TeamCityConnector(token=TOKEN),
+    "onepassword": lambda: OnePasswordConnector(token=TOKEN),
+    "jenkins": lambda: JenkinsConnector(username="user", token=TOKEN),
+    "n8n": lambda: N8NConnector(token=TOKEN),
+    "grafana": lambda: GrafanaConnector(token=TOKEN),
+}
 
-    Prove-the-fix: removing the ``validate_outbound_url`` call from any of these
-    four connectors makes this case fail, because ``_client()`` would otherwise
-    hand back a client aimed at a private/loopback/metadata address.
-    """
-    connector = _build_newly_gated(name, blocked_url)
-    with pytest.raises(ValueError, match="private/internal"):
-        connector._client()
-
-
-@pytest.mark.parametrize("name", NEWLY_GATED)
-async def test_newly_gated_health_check_reports_blocked_base_url(name: str) -> None:
-    """A blocked base_url is reported unhealthy, never raised (CHANGES_REQUESTED #1).
-
-    Jenkins previously let the ``validate_outbound_url`` ``ValueError`` escape its
-    ``health_check`` (502 instead of ``ok:false``). n8n/Grafana/Confluence catch it
-    already; Jenkins now does the same, and all four report ``ok:false``.
-    """
-    connector = _build_newly_gated(name, LOOPBACK)
-    result = await connector.health_check()
-    assert result.ok is False
-    assert "127.0.0.1" in result.detail
+LOCALHOST_DEFAULT_NAMES = list(LOCALHOST_DEFAULT_BUILDERS)
 
 
-@pytest.mark.parametrize("name", ["trivy", "sonarqube", "teamcity", "onepassword"])
+@pytest.mark.parametrize("name", LOCALHOST_DEFAULT_NAMES)
 async def test_localhost_default_base_url_is_blocked_by_default(name: str, monkeypatch) -> None:
     """The localhost-default connectors fail closed with actionable guidance.
 
-    Trivy/SonarQube/TeamCity/1Password ship a loopback default ``base_url``. With
-    loopback blocked by default they must not connect, and the error must name the
-    variable AND the both-families requirement, because ``localhost`` resolves to
-    ``127.0.0.1`` and ``::1`` on a dual-stack host.
+    Trivy/SonarQube/TeamCity/1Password/Jenkins/n8n/Grafana ship a loopback default
+    ``base_url``. With loopback blocked by default they must not connect, and the
+    error must name the variable AND the both-families requirement, because
+    ``localhost`` resolves to ``127.0.0.1`` and ``::1`` on a dual-stack host.
+
+    The health check must REPORT the rejection, never raise it. A connector whose
+    DEFAULT target is blocked is the most likely way a tenant meets this guard —
+    exactly the Jenkins case — so ``GET /connectors/{id}/health`` must answer
+    ``ok:false`` with the remediation text instead of returning a 502.
     """
     monkeypatch.delenv("SSRF_ALLOW_PRIVATE_RANGES", raising=False)
     monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["127.0.0.1", "::1"])
 
-    builders = {
-        "trivy": lambda: TrivyConnector(token=TOKEN),
-        "sonarqube": lambda: SonarQubeConnector(token=TOKEN),
-        "teamcity": lambda: TeamCityConnector(token=TOKEN),
-        "onepassword": lambda: OnePasswordConnector(token=TOKEN),
-    }
-    connector = builders[name]()
+    connector = LOCALHOST_DEFAULT_BUILDERS[name]()
 
     with pytest.raises(ValueError, match="private/internal") as exc_info:
         connector._client()
@@ -182,7 +177,7 @@ async def test_localhost_default_base_url_is_blocked_by_default(name: str, monke
     assert result.ok is False
 
 
-@pytest.mark.parametrize("name", ["trivy", "sonarqube", "teamcity", "onepassword"])
+@pytest.mark.parametrize("name", LOCALHOST_DEFAULT_NAMES)
 def test_localhost_default_works_once_both_loopback_families_allowed(name: str, monkeypatch) -> None:
     """The documented remediation must actually work on a dual-stack host.
 
@@ -190,13 +185,7 @@ def test_localhost_default_works_once_both_loopback_families_allowed(name: str, 
     fails closed; the documented ``127.0.0.0/8,::1/128`` pair is what unblocks it.
     """
     monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["127.0.0.1", "::1"])
-    builders = {
-        "trivy": lambda: TrivyConnector(token=TOKEN),
-        "sonarqube": lambda: SonarQubeConnector(token=TOKEN),
-        "teamcity": lambda: TeamCityConnector(token=TOKEN),
-        "onepassword": lambda: OnePasswordConnector(token=TOKEN),
-    }
-    connector = builders[name]()
+    connector = LOCALHOST_DEFAULT_BUILDERS[name]()
 
     # IPv4-only allowlist: ::1 is still blocked, so the guard still fails closed.
     monkeypatch.setenv("SSRF_ALLOW_PRIVATE_RANGES", "127.0.0.0/8")
