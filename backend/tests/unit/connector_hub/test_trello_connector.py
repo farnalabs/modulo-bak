@@ -280,3 +280,46 @@ async def test_query_boards_http_error(connector):
     respx.get(f"{_BASE}/members/me/boards").mock(return_value=httpx.Response(500, text="Internal Error"))
     with pytest.raises(httpx.HTTPStatusError):
         await connector.query(ConnectorQuery(resource="boards"))
+
+
+# ---------------------------------------------------------------------------
+# FAR-507 — credentials must never leak into error detail
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_query_http_error_detail_redacts_credentials(connector):
+    respx.get(f"{_BASE}/members/me/boards").mock(return_value=httpx.Response(401, text="Unauthorized"))
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await connector.query(ConnectorQuery(resource="boards"))
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert TOKEN not in message
+    assert "***" in message
+
+
+@respx.mock
+async def test_query_http_error_detail_redacts_credentials_write(connector):
+    respx.post(f"{_BASE}/cards").mock(return_value=httpx.Response(403, text="Forbidden"))
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await connector.write(ConnectorPayload(resource="card", data={"name": "n", "idList": "l1"}))
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert TOKEN not in message
+
+
+@respx.mock
+async def test_query_transport_error_detail_redacts_credentials(connector):
+    respx.get(f"{_BASE}/members/me/boards").mock(side_effect=httpx.ConnectError("Connection refused"))
+    with pytest.raises(httpx.HTTPError) as exc_info:
+        await connector.query(ConnectorQuery(resource="boards"))
+    message = str(exc_info.value)
+    assert API_KEY not in message
+    assert TOKEN not in message
+
+
+@respx.mock
+async def test_health_check_transport_error_detail_redacts_credentials(connector):
+    respx.get(f"{_BASE}/members/me").mock(side_effect=httpx.ConnectError("Connection refused"))
+    with pytest.raises(httpx.HTTPError):
+        await connector.health_check()
