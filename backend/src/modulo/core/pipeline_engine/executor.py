@@ -2531,9 +2531,15 @@ class PipelineExecutor:
         # pipeline with no policy produces the identical base hash (backward
         # compatible).
         pipeline_retry_policy_resume: dict[str, Any] = {}
-        _raw_resume_policy = getattr(pipeline, "retry_policy", None)
-        if isinstance(_raw_resume_policy, dict):
-            pipeline_retry_policy_resume = _raw_resume_policy
+        try:
+            raw_resume_policy = getattr(pipeline, "retry_policy", None)
+            if isinstance(raw_resume_policy, dict):
+                pipeline_retry_policy_resume = raw_resume_policy
+        except Exception:
+            # A malformed/legacy retry_policy must never crash resume —
+            # mirror the execute() path (_capture_execution_scalars) and
+            # fail open to no retry.
+            pipeline_retry_policy_resume = {}
         _resume_run_ref = rc.build_run_ref(str(pipeline_id), int(getattr(run, "run_number", 0) or 0))
 
         def _resume_node_idempotency_key(node_id: str, _state: dict[str, Any]) -> str | None:
