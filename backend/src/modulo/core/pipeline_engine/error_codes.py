@@ -47,6 +47,9 @@ _CODE_EVAL_BLOCKED = "eval.blocked"
 _CODE_CONTRACT_SCHEMA = "contract.schema"
 _CODE_SANDBOX_RATE_LIMITED = "sandbox.rate_limited"
 _CODE_SANDBOX_QUEUE_TIMEOUT = "sandbox.queue_timeout"
+# FAR-510: the finalize-time downgrade code for a sandbox_agent node whose
+# synthetic failure envelope was masked as a completed output.
+_CODE_SANDBOX_AGENT_FAILED = "sandbox.agent_failed"
 _CODE_CAPACITY_ORG = "capacity.org"
 # FAR-410: a connector write was cancelled mid-send (per-attempt timeout), so
 # the upstream side-effect state is unknowable. This is a DISTINCT terminal
@@ -254,13 +257,14 @@ ERROR_CODE_REGISTRY: dict[str, ErrorCodeSpec] = {
             " was exhausted within the node timeout window."
         ),
     ),
-    # FAR-510: a sandbox_agent node whose generic-exception path RETURNED the
-    # synthetic failure envelope (instead of raising) is downgraded from
-    # "complete" to "failed" at finalization. The executor writes this exact
-    # spelling into ``runs.error_code``, so it is registered verbatim (a flat
-    # key passes through ``map_legacy_code`` unchanged) — otherwise the honest
-    # downgrade would present as ``harness.unknown``.
-    "sandbox_agent_failed": ErrorCodeSpec(
+    # FAR-510: a sandbox_agent node whose synthetic failure path (generic
+    # exception, schema validation) RETURNED the stamped failure envelope
+    # (instead of raising) is downgraded from "complete" to "failed" at
+    # finalization. The executor writes this exact dotted spelling into
+    # ``runs.error_code`` (a registry key passes through ``map_legacy_code``
+    # unchanged) — otherwise the honest downgrade would present as
+    # ``harness.unknown``.
+    _CODE_SANDBOX_AGENT_FAILED: ErrorCodeSpec(
         error_class="sandbox",
         retryable=False,
         alert_severity="critical",

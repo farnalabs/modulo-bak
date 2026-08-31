@@ -14,6 +14,7 @@ from langgraph.types import interrupt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
+from modulo.core.node_output_split import split_node_output
 from modulo.core.pipeline_engine.executor import (
     PipelineExecutor,
     RunNotFoundError,
@@ -27,7 +28,12 @@ from modulo.core.pipeline_engine.executor import (
     _seed_state,
     _terminal_failure,
 )
-from modulo.core.pipeline_engine.node_runner import SANDBOX_AGENT_FAILED_SUMMARY, SandboxNodeFailedError
+from modulo.core.pipeline_engine.node_runner import (
+    SANDBOX_AGENT_FAILED_SUMMARY,
+    SandboxNodeFailedError,
+    _build_sandbox_node_envelope,
+    _SandboxNodeOutput,
+)
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
 from modulo.core.pipeline_engine.runtime_retry import (
     COMPENSATION_FAILED_CODE,
@@ -3022,49 +3028,84 @@ async def _finalize_with_patched_tail(
     return mock_finalize, final_run
 
 
+def _generic_exception_envelope(node_id: str = "node-x") -> dict[str, Any]:
+    """The REAL generic-exception failure envelope, stamped exactly as the
+    runner's ``except Exception`` path builds it (FAR-510)."""
+    return _build_sandbox_node_envelope(
+        node_id=node_id,
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary=SANDBOX_AGENT_FAILED_SUMMARY,
+            exit_code=-1,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            attempt_key="attempt-1",
+            error_type="RuntimeError",
+            error_message="boom",
+            sandbox_id="sb-1",
+            modulo_synthetic_failure=True,
+        ),
+        exclude_from_output=frozenset({"error_type", "error_message"}),
+    )
+
+
+def _schema_validation_envelope(node_id: str = "node-x", business_json: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The REAL schema-validation failure envelope, stamped exactly as the
+    runner's schema-rejection path builds it (FAR-510)."""
+    rejected = business_json if business_json is not None else {"summary": "done"}
+    return _build_sandbox_node_envelope(
+        node_id=node_id,
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary="Output failed schema validation: 'status' is a required property",
+            exit_code=0,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            cost_source=rejected,
+            output_json=rejected,
+            attempt_key="attempt-1",
+            modulo_synthetic_failure=True,
+        ),
+    )
+
+
+def _split_stored_columns(envelope: dict[str, Any], node_id: str = "node-x") -> tuple[Any, dict[str, Any]]:
+    """The ``(outputs_json, node_telemetry_json)`` pair the P1b writer
+    persists for *envelope* — driven through the production splitter."""
+    return split_node_output(envelope, "sandbox_agent", None)
+
+
 @pytest.mark.asyncio
 async def test_finalize_downgrades_masked_sandbox_agent_failure():
-    """A ``complete`` run whose completed sandbox-agent output is the synthetic
-    failure envelope finalizes ``failed`` with the ``sandbox_agent_failed`` code."""
+    """A ``complete`` run whose completed sandbox-agent output is the stamped
+    generic-exception failure envelope finalizes ``failed`` with the
+    ``sandbox.agent_failed`` code."""
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
-    args["completed_node_outputs"] = {
-        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-    }
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
 
     mock_finalize, final_run = await _finalize_with_patched_tail(executor, args)
 
     assert final_run is not None
     assert mock_finalize.await_args.kwargs["status"] == "failed"
-    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
     assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
 
 
 @pytest.mark.asyncio
-async def test_finalize_downgrades_masked_sandbox_agent_envelope_shape():
-    """The stored sandbox envelope is ``{artifacts, output}`` — the failed body
-    inside its nested ``output`` view is also detected and downgraded."""
+async def test_finalize_downgrades_stamped_schema_validation_envelope():
+    """The schema-validation synthetic failure path is stamped too — its live
+    envelope downgrades on the marker, independent of the summary text."""
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
-    args["completed_node_outputs"] = {
-        "node-x": {
-            "artifacts": [
-                {
-                    "node_id": "node-x",
-                    "status": "failed",
-                    "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-                }
-            ],
-            "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY},
-        },
-    }
+    args["completed_node_outputs"] = {"node-x": _schema_validation_envelope()}
 
     mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
 
     assert mock_finalize.await_args.kwargs["status"] == "failed"
-    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
     assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
 
 
@@ -3075,7 +3116,18 @@ async def test_finalize_keeps_complete_for_clean_sandbox_output():
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
     args["completed_node_outputs"] = {
-        "node-x": {"status": "completed", "summary": "all good"},
+        "node-x": _build_sandbox_node_envelope(
+            node_id="node-x",
+            output=_SandboxNodeOutput(
+                status="completed",
+                summary="all good",
+                exit_code=0,
+                wall_clock_time_ms=100,
+                cost_estimate_usd=0.0,
+                output_json={"summary": "all good"},
+                attempt_key="attempt-1",
+            ),
+        ),
     }
 
     mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
@@ -3087,13 +3139,11 @@ async def test_finalize_keeps_complete_for_clean_sandbox_output():
 
 @pytest.mark.asyncio
 async def test_finalize_ignores_failed_envelope_on_non_sandbox_node():
-    """A matching failed body on a non-sandbox node type is NOT downgraded."""
+    """A stamped failed envelope on a non-sandbox node type is NOT downgraded."""
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "llm"}
-    args["completed_node_outputs"] = {
-        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-    }
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
 
     mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
 
@@ -3124,38 +3174,48 @@ async def test_finalize_leaves_already_failed_run_unchanged():
 
 @pytest.mark.asyncio
 async def test_work_intact_false_for_downgraded_sandbox_agent_failure():
-    """FAR-510 — a downgraded run (``failed`` + ``sandbox_agent_failed``) is
+    """FAR-510 — a downgraded run (``failed`` + ``sandbox.agent_failed``) is
     forced work_intact=False. The synthetic failure envelope has a summary
     string, so without the forced-False rule ``compute_work_intact`` would
     count it as a valid artifact and return True for an agent that died."""
     executor, _session = _finalize_executor_with_session()
-    synthetic = {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1}
+    synthetic = {
+        "status": "failed",
+        "summary": SANDBOX_AGENT_FAILED_SUMMARY,
+        "exit_code": -1,
+        "modulo_synthetic_failure": True,
+    }
     # The completed set equals the full DAG node set and every output has a
     # summary — exactly the shape that would compute work_intact=True.
     assert (
-        executor._compute_run_work_intact("failed", "sandbox_agent_failed", {"node-x": synthetic}, {"node-x"}) is False
+        executor._compute_run_work_intact("failed", "sandbox.agent_failed", {"node-x": synthetic}, {"node-x"}) is False
     )
-    assert executor._compute_run_work_intact("failed", "sandbox_agent_failed", {}, set()) is False
+    assert executor._compute_run_work_intact("failed", "sandbox.agent_failed", {}, set()) is False
 
 
-def _stored_run_with_outputs(outputs_json: Any) -> MagicMock:
+def _stored_run_with_outputs(outputs_json: Any, node_telemetry_json: Any | None = None) -> MagicMock:
     run = MagicMock()
     run.outputs_json = outputs_json
+    run.node_telemetry_json = node_telemetry_json
     return run
 
 
 @pytest.mark.asyncio
-async def test_finalize_downgrades_masked_failure_from_stored_outputs_on_resume():
-    """Resume parity — the live segment emits nothing (HITL resume re-emits
-    only the resumed segment), but the run's STORED cumulative outputs carry
-    the masked failure from a prior segment: the downgrade still fires."""
+async def test_finalize_downgrades_stored_telemetry_failure_from_prior_segment_on_resume():
+    """Resume parity (REAL post-P1b shape) — the live segment emits nothing
+    (a HITL resume re-emits only the resumed segment), and the stored columns
+    hold the SPLIT shapes: ``outputs_json[node]`` is ``None`` (the
+    generic-exception path has no agent return) and the envelope fields
+    (``status``/``summary`` + the synthetic-failure marker) live ONLY in
+    ``node_telemetry_json``. The stored telemetry view drives the downgrade."""
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
     args["completed_node_outputs"] = {}
-    stored_run = _stored_run_with_outputs(
-        {"node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1}},
-    )
+    return_value, telemetry = _split_stored_columns(_generic_exception_envelope())
+    assert return_value is None
+    assert telemetry["status"] == "failed"
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
 
     with (
         patch.object(executor, "_compute_run_work_intact", return_value=None),
@@ -3168,20 +3228,127 @@ async def test_finalize_downgrades_masked_failure_from_stored_outputs_on_resume(
 
     assert final_run is not None
     assert mock_finalize.await_args.kwargs["status"] == "failed"
-    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
     assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
 
 
 @pytest.mark.asyncio
-async def test_finalize_keeps_complete_for_failed_status_with_different_summary():
-    """Precision boundary — a sandbox node output self-reporting ``failed``
-    with a NON-synthetic summary is a real envelope, not the masked
-    dispatch-failure marker: no downgrade (stored path exercised)."""
+async def test_finalize_downgrades_stored_schema_validation_failure():
+    """FAR-510 — the schema-validation synthetic failure path is stamped on the
+    STORED shape too: the rejected business JSON lands in ``outputs_json`` (the
+    pure return) while the stamped envelope fields land in telemetry, and the
+    telemetry view drives the downgrade."""
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
     args["completed_node_outputs"] = {}
-    stored_run = _stored_run_with_outputs({"node-x": {"status": "failed", "summary": "genuinely failed differently"}})
+    rejected = {"summary": "done", "pr_url": "https://example.com/pr/1"}
+    return_value, telemetry = _split_stored_columns(_schema_validation_envelope(business_json=rejected))
+    assert return_value == rejected
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_failed_status_without_synthetic_marker():
+    """Precision boundary — a sandbox node output self-reporting ``failed``
+    WITHOUT the runner's synthetic-failure marker is an honest failure shape
+    (real exit-code failure / agent-authored business JSON), not the masked
+    dispatch-failure marker: no downgrade."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    honest = _build_sandbox_node_envelope(
+        node_id="node-x",
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary="genuinely failed differently",
+            exit_code=1,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            output_json={"status": "failed", "summary": "genuinely failed differently"},
+            attempt_key="attempt-1",
+        ),
+    )
+    return_value, telemetry = _split_stored_columns(honest)
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrade_checks_live_and_stored_views_without_clobbering():
+    """Dedup premise — stored ``outputs_json`` and the live envelope hold
+    DIFFERENT shapes for the same node by design, so no view clobbers another:
+    a clean stored business JSON must not mask a stamped live envelope."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
+    stored_run = _stored_run_with_outputs({"node-x": {"summary": "clean business json"}})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_pre_p1b_legacy_row_without_marker():
+    """Legacy (pre-P1b) stored rows — the mixed envelope self-reports
+    status/summary but never carries the synthetic-failure marker, so a legacy
+    row never downgrades (the marker-based predicate is the contract, and the
+    legacy-safe telemetry accessor still resolves the view)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    legacy = {
+        "artifacts": [
+            {
+                "node_id": "node-x",
+                "status": "failed",
+                "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+            }
+        ],
+        "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY},
+    }
+    stored_run = _stored_run_with_outputs({"node-x": legacy})
 
     with (
         patch.object(executor, "_compute_run_work_intact", return_value=None),
@@ -3205,15 +3372,15 @@ async def test_finalize_downgrade_lists_all_matching_nodes_sorted():
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-b": "sandbox_agent", "node-a": "sandbox_agent", "node-c": "llm"}
     args["completed_node_outputs"] = {
-        "node-b": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-        "node-a": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-        "node-c": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+        "node-b": _generic_exception_envelope("node-b"),
+        "node-a": _generic_exception_envelope("node-a"),
+        "node-c": _generic_exception_envelope("node-c"),
     }
 
     mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
 
     assert mock_finalize.await_args.kwargs["status"] == "failed"
-    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
     assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-a, node-b"
 
 
@@ -3225,9 +3392,7 @@ async def test_finalize_stored_output_read_failure_falls_back_to_live_scan():
     executor, _session = _finalize_executor_with_session()
     args = _finalize_args(uuid.uuid4(), uuid.uuid4())
     args["node_type_map"] = {"node-x": "sandbox_agent"}
-    args["completed_node_outputs"] = {
-        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
-    }
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
     # First get_run (stored read) explodes; the second (final fetch) succeeds.
     get_run_mock = AsyncMock(side_effect=[RuntimeError("stored read boom"), MagicMock()])
 
@@ -3242,7 +3407,7 @@ async def test_finalize_stored_output_read_failure_falls_back_to_live_scan():
 
     assert final_run is not None
     assert mock_finalize.await_args.kwargs["status"] == "failed"
-    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
 
 
 @pytest.mark.asyncio
