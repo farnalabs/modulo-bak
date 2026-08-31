@@ -94,6 +94,7 @@ from modulo.core.pipeline_engine.graph_cache import build_graph_from_json, get_o
 from modulo.core.pipeline_engine.idempotency import read_before_write_suppression
 from modulo.core.pipeline_engine.modulo_saver import ModuloPostgresSaver
 from modulo.core.pipeline_engine.node_runner import (
+    SANDBOX_AGENT_FAILED_SUMMARY,
     OutputSchemaValidationError,
     SandboxNodeFailedError,
     SupersededNodeError,
@@ -2707,6 +2708,51 @@ class PipelineExecutor:
             except Exception:
                 _log.exception("audit.eval_blocked_failed", extra={"run_id": str(run_id)})
 
+    def _downgrade_masked_sandbox_failures(
+        self,
+        *,
+        run_id: uuid.UUID,
+        final_status: str,
+        error_code: str | None,
+        error_detail: str | None,
+        completed_node_outputs: dict[str, Any],
+        node_type_map: dict[str, str],
+    ) -> tuple[str, str | None, str | None]:
+        """FAR-510 — downgrade a masked sandbox-agent failure to an honest fail.
+
+        The sandbox_agent runner's generic-exception path does NOT raise — it
+        RETURNS a failure envelope (``status: "failed"`` +
+        ``SANDBOX_AGENT_FAILED_SUMMARY``). Node completion is
+        output-presence-based, so that node counts as completed and the run
+        would finalize ``complete`` — a failed dispatch masked as success.
+
+        Only a ``complete`` final_status is inspected (failed/eval_failed/etc.
+        are already honest). A match is a completed output on a node the
+        ``node_type_map`` says is ``sandbox_agent`` whose body self-reports
+        ``status == "failed"`` with the exact synthetic summary. Returns the
+        inputs unchanged when nothing matches.
+        """
+        if final_status != "complete":
+            return final_status, error_code, error_detail
+        found: list[str] = []
+        for node_id, node_output in completed_node_outputs.items():
+            if node_type_map.get(node_id) != "sandbox_agent" or not isinstance(node_output, dict):
+                continue
+            # The stored envelope is ``{artifacts, output}`` — match the nested
+            # output body; a flat body (older entries / direct dict) also matches.
+            body = node_output.get("output")
+            if not isinstance(body, dict):
+                body = node_output
+            if body.get("status") == "failed" and body.get("summary") == SANDBOX_AGENT_FAILED_SUMMARY:
+                found.append(node_id)
+        if not found:
+            return final_status, error_code, error_detail
+        _log.warning(
+            "pipeline.masked_sandbox_failure_downgraded",
+            extra={"run_id": str(run_id), "node_ids": sorted(found)},
+        )
+        return "failed", "sandbox_agent_failed", "Sandbox agent node(s) failed: " + ", ".join(sorted(found))
+
     async def _finalize_run_after_stream(
         self,
         *,
@@ -2726,8 +2772,24 @@ class PipelineExecutor:
         Computes ``work_intact``, runs ``finalize_cost``, records the
         compensating daily fact when needed, fetches the final row, and fires
         the post-terminal evidence probes. ``final_status`` reflects the
-        terminal/awaiting_human outcome of the stream.
+        terminal/awaiting_human outcome of the stream, after the FAR-510
+        masked-sandbox-failure downgrade.
         """
+        # FAR-510: a sandbox_agent node whose dispatch died to a generic
+        # exception RETURNS a failed envelope instead of raising, and node
+        # completion is output-presence-based — so a failed dispatch would
+        # otherwise finalize the run ``complete``. Downgrade BEFORE the
+        # eval_blocked audit, work_intact, and finalize_cost so every
+        # downstream consumer sees the honest status.
+        final_status, error_code, error_detail = self._downgrade_masked_sandbox_failures(
+            run_id=run_id,
+            final_status=final_status,
+            error_code=error_code,
+            error_detail=error_detail,
+            completed_node_outputs=completed_node_outputs,
+            node_type_map=node_type_map,
+        )
+
         # Record audit events for block failures on resume.
         eval_blocked = final_status == "eval_failed" and error_code == "eval_blocked"
         if eval_blocked:

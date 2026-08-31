@@ -347,6 +347,14 @@ _SANDBOX_KILL_TIMEOUT = 15.0
 # allowlist (the iptables rules bind concrete IPs, never DNS names).
 _SANDBOX_EGRESS_RESOLVE_TIMEOUT = 5.0
 
+# FAR-510: the summary stamped on the sandbox_agent generic-exception failure
+# envelope (the runner's ``except Exception`` path RETURNS a failed envelope
+# instead of raising). The executor matches on this exact string when
+# downgrading a run whose only "completed" sandbox node output is this
+# synthetic failure — a masked dispatch failure must never finalize the run
+# ``complete``. Single source of truth so runner and executor cannot drift.
+SANDBOX_AGENT_FAILED_SUMMARY = "Sandbox agent execution failed"
+
 
 async def _resolve_egress_allowlist(
     egress_allowlist: list[dict[str, Any]] | None,
@@ -5376,7 +5384,7 @@ async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegat
             node_id=node_id,
             output=_SandboxNodeOutput(
                 status="failed",
-                summary="Sandbox agent execution failed",
+                summary=SANDBOX_AGENT_FAILED_SUMMARY,
                 exit_code=-1,
                 wall_clock_time_ms=int(elapsed * 1000),
                 cost_estimate_usd=_cost_estimate_usd,

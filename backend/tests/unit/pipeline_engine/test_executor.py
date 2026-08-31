@@ -27,7 +27,7 @@ from modulo.core.pipeline_engine.executor import (
     _seed_state,
     _terminal_failure,
 )
-from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
+from modulo.core.pipeline_engine.node_runner import SANDBOX_AGENT_FAILED_SUMMARY, SandboxNodeFailedError
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
 from modulo.core.pipeline_engine.runtime_retry import (
     COMPENSATION_FAILED_CODE,
@@ -2985,6 +2985,139 @@ async def test_finalize_run_after_stream_revocation_failure_is_isolated():
         final_run = await executor._finalize_run_after_stream(**_finalize_args(run_id, org_id))
 
     assert final_run is not None
+
+
+# ---------------------------------------------------------------------------
+# FAR-510 — masked sandbox-agent failure downgrade at finalization
+# ---------------------------------------------------------------------------
+
+
+def _finalize_executor_with_session() -> tuple[PipelineExecutor, MagicMock]:
+    executor = PipelineExecutor(MagicMock())
+    session = AsyncMock(spec=AsyncSession)
+    session.begin = MagicMock(return_value=_begin_cm())
+    executor._session_factory = _make_session_factory(session)  # type: ignore[assignment]
+    return executor, session
+
+
+async def _finalize_with_patched_tail(
+    executor: PipelineExecutor,
+    args: dict[str, Any],
+) -> tuple[AsyncMock, Any]:
+    """Drive ``_finalize_run_after_stream`` with its DB-facing tail patched out.
+
+    Returns the ``finalize_cost`` mock (the assertion seam for the terminal
+    status/error fields) and the final run row.
+    """
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=MagicMock())),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+    return mock_finalize, final_run
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_masked_sandbox_agent_failure():
+    """A ``complete`` run whose completed sandbox-agent output is the synthetic
+    failure envelope finalizes ``failed`` with the ``sandbox_agent_failed`` code."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+
+    mock_finalize, final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_masked_sandbox_agent_envelope_shape():
+    """The stored sandbox envelope is ``{artifacts, output}`` — the failed body
+    inside its nested ``output`` view is also detected and downgraded."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {
+            "artifacts": [
+                {
+                    "node_id": "node-x",
+                    "status": "failed",
+                    "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+                }
+            ],
+            "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY},
+        },
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_clean_sandbox_output():
+    """A normal successful sandbox output finalizes ``complete`` unchanged."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "completed", "summary": "all good"},
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_ignores_failed_envelope_on_non_sandbox_node():
+    """A matching failed body on a non-sandbox node type is NOT downgraded."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "llm"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_leaves_already_failed_run_unchanged():
+    """A run already finalizing ``failed`` passes through untouched (no-op)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["final_status"] = "failed"
+    args["error_code"] = "agent.failed"
+    args["error_detail"] = "agent self-reported failure"
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "agent.failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "agent self-reported failure"
 
 
 # ---------------------------------------------------------------------------
