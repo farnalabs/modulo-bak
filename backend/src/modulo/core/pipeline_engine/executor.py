@@ -91,6 +91,7 @@ from modulo.core.pipeline_engine.evidence import (
     run_evidence_probe,
 )
 from modulo.core.pipeline_engine.graph_cache import build_graph_from_json, get_or_compile
+from modulo.core.pipeline_engine.idempotency import read_before_write_suppression
 from modulo.core.pipeline_engine.modulo_saver import ModuloPostgresSaver
 from modulo.core.pipeline_engine.node_runner import (
     OutputSchemaValidationError,
@@ -3137,9 +3138,13 @@ class PipelineExecutor:
         from modulo.settings import get_settings
 
         retries = int(get_settings().saq_run_retries)
-        node_attempt_count, current_token, run_markers, cancellation_requested = await self._load_transient_state(
-            run_id=run_id, org_id=org_id
-        )
+        (
+            node_attempt_count,
+            current_token,
+            run_markers,
+            cancellation_requested,
+            idempotency_key,
+        ) = await self._load_transient_state(run_id=run_id, org_id=org_id)
 
         superseded = self._claim_token is not None and current_token is not None and current_token != self._claim_token
         stalled = bool(stall_requested is not None and stall_requested.is_set())
@@ -3158,10 +3163,17 @@ class PipelineExecutor:
             exc=exc,
             run_markers=run_markers,
             run_id=run_id,
+            idempotency_key=idempotency_key,
             superseded=superseded,
             stalled=stalled,
             cancellation_requested=cancellation_requested,
             single_sandbox_node=single_sandbox_node,
+            # FAR-438: the transient path has no separate fan-out / content-edit
+            # context (exc.node_id already encodes parent+index for fan-out
+            # children; there is no connector payload to fold), so index/payload
+            # are None here — consistent with the marker-write side's defaults.
+            index=None,
+            payload=None,
         )
         # Only SandboxNodeFailedError carries a node_id — the gate is
         # keyed on it, so a None node_id (plain NodeCancelledError) can
@@ -3587,15 +3599,20 @@ class PipelineExecutor:
 
     async def _load_transient_state(
         self, *, run_id: uuid.UUID, org_id: uuid.UUID
-    ) -> tuple[int, str | None, dict[str, Any] | None, bool]:
+    ) -> tuple[int, str | None, dict[str, Any] | None, bool, str | None]:
         """Reload the run's attempt markers + claim + cancellation state.
 
-        Returns ``(node_attempt_count, current_token, run_markers, cancellation_requested)``.
+        Returns ``(node_attempt_count, current_token, run_markers,
+        cancellation_requested, idempotency_key)``. ``idempotency_key`` is the
+        run's persisted FAR-438 idempotency identity (``<pipeline_id>:<run_number>``)
+        written at create — a re-run reads it back to recompute the SAME per-node
+        keys for the read-before-write dedupe.
         """
         node_attempt_count = 0
         current_token: str | None = None
         run_markers: dict[str, Any] | None = None
         cancellation_requested = False
+        idempotency_key: str | None = None
         async with self._session_factory() as session, session.begin():
             await set_rls_org(session, org_id)
             await set_rls_execution_context(session)
@@ -3605,7 +3622,8 @@ class PipelineExecutor:
                 current_token = current_run.claim_token
                 run_markers = current_run.raw_output_markers
                 cancellation_requested = bool(current_run.cancellation_requested)
-        return node_attempt_count, current_token, run_markers, cancellation_requested
+                idempotency_key = current_run.idempotency_key
+        return node_attempt_count, current_token, run_markers, cancellation_requested, idempotency_key
 
     def _idempotency_gate_ok(
         self,
@@ -3613,18 +3631,64 @@ class PipelineExecutor:
         exc: NodeCancelledError | SandboxNodeFailedError,
         run_markers: dict[str, Any] | None,
         run_id: uuid.UUID,
+        idempotency_key: str | None,
         superseded: bool,
         stalled: bool,
         cancellation_requested: bool,
         single_sandbox_node: bool,
+        index: int | str | None = None,
+        payload: str | bytes | None = None,
     ) -> bool:
-        """FAR-228 guard B — should a transient retry be suppressed by the idempotency gate?"""
+        """FAR-228 guard B + FAR-438 read-before-write — should a transient retry be suppressed?
+
+        Suppresses when EITHER the run's delivery marker already records
+        ``delivery_done`` for the failing node (FAR-228, same-run retry) OR a
+        re-run that reused the run's persisted FAR-438 idempotency key records an
+        already-applied per-node key (``read_before_write_suppression``). The
+        second branch is the UNKNOWN-recovery path: an operator re-run with the
+        SAME persisted key must NOT double-submit the write.
+
+        ``index`` / ``payload`` (FAR-438) are the item-cardinality position and
+        content-version payload handed to ``read_before_write_suppression`` so the
+        derived per-node key matches the key the marker-write side stamped. They
+        must be the SAME arguments the write side used — the transient path has no
+        separate fan-out/content-edit context here (``exc.node_id`` already encodes
+        ``parent+index`` for fan-out children, and there is no connector content
+        payload to fold), so they default to ``None`` and stay consistent with the
+        sandbox marker write.
+
+        TOCTOU note (known, documented): ``run_markers`` is the run's
+        ``raw_output_markers`` read by ``_load_transient_state`` via plain
+        ``get_run`` — NOT under ``SELECT ... FOR UPDATE``. Two executors racing
+        on the same run could both read ``delivery_done`` absent and both decide
+        to suppress/retry. The marker WRITE side (``_write_raw_output_marker``)
+        DOES take ``with_for_update`` on the run row before persisting, so a
+        concurrent writer is serialised there; this read is a bounded, best-effort
+        gate (guarded by ``pipeline.idempotency_gate.check_failed``). If the
+        TOCTOU window becomes a real double-write risk, take ``with_for_update``
+        on this read too.
+        """
         from modulo.settings import get_settings
 
         gate_ok = False
         try:
+            node_id = getattr(exc, "node_id", None)
+            delivered = _should_skip_retry(node_id, run_markers, str(run_id))
+            # read_before_write_suppression is typed ``str`` for both refs and
+            # fail-opens (returns False) on a None/empty run_ref or node_ref —
+            # guard here so a None idempotency_key (no persisted key) never
+            # even attempts the derivation, and to satisfy mypy's arg-types.
+            replay_suppressed = False
+            if idempotency_key and node_id:
+                replay_suppressed = read_before_write_suppression(
+                    run_markers,
+                    run_ref=idempotency_key,
+                    node_ref=node_id,
+                    index=index,
+                    payload=payload,
+                )
             gate_ok = (
-                _should_skip_retry(getattr(exc, "node_id", None), run_markers, str(run_id))
+                (delivered or replay_suppressed)
                 and not superseded
                 and not stalled
                 and not cancellation_requested
