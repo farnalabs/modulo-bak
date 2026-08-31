@@ -922,4 +922,3 @@ def pinned_async_client_sync(
         follow_redirects=follow_redirects,
         **client_kwargs,
     )
-
