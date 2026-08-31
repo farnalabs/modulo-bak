@@ -13,6 +13,7 @@ from sqlalchemy import Date, case, cast, delete, func, select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import modulo.db.crud.account as account_crud
 from modulo.api.constants import (
     MSG_FEATURE_NOT_AVAILABLE,
     MSG_RESOURCE_ALREADY_EXISTS,
@@ -35,7 +36,7 @@ from modulo.core.eval_engine.okr import track_okr_progress
 from modulo.core.eval_engine.regression import VALID_TRENDS, detect_regressions
 from modulo.core.feature_flags import resolve_plan_context
 from modulo.core.hitl_manager.overdue_warning import get_overdue_claims
-from modulo.db.crud.account import create_account, get_account_by_email, get_account_by_id
+from modulo.db.crud.account import get_account_by_email, get_account_by_id
 from modulo.db.crud.eval_run import non_guardrail_eval_results_clause
 from modulo.db.crud.last_admin_guard import (
     LastAdminLockoutError,
@@ -672,7 +673,7 @@ async def _create_or_adopt_account(
                 )
             account.password_hash = pw_hash
         else:
-            account = await create_account(
+            account = await account_crud.create_account(
                 session,
                 email=req.email,
                 display_name=req.display_name,
