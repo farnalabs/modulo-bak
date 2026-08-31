@@ -562,6 +562,7 @@ async def update_connector_endpoint(
                         merged_cfg[k] = v
                 updates["config_json"] = merged_cfg
             if credentials_updated and existing is not None:
+                assert new_credentials is not None
                 if existing.connector_type_id == "rest":
                     # Partial credential update (FAR-466) — REST connector only.
                     # The connector reads auth identity (auth_mode, in,
