@@ -17,6 +17,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import re
 import threading
 import time
 import traceback as _traceback
@@ -50,6 +51,7 @@ from modulo.api.dependencies import (
 )
 from modulo.api.middleware.rate_limiter import RateLimitMiddleware as RateLimiterMiddleware
 from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK
+from modulo.api.routes.evals import _EVAL_TYPE_PATTERN
 from modulo.api.routes.triggers import _streak_status_for
 from modulo.auth.api_key import (
     ApiKeyInvalidError,
@@ -2769,15 +2771,12 @@ async def list_eval_definitions(
         return _tool_error("Failed to list eval definitions")
 
 
-_EVAL_TYPE_PATTERN = r"^(llm_judge|regex|json_schema|custom_function|guardrail|human_set)$"
 _EVAL_FAILURE_BEHAVIOURS = ("warn", "block")
 
 
 def _assert_eval_type(eval_type: str) -> dict[str, Any] | None:
     """Validate an eval_type value, returning an error dict or None."""
-    import re
-
-    if not re.match(_EVAL_TYPE_PATTERN, eval_type):
+    if not re.fullmatch(_EVAL_TYPE_PATTERN, eval_type):
         return {
             "error": "invalid_eval_type",
             "detail": "eval_type must be one of: llm_judge|regex|json_schema|custom_function|guardrail|human_set",
