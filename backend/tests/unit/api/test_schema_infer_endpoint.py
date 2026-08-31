@@ -145,6 +145,60 @@ def test_infer_schema_returns_200(client: TestClient) -> None:
     assert "Inferred from" in data["suggestion_name"]
 
 
+def test_infer_schema_threads_session_into_model_backend_decrypt(client: TestClient) -> None:
+    """Regression (FAR-522): the ModelBackendHub decrypt path in
+    ``_infer_definition`` must build its secrets backend with the session and
+    re-assert the org scope in the SAME transaction, or model-backend
+    credentials never decrypt and inference 502s (silent skip / degraded)."""
+    ci = _make_mock_connector_instance()
+    mb = _make_mock_model_backend()
+    page_result = MagicMock(items=[mb], total=1, page=1, page_size=1)
+    backend_id = uuid.uuid4()
+    backend_sessions: list[object] = []
+
+    def fake_create_backend(*args: object, **kwargs: object) -> object:
+        backend = MagicMock()
+        backend._session = kwargs.get("session")
+        return backend
+
+    async def fake_hub_init(self: object, instances: object, secrets_backend: object) -> None:
+        backend_sessions.append(secrets_backend._session)  # type: ignore[attr-defined]
+
+    with (
+        patch("modulo.api.routes.schemas.get_connector_instance", return_value=ci),
+        patch("modulo.api.routes.schemas.list_model_backends", return_value=page_result),
+        patch("modulo.api.routes.schemas.set_rls_org") as mock_rls,
+        patch("modulo.api.routes.schemas.ConnectorHub.sample", return_value=[{"id": "1", "title": "Test"}]),
+        patch("modulo.api.routes.schemas.ConnectorHub.initialise"),
+        patch("modulo.api.routes.schemas.SchemaInferenceService.infer", return_value={"type": "object"}),
+        patch("modulo.api.routes.schemas.ModelBackendHub.initialise", fake_hub_init),
+        patch(
+            "modulo.api.routes.schemas.ModelBackendHub.backend_ids",
+            new_callable=PropertyMock(return_value=frozenset({backend_id})),
+        ),
+        patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
+        patch("modulo.api.routes.schemas.create_secrets_backend", fake_create_backend),
+    ):
+        resp = client.post(
+            "/api/v1/schemas/infer",
+            json={
+                "connector_instance_id": str(_CONNECTOR_ID),
+                "sample_query": {"resource": "issues", "filters": {}, "limit": 5},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert backend_sessions, "ModelBackendHub must receive a secrets backend for the model-backend decrypt"
+    assert all(s is not None for s in backend_sessions), (
+        "model-backend decrypt secrets backend must carry the DB session, or credentials never decrypt"
+    )
+    # The decrypt runs with the model-backend path re-asserting the org scope in
+    # the same transaction (once in the context loader, once in the decrypt).
+    assert any(call.args[1] == _ORG_ID for call in mock_rls.call_args_list), (
+        "model-backend decrypt must re-assert the org scope (set_rls_org)"
+    )
+
+
 def test_infer_schema_forwards_filters_to_sampling(client: TestClient) -> None:
     """The request ``sample_query.filters`` must reach the connector sampling call."""
     ci = _make_mock_connector_instance()
