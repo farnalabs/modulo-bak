@@ -77,7 +77,7 @@ importers:
         version: 3.5.42(typescript@5.9.3)
       vue-echarts:
         specifier: ^8.0.1
-        version: 8.1.0(echarts@6.1.0)(vue@3.5.42(typescript@5.9.3))
+        version: 8.2.0(echarts@6.1.0)(vue@3.5.42(typescript@5.9.3))
       vue-i18n:
         specifier: ^11.4.6
         version: 11.4.10(vue@3.5.42(typescript@5.9.3))
@@ -3109,8 +3109,8 @@ packages:
       '@vue/composition-api':
         optional: true
 
-  vue-echarts@8.1.0:
-    resolution: {integrity: sha512-/uJVwijy3M2vIZ0NcPDgdZVqgboc6zZtC/vERfESau0eFpkHOIujj0sIiMiLP4kztQrckMFnDYWrid+gLI+IOg==}
+  vue-echarts@8.2.0:
+    resolution: {integrity: sha512-oUc4HgWYrUUac9AipF4Aas2R7CpGyZtSJk+pF/eFCZ47GkTmAly4mK2wx8lDg/q9Sd4gcLaoRGdGFXyXQUnjDQ==}
     peerDependencies:
       echarts: ^6.0.0
       vue: ^3.3.0
@@ -6075,7 +6075,7 @@ snapshots:
     dependencies:
       vue: 3.5.42(typescript@5.9.3)
 
-  vue-echarts@8.1.0(echarts@6.1.0)(vue@3.5.42(typescript@5.9.3)):
+  vue-echarts@8.2.0(echarts@6.1.0)(vue@3.5.42(typescript@5.9.3)):
     dependencies:
       echarts: 6.1.0
       vue: 3.5.42(typescript@5.9.3)
