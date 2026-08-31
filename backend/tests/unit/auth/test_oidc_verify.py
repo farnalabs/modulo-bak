@@ -891,3 +891,81 @@ class TestOidcCallbackIntegration:
                     session,
                     "http://localhost/callback",
                 )
+
+
+# ---------------------------------------------------------------------------
+# FAR-506: derived endpoint host allowlist (SSRF + client_secret protection)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedJwksHostAllowlist:
+    """A remote discovery document must not be able to point ``jwks_uri`` at a
+    host other than the discovery/issuer host, and such an endpoint must be
+    rejected WITHOUT any fetch attempt (no SSRF, no request to a hostile host)."""
+
+    @pytest.mark.parametrize(
+        "jwks_uri",
+        [
+            "https://evil.example.com/jwks",  # cross-host
+            "http://169.254.169.254/latest/meta-data/keys",  # cloud-metadata
+            "http://127.0.0.1/jwks",  # loopback
+        ],
+    )
+    async def test_rejects_disallowed_jwks_uri_without_fetch(self, jwks_uri: str) -> None:
+        disc_resp = _make_resp(json_data={"issuer": _ISSUER, "jwks_uri": jwks_uri})
+        mock_client = AsyncMock()
+        calls: list[str] = []
+
+        async def _get(url: str, **kwargs: object) -> MagicMock:
+            calls.append(url)
+            if url == _DISCOVERY_URL:
+                return disc_resp
+            return _make_resp(404)
+
+        mock_client.get = _get
+        mock_client.post = AsyncMock()
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="not in the OIDC provider host allowlist"):
+                await verify_id_token_with_discovery("token", _DISCOVERY_URL, _CLIENT_ID)
+
+        # Only the discovery document was fetched; the disallowed jwks_uri was
+        # rejected before any request, so no fetch to a hostile host occurred.
+        assert calls == [_DISCOVERY_URL]
+
+    async def test_rejects_cross_host_jwks_uri_after_next_issuer(self) -> None:
+        """Issuer on the same host as the discovery URL is the only allowance;
+        a jwks_uri on yet another host is still rejected."""
+        disc_resp = _make_resp(json_data={"issuer": _ISSUER, "jwks_uri": "https://accounts.example.com/jwks"})
+        mock_client = AsyncMock()
+
+        async def _get(url: str, **kwargs: object) -> MagicMock:
+            return disc_resp if url == _DISCOVERY_URL else _make_resp(404)
+
+        mock_client.get = _get
+        mock_client.post = AsyncMock()
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="not in the OIDC provider host allowlist"):
+                await verify_id_token_with_discovery("token", _DISCOVERY_URL, _CLIENT_ID)
+
+    async def test_same_host_jwks_uri_accepted(
+        self,
+        keypair: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey],
+        jwks_resp: MagicMock,
+    ) -> None:
+        """The legit same-host path (discovery, jwks and issuer all on the
+        configured issuer host) still verifies end to end."""
+        private_key, _ = keypair
+        id_token = _create_id_token(private_key)
+        mock_client = _make_httpx_mock(
+            {_DISCOVERY_URL: _make_resp(json_data=_discovery_doc()), _JWKS_URI: jwks_resp},
+        )
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            claims = await verify_id_token_with_discovery(id_token, _DISCOVERY_URL, _CLIENT_ID)
+
+        assert claims["sub"] == "user123"
