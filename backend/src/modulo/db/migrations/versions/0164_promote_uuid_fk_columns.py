@@ -1,7 +1,7 @@
 """Promote ``String(255)`` FK columns that hold UUIDs to native ``Uuid`` type.
 
-Revision ID: 0161_promote_uuid_fk_columns
-Revises: 0160_add_check_constraints
+Revision ID: 0164_promote_uuid_fk_columns
+Revises: 0163_add_check_constraints
 Create Date: 2026-08-29
 
 Four columns store UUID primary keys of other tables as ``String(255)``:
@@ -36,8 +36,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0161_promote_uuid_fk_columns"
-down_revision: str | None = "0160_add_check_constraints"
+revision: str = "0164_promote_uuid_fk_columns"
+down_revision: str | None = "0163_add_check_constraints"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

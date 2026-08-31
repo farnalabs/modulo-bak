@@ -1,6 +1,6 @@
 """Add missing foreign-key constraints on internal reference columns.
 
-Revision ID: 0159_add_missing_foreign_keys
+Revision ID: 0162_add_missing_foreign_keys
 Revises: 0158_sso_provider_id
 Create Date: 2026-08-29
 
@@ -25,8 +25,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0159_add_missing_foreign_keys"
-down_revision: str | None = "0158_sso_provider_id"
+revision: str = "0162_add_missing_foreign_keys"
+down_revision: str | None = "0161_accounts_must_change_password"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
