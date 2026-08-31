@@ -1,15 +1,15 @@
 """Integration test for the FK/CHECK constraint and UUID-promotion migration chain.
 
-Runs the real Alembic ``upgrade`` chain up to ``0164_promote_uuid_fk_columns``
+Runs the real Alembic ``upgrade`` chain up to ``0166_promote_uuid_fk_columns``
 against a *fresh* live Postgres (its own testcontainer, built from scratch) and
 proves the review-requested safety properties:
 
-  * CHECK constraints (0157) and foreign keys (0155/0162/0163) are added
+  * CHECK constraints (0157) and foreign keys (0155/0164/0165) are added
     ``NOT VALID`` then ``VALIDATE``-d, so a populated table never aborts the
     upgrade on pre-existing offending rows at ``ADD`` time.
-  * The UUID promotion (0164) preserves a well-formed UUID string across the
+  * The UUID promotion (0166) preserves a well-formed UUID string across the
     ``USING col::uuid`` cast, and its downgrade reverts with ``USING col::text``.
-  * 0164 promotes the four columns to native ``uuid`` (the ``compare_metadata``
+  * 0166 promotes the four columns to native ``uuid`` (the ``compare_metadata``
     gate requires the ORM and the migrated schema to agree on the type, and the
     ORM already declares these as ``Uuid``).
 
@@ -35,7 +35,7 @@ pytestmark = [pytest.mark.integration]
 BACKEND_ROOT = Path(__file__).parents[3]  # backend/
 
 _PRE_0154 = "0154_add_web_vital_events_time_index"
-_HEAD = "0164_promote_uuid_fk_columns"
+_HEAD = "0166_promote_uuid_fk_columns"
 
 
 def _alembic_config(db_url: str) -> Config:

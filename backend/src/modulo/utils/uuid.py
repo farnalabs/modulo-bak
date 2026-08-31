@@ -1,7 +1,7 @@
 """Lenient UUID coercion helpers shared across request and persistence boundaries.
 
 The schema migrations promote several historically ``String`` FK columns to
-native ``Uuid`` (see migration 0164_promote_uuid_fk_columns), but the API request models still
+native ``Uuid`` (see migration 0166_promote_uuid_fk_columns), but the API request models still
 accept ``str`` for those fields. Casting a free-form ``str`` with ``uuid.UUID(...)``
 raises ``ValueError`` on malformed input and produces an unhandled 500 at the
 boundary. ``coerce_uuid`` returns ``None`` for anything that is not a valid UUID,

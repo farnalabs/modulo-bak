@@ -655,16 +655,16 @@ def test_single_migration_head() -> None:
     # 0153_add_numeric_check_constraints (main) chains off 0152.
     chaining_off_0152 = [p for p in revisions if parents[p] == "0152_dismissed_by_user_id_index"]
     assert [_basename(p) for p in chaining_off_0152] == ["0153_add_numeric_check_constraints.py"]
-    # 0154_add_web_vital_events_time_index (main) chains off 0153.
+    # 0154_add_web_vital_events_time_index chains off 0153.
     chaining_off_0153 = [p for p in revisions if parents[p] == "0153_add_numeric_check_constraints"]
     assert [_basename(p) for p in chaining_off_0153] == ["0154_add_web_vital_events_time_index.py"]
     # 0155_add_hot_query_indexes (main) chains off 0154.
     chaining_off_0154 = [p for p in revisions if parents[p] == "0154_add_web_vital_events_time_index"]
     assert [_basename(p) for p in chaining_off_0154] == ["0155_add_hot_query_indexes.py"]
-    # 0156_add_soft_delete_partial_uniques (main) chains off 0155.
+    # 0156_add_soft_delete_partial_uniques (main) chains off 0155_add_hot_query_indexes.
     chaining_off_0155 = [p for p in revisions if parents[p] == "0155_add_hot_query_indexes"]
     assert [_basename(p) for p in chaining_off_0155] == ["0156_add_soft_delete_partial_uniques.py"]
-    # 0157_add_numeric_check_constraints (main) chains off 0156.
+    # 0157_add_numeric_check_constraints (main) chains off 0156_add_soft_delete_partial_uniques.
     chaining_off_0156 = [p for p in revisions if parents[p] == "0156_add_soft_delete_partial_uniques"]
     assert [_basename(p) for p in chaining_off_0156] == ["0157_add_numeric_check_constraints.py"]
     # 0158_sso_provider_id (main) chains off 0157.
@@ -679,21 +679,27 @@ def test_single_migration_head() -> None:
     # 0161_accounts_must_change_password (FAR-460) chains off 0160.
     chaining_off_0160 = [p for p in revisions if parents[p] == "0160_run_idempotency_key"]
     assert [_basename(p) for p in chaining_off_0160] == ["0161_accounts_must_change_password.py"]
-    # 0162_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0161.
+    # 0162_rls_strict_parameter_schemas_sets (main, RLS fail-open close) chains off 0161.
     chaining_off_0161 = [p for p in revisions if parents[p] == "0161_accounts_must_change_password"]
-    assert [_basename(p) for p in chaining_off_0161] == ["0162_add_missing_foreign_keys.py"]
-    # 0163_add_check_constraints chains off 0162.
-    chaining_off_0162 = [p for p in revisions if parents[p] == "0162_add_missing_foreign_keys"]
-    assert [_basename(p) for p in chaining_off_0162] == ["0163_add_check_constraints.py"]
-    # 0164_promote_uuid_fk_columns chains off 0163.
-    chaining_off_0163 = [p for p in revisions if parents[p] == "0163_add_check_constraints"]
-    assert [_basename(p) for p in chaining_off_0163] == ["0164_promote_uuid_fk_columns.py"]
-    # 0165_add_hot_query_indexes chains off 0164 and is the single head.
-    chaining_off_0164 = [p for p in revisions if parents[p] == "0164_promote_uuid_fk_columns"]
-    assert [_basename(p) for p in chaining_off_0164] == ["0165_add_hot_query_indexes.py"]
-    # Nothing chains off 0165 -> it is the single head.
-    chaining_off_0165 = [p for p in revisions if parents[p] == "0165_add_hot_query_indexes"]
-    assert chaining_off_0165 == []
+    assert [_basename(p) for p in chaining_off_0161] == ["0162_rls_strict_parameter_schemas_sets.py"]
+    # 0163_rls_strict_oauth_auth_codes_token_families (main, RLS fail-open close) chains off 0162.
+    chaining_off_0162 = [p for p in revisions if parents[p] == "0162_rls_strict_parameter_schemas_sets"]
+    assert [_basename(p) for p in chaining_off_0162] == ["0163_rls_strict_oauth_auth_codes_token_families.py"]
+    # 0164_add_missing_foreign_keys (DB-improvement FK sweep) chains off 0163_rls.
+    chaining_off_0163 = [p for p in revisions if parents[p] == "0163_rls_strict_oauth_auth_codes_token_families"]
+    assert [_basename(p) for p in chaining_off_0163] == ["0164_add_missing_foreign_keys.py"]
+    # 0165_add_check_constraints chains off 0164.
+    chaining_off_0164 = [p for p in revisions if parents[p] == "0164_add_missing_foreign_keys"]
+    assert [_basename(p) for p in chaining_off_0164] == ["0165_add_check_constraints.py"]
+    # 0166_promote_uuid_fk_columns chains off 0165.
+    chaining_off_0165 = [p for p in revisions if parents[p] == "0165_add_check_constraints"]
+    assert [_basename(p) for p in chaining_off_0165] == ["0166_promote_uuid_fk_columns.py"]
+    # 0167_add_hot_query_indexes chains off 0166 and is the single head.
+    chaining_off_0166 = [p for p in revisions if parents[p] == "0166_promote_uuid_fk_columns"]
+    assert [_basename(p) for p in chaining_off_0166] == ["0167_add_hot_query_indexes.py"]
+    # Nothing chains off 0167 -> it is the single head.
+    chaining_off_0167 = [p for p in revisions if parents[p] == "0167_add_hot_query_indexes"]
+    assert chaining_off_0167 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

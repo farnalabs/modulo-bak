@@ -1,7 +1,7 @@
 """Add hot-path composite / partial indexes on runs and triggers.
 
-Revision ID: 0165_add_hot_query_indexes
-Revises: 0164_promote_uuid_fk_columns
+Revision ID: 0167_add_hot_query_indexes
+Revises: 0166_promote_uuid_fk_columns
 Create Date: 2026-08-29
 
 * ``ix_triggers_due_cron`` — partial index
@@ -18,8 +18,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0165_add_hot_query_indexes"
-down_revision: str | None = "0164_promote_uuid_fk_columns"
+revision: str = "0167_add_hot_query_indexes"
+down_revision: str | None = "0166_promote_uuid_fk_columns"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
