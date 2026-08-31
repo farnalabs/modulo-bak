@@ -343,3 +343,77 @@ async def test_retry_one_delivery_fails_closed_on_ssrf_rebind() -> None:
     assert resp is None
     assert "169.254.169.254" in (error or "")
     mock_record.assert_awaited_once()
+
+
+# ── Test-webhook path SSRF fail-closed (FAR-517) ────────────────────────
+
+
+async def test_test_webhook_fails_closed_on_ssrf_rebind() -> None:
+    """FAR-517: ``POST /{webhook_id}/test`` must pin its client through
+    pinned_async_client, so a saved webhook URL whose host re-resolves to a
+    blocked internal address (169.254.169.254) fails closed — no request is
+    issued and no response body is echoed back to the caller — rather than
+    POSTing to the unvalidated host with a plain client (validate-at-save-only
+    leaves a DNS-rebinding window, and the route returns up to 500 chars of the
+    response body, which would make it a readable SSRF primitive)."""
+    from modulo.api.routes.admin_notifications import test_webhook
+
+    ep = _make_mock_endpoint()
+    session = _make_mock_session()
+    session.get = AsyncMock(return_value=ep)
+    principal = TenantPrincipal(username="admin", organisation_id=_ORG_ID, account_id=_USER_ID, org_role="admin")
+
+    async def _fake_pinned(_url: str) -> httpx.AsyncClient:
+        raise ValueError(
+            "URL hostname hooks.example.com resolves to a private/internal "
+            "address (169.254.169.254). Add its CIDR to SSRF_ALLOW_PRIVATE_RANGES "
+            "to allow this target, or use a public URL."
+        )
+
+    unpinned_post = AsyncMock()
+
+    with (
+        patch("modulo.api.routes.admin_notifications.set_rls_org", new=AsyncMock()),
+        patch("modulo.api.routes.admin_notifications.pinned_async_client", new=_fake_pinned),
+        patch.object(httpx.AsyncClient, "post", new=unpinned_post),
+    ):
+        result = await test_webhook(_WEBHOOK_ID, session=session, principal=principal, settings=_make_settings())
+
+    assert result.success is False
+    assert result.status_code is None
+    assert result.response_body is None
+    assert "169.254.169.254" in (result.error or "")
+    unpinned_post.assert_not_awaited()
+
+
+async def test_test_webhook_posts_through_pinned_client() -> None:
+    """FAR-517 happy path: the test POST goes out on the pinned client (not a
+    plain ``httpx.AsyncClient``), the pinned client is closed afterwards, and
+    the endpoint's response is surfaced to the caller."""
+    from modulo.api.routes.admin_notifications import test_webhook
+
+    ep = _make_mock_endpoint()
+    session = _make_mock_session()
+    session.get = AsyncMock(return_value=ep)
+    principal = TenantPrincipal(username="admin", organisation_id=_ORG_ID, account_id=_USER_ID, org_role="admin")
+
+    pinned = MagicMock()
+    pinned.post = AsyncMock(return_value=httpx.Response(status_code=200, text="pong"))
+    pinned.aclose = AsyncMock()
+
+    async def _fake_pinned(_url: str) -> MagicMock:
+        return pinned
+
+    with (
+        patch("modulo.api.routes.admin_notifications.set_rls_org", new=AsyncMock()),
+        patch("modulo.api.routes.admin_notifications.pinned_async_client", new=_fake_pinned),
+    ):
+        result = await test_webhook(_WEBHOOK_ID, session=session, principal=principal, settings=_make_settings())
+
+    assert result.success is True
+    assert result.status_code == 200
+    assert result.response_body == "pong"
+    assert result.error is None
+    pinned.post.assert_awaited_once()
+    assert pinned.post.await_args.args[0] == ep.url
+    pinned.aclose.assert_awaited_once()

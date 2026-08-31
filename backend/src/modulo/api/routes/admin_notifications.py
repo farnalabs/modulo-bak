@@ -863,8 +863,21 @@ async def test_webhook(
             logger.exception("Failed to sign test payload")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(ep.url, content=payload, headers=headers)
+        client = await pinned_async_client(ep.url)
+        client.timeout = httpx.Timeout(15.0)
+    except ValueError as exc:
+        logger.warning(
+            "admin.notifications.test_webhook.ssrf_rejected",
+            extra={"endpoint_id": str(ep.id), "error": str(exc)},
+        )
+        return TestResult(
+            success=False,
+            status_code=None,
+            response_body=None,
+            error=str(exc),
+        )
+    try:
+        resp = await client.post(ep.url, content=payload, headers=headers)
         response_body = resp.text[:500]
         return TestResult(
             success=resp.is_success,
@@ -879,6 +892,8 @@ async def test_webhook(
             response_body=None,
             error=str(exc),
         )
+    finally:
+        await client.aclose()
 
 
 # ── Re-enable ──────────────────────────────────────────────────────────
