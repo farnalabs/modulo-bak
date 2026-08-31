@@ -197,8 +197,7 @@ def _find_stale_prs(data: _InferenceData) -> list[Finding]:
         return []
     avg_age = sum(data.pr_ages) / len(data.pr_ages)
     evidence_detail = (
-        f"Average PR/MR age: {avg_age:.1f} days, "
-        f"{data.stale_pr_count}/{len(data.pr_ages)} open for >5 days"
+        f"Average PR/MR age: {avg_age:.1f} days, {data.stale_pr_count}/{len(data.pr_ages)} open for >5 days"
     )
     if data.stale_pr_count > 0:
         return [
