@@ -16,6 +16,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
 from modulo.core.ssrf import pinned_async_client_sync
 
 _RATE_LIMITED_STATUS = 429
@@ -48,6 +49,7 @@ class SonarQubeConnector(ConnectorBase):
         self._token = token
         self._base_url = base_url.rstrip("/")
         self._api_base = f"{self._base_url}/api"
+        self._redactor = CredentialRedactor([token])
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -69,6 +71,7 @@ class SonarQubeConnector(ConnectorBase):
             timeout=30,
         )
 
+    @redacting
     async def health_check(self) -> HealthResult:
         try:
             async with self._client() as c:
@@ -83,12 +86,15 @@ class SonarQubeConnector(ConnectorBase):
                     return HealthResult(ok=True, detail=f"SonarQube health: {status_text}")
                 return HealthResult(ok=False, detail=f"SonarQube health: {status_text}")
         except httpx.HTTPStatusError as e:
-            return HealthResult(ok=False, detail=f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+            return HealthResult(
+                ok=False, detail=self._redactor.redact(f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return HealthResult(ok=False, detail=str(e))
+            return HealthResult(ok=False, detail=self._redactor.redact(str(e)))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:
             match q.resource:
@@ -113,6 +119,7 @@ class SonarQubeConnector(ConnectorBase):
                 case _:
                     raise ValueError(f"Unsupported SonarQube resource: {q.resource!r}")
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         async with self._client() as c:
             match payload.resource:
