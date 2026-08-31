@@ -23,6 +23,7 @@ flipped host.
 from __future__ import annotations
 
 import asyncio
+from typing import Self
 
 import pytest
 
@@ -165,3 +166,51 @@ def test_sync_pinned_client_still_blocks_internal_target(monkeypatch: pytest.Mon
     monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["10.0.0.5"])
     with pytest.raises(ValueError, match="private/internal"):
         ssrf.pinned_async_client_sync("https://blocked.example.com/")
+
+
+def test_azure_repos_health_check_egress_is_pinned_to_profile_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAR-520: azure_repos ``health_check`` pins its ACTUAL connect host.
+
+    ``health_check`` connects to the Microsoft profile host
+    (``app.vssps.visualstudio.com``), NOT the repo ``base_url``
+    (``dev.azure.com/<org>``). It must build its client through
+    :func:`modulo.core.ssrf.pinned_async_client_sync` targeting that host — not
+    a plain unpinned ``AsyncClient`` and not a stale
+    ``validate_outbound_url(base_url)`` that guarded a host this connection
+    never uses.
+    """
+    captured: dict[str, str] = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self) -> dict[str, str]:
+            return {"displayName": "tester"}
+
+    class _ProfileClient:
+        async def __aenter__(self) -> Self:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> bool:
+            return False
+
+        async def get(self, url: str, **_kw: object) -> _Resp:
+            captured["url"] = url
+            return _Resp()
+
+    def fake_pinned(url: str, **_kw: object) -> _ProfileClient:
+        captured["pinned_url"] = url
+        return _ProfileClient()
+
+    monkeypatch.setattr("modulo.connectors.azure_repos.pinned_async_client_sync", fake_pinned)
+
+    connector = AzureReposConnector(token=TOKEN, organization="org")
+    result = asyncio.run(connector.health_check())
+
+    assert result.ok is True
+    assert result.detail == "tester"
+    assert captured["pinned_url"] == "https://app.vssps.visualstudio.com"
+    assert captured["url"] == "https://app.vssps.visualstudio.com/_apis/profile/profiles/me"

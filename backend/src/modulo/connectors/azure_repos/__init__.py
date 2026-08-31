@@ -16,7 +16,7 @@ from modulo.connectors.base import (
     HealthResult,
     health_check_failure,
 )
-from modulo.core.ssrf import pinned_async_client_sync, validate_outbound_url
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 class AzureReposConnector(ConnectorBase):
@@ -78,10 +78,17 @@ class AzureReposConnector(ConnectorBase):
     async def health_check(self) -> HealthResult:
         """Verify API access by fetching the authenticated user's profile."""
         try:
-            # Inside the try: a blocked base_url must be REPORTED as unhealthy by
+            # PINNED TRANSPORT (FAR-520): the profile endpoint lives on the
+            # Microsoft host app.vssps.visualstudio.com, not the repo base_url
+            # (dev.azure.com/<org>). Validate + pin THAT host and drop the stale
+            # validate_outbound_url(self._base_url) that guarded a host this
+            # connection never used. A blocked host is REPORTED as unhealthy by
             # the ValueError handler below, never raised out of a health check.
-            validate_outbound_url(self._base_url)
-            async with httpx.AsyncClient(headers=self._headers(), timeout=30) as client:
+            async with pinned_async_client_sync(
+                "https://app.vssps.visualstudio.com",
+                headers=self._headers(),
+                timeout=30,
+            ) as client:
                 r = await client.get(
                     "https://app.vssps.visualstudio.com/_apis/profile/profiles/me",
                     params={"api-version": "7.0"},
