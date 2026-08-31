@@ -802,8 +802,8 @@ def test_compute_eval_defs_hash_stable_and_sensitive():
     # Per-node list order (DB return order) does not affect the hash.
     assert compute_eval_defs_hash({"A": [e1, e2]}) == compute_eval_defs_hash({"A": [e2, e1]})
     # No eval defs -> empty hash (call site leaves the struct hash unchanged).
-    assert compute_eval_defs_hash(None) == ""
-    assert compute_eval_defs_hash({}) == ""
+    assert not compute_eval_defs_hash(None)
+    assert not compute_eval_defs_hash({})
 
 
 def test_struct_hash_with_eval_defs_folds_and_preserves_base():
