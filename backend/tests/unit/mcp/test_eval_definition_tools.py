@@ -181,6 +181,42 @@ class TestCreateEvalDefinition:
 
         assert result["error"] == "pipeline_not_found"
 
+    @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
+    @patch("modulo.api.mcp_server._session")
+    async def test_eval_type_trailing_newline_rejected(
+        self,
+        mock_session: AsyncMock,
+        mock_validate_auth: AsyncMock,
+    ) -> None:
+        # Pins re.fullmatch semantics: a trailing newline would be accepted by
+        # re.match/$ anchors but must be rejected here.
+        mock_session.return_value = _make_session_cm(object())
+
+        result = await create_eval_definition(
+            pipeline_id=str(uuid.uuid4()),
+            name="my-eval",
+            eval_type="regex\n",
+        )
+
+        assert result["error"] == "invalid_eval_type"
+
+    @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
+    @patch("modulo.api.mcp_server._session")
+    async def test_oversized_name_rejected(
+        self,
+        mock_session: AsyncMock,
+        mock_validate_auth: AsyncMock,
+    ) -> None:
+        mock_session.return_value = _make_session_cm(object())
+
+        result = await create_eval_definition(
+            pipeline_id=str(uuid.uuid4()),
+            name="x" * 256,
+            eval_type="regex",
+        )
+
+        assert result["error"] == "invalid_name"
+
 
 # ---------------------------------------------------------------------------
 # update_eval_definition
@@ -262,13 +298,23 @@ class TestDeleteEvalDefinition:
         assert result["hard_deleted"] is False
         assert guardrail.deleted_at is not None
         assert guardrail.deleted_by == _PLACEHOLDER_USER_ID
+        assert mock_audit.await_count == 1
+        _, kwargs = mock_audit.call_args
+        assert kwargs["event_type"] == "eval_definition.soft_deleted"
+        assert kwargs["payload_json"] == {
+            "eval_id": str(guardrail.id),
+            "name": "eval",
+            "purge": False,
+        }
 
+    @patch("modulo.core.audit_logger.append_audit_event", new_callable=AsyncMock)
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server._session")
-    async def test_non_guardrail_hard_deletes(
+    async def test_non_guardrail_hard_purges_with_audit(
         self,
         mock_session: AsyncMock,
         mock_validate_auth: AsyncMock,
+        mock_audit: AsyncMock,
     ) -> None:
         plain = _make_eval_def(eval_type="regex")
         cm = _make_session_cm(plain)
@@ -279,6 +325,35 @@ class TestDeleteEvalDefinition:
         assert "error" not in result, result
         assert result["hard_deleted"] is True
         assert cm.__aenter__.return_value.delete.called
+        # Hard purge of a non-guardrail is not audited (only guardrails are).
+        assert mock_audit.await_count == 0
+
+    @patch("modulo.core.audit_logger.append_audit_event", new_callable=AsyncMock)
+    @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
+    @patch("modulo.api.mcp_server._session")
+    async def test_guardrail_hard_purges_with_audit(
+        self,
+        mock_session: AsyncMock,
+        mock_validate_auth: AsyncMock,
+        mock_audit: AsyncMock,
+    ) -> None:
+        guardrail = _make_eval_def(eval_type="guardrail")
+        cm = _make_session_cm(guardrail)
+        mock_session.return_value = cm
+
+        result = await delete_eval_definition(eval_id=str(guardrail.id), hard=True)
+
+        assert "error" not in result, result
+        assert result["hard_deleted"] is True
+        assert cm.__aenter__.return_value.delete.called
+        assert mock_audit.await_count == 1
+        _, kwargs = mock_audit.call_args
+        assert kwargs["event_type"] == "eval_definition.purged"
+        assert kwargs["payload_json"] == {
+            "eval_id": str(guardrail.id),
+            "name": "eval",
+            "purge": True,
+        }
 
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server._session")

@@ -2773,6 +2773,11 @@ async def list_eval_definitions(
 
 _EVAL_FAILURE_BEHAVIOURS = ("warn", "block")
 
+# Mirrors the REST ``max_length=255`` on the eval-definition name field so an
+# oversized MCP-supplied name surfaces as ``invalid_name`` rather than a generic
+# constraint conflict.
+_EVAL_NAME_MAX_LENGTH = 255
+
 
 def _assert_eval_type(eval_type: str) -> dict[str, Any] | None:
     """Validate an eval_type value, returning an error dict or None."""
@@ -2844,6 +2849,11 @@ async def create_eval_definition(
 
         if not name or not name.strip():
             return {"error": "invalid_name", "detail": "name must be a non-empty string"}
+        if len(name) > _EVAL_NAME_MAX_LENGTH:
+            return {
+                "error": "invalid_name",
+                "detail": f"name must be at most {_EVAL_NAME_MAX_LENGTH} characters",
+            }
         if (err := _assert_eval_type(eval_type)) is not None:
             return err
         if (err := _assert_failure_behaviour(failure_behaviour)) is not None:
@@ -2931,7 +2941,10 @@ async def create_eval_definition(
 @mcp.tool(
     description="Update an eval definition (admin only). Bumps the definition "
     "version and snapshots the pre-edit config, mirroring the REST semantics. "
-    "Requires an admin caller; non-admins receive an insufficient_scope error.",
+    "Requires an admin caller; non-admins receive an insufficient_scope error. "
+    "NOTE: because None means 'not provided' in the tool signature, nullable "
+    "fields (node_id, pass_threshold, suite_id) cannot be cleared to NULL via "
+    "this tool - the REST PUT route must be used to unset them.",
 )
 @_RETRY_DB
 async def update_eval_definition(
@@ -2964,6 +2977,11 @@ async def update_eval_definition(
             return err
         if name is not None and (not name or not name.strip()):
             return {"error": "invalid_name", "detail": "name must be a non-empty string when provided"}
+        if name is not None and len(name) > _EVAL_NAME_MAX_LENGTH:
+            return {
+                "error": "invalid_name",
+                "detail": f"name must be at most {_EVAL_NAME_MAX_LENGTH} characters",
+            }
 
         _assert_admin_scope("update")
 
@@ -3092,6 +3110,7 @@ async def delete_eval_definition(
 
             is_guardrail = eval_def.eval_type == "guardrail"
             soft = is_guardrail and not hard
+            eval_name = eval_def.name
             if soft:
                 eval_def.deleted_at = datetime.now(UTC)
                 eval_def.deleted_by = account_id
@@ -3106,7 +3125,7 @@ async def delete_eval_definition(
                         actor_user_id=account_id,
                         resource_type="eval_definition",
                         resource_id=eid,
-                        payload_json={"eval_id": str(eid), "name": eval_def.name, "purge": hard},
+                        payload_json={"eval_id": str(eid), "name": eval_name, "purge": hard},
                     )
                 except Exception:
                     _log.exception(
