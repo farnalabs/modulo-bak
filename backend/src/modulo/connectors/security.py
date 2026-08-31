@@ -92,23 +92,87 @@ def redact_text(text: Any, secrets: Sequence[str]) -> str:
     return result
 
 
+def _scrub_headers(headers: httpx.Headers, secrets: Sequence[str]) -> list[tuple[str, str]]:
+    """Return *headers* as ``(name, value)`` pairs with credential values stripped."""
+    return [(k, redact_text(v, secrets)) for k, v in headers.items()]
+
+
+def _scrub_request(request: httpx.Request | None, secrets: Sequence[str]) -> httpx.Request | None:
+    """Return a copy of *request* with credential values stripped from URL/headers.
+
+    ``httpx`` errors echo the full request URL (query-string auth included, as
+    Trello does with ``key``/``token``) and headers, so the exception attached
+    to an errored call must be rebuilt with a redacted URL/headers — otherwise
+    the credential survives in ``exc.request.url`` even when the message is
+    redacted. Returns the original request unchanged when nothing needs
+    redacting (preserving identity so the no-op path stays a strict no-op).
+    """
+    if request is None:
+        return None
+    url = redact_text(str(request.url), secrets)
+    headers = _scrub_headers(request.headers, secrets)
+    if url == str(request.url) and headers == list(request.headers.items()):
+        return request
+    kwargs: dict[str, Any] = {"method": request.method, "url": url, "headers": headers}
+    try:
+        content = request.content
+    except Exception:
+        content = None
+    if content is not None:
+        kwargs["content"] = content
+    try:
+        return httpx.Request(**kwargs)
+    except Exception:  # pragma: no cover - defensive fallback
+        return request
+
+
+def _scrub_response(response: httpx.Response, secrets: Sequence[str]) -> httpx.Response:
+    """Return a copy of *response* with credential values stripped from text/URL/headers.
+
+    The response body is itself a live socket of a credential echo, and its
+    embedded ``.request`` carries the query-string URL — both are scrubbed so
+    ``exc.response.text`` and ``exc.response.request.url`` never expose the
+    credential after the exception is redacted. Returns the original response
+    unchanged when nothing needs redacting.
+    """
+    request = _scrub_request(response.request, secrets)
+    text = redact_text(response.text, secrets)
+    headers = _scrub_headers(response.headers, secrets)
+    if text == response.text and headers == list(response.headers.items()) and request is response.request:
+        return response
+    try:
+        return httpx.Response(status_code=response.status_code, request=request, text=text, headers=headers)
+    except Exception:  # pragma: no cover - defensive fallback
+        return response
+
+
 def redact_exc(exc: Exception, secrets: Sequence[str]) -> Exception:
     """Return a same-*type* exception whose message has credentials redacted.
 
     When the message contains no credential the ORIGINAL exception is returned
     unchanged (a strict no-op — normal operation never alters exception type,
     message, or chaining). When redaction applies, the exception is rebuilt to
-    the same type with the redacted message, preserving ``request`` /
-    ``response`` for ``httpx`` errors and the original ``__cause__``.
+    the same type with the redacted message AND a scrubbed ``request`` /
+    ``response`` so the credential does not survive in the attached transport
+    objects either (Trello's ``key``/``token`` live in the request query string,
+    which ``exc.request.url`` / ``exc.response.request.url`` would otherwise
+    still expose). The original ``__cause__`` is preserved.
     """
     message = redact_text(str(exc), secrets)
     if message == str(exc):
         return exc
     try:
         if isinstance(exc, httpx.HTTPStatusError):
-            new: Exception = httpx.HTTPStatusError(message, request=exc.request, response=exc.response)
+            request = _scrub_request(exc.request, secrets)
+            if request is None:  # pragma: no cover - HTTPStatusError always carries a request
+                request = exc.request
+            new: Exception = httpx.HTTPStatusError(
+                message,
+                request=request,
+                response=_scrub_response(exc.response, secrets),
+            )
         elif isinstance(exc, httpx.RequestError):
-            new = _rebuild_httpx_request_error(exc, message)
+            new = _rebuild_httpx_request_error(exc, message, secrets)
         else:
             new = _rebuild_generic_error(exc, message)
     except Exception:  # pragma: no cover - defensive fallback
@@ -117,17 +181,20 @@ def redact_exc(exc: Exception, secrets: Sequence[str]) -> Exception:
     return new
 
 
-def _rebuild_httpx_request_error(exc: httpx.RequestError, message: str) -> Exception:
+def _rebuild_httpx_request_error(exc: httpx.RequestError, message: str, secrets: Sequence[str] = ()) -> Exception:
     """Rebuild a ``httpx`` transport error with *message*, preserving ``request``.
 
     ``RequestError.request`` is a property that RAISES ``RuntimeError`` when the
     request was never set (e.g. a manually-constructed error), so it cannot be
-    read via ``getattr(..., None)`` — it must be wrapped in a try/except.
+    read via ``getattr(..., None)`` — it must be wrapped in a try/except. The
+    rebuilt request has its URL/headers scrubbed so the credential cannot
+    survive in ``exc.request.url``.
     """
     try:
         request = exc.request
     except Exception:
         request = None
+    request = _scrub_request(request, secrets)
     try:
         return type(exc)(message, request=request)
     except TypeError:

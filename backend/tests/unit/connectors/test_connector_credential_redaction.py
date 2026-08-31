@@ -109,6 +109,27 @@ def test_redact_exc_preserves_httpx_status_error() -> None:
     assert "secretvalue123" not in str(repaired)
 
 
+def test_redact_exc_scrubs_request_and_response_query_url() -> None:
+    # A Trello-style HTTPStatusError embeds the query-string credentials in the
+    # message AND in the attached request/response URL objects. Redacting only
+    # the message leaks the credential through ``exc.request.url`` /
+    # ``exc.response.request.url`` (the FAR-507 gap reintroduced by the shared
+    # generic redactor), so the rebuilt exception must scrub those too.
+    url = "https://api.trello.com/1/boards?key=k&token=secretvalue123"
+    request = httpx.Request("GET", url)
+    response = httpx.Response(500, text="boom", request=request)
+    exc = httpx.HTTPStatusError(
+        "Client error for url 'https://api.trello.com/1/boards?key=k&token=secretvalue123'",
+        request=request,
+        response=response,
+    )
+    repaired = CredentialRedactor(["secretvalue123"]).redact_exc(exc)
+    assert "secretvalue123" not in str(repaired)
+    assert "secretvalue123" not in str(repaired.request.url)
+    assert "secretvalue123" not in str(repaired.response.request.url)
+    assert "***" in str(repaired.request.url)
+
+
 def test_redact_exc_preserves_httpx_request_error() -> None:
     exc = httpx.ConnectError("timeout secretvalue123")
     repaired = CredentialRedactor(["secretvalue123"]).redact_exc(exc)
@@ -215,6 +236,19 @@ async def test_gitlab_redacts_token_from_401_error() -> None:
     assert "***" in str(exinfo.value)
 
 
+async def test_gitlab_redacts_token_from_health_check_detail() -> None:
+    # Health-check fallback branches surface ``response.text`` (via
+    # ``_error_detail``) in the returned HealthResult, which the ``@redacting``
+    # decorator does NOT intercept — the detail must be redacted explicitly.
+    connector = GitLabConnector(token=_GITLAB_TOKEN)
+    with respx.mock:
+        respx.get("https://gitlab.com/api/v4/user").mock(return_value=httpx.Response(500, text=f"echo {_GITLAB_TOKEN}"))
+        result = await connector.health_check()
+    assert result.ok is False
+    assert _GITLAB_TOKEN not in result.detail
+    assert "***" in result.detail
+
+
 async def test_slack_redacts_token_from_401_error() -> None:
     connector = SlackConnector(bot_token=_SLACK_TOKEN)
     with respx.mock:
@@ -280,6 +314,9 @@ async def test_trello_connector_redacts_token_from_query_url() -> None:
     assert _TRELLO_TOKEN not in str(exinfo.value)
     assert _TRELLO_KEY not in str(exinfo.value)
     assert "***" in str(exinfo.value)
+    assert _TRELLO_TOKEN not in str(exinfo.value.request.url)
+    assert _TRELLO_KEY not in str(exinfo.value.request.url)
+    assert _TRELLO_TOKEN not in str(exinfo.value.response.request.url)
 
 
 # header-auth connectors surface response text in the health_check detail

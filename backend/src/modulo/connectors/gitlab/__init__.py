@@ -590,36 +590,29 @@ class GitLabConnector(ConnectorBase):
             metadata={"rate_limit": _rate_limit_metadata(response)},
         )
 
-    @staticmethod
-    def _user_health_result(r: httpx.Response) -> HealthResult | None:
+    def _user_health_result(self, r: httpx.Response) -> HealthResult | None:
         """Map a ``/user`` response to a failure HealthResult, or ``None`` when healthy."""
         if r.status_code == 401:
-            return HealthResult(ok=False, detail=f"Invalid or expired GitLab token (HTTP 401){_id_suffix(r)}")
-        if r.status_code == 403:
-            return HealthResult(
-                ok=False,
-                detail=("Missing scopes: token cannot access /user (needs read_user/api)" + _id_suffix(r)),
-            )
-        if r.status_code != 200:
-            return HealthResult(ok=False, detail=f"HTTP {r.status_code}: {_error_detail(r)}")
-        return None
+            detail = f"Invalid or expired GitLab token (HTTP 401){_id_suffix(r)}"
+        elif r.status_code == 403:
+            detail = "Missing scopes: token cannot access /user (needs read_user/api)" + _id_suffix(r)
+        elif r.status_code != 200:
+            detail = f"HTTP {r.status_code}: {_error_detail(r)}"
+        else:
+            return None
+        return HealthResult(ok=False, detail=self._redactor.redact(detail))
 
-    @staticmethod
-    def _projects_health_result(r: httpx.Response) -> HealthResult | None:
+    def _projects_health_result(self, r: httpx.Response) -> HealthResult | None:
         """Map a ``/projects`` response to a failure HealthResult, or ``None`` when healthy."""
         if r.status_code == 401:
-            return HealthResult(ok=False, detail=f"Invalid or expired GitLab token (HTTP 401){_id_suffix(r)}")
-        if r.status_code == 403:
-            return HealthResult(
-                ok=False,
-                detail=("Missing scopes: read_api/api not granted (projects API denied)" + _id_suffix(r)),
-            )
-        if not r.is_success:
-            return HealthResult(
-                ok=False,
-                detail=f"Projects API returned HTTP {r.status_code}: {_error_detail(r)}",
-            )
-        return None
+            detail = f"Invalid or expired GitLab token (HTTP 401){_id_suffix(r)}"
+        elif r.status_code == 403:
+            detail = "Missing scopes: read_api/api not granted (projects API denied)" + _id_suffix(r)
+        elif not r.is_success:
+            detail = f"Projects API returned HTTP {r.status_code}: {_error_detail(r)}"
+        else:
+            return None
+        return HealthResult(ok=False, detail=self._redactor.redact(detail))
 
     @staticmethod
     def _scope_missing_result(declared_scopes: frozenset[str]) -> HealthResult | None:
