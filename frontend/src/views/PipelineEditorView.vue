@@ -1241,7 +1241,9 @@ const retryPolicyOptions = [
   { value: 'stall', labelKey: 'views.PipelineEditorView.retry_policy_stall' },
   { value: 'timeout', labelKey: 'views.PipelineEditorView.retry_policy_timeout' },
   { value: 'failure', labelKey: 'views.PipelineEditorView.retry_policy_failure' },
+  { value: 'eval_failed', labelKey: 'views.PipelineEditorView.retry_policy_eval_failed' },
 ]
+const retryPolicyEventValues = retryPolicyOptions.map((o) => o.value)
 
 interface RetryPolicy {
   on?: string[]
@@ -1264,7 +1266,7 @@ function syncRetryPolicyFromPipeline() {
   const rp = (pipeline.value as PipelineRetryPolicySource | null)?.retry_policy
   if (rp && typeof rp === 'object' && !Array.isArray(rp)) {
     const events = Array.isArray(rp.on)
-      ? rp.on.filter((e: string): e is string => ['stall', 'timeout', 'failure'].includes(e))
+      ? rp.on.filter((e: string): e is string => retryPolicyEventValues.includes(e))
       : []
     retryPolicyEvents.value = events
     const max = typeof rp.max_retries === 'number' ? Math.round(rp.max_retries) : 0
