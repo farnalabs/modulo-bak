@@ -750,13 +750,13 @@ watch(() => configData.value, (cfg) => {
 })
 
 const contextSourceDefs = [
-  { key: 'product_primer', labelKey: 'context_source_primer_label', descKey: 'product_primer_description', tokens: '~700' },
-  { key: 'page_context', labelKey: 'context_source_page_label', descKey: 'page_context_description', tokens: '~100' },
-  { key: 'user_profile', labelKey: 'context_source_user_profile_label', descKey: 'user_profile_description', tokens: '~150' },
-  { key: 'product_docs', labelKey: 'context_source_product_docs_label', descKey: 'product_docs_description', toolCall: 'search_documentation()' },
-  { key: 'integration_status', labelKey: 'context_source_integration_status_label', descKey: 'integration_status_description', toolCall: 'get_integration_status()' },
-  { key: 'org_config', labelKey: 'context_source_org_config_label', descKey: 'org_config_description', toolCall: 'get_org_config()' },
-  { key: 'feature_overview', labelKey: 'context_source_feature_overview_label', descKey: 'feature_overview_description', toolCall: 'get_available_features()' },
+  { key: 'product_primer', labelKey: 'views.AdminRemyView.context_source_primer_label', descKey: 'product_primer_description', tokens: '~700' },
+  { key: 'page_context', labelKey: 'views.AdminRemyView.context_source_page_label', descKey: 'page_context_description', tokens: '~100' },
+  { key: 'user_profile', labelKey: 'views.AdminRemyView.context_source_user_profile_label', descKey: 'user_profile_description', tokens: '~150' },
+  { key: 'product_docs', labelKey: 'views.AdminRemyView.context_source_product_docs_label', descKey: 'product_docs_description', toolCall: 'search_documentation()' },
+  { key: 'integration_status', labelKey: 'views.AdminRemyView.context_source_integration_status_label', descKey: 'integration_status_description', toolCall: 'get_integration_status()' },
+  { key: 'org_config', labelKey: 'views.AdminRemyView.context_source_org_config_label', descKey: 'org_config_description', toolCall: 'get_org_config()' },
+  { key: 'feature_overview', labelKey: 'views.AdminRemyView.context_source_feature_overview_label', descKey: 'feature_overview_description', toolCall: 'get_available_features()' },
 ]
 
 const contextSources = ref<Record<string, string>>({})
@@ -896,17 +896,17 @@ const toolPermSaving = ref(false)
 const toolPermError = ref<string | null>(null)
 
 const uiTools: Record<string, { descKey: string }> = {
-  navigate: { descKey: 'tool_navigate' },
-  click: { descKey: 'tool_click' },
-  fill: { descKey: 'tool_fill' },
-  select: { descKey: 'tool_select' },
-  extract: { descKey: 'tool_extract' },
-  extract_all: { descKey: 'tool_extract_all' },
-  get_page_interactables: { descKey: 'tool_get_page_interactables' },
-  wait: { descKey: 'tool_wait' },
-  go_back: { descKey: 'tool_go_back' },
-  get_url: { descKey: 'tool_get_url' },
-  press: { descKey: 'tool_press' },
+  navigate: { descKey: 'views.AdminRemyView.tool_navigate' },
+  click: { descKey: 'views.AdminRemyView.tool_click' },
+  fill: { descKey: 'views.AdminRemyView.tool_fill' },
+  select: { descKey: 'views.AdminRemyView.tool_select' },
+  extract: { descKey: 'views.AdminRemyView.tool_extract' },
+  extract_all: { descKey: 'views.AdminRemyView.tool_extract_all' },
+  get_page_interactables: { descKey: 'views.AdminRemyView.tool_get_page_interactables' },
+  wait: { descKey: 'views.AdminRemyView.tool_wait' },
+  go_back: { descKey: 'views.AdminRemyView.tool_go_back' },
+  get_url: { descKey: 'views.AdminRemyView.tool_get_url' },
+  press: { descKey: 'views.AdminRemyView.tool_press' },
 }
 
 function getDefaultPerms(): Record<string, string> {
