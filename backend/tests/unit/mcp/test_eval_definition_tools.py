@@ -47,9 +47,9 @@ def _make_session_cm(return_obj: object) -> AsyncMock:
     sess = AsyncMock()
     execute_result = MagicMock()
     execute_result.scalar_one_or_none = MagicMock(return_value=return_obj)
-    sess.execute = MagicMock(return_value=execute_result)
+    sess.execute = AsyncMock(return_value=execute_result)
     sess.add = MagicMock()
-    sess.delete = MagicMock()
+    sess.delete = AsyncMock()
     sess.flush = AsyncMock()
     cm = AsyncMock()
     cm.__aenter__ = AsyncMock(return_value=sess)
@@ -122,7 +122,7 @@ class TestCreateEvalDefinition:
             config_json={"k": "v"},
         )
 
-        assert result["error"] != "insufficient_scope", result
+        assert "error" not in result, result
         assert result["name"] == "my-eval"
         assert result["eval_type"] == "regex"
         assert result["config_json"] == {"k": "v"}
@@ -209,7 +209,7 @@ class TestUpdateEvalDefinition:
             name="new",
         )
 
-        assert result["error"] != "insufficient_scope", result
+        assert "error" not in result, result
         assert result["name"] == "new"
         assert result["version"] == 2
         assert result["pre_version_raw"] == {"config_json": {"foo": "bar"}}
@@ -257,7 +257,7 @@ class TestDeleteEvalDefinition:
 
         result = await delete_eval_definition(eval_id=str(guardrail.id), hard=False)
 
-        assert result["error"] != "insufficient_scope", result
+        assert "error" not in result, result
         assert result["soft_deleted"] is True
         assert result["hard_deleted"] is False
         assert guardrail.deleted_at is not None
@@ -276,7 +276,7 @@ class TestDeleteEvalDefinition:
 
         result = await delete_eval_definition(eval_id=str(plain.id), hard=True)
 
-        assert result["error"] != "insufficient_scope", result
+        assert "error" not in result, result
         assert result["hard_deleted"] is True
         assert cm.__aenter__.return_value.delete.called
 
