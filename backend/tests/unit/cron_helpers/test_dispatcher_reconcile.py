@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -668,6 +669,101 @@ class TestNodelessRedispatchThrottle:
         assert ch._is_nodeless_redispatch_throttled(self._row(10), 35) is True
         assert ch._is_nodeless_redispatch_throttled(self._row(34), 35) is True
         assert ch._is_nodeless_redispatch_throttled(self._row(36), 35) is False
+
+
+class TestNodelessRedispatchPerTickCap:
+    """FAR-509 (qa-iterate): the nodeless re-dispatch is fleet-capped at
+    ``NODELESS_REDISPATCH_MAX_PER_TICK`` enqueues per tick — after a fleet-wide
+    worker wedge every aged nodeless zombie becomes throttle-eligible in the
+    SAME tick, and the fresh key_suffix defeats SAQ dedupe, so without the cap
+    the first recovery tick floods the queue. Mirrors the B3 enqueue-failed
+    cap: capped rows are deferred (no enqueue, no terminal-fail — they stay
+    running and become eligible again next tick; budget/throttle unaffected),
+    counted ``nodeless_capped``, warning logged once per tick. The cap gates
+    ONLY the re-dispatch outcome: budget-exhausted rows still terminal-fail
+    when the cap is hit."""
+
+    @staticmethod
+    def _rows(count: int) -> list[SimpleNamespace]:
+        """*count* distinct throttle-eligible, budget-available nodeless
+        zombies (dispatched 40 min ago — the 35-min window elapsed)."""
+        return [
+            _run_row(
+                uuid.uuid4(),
+                "running",
+                stale=False,
+                nodeless=True,
+                dispatched=False,
+                dispatched_minutes_ago=40,
+                claim_count=1,
+            )
+            for _ in range(count)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_burst_above_cap_enqueues_cap_and_defers_rest(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """4 eligible zombies with the cap patched to 2: exactly 2 enqueues,
+        the other 2 untouched (no enqueue, no terminal-fail), nodeless_capped
+        == 2, and the warning logs ONCE per tick (not per capped row)."""
+        monkeypatch.setattr(ch, "NODELESS_REDISPATCH_MAX_PER_TICK", 2)
+        rows = self._rows(4)
+        with caplog.at_level(logging.WARNING, logger="modulo.core.cron_helpers"):
+            summary, reenqueue, ingest, _, _, session = await _run_reconcile(monkeypatch, rows)
+        assert summary["nodeless_redispatched"] == 2
+        assert summary["nodeless_capped"] == 2
+        assert summary["nodeless_failed"] == 0
+        assert reenqueue.await_count == 2
+        ingest.assert_not_awaited()
+        session.record_facts.assert_not_awaited()
+        assert sum("nodeless re-dispatch cap hit" in r.message for r in caplog.records) == 1
+        # Stats plumbing: the capped count reaches set_dispatcher_reconcile_stats
+        # (the /healthz/ready dict) for this tick.
+        assert ch._dispatcher_reconcile_stats["nodeless_capped"] == 2
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_still_terminal_fails_when_cap_hit(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Ordering pinned: the cap gates only the re-dispatch outcome. The
+        budget-exhausted zombie is placed AFTER the cap is already hit — it
+        still terminal-fails (the budget check precedes the cap; terminal-fail
+        reduces load and never enqueues)."""
+        monkeypatch.setattr(ch, "NODELESS_REDISPATCH_MAX_PER_TICK", 2)
+        exhausted = _run_row(
+            uuid.uuid4(),
+            "running",
+            stale=False,
+            nodeless=True,
+            dispatched=False,
+            dispatched_minutes_ago=40,
+            claim_count=3,
+        )
+        rows = [*self._rows(3), exhausted]
+        with caplog.at_level(logging.WARNING, logger="modulo.core.cron_helpers"):
+            summary, reenqueue, _, _, _, session = await _run_reconcile(monkeypatch, rows)
+        assert summary["nodeless_redispatched"] == 2
+        assert summary["nodeless_capped"] == 1
+        assert summary["nodeless_failed"] == 1
+        assert reenqueue.await_count == 2
+        session.record_facts.assert_awaited_once_with(exhausted.id, ORG)
+
+    @pytest.mark.asyncio
+    async def test_burst_at_cap_enqueues_all_without_capping(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Exactly *cap* eligible zombies (boundary): all enqueued,
+        nodeless_capped == 0, no cap warning."""
+        monkeypatch.setattr(ch, "NODELESS_REDISPATCH_MAX_PER_TICK", 2)
+        rows = self._rows(2)
+        with caplog.at_level(logging.WARNING, logger="modulo.core.cron_helpers"):
+            summary, reenqueue, _, _, _, _ = await _run_reconcile(monkeypatch, rows)
+        assert summary["nodeless_redispatched"] == 2
+        assert summary["nodeless_capped"] == 0
+        assert summary["nodeless_failed"] == 0
+        assert reenqueue.await_count == 2
+        assert not any("nodeless re-dispatch cap hit" in r.message for r in caplog.records)
 
 
 class TestReconcileRedisFailSafe:
