@@ -1,7 +1,7 @@
 """Add missing foreign-key constraints on internal reference columns.
 
 Revision ID: 0162_add_missing_foreign_keys
-Revises: 0158_sso_provider_id
+Revises: 0161_accounts_must_change_password
 Create Date: 2026-08-29
 
 These columns are clearly foreign keys (named ``*_id`` and referencing another

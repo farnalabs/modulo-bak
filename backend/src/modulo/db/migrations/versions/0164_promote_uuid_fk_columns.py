@@ -28,6 +28,18 @@ choice. (A real ``FOREIGN KEY`` on these columns is intentionally deferred: it
 would reject the synthetic node UUIDs that today's integration tests write, and
 is tracked separately once those tests are migrated to maintain referential
 integrity.)
+
+Deploy window — lock / rewrite budget
+-------------------------------------
+``ALTER TYPE ... USING col::uuid`` on ``run_evidence.node_id`` and
+``feedback_records.producing_node_id`` takes an ``ACCESS EXCLUSIVE`` lock and
+rewrites the table; chained with 0162 (FKs) and 0163 (CHECKs) this is the
+longest-held exclusive window in the chain. The pre-flight scan is a full,
+unindexed pass over ``run_evidence`` and should be run against a quiet replica
+first (or during a low-traffic window). Prefer applying this migration in its
+own maintenance window rather than bundled with app traffic; on very large
+``run_evidence`` tables consider splitting the type change out into a separate
+migration with its own lock-time budget.
 """
 
 from __future__ import annotations
