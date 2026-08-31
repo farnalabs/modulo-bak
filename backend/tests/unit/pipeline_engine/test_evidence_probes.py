@@ -1071,7 +1071,7 @@ class TestRunEvidenceProbeErrorPaths:
 
         result = await run_evidence_probe(
             provider=provider,
-            session_factory=sqlite_factory,
+            session_factory=_BrokenFactory(),
             run_id=uuid.uuid4(),
             node_id=str(_NODE_A),
             organisation_id=_TEST_ORG,

@@ -1,21 +1,19 @@
-"""Integration test for migrations 0155-0157 (FK sweep, CHECKs, UUID promotion).
+"""Integration test for the FK/CHECK constraint and UUID-promotion migration chain.
 
-Runs the real Alembic ``upgrade`` chain 0155 -> 0156 -> 0157 against a *fresh*
-live Postgres (its own testcontainer, built from scratch) and proves the
-review-requested safety properties:
+Runs the real Alembic ``upgrade`` chain up to ``0164_promote_uuid_fk_columns``
+against a *fresh* live Postgres (its own testcontainer, built from scratch) and
+proves the review-requested safety properties:
 
-  * CHECK constraints (0156) and foreign keys (0155) are added ``NOT VALID``
-    then ``VALIDATE``-d, so a populated table never aborts the upgrade on
-    pre-existing offending rows at ``ADD`` time (the bug class 0151 already
-    avoids, and which 0155/0156 originally replicated).
-  * The UUID promotion (0157) preserves a well-formed UUID string across the
-    ``USING col::uuid`` cast, and its downgrade reverts with ``USING col::text``
-    (the missing downgrade cast that would otherwise raise on ``uuid -> varchar``).
-  * 0157 promotes the four columns to native ``uuid`` (the ``compare_metadata``
+  * CHECK constraints (0157) and foreign keys (0155/0162/0163) are added
+    ``NOT VALID`` then ``VALIDATE``-d, so a populated table never aborts the
+    upgrade on pre-existing offending rows at ``ADD`` time.
+  * The UUID promotion (0164) preserves a well-formed UUID string across the
+    ``USING col::uuid`` cast, and its downgrade reverts with ``USING col::text``.
+  * 0164 promotes the four columns to native ``uuid`` (the ``compare_metadata``
     gate requires the ORM and the migrated schema to agree on the type, and the
     ORM already declares these as ``Uuid``).
 
-The test builds its own container rather than re-applying 0155-0157 on the
+The test builds its own container rather than re-applying the constraints on the
 already-migrated shared test DB: re-running the bare ``ADD CONSTRAINT`` statements
 against a schema that already has them raises ``duplicate_object``. A freshly
 built schema proves the chain applies cleanly.

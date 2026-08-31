@@ -78,7 +78,7 @@ def _scan_offending_uuids() -> None:
     if offenders:
         report = "\n".join(f"  - {t}.{c} = {v!r}" for t, c, v in offenders)
         raise RuntimeError(
-            "Migration 0157 aborted: the following rows store a non-UUID value in "
+            "Migration 0164 aborted: the following rows store a non-UUID value in "
             "a column being promoted to uuid. Quarantine/repair these rows before "
             f"re-running the upgrade:\n{report}"
         )

@@ -47,6 +47,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo._types import _DICT_STR_ANY
+from modulo.utils.uuid import coerce_uuid
 
 _log = logging.getLogger(__name__)
 
@@ -413,13 +414,26 @@ async def write_evidence_row(
             )
             return
 
+    # ``node_id`` arrives as a ``str`` from stored ``outputs_json``/
+    # ``telemetry_json`` keys, which for legacy runs can hold non-UUID values.
+    # Cast leniently (matching every other boundary in this PR) and skip rather
+    # than raise inside the write path - a throwing ``UUID(node_id)`` would drop
+    # the evidence row and only log a metric (the advertised no-crash behaviour).
+    node_uuid = coerce_uuid(node_id)
+    if node_uuid is None:
+        _log.warning(
+            "heuristic.evidence_write_skipped_unparseable_node_id",
+            extra={"run_id": str(run_id), "node_id": node_id, "evidence_state": evidence_state},
+        )
+        return
+
     try:
         async with session.begin_nested():
             session.add(
                 RunEvidence(
                     organisation_id=organisation_id,
                     run_id=run_id,
-                    node_id=node_id if isinstance(node_id, UUID) else UUID(node_id),
+                    node_id=node_uuid,
                     evidence_state=evidence_state,
                     evidence_detail=evidence_detail,
                 )
