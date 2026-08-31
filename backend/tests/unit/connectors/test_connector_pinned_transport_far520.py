@@ -1,9 +1,13 @@
 """FAR-520: remaining ``base_url`` connectors migrated to the pinned-IP transport.
 
-FAR-512 migrated rest/github/gitlab/jira/slack/linear/n8n/sonarqube + model
-backends. This file covers the leftovers: trivy, jenkins, grafana, teamcity,
+This file covers the FAR-520 leftovers: trivy, jenkins, grafana, teamcity,
 youtrack, gitea, azure_repos, confluence, sentry, onepassword, azure_key_vault,
 azure_pipelines and the ``ci_runner`` GitLab CI runner.
+
+Note: the rest/github/gitlab/jira/slack/linear/n8n/sonarqube connectors and the
+model backends are NOT covered by this file. Those connectors' pinning status is
+tracked separately (see FAR-520) and must not be assumed migrated here — this
+test suite only proves the pin for the connectors listed above.
 
 Before FAR-520 each validated its egress target
 (:func:`modulo.core.ssrf.validate_outbound_url`) and then built its own
@@ -25,6 +29,7 @@ from __future__ import annotations
 import asyncio
 from typing import Self
 
+import httpx
 import pytest
 
 import modulo.core.ssrf as ssrf
@@ -214,3 +219,38 @@ def test_azure_repos_health_check_egress_is_pinned_to_profile_host(
     assert result.detail == "tester"
     assert captured["pinned_url"] == "https://app.vssps.visualstudio.com"
     assert captured["url"] == "https://app.vssps.visualstudio.com/_apis/profile/profiles/me"
+
+
+def test_pinned_transport_defaults_to_bounded_httpx_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MAJOR regression (FAR-520 review): a pinned transport built WITHOUT a
+    caller-supplied ``limits`` must keep httpx's DEFAULT connection cap (100/20).
+
+    ``limits or httpx.Limits()`` previously evaluated to an empty ``httpx.Limits()``
+    which httpcore substitutes with ``sys.maxsize`` — an unbounded pool — silently
+    lifting the per-client connection ceiling for every migrated connector (and the
+    OIDC discovery/JWKS/token fetches). The pin must not also remove the cap.
+    """
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: [_VALIDATED_PUBLIC])
+    transport = ssrf.pinned_async_transport_sync("https://scanner.example.com/")
+    assert transport._pool._max_connections == 100
+    assert transport._pool._max_keepalive_connections == 20
+
+
+def test_pinned_transport_respects_caller_supplied_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller-supplied ``limits`` flows into the httpcore pool intact."""
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: [_VALIDATED_PUBLIC])
+    custom = httpx.Limits(max_connections=5, max_keepalive_connections=2)
+    transport = ssrf.pinned_async_transport_sync("https://scanner.example.com/", limits=custom)
+    assert transport._pool._max_connections == 5
+    assert transport._pool._max_keepalive_connections == 2
+
+
+def test_pinned_client_sync_rejects_caller_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MINOR regression (FAR-520 review): a ``transport`` in client_kwargs must be
+    rejected so it cannot silently bypass the pinned transport.
+    """
+    monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: [_VALIDATED_PUBLIC])
+    with pytest.raises(ValueError, match="transport"):
+        ssrf.pinned_async_client_sync(
+            "https://scanner.example.com/", transport=httpx.MockTransport(lambda _req: httpx.Response(200))
+        )
