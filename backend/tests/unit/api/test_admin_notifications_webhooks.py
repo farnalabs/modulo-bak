@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -18,7 +19,7 @@ from fastapi.testclient import TestClient
 from modulo.api.dependencies import get_db_session, get_plan_context
 from modulo.api.main import app
 from modulo.auth.dependencies import get_current_user
-from modulo.auth.jwt import AuthenticatedPrincipal
+from modulo.auth.jwt import AuthenticatedPrincipal, TenantPrincipal
 from modulo.settings import Settings, get_settings
 
 _ORG_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -305,3 +306,40 @@ def test_get_webhook_echoes_team_id(client: TestClient) -> None:
 
     assert resp.status_code == 200
     assert resp.json()["team_id"] == str(_TEAM_ID)
+
+
+# ── Retry path SSRF fail-closed (FAR-517) ───────────────────────────────
+
+
+async def test_retry_one_delivery_fails_closed_on_ssrf_rebind() -> None:
+    """FAR-517: the manual/bulk retry POST must pin its client through
+    pinned_async_client, so a saved webhook URL whose host re-resolves to a
+    blocked internal address (169.254.169.254) fails closed — recorded as an
+    error with no request issued — rather than POSTing to the unvalidated host."""
+    from modulo.api.routes.admin_notifications import _retry_one_delivery
+
+    ep = _make_mock_endpoint()
+    delivery = MagicMock()
+    delivery.event_type = "hitl_awaiting"
+    delivery.endpoint_id = _WEBHOOK_ID
+    delivery.attempt_count = 2
+
+    async def _fake_pinned(_url: str) -> httpx.AsyncClient:
+        raise ValueError(
+            "URL hostname hooks.example.com resolves to a private/internal "
+            "address (169.254.169.254). Add its CIDR to SSRF_ALLOW_PRIVATE_RANGES "
+            "to allow this target, or use a public URL."
+        )
+
+    session = _make_mock_session()
+    principal = TenantPrincipal(username="admin", organisation_id=_ORG_ID, account_id=_USER_ID, org_role="admin")
+
+    with (
+        patch("modulo.api.routes.admin_notifications.pinned_async_client", new=_fake_pinned),
+        patch("modulo.api.routes.admin_notifications._record_delivery_error", new=AsyncMock()) as mock_record,
+    ):
+        resp, error = await _retry_one_delivery(session, principal, _make_settings(), delivery, ep)
+
+    assert resp is None
+    assert "169.254.169.254" in (error or "")
+    mock_record.assert_awaited_once()

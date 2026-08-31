@@ -30,6 +30,7 @@ from modulo.core.notifier import (
     EVENT_TRIGGER_DEACTIVATED,
     endpoint_events_to_list,
 )
+from modulo.core.ssrf import pinned_async_client
 from modulo.db.models.notification_delivery import NotificationDeliveryLog
 from modulo.db.models.notification_endpoint import NotificationEndpoint
 from modulo.db.models.team import Team
@@ -423,13 +424,24 @@ async def _retry_one_delivery(
             logger.exception("Failed to sign retry payload")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(ep.url, content=body, headers=headers)
+        client = await pinned_async_client(ep.url)
+        client.timeout = httpx.Timeout(15.0)
+    except ValueError as exc:
+        logger.warning(
+            "admin.notifications.retry_delivery.ssrf_rejected",
+            extra={"endpoint_id": str(ep.id), "error": str(exc)},
+        )
+        await _record_delivery_error(session, principal, delivery, ep, exc)
+        return None, str(exc)
+    try:
+        resp = await client.post(ep.url, content=body, headers=headers)
         await _record_delivery_result(session, principal, delivery, ep, resp)
         return resp, None
     except httpx.RequestError as exc:
         await _record_delivery_error(session, principal, delivery, ep, exc)
         return None, str(exc)
+    finally:
+        await client.aclose()
 
 
 async def _record_delivery_result(
