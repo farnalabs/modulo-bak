@@ -2531,6 +2531,10 @@ class PipelineExecutor:
         # (``<pipeline_id>:<run_number>``) — identical on resume because a resume
         # is the SAME run, so a side-effecting node re-executed after the HITL
         # pause dedupes exactly as it would on a same-run retry (FAR-402 P5).
+        # The retry policy + run_number are sourced from the SAME
+        # _capture_execution_scalars helper the execute path uses, so the resume
+        # wiring cannot drift from execute() again (FAR-505). The helper already
+        # fails open on a malformed/legacy retry_policy.
         pipeline_retry_policy = scalars["pipeline_retry_policy"]
         run_ref = rc.build_run_ref(str(pipeline_id), scalars["run_number"])
 
