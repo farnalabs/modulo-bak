@@ -93,6 +93,15 @@ _LOCALHOST_5678: str = "http://localhost:5678"
 _LOCALHOST_8111: str = "http://localhost:8111"
 _LOCALHOST_9000: str = "http://localhost:9000"
 
+# Process-lifetime dedup for connector skip-warnings (FAR-465): a fresh hub is
+# built per run/request, so one persistently misconfigured connector used to
+# re-log its FULL traceback on every initialise() and flood worker logs. The
+# first sighting of a (instance, type, "ExcType: message") key logs the full
+# traceback; later sightings log a concise repeat line. The key space is
+# bounded by the number of connector instances in the deployment, so the set
+# cannot grow unbounded within a process.
+_SKIP_WARN_SEEN: set[tuple[str, str, str]] = set()
+
 
 class ConnectorNotFoundError(KeyError):
     """Raised when hub.get() is called with an unregistered connector ID."""
@@ -446,13 +455,26 @@ class ConnectorHub:
                     TypeError,
                     KeyError,
                     OSError,
-                ):
-                    logger.warning(
-                        "Skipping connector %s (%s)",
-                        ci.id,
-                        ci.connector_type_id,
-                        exc_info=True,
-                    )
+                ) as exc:
+                    # Skip-warn dedup (FAR-465): full traceback once per
+                    # (instance, error) per process, concise repeat afterwards.
+                    # Check-and-add is synchronous (no await between) so it is
+                    # race-free under asyncio.
+                    skip_key = (str(ci.id), ci.connector_type_id, type(exc).__name__ + ": " + str(exc))
+                    if skip_key in _SKIP_WARN_SEEN:
+                        logger.warning(
+                            "Skipping connector %s (%s) (repeat; full traceback logged earlier)",
+                            ci.id,
+                            ci.connector_type_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Skipping connector %s (%s)",
+                            ci.id,
+                            ci.connector_type_id,
+                            exc_info=True,
+                        )
+                        _SKIP_WARN_SEEN.add(skip_key)
                 except SharedBudgetUnavailableError:
                     # A configured-but-unconstructable shared Redis client is a
                     # hard config error (FAR-439): degrade to the local bucket
