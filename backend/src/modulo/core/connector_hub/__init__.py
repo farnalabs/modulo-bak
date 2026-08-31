@@ -93,6 +93,54 @@ _LOCALHOST_5678: str = "http://localhost:5678"
 _LOCALHOST_8111: str = "http://localhost:8111"
 _LOCALHOST_9000: str = "http://localhost:9000"
 
+# FAR-496 read-side heal: the REST create/update endpoints store `credentials`
+# as a bare string, Fernet-encrypted into `credentials_ciphertext`. Token-keyed
+# connector types below read a DIFFERENT credential key in ``_build_connector``,
+# so legacy bare-token ciphertext rows for those types always failed
+# instantiation with "Missing credential key 'token'". The bare-scalar fallback
+# wrap in ``initialise()`` therefore wraps a decrypted bare scalar under the
+# connector type's OWN single credential key (this map), healing legacy rows at
+# read time — no write-side migration needed. Multi-key types (jira, trello,
+# jenkins, confluence, datadog, rest, ticket-tracker) require JSON-dict
+# credentials and keep the legacy "api_key" default, as do plugin types.
+_CREDENTIAL_KEY_BY_TYPE: dict[str, str] = {
+    "github": "token",
+    "gitlab": "token",
+    "gitea": "token",
+    "azure_repos": "token",
+    "bitbucket": "token",
+    "github_actions_ci": "token",
+    "gitlab_ci": "token",
+    "linear": "token",
+    "sharepoint": "token",
+    "shortcut": "token",
+    "youtrack": "token",
+    "notion": "token",
+    "npm": "token",
+    "pypi": "token",
+    "dropbox_paper": "token",
+    "buildkite": "token",
+    "circleci": "token",
+    "teamcity": "token",
+    "azure_key_vault": "token",
+    "azure_pipelines": "token",
+    "sentry": "token",
+    "pagerduty": "token",
+    "grafana": "token",
+    "microsoft_teams": "token",
+    "discord": "token",
+    "onepassword": "token",
+    "sonarqube": "token",
+    "codeclimate": "token",
+    "snyk": "token",
+    "trivy": "token",
+    "n8n": "token",
+    "slack": "bot_token",
+    "asana": "personal_access_token",
+    "monday": "api_key",
+    "opsgenie": "api_key",
+}
+
 
 class ConnectorNotFoundError(KeyError):
     """Raised when hub.get() is called with an unregistered connector ID."""
@@ -382,8 +430,11 @@ class ConnectorHub:
                                 plaintext = f.decrypt(ciphertext).decode("utf-8")
                                 # Multi-field creds round-trip: a JSON dict in the
                                 # ciphertext is used as-is (REST auth_mode/token/
-                                # api_key/...); a bare scalar falls back to the
-                                # legacy single api_key wrapper.
+                                # api_key/...); a bare scalar is wrapped under the
+                                # connector type's own single credential key
+                                # (FAR-496 read-side heal — see
+                                # _CREDENTIAL_KEY_BY_TYPE), falling back to the
+                                # legacy single api_key wrapper for unlisted types.
                                 try:
                                     parsed_plain = json.loads(plaintext)
                                 except json.JSONDecodeError:
@@ -391,7 +442,9 @@ class ConnectorHub:
                                 if isinstance(parsed_plain, dict):
                                     raw_str = plaintext
                                 else:
-                                    raw_str = json.dumps({"api_key": plaintext})
+                                    raw_str = json.dumps(
+                                        {_CREDENTIAL_KEY_BY_TYPE.get(ci.connector_type_id, "api_key"): plaintext}
+                                    )
                             except Exception:
                                 logger.warning(
                                     "Failed to decrypt credentials_ciphertext for connector %s", ci.id, exc_info=True
