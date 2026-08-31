@@ -96,6 +96,7 @@ def _run_row(
     status: str,
     *,
     dispatched: bool = True,
+    dispatched_minutes_ago: float | None = None,
     stale: bool = True,
     nodeless: bool = False,
     error_code: str | None = None,
@@ -105,11 +106,15 @@ def _run_row(
     retry_policy: Any = None,
 ) -> SimpleNamespace:
     heartbeat = datetime.now(UTC) - timedelta(minutes=30) if stale else datetime.now(UTC)
+    if dispatched_minutes_ago is not None:
+        dispatched_at: Any = datetime.now(UTC) - timedelta(minutes=dispatched_minutes_ago)
+    else:
+        dispatched_at = datetime.now(UTC) if dispatched else None
     return SimpleNamespace(
         id=run_id,
         pipeline_id=uuid.uuid4(),
         status=status,
-        dispatched_at=datetime.now(UTC) if dispatched else None,
+        dispatched_at=dispatched_at,
         heartbeat_at=heartbeat,
         # Non-None by default (has finalised node output → NOT nodeless); a
         # nodeless zombie has never finalised any node.
@@ -129,7 +134,7 @@ def _settings(**overrides: object) -> MagicMock:
         "saq_runs_queue": "runs",
         "saq_reenqueue_window": 600,
         "saq_job_heartbeat": 300,
-        "saq_claimed_nodeless_minutes": 45,
+        "saq_claimed_nodeless_minutes": 35,
         "saq_nodeless_redispatch_budget": 2,
         "redis_url": "redis://localhost:6379/0",
         "saq_redis_pool_size": 5,
@@ -370,10 +375,11 @@ class TestReconcilePredicateMatrix:
         a nodeless zombie executed ZERO nodes, so re-dispatch is safe and recovers
         the run instead of permanently losing it. With no retry_policy, the
         configurable budget (SAQ_NODELESS_REDISPATCH_BUDGET, default 2) applies
-        and claim_count == 1 is within it."""
+        and claim_count == 1 is within it. dispatched_at is NULL (never
+        dispatched) so the re-dispatch throttle does not suppress it."""
         summary, reenqueue, ingest, _, _, session = await _run_reconcile(
             monkeypatch,
-            [_run_row(RUN_RUNNING, "running", stale=False, nodeless=True)],
+            [_run_row(RUN_RUNNING, "running", stale=False, nodeless=True, dispatched=False)],
         )
         assert summary["nodeless_redispatched"] == 1
         assert summary["nodeless_failed"] == 0
@@ -402,7 +408,8 @@ class TestReconcilePredicateMatrix:
 
     async def test_running_nodeless_retry_policy_stall_redispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """retry_policy with 'stall' in 'on' honors max_retries: a run within the
-        retry budget (claim_count <= max_retries) is re-dispatched."""
+        retry budget (claim_count <= max_retries) is re-dispatched. dispatched_at
+        is NULL so the re-dispatch throttle does not suppress it."""
         summary, reenqueue, _, _, _, _ = await _run_reconcile(
             monkeypatch,
             [
@@ -411,6 +418,7 @@ class TestReconcilePredicateMatrix:
                     "running",
                     stale=False,
                     nodeless=True,
+                    dispatched=False,
                     claim_count=2,
                     retry_policy={"on": ["stall"], "max_retries": 3},
                 )
@@ -447,7 +455,10 @@ class TestReconcilePredicateMatrix:
         the run falls back to terminal-fail so it is never left dangling."""
         _patch_env(monkeypatch)
         session = _MockSession(
-            [_org_result([ORG]), _rows_result([_run_row(RUN_RUNNING, "running", stale=False, nodeless=True)])]
+            [
+                _org_result([ORG]),
+                _rows_result([_run_row(RUN_RUNNING, "running", stale=False, nodeless=True, dispatched=False)]),
+            ]
         )
         factory = MagicMock(return_value=session)
         redis_client = AsyncMock()
@@ -568,6 +579,95 @@ class TestNodelessRedispatchBudget:
         monkeypatch.setattr(ch, "get_settings", lambda: _settings())
         assert ch._should_redispatch_nodeless(self._row(2, retry_policy={})) is True
         assert ch._should_redispatch_nodeless(self._row(3, retry_policy={})) is False
+
+
+class TestNodelessRedispatchThrottle:
+    """FAR-509 (qa-iterate): the nodeless re-dispatch is THROTTLED to at most
+    one enqueue per ``SAQ_CLAIMED_NODELESS_MINUTES`` window per run — without
+    the throttle, a budget-eligible zombie was re-enqueued on every 60s tick
+    (the fresh key_suffix defeats SAQ dedupe). Three-way outcome at the repair
+    branch: budget exhaustion terminal-fails (even when throttled — waiting
+    cannot help a run that can no longer be re-dispatched); a run dispatched
+    within the window is skipped silently (no enqueue, no terminal-fail); a run
+    whose window elapsed is re-dispatched. Between the budget and the throttle,
+    a never-re-claimable zombie is bounded by the mid-graph-wedge age backstop."""
+
+    @staticmethod
+    def _row(dispatched_minutes_ago: float | None, claim_count: int = 1) -> SimpleNamespace:
+        return _run_row(
+            RUN_RUNNING,
+            "running",
+            stale=False,
+            nodeless=True,
+            dispatched=False,
+            dispatched_minutes_ago=dispatched_minutes_ago,
+            claim_count=claim_count,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dispatched_at_null_budget_available_redispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A never-dispatched nodeless zombie (dispatched_at NULL) is never
+        throttled: budget available → re-dispatched (enqueue called, no fail)."""
+        summary, reenqueue, ingest, _, _, session = await _run_reconcile(
+            monkeypatch, [self._row(dispatched_minutes_ago=None)]
+        )
+        assert summary["nodeless_redispatched"] == 1
+        assert summary["nodeless_failed"] == 0
+        assert summary["repaired"] == 0
+        reenqueue.assert_awaited_once()
+        assert reenqueue.await_args.args[3] == "execute_run"
+        ingest.assert_not_awaited()
+        session.record_facts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_recent_dispatch_throttled_no_enqueue_no_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A run re-dispatched 10 minutes ago (within the 35-min nodeless
+        window) is THROTTLED: no duplicate enqueue, no terminal-fail — the run
+        is left untouched for a later tick (the throttle bounds the enqueue
+        rate; the budget bounds the claim cycles)."""
+        summary, reenqueue, ingest, _, _, session = await _run_reconcile(
+            monkeypatch, [self._row(dispatched_minutes_ago=10)]
+        )
+        assert summary["nodeless_redispatched"] == 0
+        assert summary["nodeless_failed"] == 0
+        assert summary["repaired"] == 0
+        reenqueue.assert_not_awaited()
+        ingest.assert_not_awaited()
+        # Throttle-skip is silent: no compensating fact, run untouched.
+        session.record_facts.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_window_elapsed_redispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A run last dispatched 40 minutes ago (nodeless window elapsed) is
+        re-dispatched again — at most one re-dispatch per window."""
+        summary, reenqueue, _, _, _, _ = await _run_reconcile(monkeypatch, [self._row(dispatched_minutes_ago=40)])
+        assert summary["nodeless_redispatched"] == 1
+        assert summary["nodeless_failed"] == 0
+        reenqueue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_terminal_fails_even_when_throttled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ordering pinned: the budget check wins over the throttle. A run past
+        its claim budget is terminal-failed even with a fresh dispatched_at —
+        waiting cannot help a run that can no longer be re-dispatched."""
+        summary, reenqueue, _, _, _, session = await _run_reconcile(
+            monkeypatch, [self._row(dispatched_minutes_ago=10, claim_count=3)]
+        )
+        assert summary["nodeless_failed"] == 1
+        assert summary["nodeless_redispatched"] == 0
+        reenqueue.assert_not_awaited()
+        session.record_facts.assert_awaited_once_with(RUN_RUNNING, ORG)
+
+    def test_throttle_helper_boundaries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Direct boundary checks of ``_is_nodeless_redispatch_throttled``:
+        NULL dispatched_at never throttles; a dispatch inside the window
+        throttles; past the window it does not (5-min margins around the 35-min
+        window — no exact-boundary flake)."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._is_nodeless_redispatch_throttled(self._row(None), 35) is False
+        assert ch._is_nodeless_redispatch_throttled(self._row(10), 35) is True
+        assert ch._is_nodeless_redispatch_throttled(self._row(34), 35) is True
+        assert ch._is_nodeless_redispatch_throttled(self._row(36), 35) is False
 
 
 class TestReconcileRedisFailSafe:
