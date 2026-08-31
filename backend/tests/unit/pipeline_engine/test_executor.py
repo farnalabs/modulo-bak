@@ -3172,8 +3172,7 @@ async def test_finalize_leaves_already_failed_run_unchanged():
     assert mock_finalize.await_args.kwargs["error_detail"] == "agent self-reported failure"
 
 
-@pytest.mark.asyncio
-async def test_work_intact_false_for_downgraded_sandbox_agent_failure():
+def test_work_intact_false_for_downgraded_sandbox_agent_failure():
     """FAR-510 — a downgraded run (``failed`` + ``sandbox.agent_failed``) is
     forced work_intact=False. The synthetic failure envelope has a summary
     string, so without the forced-False rule ``compute_work_intact`` would
