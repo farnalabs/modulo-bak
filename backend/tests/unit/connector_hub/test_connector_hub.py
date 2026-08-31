@@ -598,8 +598,8 @@ async def test_skip_warning_dedup_full_traceback_once_per_process(caplog):
     assert "Missing credential key" in str(skips[0].exc_info[1])
     assert skips[1].exc_info is None
     assert "(repeat; full traceback logged earlier)" in skips[1].message
-    assert hub1.connector_ids == frozenset()
-    assert hub2.connector_ids == frozenset()
+    assert not hub1.connector_ids
+    assert not hub2.connector_ids
 
 
 async def test_skip_warning_dedup_different_instance_id_logs_traceback(caplog):
