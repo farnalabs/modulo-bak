@@ -4,6 +4,7 @@ import jmespath
 import pytest
 
 from modulo.core.graph_validator._types import ValidationResult
+from modulo.core.pipeline_engine.executor import compute_retry_aware_topology_hash
 from modulo.core.pipeline_engine.port_resolver import (
     DEFAULT_INPUT_PORT,
     DEFAULT_OUTPUT_PORT,
@@ -136,6 +137,47 @@ def test_fan_in_legacy_graph_not_rejected():
     assert not any(i.code == PORT_FAN_IN_ERROR for i in result.issues)
 
 
+def test_fan_in_legacy_graph_with_default_edge_ports_not_rejected():
+    # Sibling of the FAR-480 fix (the edge half): every persisted edge carries
+    # source_port='out' / target_port='in' (DB NOT NULL defaults, migration
+    # 0141) and the save-time validator-edge serializer always emits them, so
+    # KEY PRESENCE would declare ports on every legacy edge. Default-equivalent
+    # values must NOT flip strict fan-in on — the FAR-480 production shape
+    # (null-port nodes, 2-edge fan-in target, default-valued edge ports)
+    # stays legacy last-write-wins.
+    graph = {
+        "nodes": [
+            _node("a", inputs=None, outputs=None),
+            _node("c", inputs=None, outputs=None),
+            _node("b", inputs=None, outputs=None),
+        ],
+        "edges": [
+            _edge("a", "b", source_port="out", target_port="in"),
+            _edge("c", "b", source_port="out", target_port="in"),
+        ],
+    }
+    result = ValidationResult()
+    validate_port_topology(graph, result)
+    assert not any(i.code == PORT_FAN_IN_ERROR for i in result.issues)
+
+
+def test_fan_in_nondefault_edge_port_still_rejected():
+    # An edge pointing at a NON-default port IS explicit port topology even
+    # when the target node declares no ports of its own.
+    graph = {
+        "nodes": [_node("a"), _node("c"), _node("b")],
+        "edges": [
+            _edge("a", "b", target_port="data"),
+            _edge("c", "b", target_port="data"),
+        ],
+    }
+    result = ValidationResult()
+    validate_port_topology(graph, result)
+    fan_in = [i for i in result.issues if i.code == PORT_FAN_IN_ERROR]
+    assert len(fan_in) == 1
+    assert fan_in[0].node_id == "b"
+
+
 def test_fan_in_null_port_keys_api_round_trip_not_rejected():
     # FAR-480 regression (the exact production failure): every node round-tripped
     # through the API carries inputs/outputs = null, and a 2-edge fan-in target
@@ -248,6 +290,40 @@ def test_topology_hash_changes_when_source_port_set_on_edge():
     g3["edges"][0]["source_port"] = "custom"
     assert compute_port_topology_hash(g1) == compute_port_topology_hash(g2)
     assert compute_port_topology_hash(g1) != compute_port_topology_hash(g3)
+
+
+def test_retry_aware_hash_equals_base_hash_without_policy():
+    """No pipeline retry_policy -> hash is identical to the base port-topology hash."""
+    g = _base_graph()
+    assert compute_retry_aware_topology_hash(g, None) == compute_port_topology_hash(g)
+    assert compute_retry_aware_topology_hash(g, {}) == compute_port_topology_hash(g)
+
+
+def test_retry_aware_hash_folds_policy_into_hash():
+    """A present retry_policy changes the hash (forces recompile on policy PATCH)."""
+    g = _base_graph()
+    base = compute_port_topology_hash(g)
+    with_policy = compute_retry_aware_topology_hash(g, {"on": ["failure"], "max_retries": 2})
+    assert with_policy != base
+    assert with_policy.startswith(base + ":")
+
+
+def test_retry_aware_hash_stable_for_same_policy():
+    """The same policy produces a deterministic hash across calls/orderings."""
+    g = _base_graph()
+    h1 = compute_retry_aware_topology_hash(g, {"max_retries": 2, "on": ["failure"]})
+    h2 = compute_retry_aware_topology_hash(g, {"on": ["failure"], "max_retries": 2})
+    assert h1 == h2
+    assert h1 != compute_retry_aware_topology_hash(g, {"on": ["failure"], "max_retries": 3})
+
+
+def test_retry_aware_hash_stable_across_key_order():
+    """A dict-default policy is key-order independent (json.dumps sort_keys)."""
+    g = _base_graph()
+    g["nodes"] = [g["nodes"][1], g["nodes"][0]]
+    h_a = compute_retry_aware_topology_hash(g, {"on": ["failure"], "max_retries": 2})
+    h_b = compute_retry_aware_topology_hash(_base_graph(), {"max_retries": 2, "on": ["failure"]})
+    assert h_a == h_b
 
 
 # ---------------------------------------------------------------------------

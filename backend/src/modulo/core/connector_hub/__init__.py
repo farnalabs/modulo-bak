@@ -93,6 +93,27 @@ _LOCALHOST_5678: str = "http://localhost:5678"
 _LOCALHOST_8111: str = "http://localhost:8111"
 _LOCALHOST_9000: str = "http://localhost:9000"
 
+# FAR-496 read-side heal: the REST create/update endpoints store `credentials`
+# as a bare string, Fernet-encrypted into `credentials_ciphertext`. Token-keyed
+# connector types below read a DIFFERENT credential key in ``_build_connector``,
+# so legacy bare-token ciphertext rows for those types always failed
+# instantiation with "Missing credential key 'token'". The bare-scalar fallback
+# wrap in ``initialise()`` therefore wraps a decrypted bare scalar under the
+# connector type's OWN single credential key (see ``_bare_credential_key``),
+# healing legacy rows at read time — no write-side migration needed. Multi-key
+# types (jira, trello, jenkins, confluence, datadog, rest, ticket-tracker)
+# require JSON-dict credentials and keep the legacy "api_key" default, as do
+# plugin types.
+
+# Process-lifetime dedup for connector skip-warnings (FAR-465): a fresh hub is
+# built per run/request, so one persistently misconfigured connector used to
+# re-log its FULL traceback on every initialise() and flood worker logs. The
+# first sighting of a (instance, type, "ExcType: message") key logs the full
+# traceback; later sightings log a concise repeat line. The key space is
+# bounded by the number of connector instances in the deployment, so the set
+# cannot grow unbounded within a process.
+_SKIP_WARN_SEEN: set[tuple[str, str, str]] = set()
+
 
 class ConnectorNotFoundError(KeyError):
     """Raised when hub.get() is called with an unregistered connector ID."""
@@ -382,8 +403,11 @@ class ConnectorHub:
                                 plaintext = f.decrypt(ciphertext).decode("utf-8")
                                 # Multi-field creds round-trip: a JSON dict in the
                                 # ciphertext is used as-is (REST auth_mode/token/
-                                # api_key/...); a bare scalar falls back to the
-                                # legacy single api_key wrapper.
+                                # api_key/...); a bare scalar is wrapped under the
+                                # connector type's own single credential key
+                                # (FAR-496 read-side heal — see
+                                # _bare_credential_key), falling back to the
+                                # legacy single api_key wrapper for unlisted types.
                                 try:
                                     parsed_plain = json.loads(plaintext)
                                 except json.JSONDecodeError:
@@ -391,7 +415,13 @@ class ConnectorHub:
                                 if isinstance(parsed_plain, dict):
                                     raw_str = plaintext
                                 else:
-                                    raw_str = json.dumps({"api_key": plaintext})
+                                    # Wrap the bare scalar under the connector
+                                    # type's OWN credential key so token-keyed
+                                    # types (github, linear, slack, ...) heal
+                                    # instead of failing with
+                                    # "Missing credential key 'token'" (FAR-496).
+                                    cred_key = _bare_credential_key(ci.connector_type_id)
+                                    raw_str = json.dumps({cred_key: plaintext})
                             except Exception:
                                 logger.warning(
                                     "Failed to decrypt credentials_ciphertext for connector %s", ci.id, exc_info=True
@@ -446,13 +476,26 @@ class ConnectorHub:
                     TypeError,
                     KeyError,
                     OSError,
-                ):
-                    logger.warning(
-                        "Skipping connector %s (%s)",
-                        ci.id,
-                        ci.connector_type_id,
-                        exc_info=True,
-                    )
+                ) as exc:
+                    # Skip-warn dedup (FAR-465): full traceback once per
+                    # (instance, error) per process, concise repeat afterwards.
+                    # Check-and-add is synchronous (no await between) so it is
+                    # race-free under asyncio.
+                    skip_key = (str(ci.id), ci.connector_type_id, type(exc).__name__ + ": " + str(exc))
+                    if skip_key in _SKIP_WARN_SEEN:
+                        logger.warning(
+                            "Skipping connector %s (%s) (repeat; full traceback logged earlier)",
+                            ci.id,
+                            ci.connector_type_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Skipping connector %s (%s)",
+                            ci.id,
+                            ci.connector_type_id,
+                            exc_info=True,
+                        )
+                        _SKIP_WARN_SEEN.add(skip_key)
                 except SharedBudgetUnavailableError:
                     # A configured-but-unconstructable shared Redis client is a
                     # hard config error (FAR-439): degrade to the local bucket
@@ -672,6 +715,73 @@ def _in_fetch_scope(instance: ConnectorInstance, fetch_scope: set[str]) -> bool:
     return str(instance.id) in fetch_scope or instance.connector_type_id in fetch_scope
 
 
+# Token-keyed connector types whose single credential is read under the key
+# "token" (see the `_get_cred(creds, "token", type_id)` calls in `_build_connector`
+# below). A bare (non-JSON) ciphertext scalar for these types must be wrapped
+# under "token" on the read-side fallback, NOT the legacy "api_key" wrapper
+# (FAR-496).
+_TOKEN_CRED_TYPES: frozenset[str] = frozenset(
+    {
+        "gitea",
+        "azure_repos",
+        "bitbucket",
+        "github",
+        "github_actions_ci",
+        "gitlab_ci",
+        "gitlab",
+        "linear",
+        "sharepoint",
+        "shortcut",
+        "youtrack",
+        "notion",
+        "npm",
+        "pypi",
+        "dropbox_paper",
+        "buildkite",
+        "circleci",
+        "teamcity",
+        "azure_key_vault",
+        "azure_pipelines",
+        "sentry",
+        "pagerduty",
+        "grafana",
+        "microsoft_teams",
+        "discord",
+        "onepassword",
+        "sonarqube",
+        "codeclimate",
+        "snyk",
+        "trivy",
+        "n8n",
+    }
+)
+
+# Single-key overrides for token-keyed types whose credential key is not "token".
+_BARE_CRED_KEY_OVERRIDES: dict[str, str] = {
+    "slack": "bot_token",
+    "asana": "personal_access_token",
+}
+
+
+def _bare_credential_key(type_id: str) -> str:
+    """Return the credential key a bare (non-JSON) ciphertext scalar is wrapped under.
+
+    Token-keyed connectors read a credential key other than "api_key" (FAR-496):
+    wrapping a bare token under "api_key" guarantees instantiation failure with
+    ``Missing credential key 'token'``. We therefore wrap under the connector
+    type's OWN credential key. api_key-keyed single types (monday, opsgenie, ...)
+    and multi-key types (jira, datadog, rest, confluence, trello, jenkins,
+    ticket-tracker, ...) keep the legacy "api_key" default — multi-key types
+    require a JSON-dict credential anyway, so a bare scalar can never be valid
+    for them and their shape must not change.
+    """
+    if type_id in _BARE_CRED_KEY_OVERRIDES:
+        return _BARE_CRED_KEY_OVERRIDES[type_id]
+    if type_id in _TOKEN_CRED_TYPES:
+        return "token"
+    return "api_key"
+
+
 def _get_cred(creds: dict[str, Any], key: str, type_id: str) -> Any:
     try:
         return creds[key]
@@ -836,7 +946,7 @@ def _build_connector(
         case "datadog":
             return DatadogConnector(
                 api_key=_get_cred(creds, "api_key", type_id),
-                app_key=_get_cred(creds, "app_key", type_id),
+                app_key=_get_cred(creds, "application_key", type_id),
                 site=config.get("site", "us"),
             )
         case "sentry":
