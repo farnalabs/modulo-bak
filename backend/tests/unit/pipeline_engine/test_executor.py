@@ -555,7 +555,7 @@ async def test_resume_fails_open_when_retry_policy_access_raises():
     # No policy threaded through -> base hash (legacy value ignored safely).
     assert goc_calls == [compute_retry_aware_topology_hash(snapshot.graph_json, None)]
     spy_build.assert_called_once()
-    assert spy_build.call_args.kwargs.get("pipeline_retry_policy") == {}
+    assert not spy_build.call_args.kwargs.get("pipeline_retry_policy")
 
 
 # ---------------------------------------------------------------------------
