@@ -163,7 +163,7 @@ describe('PipelineEditorView', () => {
     expect(vm.selectedNodeData.capability_scope).toBeNull()
   })
 
-  it('renders all retry policy event options including eval_failed', async () => {
+  it('offers only the backend-supported retry policy events and filters unknown values', async () => {
     router.push('/pipelines/test-pipeline-id/editor')
     await router.isReady()
     const wrapper = mountEditor()
@@ -175,27 +175,30 @@ describe('PipelineEditorView', () => {
     const panel = wrapper.find('[data-testid="pipeline-editor-retry-policy-panel"]')
     expect(panel.exists()).toBe(true)
 
-    const expectedEvents = ['stall', 'timeout', 'failure', 'eval_failed']
-    for (const event of expectedEvents) {
+    // Only the events the backend allowlist accepts are offered in the UI.
+    const supportedEvents = ['stall', 'timeout', 'failure']
+    for (const event of supportedEvents) {
       const checkbox = wrapper.find(`[data-testid="pipeline-editor-retry-event-${event}"]`)
       expect(checkbox.exists(), `retry event checkbox for ${event}`).toBe(true)
     }
 
-    // checking eval_failed updates the retryPolicyEvents model, which the
-    // save path sends verbatim as retry_policy.on
+    // eval_failed is NOT a selectable option: the backend retry_policy allowlist
+    // (api/routes/pipelines.py) rejects it and the engine never auto-resurrects
+    // guardrail-blocked runs (core/pipeline_engine/recovery.py), so offering it
+    // would be a no-op trap where every save fails with 422.
     const evalCheckbox = wrapper.find('[data-testid="pipeline-editor-retry-event-eval_failed"]')
-    await evalCheckbox.setValue(true)
-    expect((wrapper.vm as any).retryPolicyEvents).toContain('eval_failed')
+    expect(evalCheckbox.exists()).toBe(false)
 
-    // round-trip: a saved policy carrying eval_failed survives the load sync,
-    // while unknown event values are still filtered out
+    // round-trip: a policy persisted with an unsupported event (e.g. eval_failed)
+    // or a bogus value is loaded safely — unknown events are dropped, supported
+    // ones are kept, and the editor never crashes on stale payloads.
     ;(wrapper.vm as any).pipeline = {
       retry_policy: { on: ['eval_failed', 'stall', 'bogus_event'], max_retries: 2 },
     }
     ;(wrapper.vm as any).syncRetryPolicyFromPipeline()
     await nextTick()
-    const reloadedEval = wrapper.find('[data-testid="pipeline-editor-retry-event-eval_failed"]')
-    expect((reloadedEval.element as HTMLInputElement).checked).toBe(true)
-    expect((wrapper.vm as any).retryPolicyEvents).toEqual(['eval_failed', 'stall'])
+    expect((wrapper.vm as any).retryPolicyEvents).toEqual(['stall'])
+    const stallCheckbox = wrapper.find('[data-testid="pipeline-editor-retry-event-stall"]')
+    expect((stallCheckbox.element as HTMLInputElement).checked).toBe(true)
   })
 })
