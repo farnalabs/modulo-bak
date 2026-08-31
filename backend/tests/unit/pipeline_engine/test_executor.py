@@ -14,6 +14,7 @@ from langgraph.types import interrupt
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
+from modulo.core.eval_engine import EvalDefinition, EvalType
 from modulo.core.pipeline_engine.executor import (
     PipelineExecutor,
     RunNotFoundError,
@@ -28,6 +29,7 @@ from modulo.core.pipeline_engine.executor import (
     _terminal_failure,
     compute_retry_aware_topology_hash,
 )
+from modulo.core.pipeline_engine.graph_cache import struct_hash_with_eval_defs
 from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
 from modulo.otel_bridge import trace_id_for_thread
@@ -410,7 +412,17 @@ async def test_resume_compile_carries_run_path_config():
     settings_mock = MagicMock()
     settings_mock.fernet_key = "test-fernet-key-not-for-production="
 
-    eval_defs_sentinel: dict[str, Any] = {"node-a": ["eval-def"]}
+    eval_defs_sentinel: dict[str, list[EvalDefinition]] = {
+        "node-a": [
+            EvalDefinition(
+                id=uuid.uuid4(),
+                org_id=uuid.uuid4(),
+                node_id=str(uuid.uuid4()),
+                name="eval-def",
+                eval_type=EvalType.REGEX,
+            )
+        ]
+    }
     get_or_compile_mock = MagicMock(return_value=compiled)
 
     with (
@@ -445,7 +457,10 @@ async def test_resume_compile_carries_run_path_config():
         compile_factory()
         build_kwargs = dict(build_mock.call_args.kwargs)
 
-    assert hash_observed == compute_retry_aware_topology_hash(snapshot.graph_json, retry_policy)
+    assert hash_observed == struct_hash_with_eval_defs(
+        compute_retry_aware_topology_hash(snapshot.graph_json, retry_policy),
+        eval_defs_sentinel,
+    )
     assert build_kwargs["eval_definitions_by_node"] is eval_defs_sentinel
     assert build_kwargs["pipeline_retry_policy"] == retry_policy
 

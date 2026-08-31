@@ -2528,14 +2528,21 @@ class PipelineExecutor:
                 session_factory=self._session_factory,
                 org_id=org_id,
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+                pipeline_retry_policy=pipeline.retry_policy,
             ),
             pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
-            # FAR-502: eval definitions are baked into HITL gate closures at
-            # compile time, so their content hash must be part of the cache key
-            # (and the defs must reach the factory) — otherwise a resume after
-            # an eval-definition change either reuses the FIRST run's closures
-            # or cold-compiles gates with NO eval definitions at all.
-            graph_struct_hash=struct_hash_with_eval_defs(compute_port_topology_hash(graph_json), eval_defs_by_node),
+            # FAR-502 + resume/run parity: eval definitions AND the pipeline
+            # retry_policy are both baked into the compiled graph (the retry
+            # wrapper reads the policy as the node default), so both must fold
+            # into the cache key. Use the SAME combined hash the run-start path
+            # computes (compute_retry_aware_topology_hash folds the policy, then
+            # struct_hash_with_eval_defs folds the eval defs) — otherwise a
+            # resume reuses a stale graph missing the retry wrapper, or a
+            # non-retry-wrapped graph under a different key than the run.
+            graph_struct_hash=struct_hash_with_eval_defs(
+                compute_retry_aware_topology_hash(graph_json, pipeline.retry_policy),
+                eval_defs_by_node,
+            ),
         )
 
         config = {"configurable": {"thread_id": thread_id}}
