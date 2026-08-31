@@ -254,6 +254,18 @@ ERROR_CODE_REGISTRY: dict[str, ErrorCodeSpec] = {
             " was exhausted within the node timeout window."
         ),
     ),
+    # FAR-510: a sandbox_agent node whose generic-exception path RETURNED the
+    # synthetic failure envelope (instead of raising) is downgraded from
+    # "complete" to "failed" at finalization. The executor writes this exact
+    # spelling into ``runs.error_code``, so it is registered verbatim (a flat
+    # key passes through ``map_legacy_code`` unchanged) — otherwise the honest
+    # downgrade would present as ``harness.unknown``.
+    "sandbox_agent_failed": ErrorCodeSpec(
+        error_class="sandbox",
+        retryable=False,
+        alert_severity="critical",
+        guidance="Sandbox agent execution failed; the run was downgraded from complete at finalization.",
+    ),
     # --- node guard codes ------------------------------------------------
     _CODE_NODE_TIMEOUT: ErrorCodeSpec(
         error_class="node",

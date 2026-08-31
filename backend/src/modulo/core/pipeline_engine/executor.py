@@ -2351,11 +2351,17 @@ class PipelineExecutor:
         honest work verdict is False (§15.4), so the zero-work elevation banner
         is what renders. Same for a ``sandbox.no_output_json`` session-lost run
         (FAR-227): the agent produced no output at all, so it can never be
-        "work intact".
+        "work intact". Same for a FAR-510 downgraded run
+        (``failed`` + ``sandbox_agent_failed``): the synthetic failure envelope
+        is not a work artifact — the agent died.
         """
         if final_status not in _TERMINAL_STATUSES:
             return None
-        if final_status == "failed" and error_code in ("agent.failed", "sandbox.no_output_json"):
+        if final_status == "failed" and error_code in (
+            "agent.failed",
+            "sandbox.no_output_json",
+            "sandbox_agent_failed",
+        ):
             return False
         return compute_work_intact(completed_node_outputs, node_ids)
 
@@ -2717,6 +2723,7 @@ class PipelineExecutor:
         error_detail: str | None,
         completed_node_outputs: dict[str, Any],
         node_type_map: dict[str, str],
+        stored_node_outputs: dict[str, Any] | None = None,
     ) -> tuple[str, str | None, str | None]:
         """FAR-510 — downgrade a masked sandbox-agent failure to an honest fail.
 
@@ -2731,11 +2738,18 @@ class PipelineExecutor:
         ``node_type_map`` says is ``sandbox_agent`` whose body self-reports
         ``status == "failed"`` with the exact synthetic summary. Returns the
         inputs unchanged when nothing matches.
+
+        The scan covers the UNION of the live ``completed_node_outputs`` and
+        the run's STORED cumulative outputs (``stored_node_outputs`` — dedup
+        by node id, stored wins; the two should agree). A HITL resume only
+        re-emits the resumed segment's node events, so a masked failure from a
+        PRIOR segment is only visible in the stored row.
         """
         if final_status != "complete":
             return final_status, error_code, error_detail
+        scan_outputs: dict[str, Any] = {**completed_node_outputs, **(stored_node_outputs or {})}
         found: list[str] = []
-        for node_id, node_output in completed_node_outputs.items():
+        for node_id, node_output in scan_outputs.items():
             if node_type_map.get(node_id) != "sandbox_agent" or not isinstance(node_output, dict):
                 continue
             # The stored envelope is ``{artifacts, output}`` — match the nested
@@ -2752,6 +2766,37 @@ class PipelineExecutor:
             extra={"run_id": str(run_id), "node_ids": sorted(found)},
         )
         return "failed", "sandbox_agent_failed", "Sandbox agent node(s) failed: " + ", ".join(sorted(found))
+
+    async def _load_stored_node_outputs(self, *, run_id: uuid.UUID, org_id: uuid.UUID) -> dict[str, Any]:
+        """FAR-510 — the run's STORED cumulative per-node outputs (outputs_json).
+
+        A HITL resume only re-emits the resumed segment's node events, so the
+        live ``completed_node_outputs`` can miss a masked sandbox failure from
+        a prior segment; the stored row is the cumulative truth. Best-effort
+        (guard-the-guard): any failure — including a missing row or a non-dict
+        column — yields ``{}`` so the downgrade falls back to scanning the live
+        dict only. It must never crash finalization.
+        """
+        if self._session_factory is None:
+            return {}
+        try:
+            async with self._session_factory() as session, session.begin():
+                await set_rls_org(session, org_id)
+                await set_rls_execution_context(session)
+                run = await get_run(session, run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.warning(
+                "pipeline.masked_sandbox_failure_stored_scan_unavailable",
+                extra={"run_id": str(run_id)},
+                exc_info=True,
+            )
+            return {}
+        if run is None:
+            return {}
+        outputs_json = getattr(run, "outputs_json", None)
+        return dict(outputs_json) if isinstance(outputs_json, dict) else {}
 
     async def _finalize_run_after_stream(
         self,
@@ -2780,7 +2825,14 @@ class PipelineExecutor:
         # completion is output-presence-based — so a failed dispatch would
         # otherwise finalize the run ``complete``. Downgrade BEFORE the
         # eval_blocked audit, work_intact, and finalize_cost so every
-        # downstream consumer sees the honest status.
+        # downstream consumer sees the honest status. The scan also covers the
+        # run's STORED cumulative outputs (resume parity: a HITL resume only
+        # re-emits the resumed segment, so a masked failure from a prior
+        # segment is only visible in the stored row). The extra run-row read
+        # happens on the complete path ONLY — failed/awaiting_human skip it.
+        stored_node_outputs: dict[str, Any] = {}
+        if final_status == "complete":
+            stored_node_outputs = await self._load_stored_node_outputs(run_id=run_id, org_id=org_id)
         final_status, error_code, error_detail = self._downgrade_masked_sandbox_failures(
             run_id=run_id,
             final_status=final_status,
@@ -2788,6 +2840,7 @@ class PipelineExecutor:
             error_detail=error_detail,
             completed_node_outputs=completed_node_outputs,
             node_type_map=node_type_map,
+            stored_node_outputs=stored_node_outputs,
         )
 
         # Record audit events for block failures on resume.

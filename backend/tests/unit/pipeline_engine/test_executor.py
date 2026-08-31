@@ -1704,7 +1704,9 @@ async def test_execute_proceeds_when_under_capacity():
         patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
         patch(
             "modulo.core.pipeline_engine.executor.get_run",
-            side_effect=[run, running_run, running_run, running_run],
+            # One result per get_run call — the FAR-510 stored-outputs read on
+            # the complete path adds a fifth call to this sequence.
+            side_effect=[run, running_run, running_run, running_run, running_run],
         ),
         patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
         patch("modulo.core.pipeline_engine.executor.set_rls_org"),
@@ -3118,6 +3120,153 @@ async def test_finalize_leaves_already_failed_run_unchanged():
     assert mock_finalize.await_args.kwargs["status"] == "failed"
     assert mock_finalize.await_args.kwargs["error_code"] == "agent.failed"
     assert mock_finalize.await_args.kwargs["error_detail"] == "agent self-reported failure"
+
+
+@pytest.mark.asyncio
+async def test_work_intact_false_for_downgraded_sandbox_agent_failure():
+    """FAR-510 — a downgraded run (``failed`` + ``sandbox_agent_failed``) is
+    forced work_intact=False. The synthetic failure envelope has a summary
+    string, so without the forced-False rule ``compute_work_intact`` would
+    count it as a valid artifact and return True for an agent that died."""
+    executor, _session = _finalize_executor_with_session()
+    synthetic = {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1}
+    # The completed set equals the full DAG node set and every output has a
+    # summary — exactly the shape that would compute work_intact=True.
+    assert (
+        executor._compute_run_work_intact("failed", "sandbox_agent_failed", {"node-x": synthetic}, {"node-x"}) is False
+    )
+    assert executor._compute_run_work_intact("failed", "sandbox_agent_failed", {}, set()) is False
+
+
+def _stored_run_with_outputs(outputs_json: Any) -> MagicMock:
+    run = MagicMock()
+    run.outputs_json = outputs_json
+    return run
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_masked_failure_from_stored_outputs_on_resume():
+    """Resume parity — the live segment emits nothing (HITL resume re-emits
+    only the resumed segment), but the run's STORED cumulative outputs carry
+    the masked failure from a prior segment: the downgrade still fires."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    stored_run = _stored_run_with_outputs(
+        {"node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1}},
+    )
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_failed_status_with_different_summary():
+    """Precision boundary — a sandbox node output self-reporting ``failed``
+    with a NON-synthetic summary is a real envelope, not the masked
+    dispatch-failure marker: no downgrade (stored path exercised)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    stored_run = _stored_run_with_outputs({"node-x": {"status": "failed", "summary": "genuinely failed differently"}})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrade_lists_all_matching_nodes_sorted():
+    """Multi-node — every matching node is listed, sorted, in error_detail."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-b": "sandbox_agent", "node-a": "sandbox_agent", "node-c": "llm"}
+    args["completed_node_outputs"] = {
+        "node-b": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+        "node-a": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+        "node-c": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-a, node-b"
+
+
+@pytest.mark.asyncio
+async def test_finalize_stored_output_read_failure_falls_back_to_live_scan():
+    """Failure isolation — a stored-outputs read failure is swallowed (warn +
+    empty dict) and the downgrade still scans the live dict; finalization
+    never crashes."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+    # First get_run (stored read) explodes; the second (final fetch) succeeds.
+    get_run_mock = AsyncMock(side_effect=[RuntimeError("stored read boom"), MagicMock()])
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=get_run_mock),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox_agent_failed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_stored_output_read_when_not_complete():
+    """Performance contract — the extra stored-outputs run-row read happens on
+    the complete path only; a failed run issues exactly one get_run (the
+    final-row fetch)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["final_status"] = "failed"
+    args["error_code"] = "agent.failed"
+    args["error_detail"] = "agent self-reported failure"
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=MagicMock())) as get_run_mock,
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert get_run_mock.await_count == 1
 
 
 # ---------------------------------------------------------------------------
