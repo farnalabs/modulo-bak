@@ -130,6 +130,7 @@ def _settings(**overrides: object) -> MagicMock:
         "saq_reenqueue_window": 600,
         "saq_job_heartbeat": 300,
         "saq_claimed_nodeless_minutes": 45,
+        "saq_nodeless_redispatch_budget": 2,
         "redis_url": "redis://localhost:6379/0",
         "saq_redis_pool_size": 5,
         "saq_run_claim_cap": 20,
@@ -367,8 +368,9 @@ class TestReconcilePredicateMatrix:
         """A claimed-but-nodeless zombie (running + FRESH heartbeat + zero node
         output after the nodeless window) is now RE-DISPATCHED (not terminal-failed):
         a nodeless zombie executed ZERO nodes, so re-dispatch is safe and recovers
-        the run instead of permanently losing it. With no retry_policy, the default
-        is a single re-dispatch (claim_count == 1)."""
+        the run instead of permanently losing it. With no retry_policy, the
+        configurable budget (SAQ_NODELESS_REDISPATCH_BUDGET, default 2) applies
+        and claim_count == 1 is within it."""
         summary, reenqueue, ingest, _, _, session = await _run_reconcile(
             monkeypatch,
             [_run_row(RUN_RUNNING, "running", stale=False, nodeless=True)],
@@ -383,13 +385,14 @@ class TestReconcilePredicateMatrix:
         # A re-dispatched (non-terminal) run is NOT given a compensating fact.
         session.record_facts.assert_not_awaited()
 
-    async def test_running_nodeless_second_attempt_terminal_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without a retry_policy, re-dispatch is bounded to a single attempt.
-        Once claim_count has advanced past 1 (already re-dispatched once), the
+    async def test_running_nodeless_budget_exhausted_terminal_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Without a retry_policy, re-dispatch is bounded by the configurable
+        nodeless budget (SAQ_NODELESS_REDISPATCH_BUDGET, default 2). Once
+        claim_count has advanced past the budget (already re-dispatched), the
         run is terminal-failed so it is never left dangling in a re-dispatch loop."""
         summary, reenqueue, ingest, _, _, session = await _run_reconcile(
             monkeypatch,
-            [_run_row(RUN_RUNNING, "running", stale=False, nodeless=True, claim_count=2)],
+            [_run_row(RUN_RUNNING, "running", stale=False, nodeless=True, claim_count=3)],
         )
         assert summary["nodeless_failed"] == 1
         assert summary["nodeless_redispatched"] == 0
@@ -505,6 +508,66 @@ class TestReconcilePredicateMatrix:
         assert summary["nodeless_failed"] == 0
         assert summary["skipped"] == 1
         reenqueue.assert_not_awaited()
+
+
+class TestNodelessRedispatchBudget:
+    """FAR-509: the policy-less nodeless re-dispatch budget is configurable via
+    SAQ_NODELESS_REDISPATCH_BUDGET (default 2). Direct unit checks of
+    ``_should_redispatch_nodeless`` — the retry-policy taxonomy (stall-covered
+    → max_retries; non-empty without stall → never) is deliberate and MUST NOT
+    change."""
+
+    @staticmethod
+    def _row(claim_count: int, retry_policy: Any = None) -> SimpleNamespace:
+        return _run_row(
+            RUN_RUNNING, "running", stale=False, nodeless=True, claim_count=claim_count, retry_policy=retry_policy
+        )
+
+    def test_policy_less_first_claim_redispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """claim_count=1 (the initial claim, never re-dispatched) is within the
+        default budget → re-dispatch."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._should_redispatch_nodeless(self._row(1)) is True
+
+    def test_policy_less_second_claim_within_default_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default budget 2: claim_count=2 is still re-dispatched (one
+        re-dispatch after the original claim)."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._should_redispatch_nodeless(self._row(2)) is True
+
+    def test_policy_less_budget_exhausted_terminal_failed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default budget 2: claim_count=3 has exhausted the budget → the
+        backstop terminal-fail applies."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._should_redispatch_nodeless(self._row(3)) is False
+
+    def test_policy_less_custom_budget_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With SAQ_NODELESS_REDISPATCH_BUDGET=1, claim_count=2 is already past
+        the budget → terminal-fail (the pre-FAR-509 hardcoded behaviour)."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings(saq_nodeless_redispatch_budget=1))
+        assert ch._should_redispatch_nodeless(self._row(2)) is False
+
+    def test_stall_retry_policy_honors_max_retries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A policy covering 'stall' honors its OWN max_retries budget, not the
+        global nodeless budget (claim_count <= max_retries)."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._should_redispatch_nodeless(self._row(2, retry_policy={"on": ["stall"], "max_retries": 2})) is True
+        assert ch._should_redispatch_nodeless(self._row(3, retry_policy={"on": ["stall"], "max_retries": 2})) is False
+
+    def test_non_stall_policy_never_redispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-empty policy WITHOUT 'stall' in 'on' is terminal-failed
+        regardless of claim_count or the configured budget."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings(saq_nodeless_redispatch_budget=10))
+        assert (
+            ch._should_redispatch_nodeless(self._row(1, retry_policy={"on": ["ci_failure"], "max_retries": 5})) is False
+        )
+
+    def test_empty_policy_treated_as_policy_less(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty dict policy (the column default) is treated as policy-less:
+        the configurable budget applies."""
+        monkeypatch.setattr(ch, "get_settings", lambda: _settings())
+        assert ch._should_redispatch_nodeless(self._row(2, retry_policy={})) is True
+        assert ch._should_redispatch_nodeless(self._row(3, retry_policy={})) is False
 
 
 class TestReconcileRedisFailSafe:

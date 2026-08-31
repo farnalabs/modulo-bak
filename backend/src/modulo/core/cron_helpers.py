@@ -3813,8 +3813,11 @@ def _should_redispatch_nodeless(row: Any) -> bool:
         re-dispatch is allowed while ``claim_count <= max_retries`` (initial
         attempt + up to ``max_retries`` retries).
       * ``retry_policy`` absent/None OR an empty policy (the column defaults to
-        ``{}``): re-dispatch ONCE only, bounded by ``claim_count <= 1`` (the
-        original claim has not yet been re-dispatched).
+        ``{}``): re-dispatch up to the configurable nodeless budget
+        (``SAQ_NODELESS_REDISPATCH_BUDGET``, default 2) — allowed while
+        ``claim_count <= budget``. Zero nodes have executed, so every
+        re-dispatch is safe; the budget bounds the loop and the backstop
+        terminal-fail applies once it is exhausted.
       * ``retry_policy`` present (non-empty) but WITHOUT ``"stall"`` in ``on``:
         terminal-fail — never re-dispatch a nodeless zombie for a trigger it does
         not cover.
@@ -3828,9 +3831,10 @@ def _should_redispatch_nodeless(row: Any) -> bool:
         # A non-empty policy that does not cover "stall" must NOT re-dispatch a
         # nodeless zombie — terminal-fail it.
         return False
-    # No stall retry policy (or no/empty policy): re-dispatch exactly once
-    # (only the un-re-redispatched claim).
-    return bool(row.claim_count <= 1)
+    # No stall retry policy (or no/empty policy): re-dispatch up to the
+    # configurable budget (SAQ_NODELESS_REDISPATCH_BUDGET, default 2 — FAR-509;
+    # claim_count is 1 for the un-re-dispatched initial claim).
+    return bool(row.claim_count <= int(get_settings().saq_nodeless_redispatch_budget))
 
 
 async def _fail_nodeless_run(session: AsyncSession, run_id: uuid.UUID, org_id: uuid.UUID) -> None:
