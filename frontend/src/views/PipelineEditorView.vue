@@ -240,6 +240,10 @@
         <!-- Run dialog modal -->
         <div
           v-if="showRunDialog"
+          role="button"
+          tabindex="0"
+          @keydown.enter="($event.currentTarget as HTMLElement).click()"
+          @keydown.space.prevent="($event.currentTarget as HTMLElement).click()"
           class="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
           @click.self="closeRunDialog"
         >

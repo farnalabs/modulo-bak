@@ -83,6 +83,7 @@
             <div class="flex items-center gap-3">
               <output
                 data-testid="variant-builder-headroom"
+                :aria-label="$t('views.variantCreator.variants_title')"
                 class="text-xs text-muted-foreground"
               >
                 {{ $t('views.variantCreator.headroom', { used: variants.length, max: MAX_VARIANTS }) }}
@@ -207,6 +208,7 @@
           <output
             v-if="variants.length < 2"
             data-testid="variant-builder-min-two"
+            :aria-label="$t('views.variantCreator.aria_min_variants')"
             class="text-sm text-muted-foreground"
           >
             {{ $t('views.variantCreator.min_two_hint') }}

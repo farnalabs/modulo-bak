@@ -18,6 +18,7 @@
             <div class="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
               <output
                 data-testid="variant-batch-status"
+                :aria-label="$t('views.variantBatch.statusHeader')"
                 class="inline-flex items-center gap-1.5"
               >
                 <span class="h-2 w-2 rounded-full" :class="statusDotClass"></span>
@@ -49,10 +50,10 @@
           </div>
         </div>
 
-        <output v-if="hasPartialResults" data-testid="variant-batch-partial" class="rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning">
+        <output v-if="hasPartialResults" data-testid="variant-batch-partial" :aria-label="$t('views.variantBatch.aria_partial_results')" class="rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning">
           {{ $t('views.variantBatch.partialResults') }}
         </output>
-        <output v-if="batchFailed" data-testid="variant-batch-failed" class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+        <output v-if="batchFailed" data-testid="variant-batch-failed" :aria-label="$t('views.variantBatch.aria_batch_failed')" class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
           {{ $t('views.variantBatch.batchFailed') }}
         </output>
 
