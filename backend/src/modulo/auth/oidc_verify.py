@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import time
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -23,7 +24,12 @@ import jwt
 from jwt import InvalidTokenError as JWTError
 from jwt import PyJWK, PyJWKError
 
-from modulo.core.ssrf import derive_oidc_allowed_hosts, pinned_async_client, require_url_host_in_allowlist
+from modulo.core.ssrf import (
+    derive_oidc_allowed_hosts,
+    pinned_async_client,
+    require_url_host_in_allowlist,
+    validate_outbound_url_preflight,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -243,12 +249,22 @@ async def verify_id_token_with_discovery(
     if not issuer:
         raise OidcVerifyError("No issuer in discovery document")
 
-    # Host-allowlist enforcement: a remote discovery document must not be able
-    # to point ``jwks_uri`` at a host other than the discovery/issuer host.
+    # FAR-506: the exact-host allowlist was an over-restrictive secondary boundary
+    # that broke multi-host IdPs (Google's ``jwks_uri`` on www.googleapis.com).
+    # The pinned client is the real SSRF boundary — it pins the validated
+    # non-internal IP and closes the DNS-rebinding window — so this check is
+    # defense-in-depth only: reject a non-HTTPS / userinfo / internal-literal
+    # target, and WARN (never reject) on a sibling host.
+    if urllib.parse.urlparse(jwks_uri).scheme != "https":
+        raise OidcVerifyError("jwks_uri must use the https:// scheme")
     try:
-        require_url_host_in_allowlist(jwks_uri, derive_oidc_allowed_hosts(discovery_url, issuer))
+        validate_outbound_url_preflight(jwks_uri)
     except ValueError as exc:
         raise OidcVerifyError(str(exc)) from None
+    try:
+        require_url_host_in_allowlist(jwks_uri, derive_oidc_allowed_hosts(discovery_url, issuer))
+    except ValueError:
+        _log.warning("oidc_verify.jwks_cross_host", extra={"jwks_uri": jwks_uri})
 
     return await verify_id_token(id_token, jwks_uri, client_id, issuer)
 

@@ -584,6 +584,28 @@ async def validate_outbound_url_async(url: str, *, allow_networks: Sequence[str]
     _check_resolved(target.host, await _resolve_all_async(target.host), extra)
 
 
+def validate_outbound_url_preflight(url: str, *, allow_networks: Sequence[str] | None = None) -> None:
+    """DNS-free SSRF preflight: syntax floor plus literal-IP internal blocking.
+
+    Enforces the cheap, engine-free parts of :func:`validate_outbound_url` (an
+    ``http(s)`` scheme, no userinfo credentials, a valid hostname) and, for a
+    literal-IP target, the private/loopback/link-local/cloud-metadata block.
+
+    This deliberately does **not** resolve hostnames. Hostname resolution,
+    rebinding-close pinning and per-connect validation are performed by
+    :func:`resolve_pinned_ip` / :func:`pinned_async_client` at connect time —
+    those are the primary SSRF boundary. Use this preflight where a caller wants
+    a cheap synchronous guard ahead of (or in place of the exact-host check on) a
+    pinned connection, so an obviously-internal literal such as
+    ``https://169.254.169.254/...`` is rejected before any request, without a DNS
+    round-trip. Raises ``ValueError`` when the target is unsafe.
+    """
+    target = _parse_url_target(url)
+    extra = normalize_allow_networks(allow_networks)
+    if target.literal_ip is not None:
+        _validate_literal_ip(target.literal_ip, extra)
+
+
 async def resolve_pinned_ip(url: str, *, allow_networks: Sequence[str] | None = None) -> PinnedTarget:
     """Resolve and validate a URL, returning the pinned connect target.
 

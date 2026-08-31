@@ -22,6 +22,7 @@ from modulo.core.ssrf import (
     pinned_async_client,
     require_url_host_in_allowlist,
     validate_outbound_url_async,
+    validate_outbound_url_preflight,
 )
 from modulo.db.crud.account import create_account, get_account_by_email, update_last_login
 from modulo.db.crud.org_membership import create_membership, get_membership_by_account_and_org
@@ -564,17 +565,34 @@ async def _fetch_discovery_pinned(discovery_url: str) -> dict[str, object]:
 
 
 def _enforce_oidc_endpoint_host(url: str, discovery_url: str, issuer: str | None, purpose: str) -> None:
-    """Reject a remote-supplied OIDC endpoint whose host is outside the allowlist.
+    """Reject a remote-supplied OIDC endpoint that points at an unsafe host.
 
-    The host allowlist is derived from the admin-configured ``discovery_url`` and
-    the document's ``issuer`` (OIDC says the issuer matches the discovery host).
-    A compromised/malicious discovery document therefore cannot point a derived
-    endpoint at an internal/cloud-metadata address or an arbitrary third party.
+    NOTE (FAR-506): the exact-host allowlist was an over-restrictive secondary
+    boundary that broke legitimate multi-host IdPs. Google's real discovery
+    document returns ``token_endpoint`` on oauth2.googleapis.com and
+    ``jwks_uri`` on www.googleapis.com — sibling hosts of the discovery/issuer
+    host (accounts.google.com). The **pinned client** is the real SSRF boundary:
+    it pins the validated non-internal IP, closes the DNS-rebinding window, and
+    blocks metadata/loopback. This check is therefore defense-in-depth only and
+    rejects what a pinned client could never safely reach anyway — a non-HTTPS
+    URL, an embedded-userinfo URL, or a literal-IP internal/loopback/metadata
+    host. The discovery/issuer-host allowlist is kept as a preferred-log nicety:
+    a cross-host (multi-host IdP) endpoint is logged as a warning, never
+    rejected.
     """
+    if urllib.parse.urlparse(url).scheme != "https":
+        raise ValueError(f"Rejected OIDC {purpose} endpoint: URL must use https:// scheme")
     try:
-        require_url_host_in_allowlist(url, derive_oidc_allowed_hosts(discovery_url, issuer))
+        validate_outbound_url_preflight(url)
     except ValueError as exc:
         raise ValueError(f"Rejected OIDC {purpose} endpoint: {exc}") from None
+
+    # Preferred-log nicety: warn (but do NOT reject) when a derived endpoint lives
+    # on a sibling host. Legitimate for multi-host IdPs (Google etc.).
+    try:
+        require_url_host_in_allowlist(url, derive_oidc_allowed_hosts(discovery_url, issuer))
+    except ValueError:
+        _log.warning("sso.oidc_endpoint_cross_host", extra={"purpose": purpose, "url": url})
 
 
 async def _exchange_code(
