@@ -26,6 +26,7 @@ from modulo.core.pipeline_engine.executor import (
     _retry_after_policy,
     _seed_state,
     _terminal_failure,
+    compute_retry_aware_topology_hash,
 )
 from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
@@ -372,6 +373,83 @@ async def test_resume_wires_reclassify_after_work_intact():
     assert order == ["apply_work_intact", "reclassify_after_work_intact"]
 
 
+async def test_resume_compile_carries_run_path_config():
+    """Resume/run compile parity: the resume get_or_compile call must bake the
+    eval definitions it loaded and the pipeline retry_policy into the factory,
+    and key on the retry-aware topology hash — the same inputs the run-start
+    compile uses. Previously the resume path loaded the eval defs and then
+    DROPPED them, compiled without the retry wrapper, and keyed on the plain
+    topology hash: pipelines with a retry_policy got a second, retry-less
+    compiled graph under a different cache key (and empty-policy pipelines
+    collided with the run's key)."""
+    run = _make_run()
+    final_run = _make_run(run_id=run.id, status="complete")
+    retry_policy = {"on": ["stall"], "max_retries": 2}
+    snapshot = _make_snapshot()
+    session = _make_resume_session(snapshot, retry_policy=retry_policy)
+    factory = _make_session_factory(session)
+    registry = _mock_registry()
+    events = [
+        {
+            "event": "on_chain_end",
+            "name": "node-a",
+            "data": {
+                "output": {
+                    "output": {"status": "completed", "cost_estimate_usd": 0.75},
+                }
+            },
+        }
+    ]
+    compiled = _mock_compiled(events)
+    compiled.aupdate_state = AsyncMock()
+
+    checkpointer_mock = MagicMock()
+    checkpointer_mock.__aenter__ = AsyncMock(return_value=checkpointer_mock)
+    checkpointer_mock.__aexit__ = AsyncMock(return_value=False)
+
+    settings_mock = MagicMock()
+    settings_mock.fernet_key = "test-fernet-key-not-for-production="
+
+    eval_defs_sentinel: dict[str, Any] = {"node-a": ["eval-def"]}
+    get_or_compile_mock = MagicMock(return_value=compiled)
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
+        patch("modulo.core.pipeline_engine.executor.get_run", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.update_run_status", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org"),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context"),
+        patch("modulo.core.pipeline_engine.executor.get_or_compile", new=get_or_compile_mock),
+        patch("modulo.core.pipeline_engine.executor.build_graph_from_json", return_value=MagicMock()) as build_mock,
+        patch("modulo.core.pipeline_engine.executor.get_registry", return_value=registry),
+        patch("modulo.core.pipeline_engine.executor.GraphValidator", new=_mock_graph_validator()),
+        patch("modulo.core.pipeline_engine.executor._checkpointer_scope", return_value=checkpointer_mock),
+        patch("modulo.settings.get_settings", return_value=settings_mock),
+        patch("modulo.core.pipeline_engine.executor.RunawayGuard", return_value=MagicMock()),
+    ):
+        executor = PipelineExecutor(MagicMock())
+        executor._checkpointer_conn_string = "sqlite:///test.db"
+        executor._load_eval_defs_for_pipeline = AsyncMock(return_value=[])
+        executor._build_eval_defs_by_node = MagicMock(return_value=eval_defs_sentinel)
+        await executor.resume(run_id=run.id, org_id=uuid.uuid4(), resume_data={"action": "approved"})
+
+        get_or_compile_mock.assert_called_once()
+        goc_args, goc_kwargs = get_or_compile_mock.call_args
+        hash_observed = goc_kwargs["graph_struct_hash"]
+
+        # The compile factory must receive the eval defs + retry policy (run
+        # parity). Invoke it INSIDE the patch context so the factory's module
+        # global still resolves to the patched build_graph_from_json.
+        compile_factory = goc_args[2]
+        compile_factory()
+        build_kwargs = dict(build_mock.call_args.kwargs)
+
+    assert hash_observed == compute_retry_aware_topology_hash(snapshot.graph_json, retry_policy)
+    assert build_kwargs["eval_definitions_by_node"] is eval_defs_sentinel
+    assert build_kwargs["pipeline_retry_policy"] == retry_policy
+
+
 # ---------------------------------------------------------------------------
 # FAR-198 — deterministic OTel trace context seeding + per-node span stamps
 # ---------------------------------------------------------------------------
@@ -581,7 +659,7 @@ def _make_session_factory(session: AsyncMock) -> MagicMock:
     return MagicMock(side_effect=lambda: _ctx())
 
 
-def _make_resume_session(snapshot: MagicMock) -> AsyncMock:
+def _make_resume_session(snapshot: MagicMock, *, retry_policy: dict[str, Any] | None = None) -> AsyncMock:
     """Session mock whose execute() order matches resume()'s query sequence.
 
     resume() queries the snapshot's graph_json FIRST (the atomic sandbox-capacity
@@ -589,6 +667,8 @@ def _make_resume_session(snapshot: MagicMock) -> AsyncMock:
     of execute(), so the shared _make_session iterator is not reusable here.
     """
     pipeline = _make_pipeline()
+    if retry_policy is not None:
+        pipeline.retry_policy = retry_policy
 
     pipeline_result = MagicMock()
     pipeline_result.scalar_one_or_none.return_value = pipeline
