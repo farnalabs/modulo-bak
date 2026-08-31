@@ -341,6 +341,22 @@ async def test_status_error_request_and_response_url_redacted(connector):
 
 
 @respx.mock
+async def test_transport_error_request_url_redacted(connector):
+    """FAR-507: the exact leak this PR fixes — a transport error (e.g.
+    ``httpx.ReadTimeout`` / ``httpx.ConnectError``) carries a CLEAN message but
+    the LIVE ``key``/``token`` still sits in ``exc.request.url``. The shared
+    ``CredentialRedactor`` (``scrub_url=True``) must scrub it even though the
+    message itself contains no credential."""
+    respx.get(f"{_BASE}/members/me/boards").mock(side_effect=httpx.ConnectError("Connection refused"))
+    with pytest.raises(httpx.HTTPError) as exc_info:
+        await connector.query(ConnectorQuery(resource="boards"))
+    exc = exc_info.value
+    assert hasattr(exc, "request")
+    assert API_KEY not in str(exc.request.url)
+    assert TOKEN not in str(exc.request.url)
+
+
+@respx.mock
 async def test_status_error_does_not_chain_raw_cause(connector):
     """FAR-507: ``raise ... from exc`` would chain the raw un-redacted exception
     as ``__cause__``, so a full-traceback render prints the credential URL. The

@@ -13,53 +13,9 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
 
 _TRELLO_API = "https://api.trello.com/1"
-
-
-class TrelloHTTPStatusError(httpx.HTTPStatusError):
-    """``HTTPStatusError`` whose ``__str__`` redacts Trello credentials (FAR-507).
-
-    ``httpx.HTTPStatusError.__str__`` renders the full message incl. the request
-    URL — e.g. ``"Client error '401 Unauthorized' for url
-    'https://api.trello.com/1/...?key=<key>&token=<token>'"``. Because the Trello
-    client puts ``key``/``token`` in the request query string, the URL carries the
-    LIVE credentials — and the shared ``sanitize_error_text`` does not match a
-    bare ``token=<alnum>`` / ``key=<alnum>``, so they would otherwise persist
-    verbatim into run/error detail. Subclassing lets the connector re-raise the
-    SAME error family (callers catching ``httpx.HTTPStatusError`` keep working)
-    with a redacted string rendering.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        request: httpx.Request,
-        response: httpx.Response,
-        redact: Callable[[str], str],
-    ) -> None:
-        super().__init__(message, request=request, response=response)
-        self._redact = redact
-
-    def __str__(self) -> str:
-        return self._redact(super().__str__())
-
-
-class TrelloHTTPError(httpx.HTTPError):
-    """Transport ``httpx.HTTPError`` whose ``__str__`` redacts credentials.
-
-    Covers the connect/timeout/read transport failures (never ``HTTPStatusError``
-    — that is :class:`TrelloHTTPStatusError`) so a transport message that embeds
-    the credential-bearing URL is still stripped before it propagates.
-    """
-
-    def __init__(self, message: str, *, redact: Callable[[str], str]) -> None:
-        super().__init__(message)
-        self._redact = redact
-
-    def __str__(self) -> str:
-        return self._redact(super().__str__())
 
 
 class TrelloConnector(ConnectorBase):
@@ -85,6 +41,13 @@ class TrelloConnector(ConnectorBase):
     def __init__(self, api_key: str, token: str) -> None:
         self._api_key = api_key
         self._token = token
+        # Trello puts ``key``/``token`` in the request query string, so a
+        # transport error whose message is clean still carries the LIVE
+        # credentials in ``exc.request.url`` (FAR-507). Scrub the request URL
+        # unconditionally and never chain the raw exception as ``__cause__`` so
+        # a full-traceback render cannot print the credential URL. This reuses
+        # the shared ``CredentialRedactor`` rather than a per-connector fork.
+        self._redactor = CredentialRedactor([api_key, token], scrub_url=True, chain_cause=False)
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -97,71 +60,6 @@ class TrelloConnector(ConnectorBase):
             timeout=30,
         )
 
-    # ── Credential redaction (FAR-507) ─────────────────────────────────────
-
-    def _secret_values(self) -> list[str]:
-        """Live credential values that must be stripped from any error text."""
-        return [value for value in (self._api_key, self._token) if isinstance(value, str) and len(value) >= 4]
-
-    def _redact(self, text: str) -> str:
-        """Strip the live api_key + token from *text*.
-
-        The credentials live in the request query string (``_client`` sets
-        ``params={"key", "token"}``), so an httpx error message that echoes the
-        request URL carries them verbatim. Stripping the actual values (not a
-        regex) guarantees they can never survive into run/error detail,
-        regardless of where they appear.
-        """
-        redacted = text
-        for secret in self._secret_values():
-            if secret and secret in redacted:
-                redacted = redacted.replace(secret, "***")
-        return redacted
-
-    def _scrub_request(self, request: httpx.Request) -> httpx.Request:
-        """Rebuild *request* with a copy of the credential-bearing URL scrubbed.
-
-        ``key``/``token`` live in the query string (``_client`` applies them as
-        client-level params), so ``request.url`` carries the LIVE credentials.
-        httpx sinks (OTel/Sentry/debug logging) auto-capture ``request.url``, so
-        the redaction must happen at the request/response level too — not just in
-        ``__str__``. Rebuilding a new ``httpx.Request`` with a redacted URL means
-        the stored exception never holds a credential-bearing URL.
-        """
-        url = httpx.URL(self._redact(str(request.url)))
-        return httpx.Request(request.method, url, content=request.content, headers=request.headers)
-
-    def _scrub_response(self, response: httpx.Response, request: httpx.Request) -> httpx.Response:
-        """Rebuild *response* so ``response.request.url`` points at the scrubbed request."""
-        return httpx.Response(
-            response.status_code,
-            headers=response.headers,
-            content=response.content,
-            request=request,
-            extensions=response.extensions,
-        )
-
-    def _sanitize_status_error(self, exc: httpx.HTTPStatusError) -> TrelloHTTPStatusError:
-        """Wrap a status error so neither its message, nor its request/response
-        URLs, nor its chained cause can leak the credentials.
-
-        The original ``exc`` is NOT retained as ``__cause__``: a full-traceback
-        render would otherwise print the credential-bearing URL from the chained
-        raw exception. The wrapper carries a redacted message + scrubbed
-        request/response instead.
-        """
-        scrubbed_request = self._scrub_request(exc.request)
-        scrubbed_response = self._scrub_response(exc.response, scrubbed_request)
-        return TrelloHTTPStatusError(
-            self._redact(str(exc)),
-            request=scrubbed_request,
-            response=scrubbed_response,
-            redact=self._redact,
-        )
-
-    def _sanitize_transport_error(self, exc: httpx.HTTPError) -> TrelloHTTPError:
-        return TrelloHTTPError(self._redact(str(exc)), redact=self._redact)
-
     async def _request(
         self,
         method: str,
@@ -170,25 +68,19 @@ class TrelloConnector(ConnectorBase):
         raise_on_status: bool = True,
         **kwargs: Any,
     ) -> httpx.Response:
-        """Issue a Trello request, sanitising httpx errors of the credentials.
+        """Issue a Trello request, letting httpx errors propagate.
 
-        Every request URL carries ``?key=<api_key>&token=<token>`` (client-level
-        params), so a raw ``httpx.HTTPStatusError``/transport message would leak
-        the LIVE credentials into run/error detail. This wrapper re-raises a
-        redacted exception so ``str(exc)`` is clean; the original is never chained
-        as ``__cause__`` (``from None``) so a full-traceback render cannot print
-        the credential-bearing URL either.
+        Credential redaction (message + request/response URL + no raw-cause
+        chaining) is handled centrally by the shared ``CredentialRedactor``
+        that wraps every public entry point (``query`` / ``write`` /
+        ``health_check``) via the ``@redacting`` decorator — so a leaked
+        ``key``/``token`` never survives into run/error detail regardless of
+        which transport/status error occurs.
         """
         async with self._client() as client:
-            try:
-                resp = await client.request(method, path, **kwargs)
-            except httpx.HTTPError as exc:
-                raise self._sanitize_transport_error(exc) from None
+            resp = await client.request(method, path, **kwargs)
             if raise_on_status:
-                try:
-                    resp.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    raise self._sanitize_status_error(exc) from None
+                resp.raise_for_status()
         return resp
 
     async def health_check(self) -> HealthResult:
@@ -196,7 +88,7 @@ class TrelloConnector(ConnectorBase):
         r = await self._request("GET", "/members/me", raise_on_status=False)
 
         if r.status_code != 200:
-            return HealthResult(ok=False, detail=f"HTTP {r.status_code}: {r.text[:200]}")
+            return HealthResult(ok=False, detail=f"HTTP {r.status_code}: {self._redactor.redact(r.text[:200])}")
 
         body: dict[str, Any] = r.json()
         if "id" not in body:
@@ -205,6 +97,7 @@ class TrelloConnector(ConnectorBase):
         display_name = body.get("fullName") or body.get("username") or ""
         return HealthResult(ok=True, detail=display_name)
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         handler = self._query_handlers().get(q.resource)
         if handler is None:
@@ -283,6 +176,7 @@ class TrelloConnector(ConnectorBase):
             return {"fields": q.filters["fields"]}
         return {}
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         match payload.resource:
             case "card":

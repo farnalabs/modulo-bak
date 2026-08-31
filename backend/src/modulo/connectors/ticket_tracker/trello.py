@@ -22,6 +22,7 @@ from modulo.connectors.base import (
     HealthResult,
     health_check_failure,
 )
+from modulo.connectors.security import CredentialRedactor
 from modulo.connectors.ticket_tracker.base import Ticket, TicketFilter, TicketTrackerBase
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,10 @@ class TrelloTicketTracker(TicketTrackerBase):
         self._base_url = "https://api.trello.com/1"
         if not self._api_key or not self._token:
             raise ValueError("Trello connector requires api_key and token credentials")
+        # Credential redaction now lives in the shared ``CredentialRedactor``
+        # (FAR-507) instead of a per-connector fork — Trello's ``key``/``token``
+        # are the secret values, and the same scrubbing covers every entry point.
+        self._redactor = CredentialRedactor([self._api_key, self._token])
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -59,24 +64,9 @@ class TrelloTicketTracker(TicketTrackerBase):
     def _auth(self) -> dict[str, str]:
         return {"key": self._api_key, "token": self._token}
 
-    def _secret_values(self) -> list[str]:
-        """Live credential values that must be stripped from any error text."""
-        return [v for v in (self._api_key, self._token) if isinstance(v, str) and len(v) >= 4]
-
     def _redact(self, text: str) -> str:
-        """Strip the live api_key + token from *text*.
-
-        The credentials live in the request query string (``_auth`` sets ``key``
-        /``token``), so an httpx error message that echoes the request URL
-        carries them verbatim. Stripping the actual values (not a regex)
-        guarantees they can never survive into run/error detail, regardless of
-        where they appear.
-        """
-        redacted = text
-        for secret in self._secret_values():
-            if secret and secret in redacted:
-                redacted = redacted.replace(secret, "***")
-        return redacted
+        """Strip the live api_key + token from *text* via the shared redactor."""
+        return self._redactor.redact(text)
 
     def _health_failure_detail(self, exc: Exception) -> str:
         """Produce a credential-redacted detail string for a health failure."""
