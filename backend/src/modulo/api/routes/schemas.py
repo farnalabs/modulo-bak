@@ -823,12 +823,21 @@ async def _sample_connector_records(
     settings: Settings,
     ci: Any,
     req: SchemaInferRequest,
+    session: AsyncSession,
+    org_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
     """Sample connector data, failing open with informative HTTP errors."""
-    secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
+    secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
     async with ConnectorHub(secrets_backend=secrets_backend) as ch:
         try:
-            await ch.initialise([ci])
+            # Connector credential decrypt needs the org-scoped RLS context in
+            # the SAME transaction as the secrets read — the context-loader
+            # transaction already committed, so re-assert set_rls_org here. It
+            # runs BEFORE _infer_definition, so a missing org scope would 502
+            # the whole infer endpoint at sampling.
+            async with session.begin():
+                await set_rls_org(session, org_id)
+                await ch.initialise([ci])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1023,7 +1032,7 @@ async def infer_schema_endpoint(
             detail="Schema inference failed due to an unexpected error.",
         ) from None
 
-    records = await _sample_connector_records(settings, ci, req)
+    records = await _sample_connector_records(settings, ci, req, session, principal.organisation_id)
     definition_json, first_backend_id = await _infer_definition(
         settings,
         mbs,

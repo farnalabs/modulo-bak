@@ -133,18 +133,23 @@ def test_generate_schema_threads_session_into_model_backend_decrypt(client: Test
     page_result = MagicMock(items=[mb], total=1, page=1, page_size=1)
     backend_id = uuid.uuid4()
     backend_sessions: list[object] = []
+    events: list[tuple[str, object]] = []
 
     def fake_create_backend(*args: object, **kwargs: object) -> object:
         backend = MagicMock()
         backend._session = kwargs.get("session")
+        events.append(("create_backend", backend._session))  # type: ignore[arg-type]
         return backend
 
     async def fake_hub_init(self: object, instances: object, secrets_backend: object) -> None:
         backend_sessions.append(secrets_backend._session)  # type: ignore[attr-defined]
 
+    def spy_set_rls_org(session: object, org_id: object) -> object:
+        events.append(("rls", org_id))
+
     with (
         patch("modulo.api.routes.schemas.list_model_backends", return_value=page_result),
-        patch("modulo.api.routes.schemas.set_rls_org") as mock_rls,
+        patch("modulo.api.routes.schemas.set_rls_org", side_effect=spy_set_rls_org) as mock_rls,
         patch("modulo.api.routes.schemas.ModelBackendHub.initialise", fake_hub_init),
         patch(
             "modulo.api.routes.schemas.ModelBackendHub.backend_ids",
@@ -167,11 +172,18 @@ def test_generate_schema_threads_session_into_model_backend_decrypt(client: Test
     assert all(s is not None for s in backend_sessions), (
         "model-backend decrypt secrets backend must carry the DB session, or credentials never decrypt"
     )
-    # The decrypt runs with the model-backend path re-asserting the org scope in
-    # the same transaction (once in the endpoint context, once in the decrypt).
-    assert any(call.args[1] == _ORG_ID for call in mock_rls.call_args_list), (
-        "model-backend decrypt must re-assert the org scope (set_rls_org)"
+    # ORG-SCOPE AT DECRYPT (MAJOR regression): the decrypt is the only secrets
+    # backend built by the generate path. It must re-assert the org scope AFTER
+    # building that backend (the endpoint-context loader scope is transaction-
+    # local and gone once it commits). A missing re-assert leaves no set_rls_org
+    # call after the final backend build.
+    last_backend_build = next(i for i, (kind, _) in reversed(list(enumerate(events))) if kind == "create_backend")
+    assert any(kind == "rls" and org == _ORG_ID for i, (kind, org) in enumerate(events) if i > last_backend_build), (
+        "model-backend decrypt must re-assert the org scope (set_rls_org) in the same "
+        "transaction as the credential decrypt"
     )
+    # Sanity: the endpoint-context loader re-assert happens before the build.
+    assert mock_rls.call_count >= 2
 
 
 def test_generate_schema_no_examples_returns_200(client: TestClient) -> None:
