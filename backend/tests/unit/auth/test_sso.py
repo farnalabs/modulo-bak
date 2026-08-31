@@ -1675,11 +1675,14 @@ class TestEnforceOidcEndpointHost:
         exact-host allowlist is now a preferred-log nicety, not a hard gate."""
         from modulo.auth.sso import _enforce_oidc_endpoint_host
 
-        _enforce_oidc_endpoint_host(
-            "https://oauth2.googleapis.com/token",
-            "https://accounts.google.com/.well-known/openid-configuration",
-            "https://accounts.google.com",
-            "token",
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://oauth2.googleapis.com/token",
+                "https://accounts.google.com/.well-known/openid-configuration",
+                "https://accounts.google.com",
+                "token",
+            )
+            is None
         )
 
     def test_rejects_metadata_address(self) -> None:
@@ -1708,11 +1711,14 @@ class TestEnforceOidcEndpointHost:
     def test_accepts_same_host(self) -> None:
         from modulo.auth.sso import _enforce_oidc_endpoint_host
 
-        _enforce_oidc_endpoint_host(
-            "https://issuer.example/token",
-            "https://issuer.example/.well-known/openid-configuration",
-            "https://issuer.example",
-            "token",
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://issuer.example/token",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "token",
+            )
+            is None
         )
 
     def test_issuer_host_also_allowed(self) -> None:
@@ -1720,11 +1726,14 @@ class TestEnforceOidcEndpointHost:
 
         # The jwks_uri may target the issuer host even when it differs (in path)
         # from the discovery URL host — the issuer is an OIDC trust anchor.
-        _enforce_oidc_endpoint_host(
-            "https://issuer.example/jwks",
-            "https://issuer.example/.well-known/openid-configuration",
-            "https://issuer.example",
-            "jwks",
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://issuer.example/jwks",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "jwks",
+            )
+            is None
         )
 
     def test_rejects_non_http_scheme(self) -> None:
