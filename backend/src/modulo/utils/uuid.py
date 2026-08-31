@@ -24,7 +24,11 @@ def coerce_uuid(value: Any) -> uuid.UUID | None:
     """
     if value is None:
         return None
+    if isinstance(value, uuid.UUID):
+        return value
     try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError):
+        if isinstance(value, int):
+            return uuid.UUID(int=value)
+        return uuid.UUID(value)
+    except (TypeError, ValueError, AttributeError):
         return None
