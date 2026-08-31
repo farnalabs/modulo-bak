@@ -647,6 +647,39 @@ regression that silently weakens the suite:
   assert inside is reachable and meaningful. Move the assertion after the
   ``with`` block (asserting on the recorded ``exc_info.value`` is the canonical
   form), or make it the intentional trigger with ``pytest.raises(AssertionError)``
+- a ``dict`` literal that *repeats the same key* more than once —
+  ``{'a': 1, 'a': 2}``, ``{key: 1, key: 2}``. Python evaluates the duplicate
+  keys in source order and silently keeps only the LAST value, so the first
+  occurrence is dead data: an expected-value dict, a mock ``side_effect``
+  table, a request payload, or a config overlay holds an entry that never
+  applies while a reader (and a mutation-testing run) believes both are used.
+  Two identical keys are almost always copy-paste from editing one case into
+  an existing dict — and when the duplicate sits in a *rewrite* (the value the
+  code under test is compared against), the dead first entry desynchronizes
+  the test's expectation from its source. This is the dict-data twin of the
+  duplicate-membership-element lens, which owns repeated elements in
+  list/tuple/set membership containers; a dict literal has a different shape
+  (``ast.Dict`` pairs, not elements) that lens cannot see. Byte-identical
+  pure keys (constants, names, attribute paths, subscripts — the
+  ``_stable_dump`` family) are flagged; call/comprehension keys (may carry
+  side effects or non-determinism) and ``**other`` unpacking (dynamic by
+  nature) are left alone
+- an *unseeded* random-number generator constructed in test code —
+  ``random.Random()``/``random.Random(seed=None)`` (and the ``from random
+  import Random`` bare-name twin), ``numpy.random.RandomState()``, and
+  ``numpy.random.default_rng()`` (with ``np`` the alias spelling). An RNG
+  constructed with no seed draws its state from OS entropy, so every run of
+  the test produces DIFFERENT data: a failing run cannot be re-run with the
+  same inputs (the failure is unreproducible by construction), and a
+  mutation-testing run observes inputs that no real run ever drew. This is
+  the construction twin of the fresh-random-draw lens (which owns a draw
+  standing in an assertion) and the random-reseed lens (which owns the shared
+  global generator) — nowhere else does this file bless ``Random(N)`` as the
+  deterministic form, so an unseeded construction defeats that contract. Pass
+  an explicit seed (``random.Random(0)``, ``default_rng(seed=0)``) so the run
+  is reproducible. Calls carrying any positional argument or a non-``None``
+  ``seed=`` are seeded by definition and left alone; the bare ``Random(...)``
+   spelling is only judged when the module imports the name from ``random``
 - a wall-clock *elapsed* measure compared inside an ``assert`` —
   ``assert time.monotonic() - started < 1.0``, ``assert deadline -
    time.time() > 0.1``, ``assert (time.perf_counter() - t0) == 0.5``. An
@@ -666,6 +699,111 @@ regression that silently weakens the suite:
    started``, ``abs(a) - b``) are deliberately left alone, as are wall-clock reads
    inside subtraction buried more than one level under the compare operand (the
    lens owns the top-level operand shape only)
+- a *fresh non-deterministic value* passed as the *expected* argument to a mock
+  call-assertion — ``<mock>.assert_called_with(id=uuid.uuid4())``,
+  ``assert_awaited_once_with(event_time=datetime.now(UTC))``,
+  ``assert_any_call(time.monotonic())`` — the expected-argument twin of the
+  fresh-value lens. Every UUID/secrets-token/wall-clock/`datetime.now()` call
+  mints a *new* value on each evaluation, so the recorded call (whatever the
+  code under test actually passed) can never equal the freshly-regenerated
+  expectation: for ``assert_called_with``/``assert_called_once_with`` and the
+  awaited twins the assertion ALWAYS FAILS, and for ``assert_any_call`` no
+  recorded call ever matches. These are almost always a broken attempt to
+  assert against a value the test re-generated at assert time instead of
+  capturing it in a variable, feeding it into the code under test, and
+  comparing against the same bound name. The recognised spellings are exactly
+  the fresh-value lens's set (bare UUID/token names, the ``uuid.``/``secrets.``
+  attribute paths, the ``time.*`` wall-clock reads, and ``datetime.now()``/
+  ``datetime.utcnow()``), and only *direct* positional/keyword argument
+  positions of the verify methods are checked — a fresh value nested inside a
+  container or ``call(...)`` wrapper is a less direct shape and is left alone,
+  mirroring the fresh-Mock-in-call-assertion lens
+- membership against an *empty-container builtin call* — ``assert x in set()``,
+  ``assert x not in list()``, ``assert x in dict()``, ``assert x in tuple()``.
+  A zero-argument ``set()``/``list()``/``dict()``/``tuple()``/``frozenset()``/
+  ``bytearray()`` always yields an *empty* container, and an empty container can
+  never contain anything, so ``in`` ALWAYS FAILS and ``not in`` ALWAYS PASSES no
+  matter what ``x`` evaluates to — the same dead assertion as ``assert x in []``,
+  but in the call spelling the empty-container *literal* membership lens and the
+  empty-builtin *equality* lens can provably miss. This is the membership twin
+  of the ``== set()``/``== list()`` equality lens. ``bytes()`` is deliberately
+  excluded: bytes ``in`` uses *substring* semantics, so ``assert b'' in bytes()``
+  is TRUE (an empty bytes contains itself) and the `empty_bytes_tautologies`
+  lens already owns the ``in b""`` shape. A bare-name other operand is left
+  alone (mirroring the sibling lenses), and literals on the other side are owned
+  by the literal-comparison lens
+- a fresh non-deterministic value buried inside a *container literal* that is
+  a comparison operand of an ``assert`` — ``assert result == {'id': uuid.uuid4()}``,
+  ``assert result != [token_hex()]``, ``assert tag in (time.monotonic(),)``,
+  ``assert result not in {secrets.token_urlsafe()}``. The direct fresh-value
+  lens owns only the bare/``not``/single-comparison-operand positions; a fresh
+  UUID/token/wall-clock/``datetime.now()`` call nested inside a list/dict/tuple/
+  set literal is a different ``ast`` shape it provably misses, exactly the gap
+  the container-nested Mock lens closes for ``Mock()``. Every evaluation re-mints
+  the call, so the freshly-constructed container can never equal the one the code
+  under test produced and stored: ``==`` ALWAYS FAILS and ``!=`` ALWAYS PASSES
+  no matter what the other operand evaluates to. For membership, the verdict is
+  fixed only when *every* candidate element (or dict key) of a non-empty literal
+  container is a fresh call — then no value the code under test produced can ever
+  match, so ``in`` ALWAYS FAILS and ``not in`` ALWAYS PASSES. Capture the
+  generated value in a variable first, feed it into the code under test, and
+  compare against that bound name. Mixed containers (``assert x in [uuid.uuid4(),
+  'fallback']``), membership against a container whose fresh value sits in a
+  non-candidate slot (a dict *value*, which ``in`` never consults), ``**``-spread
+  dicts and ``*``-starred lists (dynamic memberships), and fresh values nested
+  inside ``call(...)`` wrappers are not provable and are left alone
+- a fresh *random-value draw* passed as the *expected* argument to a mock
+  call-assertion — ``<mock>.assert_called_with(random.randint(0, 9))``,
+  ``assert_awaited_once_with(name=random.choice(names))``,
+  ``assert_any_call(random.random())`` — the expected-argument twin of the
+  random-draw lens, in the same relationship the fresh-value-in-call-assertion
+  lens holds to the fresh-value lens. Every ``random.<fn>`` draw returns a *new*
+  value on each evaluation, so the recorded call (whatever the code under test
+  actually passed) can never equal the re-drawn expectation: for
+  ``assert_called_with``/``assert_called_once_with`` and the awaited twins the
+  assertion ALWAYS FAILS, and for ``assert_any_call`` no recorded call ever
+  matches. These are the flaky expected-value variant of comparing code output
+  against a value the test itself draws at verify time instead of capturing it
+  into a variable and passing the bound name. The recognised spellings and
+  *direct* positional/keyword argument positions mirror the fresh-value-in-call-
+  assertion lens; draws nested inside a container or ``call(...)`` wrapper are a
+  less direct shape and are left alone
+- an assertion whose operand is a freshly-built *iterator object* — a
+  generator expression (``assert (x for x in results)``) or an
+  iterator-producing builtin call (``map()``/``filter()``/``zip()``/``iter()``/
+  ``reversed()``/``enumerate()``) standing as the assert's truthiness position
+  (bare or ``not``-wrapped) or compared with ``==``/``!=`` against a
+  freshly-allocated container literal. Iterator objects have no ``__bool__``/
+  ``__len__``, so a generator that yields nothing — or a ``filter()`` that
+  matches nothing — is still a *truthy* object: ``assert <iterator>`` ALWAYS
+  PASSES (a silent false green when the code under test produced an empty
+  result) and ``assert not <iterator>`` ALWAYS FAILS. The equality form is
+  fixed too: a fresh iterator can never equal a freshly-allocated
+  list/dict/set/tuple literal (``assert map(...) == [...]`` ALWAYS FAILS,
+  ``!=`` ALWAYS PASSES), and two fresh iterators compare by identity, so
+  ``assert map(...) == filter(...)`` ALWAYS FAILS. These are almost always a
+  forgotten materialization — ``assert map(...)`` instead of ``assert
+  list(map(...))``, ``assert (x for x in y)`` instead of ``assert any(x for x
+  in y)`` — the lazy-iterator twin of the container-literal-truthiness lens,
+  which provably misses both shapes (a generator expression parses as
+  ``ast.GeneratorExp``, not a container literal, and a bare builtin call is
+  ``ast.Call``, not a literal). Consume or reduce the iterator before
+  asserting. Attribute spellings (``df.map``/``conn.iter``), iterators nested
+  as an argument to a materializing call (``assert list(map(...))``), and
+  compares against a *name* (which cannot be proven unequal — a bound mock's
+  ``__eq__`` can always return truthy) are left alone
+- ``type(x) == X`` / ``type(x) != X`` equality on the builtin ``type`` —
+  ``assert type(err) == ValueError``, ``assert ValueError == type(result)``,
+  ``assert type(a) != type(b)``. ``type()`` returns the exact runtime class,
+  and comparing it with ``==``/``!=`` (rather than ``is``/``is not``)
+  silently rejects an instance of a *subclass* of ``X`` — the unidiomatic
+  typecheck a subclass-aware ``isinstance(x, X)`` (or the identity-safe
+  exact-type ``type(x) is X``) was meant to be — and a mocked or replaced
+  class defeats the check outright. Only the builtin ``type`` name with a
+  single argument is matched (the three-argument ``type(name, bases, ns)``
+  form *creates* a class and is left alone), the ``is``/``is not`` exact-type
+  spellings are blessed and left alone, and ``type(a) == type(b)`` is
+  covered (prefer ``type(a) is type(b)``)
 
 Every lens is written so it reports actionable file:line violations instead
 of a bare "assert not violations", mirroring the sibling architecture tests.
@@ -7392,6 +7530,49 @@ def _is_fresh_value_call(node: ast.AST) -> bool:
     )
 
 
+#: Name-based UUIDs that are *deterministic*: ``uuid3``/``uuid5`` hash their
+#: inputs, so they return the SAME value on every call. They must never drive an
+#: "always FAILS/PASSES" membership/equality verdict (such an assertion is
+#: satisfiable), even though they are still freshly-constructed objects for the
+#: direct truthy-assert purpose.
+_DETERMINISTIC_UUID_NAMES = frozenset({"uuid3", "uuid5"})
+
+
+def _is_non_deterministic_fresh_call(node: ast.AST) -> bool:
+    """Like :func:`_is_fresh_value_call` but excludes deterministic name-based
+    UUIDs (``uuid3``/``uuid5``), which return the SAME value on every call.
+
+    A membership/equality verdict built on a deterministic UUID is satisfiable
+    (not always-failing), so it must not be flagged as a dead always-FAILS/always-
+    PASSES assertion. The direct truthy-assert lens keeps treating ``uuid3``/
+    ``uuid5`` as fresh (a freshly built UUID object is still a silent false
+    green), but the container-nested and membership lenses use this stricter
+    check instead."""
+    if not _is_fresh_value_call(node):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    return name not in _DETERMINISTIC_UUID_NAMES
+
+
+def _walk_operand(node: ast.AST):
+    """Yield ``node`` and its descendants, but never descend into ``Call``,
+    ``Subscript``, or comprehension (``ListComp``/``SetComp``/``DictComp``/
+    ``GeneratorExp``) boundaries.
+
+    This keeps a comparison-operand search scoped to the operand's OWN container
+    literals: a fresh value hidden behind a ``call(...)`` wrapper, a subscript,
+    or a comprehension is left alone, exactly as the container lens documents
+    its own contract — so ``assert load({'id': uuid.uuid4()}) == expected`` is
+    NOT flagged (the fresh value is an argument to ``load``, not the compared
+    container itself)."""
+    yield node
+    if isinstance(node, (ast.Call, ast.Subscript, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_operand(child)
+
+
 def _fresh_value_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(lineno, detail)`` pairs for every ``assert`` whose test
     expression — or a single equality-comparison operand — is a freshly
@@ -9866,6 +10047,248 @@ def test_point_collapsed_range_lens_flags_degenerate_bounds():
         assert not _point_collapsed_range_violations(tree), f"lens should NOT flag:\n{source}"
 
 
+def _duplicate_dict_key_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``dict`` literal that repeats
+    the same (pure) key more than once — ``{'a': 1, 'a': 2}``,
+    ``{key: 1, key: 2}``, ``{'x': 1, 'y': 2, 'x': 3}``. Python evaluates the
+    duplicate keys in source order and silently keeps only the LAST value, so
+    the first occurrence is dead data: an expected-value dict, a mock
+    ``side_effect`` table, a request payload, or a config overlay carries an
+    entry that never applies while a reader believes both are used. Almost
+    always copy-paste from editing one case into an existing dict. Byte-
+    identical pure keys (constants, names, attribute paths, subscripts —
+    the ``_stable_dump`` set) are flagged; call/comprehension keys (may carry
+    side effects or non-determinism) and ``**other`` unpacking (dynamic keys)
+    are left alone."""
+    found: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Dict):
+            continue
+        seen: dict[str, int] = {}
+        for key in node.keys:
+            if key is None:
+                continue  # ``{**other}`` unpacking supplies dynamic keys
+            key_dump = _stable_dump(key)
+            if key_dump is None:
+                continue  # dynamic key cannot be judged or compared
+            if key_dump in seen:
+                found.append(
+                    (
+                        node.lineno,
+                        f"dict literal repeats key {ast.unparse(key)} (first occurrence at line "
+                        f"{seen[key_dump]}); Python silently keeps only the last value, so the "
+                        "earlier entry is dead data (drop the duplicate key)",
+                    )
+                )
+                break
+            seen[key_dump] = node.lineno
+    return found
+
+
+def test_no_duplicate_dict_literal_keys():
+    """A ``dict`` literal that repeats the same key — ``{'a': 1, 'a': 2}``,
+    ``{key: 1, key: 2}`` — silently drops the first value: Python evaluates
+    the keys in order and keeps only the last occurrence, so an expected-value
+    dict, a mock ``side_effect`` table, or a request payload carries an entry
+    that never applies. When the duplicate sits in the expected value, the dead
+    first entry desynchronizes the assertion from its source. This is the
+    dict-data twin of the duplicate-membership-element lens (list/tuple/set
+    membership containers only); a dict literal is a different AST shape it
+    cannot see. Identical pure keys are flagged; calls/comprehensions and
+    ``**``-unpacking are left alone."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _duplicate_dict_key_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} dict literal(s) with a duplicate key.\n"
+        "Python keeps only the last of two identical keys, so the first occurrence is dead\n"
+        "data that a reader and a mutation-testing run believe is used; drop the duplicate.\n" + "\n".join(violations)
+    )
+
+
+def test_duplicate_dict_key_lens_flags_dead_first_values():
+    """Synthetic positive/negative control for the duplicate-dict-key lens: it
+    must flag every dict literal that repeats a pure key (constants, names,
+    attribute paths, nested pure values) and ignore distinct keys, dynamic
+    ``**``-unpacking, repeated *call* keys, and dict comprehensions."""
+    positive_sources = [
+        "def test_foo():\n    payload = {'a': 1, 'a': 2}\n",
+        "def test_foo():\n    assert get() == {'k': 'v1', 'k': 'v2'}\n",
+        "def test_foo():\n    mock.side_effect = {'k': 1, 'k': 2}\n",
+        "def test_foo():\n    d = {KEY: 1, KEY: 2}\n",
+        "def test_foo():\n    d = {'x': 1, 'y': 2, 'x': 3}\n",
+        "def test_foo():\n    cfg = {item.kind: 1, item.kind: 2}\n",
+        "def test_foo():\n    d = {'a': {'n': 1}, 'a': {'n': 2}}\n",
+        "def test_foo():\n    d = {**base, 'a': 1, 'a': 2}\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _duplicate_dict_key_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    d = {'a': 1, 'b': 2}\n",
+        "def test_foo():\n    d = {**other, 'a': 1}\n",
+        "def test_foo():\n    d = {f(x): 1, f(x): 2}\n",
+        "def test_foo():\n    d = {'a': 1}\n",
+        "def test_foo():\n    d = {k: None for k in keys}\n",
+        "def test_foo():\n    d = {'a' + 'b': 1, 'ab': 2}\n",
+        "def test_foo():\n    return {'x': 1} or {'x': 2}\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _duplicate_dict_key_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _rng_construction_has_seed(call: ast.Call) -> bool:
+    """True when an RNG constructor call carries an explicit seed.
+
+    Any positional argument counts as a seed; a ``seed=None`` keyword (or a
+    leading literal ``None``) is the same as omitting the seed entirely — the
+    OS-entropy path — and does not count."""
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and arg.value is None:
+            continue
+        return True
+    for keyword in call.keywords:
+        if keyword.arg == "seed":
+            if isinstance(keyword.value, ast.Constant) and keyword.value.value is None:
+                continue
+            return True
+    return False
+
+
+def _unseeded_rng_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every random-number generator
+    constructed *without a seed* in a test module — ``random.Random()``,
+    ``random.Random(seed=None)``, the ``from random import Random`` bare-name
+    twin, ``numpy.random.RandomState()``, and ``numpy.random.default_rng()``
+    (with ``np`` the alias spelling). An RNG constructed with no explicit seed
+    draws its state from OS entropy, so every run produces a DIFFERENT dataset:
+    a failing test cannot be re-run with the same inputs, and a mutation-testing
+    run observes inputs no real run drew — the failure is unreproducible by
+    construction. This is the construction twin of the fresh-random-draw lens
+    (a draw standing in an assertion) and the global-reseed lens (the shared
+    ``random`` singleton); wherever this suite blesses determinism it blesses
+    ``random.Random(N)``, so an unseeded construction defeats that contract.
+    The bare ``Random(...)`` spelling is judged only when the module imports the
+    name from ``random`` — otherwise it is some other Random the lens cannot
+    know. Calls carrying any positional argument or a non-``None`` ``seed=`` are
+    seeded by definition and are left alone."""
+    from_random_names = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "random"
+        for alias in node.names
+    }
+    found: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        kind = None
+        if isinstance(func, ast.Attribute):
+            attr = func.attr
+            base = func.value
+            if isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+                outer, mid = base.value.id, base.attr
+                if outer in ("numpy", "np") and mid == "random" and attr in ("RandomState", "default_rng"):
+                    kind = attr
+            elif isinstance(base, ast.Name) and base.id == "random" and attr == "Random":
+                kind = "Random"
+        elif isinstance(func, ast.Name) and func.id == "Random" and "Random" in from_random_names:
+            kind = "Random"
+        if kind is None:
+            continue
+        if _rng_construction_has_seed(node):
+            continue
+        found.append(
+            (
+                node.lineno,
+                f"{ast.unparse(node)} constructs a random-number generator without a seed — every "
+                "run draws different data, so a failure cannot be reproduced with the same inputs; "
+                "pass an explicit seed (e.g. random.Random(0))",
+            )
+        )
+    return found
+
+
+def test_no_unseeded_rng_construction():
+    """A random-number generator constructed without a seed —
+    ``random.Random()``, ``random.Random(seed=None)``,
+    ``numpy.random.RandomState()``, ``numpy.random.default_rng()`` — draws its
+    state from OS entropy, so every run of the test produces a different
+    dataset: a failing run cannot be re-run with the same inputs (unreproducible
+    by construction), and a mutation-testing run observes inputs no real run
+    drew. This is the construction twin of the fresh-random-draw lens (a draw
+    standing in an assertion) and the global-reseed lens (the shared ``random``
+    singleton); the deterministic form this suite blesses is
+    ``random.Random(N)``, so passing an explicit seed restores reproducibility.
+    Any positional argument or a non-``None`` ``seed=`` counts as seeded; the
+    bare ``Random(...)`` spelling is judged only under a ``from random import
+    Random``."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _unseeded_rng_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} unseeded random-number generator construction(s).\n"
+        "An RNG constructed without a seed draws fresh entropy every run, so failures are\n"
+        "unreproducible and a mutation-testing run observes inputs no real run drew; pass an\n"
+        "explicit seed (e.g. random.Random(0)) to pin the dataset.\n" + "\n".join(violations)
+    )
+
+
+def test_unseeded_rng_lens_flags_nondeterministic_constructions():
+    """Synthetic positive/negative control for the unseeded-RNG lens: it must
+    flag every seedless construction (``random.Random``, the bare ``Random()``
+    twin, explicit ``seed=None``, numpy ``RandomState``/``default_rng``, at
+    module or function scope) and ignore seeded constructions, calls on an
+    already-constructed generator, bare ``Random`` without the from-import,
+    and unrelated random reads."""
+    positive_sources = [
+        "def test_foo():\n    rng = random.Random()\n",
+        "def test_foo():\n    import random\n    random.Random()\n",
+        "def test_foo():\n    rng = random.Random(seed=None)\n",
+        "from random import Random\ndef test_foo():\n    rng = Random()\n",
+        "def test_foo():\n    rng = np.random.RandomState()\n",
+        "def test_foo():\n    rs = numpy.random.default_rng()\n",
+        "import random\nrng = random.Random()\n",
+        "def test_foo():\n    from random import Random\n    rng = Random()\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _unseeded_rng_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    rng = random.Random(42)\n",
+        "def test_foo():\n    rng = random.Random(seed=7)\n",
+        "def test_foo():\n    rng = random.Random([1, 2, 3])\n",
+        "def test_foo():\n    rng = default_rng(0)\n",
+        "def test_foo():\n    rng = np.random.default_rng(seed=1)\n",
+        "def test_foo():\n    rng = np.random.RandomState(42)\n",
+        "def test_foo():\n    x = random.random()\n",
+        "def test_foo():\n    assert rng.random()\n",
+        "def test_foo():\n    Random()\n",
+        "def test_foo():\n    rng = other.Random()\n",
+        "def test_foo():\n    random.seed(42)\n",
+        "def test_foo():\n    rng = seeded_factory()\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _unseeded_rng_violations(tree), f"lens should NOT flag:\n{source}"
+
+
 #: Wall-clock reads (``time.<name>()`` attribute spellings) whose subtraction
 #: from another value yields an *elapsed* measure. Reads on the left of a
 #: subtraction measure elapsed-since-anchor; reads on the right measure
@@ -10006,3 +10429,918 @@ def test_wall_clock_elapsed_lens_flags_flaky_durations():
     for source in negative_sources:
         tree = ast.parse(source)
         assert not _wall_clock_elapsed_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _fresh_value_call_assertion_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every fresh non-deterministic value
+    passed as an *expected* argument to a mock call-assertion
+    (``assert_called_with``, ``assert_called_once_with``, ``assert_any_call``,
+    and their awaited twins).
+
+    Every UUID/secrets-token/wall-clock/``datetime.now()`` call mints a *new*
+    value on each evaluation, so the recorded call — whatever the code under
+    test actually passed — can never equal the freshly-regenerated expectation:
+    the assertion is dead code that always FAILS (and ``assert_any_call`` can
+    never match any recorded call either). This is the expected-argument twin
+    of the assert-position fresh-value lens in ``_fresh_value_assert_violations``,
+    just as ``_fresh_mock_in_call_assertions`` is the expected-argument twin of
+    the Mock-constructor lens. Only direct positional/keyword argument
+    positions are checked, mirroring the fresh-Mock twin: a fresh value nested
+    inside a container or ``call(...)`` wrapper is a less direct shape and is
+    deliberately left alone."""
+    found: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in _MOCK_CALL_VERIFY_METHODS:
+            continue
+        for arg in node.args:
+            if _is_fresh_value_call(arg):
+                found.append(
+                    (
+                        arg.lineno,
+                        f"{ast.unparse(arg)} passed as an expected-call argument to "
+                        f"{node.func.attr}() — a fresh non-deterministic value is regenerated on "
+                        "every evaluation, so the recorded call can never equal it and the "
+                        "assertion always FAILS; capture the value in a variable first, feed it "
+                        "into the code under test, and assert against that bound name",
+                    )
+                )
+        for kw in node.keywords:
+            if kw.arg and _is_fresh_value_call(kw.value):
+                found.append(
+                    (
+                        kw.value.lineno,
+                        f"{kw.arg}={ast.unparse(kw.value)} passed as an expected-call argument to "
+                        f"{node.func.attr}() — a fresh non-deterministic value is regenerated on "
+                        "every evaluation, so the recorded call can never equal it and the "
+                        "assertion always FAILS; capture the value in a variable first, feed it "
+                        "into the code under test, and assert against that bound name",
+                    )
+                )
+    return found
+
+
+def test_no_fresh_value_in_call_assertions():
+    """``<mock>.assert_called_with(id=uuid.uuid4())`` (and ``assert_called_once_with``,
+    ``assert_any_call``, plus the awaited twins) declares a *fresh* non
+    deterministic value as the expected call argument. Every UUID, secrets
+    token, ``time.*`` read, and ``datetime.now()`` call returns a value unique
+    to that single evaluation, so the recorded call (whatever the code under
+    test actually passed) can never equal the re-generated expectation: the
+    assertion always FAILS, and an ``assert_any_call`` can never match any
+    recorded call either. This is the expected-argument twin of the assert-
+    position fresh-value lens, and is almost always a broken attempt to assert
+    against a value generated by the test itself at assert time. Capture the
+    generated value in a variable first, feed it into the code under test (or
+    into the mock), then assert against that same bound name."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _fresh_value_call_assertion_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} fresh non-deterministic value(s) in call-assertion expected "
+        "arguments.\n"
+        "A fresh UUID/token/wall-clock/datetime.now() value is regenerated on every evaluation, "
+        "so the recorded call can never equal it and the assertion ALWAYS FAILS. Capture the\n"
+        "value in a variable first, feed it into the code under test (or into the mock), and\n"
+        "assert against that bound name.\n" + "\n".join(violations)
+    )
+
+
+def test_fresh_value_call_assertion_lens_flags_impossible_expectations():
+    """Synthetic positive/negative control for the fresh-value-in-call-
+    assertion lens: it must flag a fresh non-deterministic call in any
+    expected-argument position (positional, keyword, sync or awaited method,
+    every recognised spelling) and ignore bound names holding a previously
+    captured value, non-assertion mock calls, fresh values nested inside
+    container/call wrappers, and fresh values anywhere outside the verify
+    methods."""
+    positive_sources = [
+        "def test_foo():\n    mock.assert_called_with(request_id=uuid.uuid4())\n",
+        "def test_foo():\n    mock.assert_called_once_with(uuid4())\n",
+        "def test_foo():\n    mock.assert_any_call(token_hex(), 'header')\n",
+        "def test_foo():\n    mock_async.assert_awaited_with(event_time=datetime.now(UTC))\n",
+        "def test_foo():\n    mock_async.assert_awaited_once_with(datetime.utcnow())\n",
+        "def test_foo():\n    mock_async.assert_awaited_any_call(secrets.token_urlsafe())\n",
+        "def test_foo():\n    mock.assert_called_with(time.monotonic())\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _fresh_value_call_assertion_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    expected = uuid.uuid4()\n    mock.assert_called_with(request_id=expected)\n",
+        "def test_foo():\n    mock.assert_called_with(request_id=request.id)\n",
+        "def test_foo():\n    mock.assert_called()\n",
+        "def test_foo():\n    mock.assert_called_once()\n",
+        "def test_foo():\n    mock.assert_not_called()\n",
+        "def test_foo():\n    mock.assert_called_once_with(request_id=ANY)\n",
+        "def test_foo():\n    mock.assert_called_with({'id': uuid.uuid4()})\n",
+        "def test_foo():\n    mock.assert_called_with(call(uuid.uuid4()))\n",
+        "def test_foo():\n    result_id = uuid.uuid4()\n    mock.assert_called_with(result_id)\n",
+        "def test_foo():\n    assert mock.call_args == uuid.UUID(result_id)\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _fresh_value_call_assertion_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+#: Zero-argument builtin calls that always produce an empty container for which
+#: ``in``/``not in`` membership is statically dead. ``bytes()`` is deliberately
+#: excluded: bytes ``in`` uses *substring* semantics, so ``b'' in bytes()`` is
+#: TRUE rather than False, and the ``in b""`` literal spelling is already owned
+#: by the empty-bytes tautology lens.
+_EMPTY_MEMBERSHIP_BUILTINS = frozenset({"list", "dict", "set", "tuple", "frozenset", "bytearray"})
+
+
+def _empty_builtin_call_membership_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``in``/``not in`` comparison
+    whose container operand is an empty container produced by a zero-argument
+    builtin call (``set()``/``list()``/``dict()``/``tuple()``/``frozenset()``/
+    ``bytearray()``).
+
+    An empty container can never contain anything, so ``in`` ALWAYS FAILS and
+    ``not in`` ALWAYS PASSES regardless of what the other operand evaluates to.
+    This is the membership twin of the ``== set()``/``== list()`` equality lens
+    (``_empty_builtin_call_comparisons``) and the call-based twin of the
+    empty-container *literal* membership lens (``_empty_container_membership_
+    tautologies``). A literal other-side is owned by the literal-comparison
+    lens, and a bare name is left alone exactly as in the sibling lenses."""
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            continue
+        if not isinstance(test.ops[0], (ast.In, ast.NotIn)):
+            continue
+        for operand, container in ((test.left, test.comparators[0]), (test.comparators[0], test.left)):
+            if not (
+                isinstance(container, ast.Call)
+                and isinstance(container.func, ast.Name)
+                and container.func.id in _EMPTY_MEMBERSHIP_BUILTINS
+                and not container.args
+                and not container.keywords
+            ):
+                continue
+            if isinstance(operand, ast.Constant):
+                continue
+            op_name = "in" if isinstance(test.ops[0], ast.In) else "not in"
+            verdict = "always FAILS" if isinstance(test.ops[0], ast.In) else "always PASSES"
+            found.append(
+                (
+                    node.lineno,
+                    f"asserts value {op_name} {container.func.id}() — {verdict} "
+                    "(the zero-argument builtin always yields an empty container, which never "
+                    "contains anything)",
+                )
+            )
+            break
+    return found
+
+
+def test_no_empty_builtin_call_membership():
+    """``assert x in set()`` / ``assert x not in list()`` compare membership
+    against an empty container produced by a zero-argument builtin call — the
+    call-based twin of the ``in []``/``not in {}`` literal lens. Every such
+    builtin returns an empty container, and an empty container can never
+    contain anything, so ``in`` always FAILS and ``not in`` always PASSES, no
+    matter what ``x`` evaluates to: the assertion is dead code either way. This
+    is the membership twin of the ``== set()``/``== list()`` equality lens.
+    ``bytes()`` is excluded because bytes ``in`` uses substring semantics
+    (``b'' in bytes()`` is TRUE, not dead), and a bare-name other operand is
+    left alone exactly as in the sibling lenses."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _empty_builtin_call_membership_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} empty-builtin-call membership assertion(s).\n"
+        "A zero-argument set()/list()/dict()/tuple()/frozenset()/bytearray() is always empty, so\n"
+        "its membership check is dead: 'in' always FAILS and 'not in' always PASSES. Assert the\n"
+        "membership (or emptiness) you actually mean on the non-empty container, or drop the\n"
+        "check entirely.\n" + "\n".join(violations)
+    )
+
+
+def test_empty_builtin_call_membership_lens_flags_impossible_membership():
+    """Synthetic positive/negative control for the empty-builtin-call membership
+    lens: it must flag ``in``/``not in`` against a zero-argument
+    ``set()``/``list()``/``dict()``/``tuple()``/``frozenset()``/``bytearray()``
+    (either operand order) and ignore ``bytes()`` (substring semantics),
+    non-empty builtin calls, bound-named containers, literal containers owned
+    by sibling lenses, and literal-vs-literal membership."""
+    positive_sources = [
+        "def test_foo():\n    assert value in set()\n",
+        "def test_foo():\n    assert value not in list()\n",
+        "def test_foo():\n    assert value in dict()\n",
+        "def test_foo():\n    assert value not in tuple()\n",
+        "def test_foo():\n    assert frozenset() in values\n",
+        "def test_foo():\n    assert value in bytearray()\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _empty_builtin_call_membership_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert needle in b''\n",
+        "def test_foo():\n    assert value in bytes()\n",
+        "def test_foo():\n    assert value not in bytes()\n",
+        "def test_foo():\n    assert value in set([1, 2])\n",
+        "def test_foo():\n    assert value in {'a': 1}\n",
+        "def test_foo():\n    assert value in []\n",
+        "def test_foo():\n    seen = set()\n    assert value in seen\n",
+        "def test_foo():\n    assert 1 in []\n",
+        "def test_foo():\n    assert item in load_set()\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _empty_builtin_call_membership_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _fresh_value_container_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``assert`` comparison whose
+    operand is a container literal that nests a freshly minted non-deterministic
+    value — a UUID/secrets token/wall-clock read/``datetime.now()`` call.
+
+    Every evaluation re-mints the nested call, so the freshly-constructed
+    container can never equal the one the code under test produced and stored
+    earlier: ``assert result == {'id': uuid.uuid4()}`` ALWAYS FAILS and
+    ``assert result != [token_hex()]`` ALWAYS PASSES no matter what ``result``
+    evaluates to. This is the container-nested twin of the assert-position
+    fresh-value lens (``_fresh_value_assert_violations``), which owns only the
+    direct bare/``not``/single-comparison-operand positions — a fresh call
+    buried inside a list/dict/tuple/set literal is a different ``ast`` shape it
+    provably misses, exactly the gap the container-nested Mock lens closes for
+    ``Mock()`` constructors. Only *direct* container members are considered (a
+    fresh call hidden behind a ``call(...)`` wrapper, a subscript, or a nested
+    function call is a less direct shape and is left alone, mirroring its Mock
+    sibling). For ``in``/``not in`` the verdict is fixed only when *every*
+    membership candidate (element for list/tuple/set, key for dict) of a
+    non-empty literal container is a fresh call — then no value the code under
+    test produced can ever match. Mixed containers, ``**``-spread dicts,
+    ``*``-starred sequences, and fresh values in a dict *value* slot (``in``
+    never consults values) all leave the verdict runtime-dependent and are
+    deliberately left alone."""
+    found: list[tuple[int, str]] = []
+
+    def _container_direct_fresh_value(container: ast.AST) -> ast.Call | None:
+        """Return the first fresh-value call among a container literal's direct
+        members (elements, or both keys and values for a dict), else None."""
+        if isinstance(container, ast.Dict):
+            candidates = [k for k in container.keys if k is not None] + list(container.values)
+        else:
+            candidates = list(container.elts)
+        for candidate in candidates:
+            if _is_non_deterministic_fresh_call(candidate):
+                return candidate
+        return None
+
+    def _contains_direct_fresh_value(expr: ast.AST) -> ast.Call | None:
+        """Return the first fresh-value call nested directly inside any container
+        literal findable within ``expr`` — WITHOUT descending through Call/
+        Subscript/comprehension boundaries, so a fresh value buried inside a
+        ``call(...)`` wrapper (e.g. ``load({'id': uuid.uuid4()})``) is left
+        alone, as documented."""
+        for container in _walk_operand(expr):
+            if not isinstance(container, (ast.List, ast.Dict, ast.Tuple, ast.Set)):
+                continue
+            fresh = _container_direct_fresh_value(container)
+            if fresh is not None:
+                return fresh
+        return None
+
+    def _membership_only_fresh_candidates(expr: ast.AST) -> bool:
+        """True when ``expr`` is a non-empty list/tuple/set/dict literal whose
+        *every* membership candidate (element, or dict key) is a non-
+        deterministic fresh-value call — so no value the code under test produced
+        can ever match. Deterministic name-based UUIDs (``uuid3``/``uuid5``) are
+        excluded: they return the same value every call, so the verdict is
+        satisfiable and must not be flagged as always-failing."""
+        if isinstance(expr, ast.Dict):
+            if not expr.keys or any(key is None for key in expr.keys):
+                return False
+            return all(_is_non_deterministic_fresh_call(key) for key in expr.keys)
+        if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+            return False
+        if not expr.elts or any(isinstance(elt, ast.Starred) for elt in expr.elts):
+            return False
+        return all(_is_non_deterministic_fresh_call(elt) for elt in expr.elts)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            continue
+        op = test.ops[0]
+        if isinstance(op, (ast.Eq, ast.NotEq)):
+            fresh = None
+            for side in (test.left, test.comparators[0]):
+                fresh = _contains_direct_fresh_value(side)
+                if fresh is not None:
+                    break
+            if fresh is None:
+                continue
+            op_name = "==" if isinstance(op, ast.Eq) else "!="
+            verdict = "always FAILS" if isinstance(op, ast.Eq) else "always PASSES"
+            found.append(
+                (
+                    node.lineno,
+                    f"assert {ast.unparse(test)} — the container literal re-mints "
+                    f"{ast.unparse(fresh)} on every evaluation, so the freshly built container "
+                    f"can never equal the one the code under test produced and {op_name} "
+                    f"{verdict}; capture the fresh value in a variable first and compare "
+                    "against that bound name",
+                )
+            )
+        elif isinstance(op, (ast.In, ast.NotIn)):
+            container = None
+            for candidate in (test.left, test.comparators[0]):
+                if _membership_only_fresh_candidates(candidate):
+                    container = candidate
+                    break
+            if container is None:
+                continue
+            op_name = "in" if isinstance(op, ast.In) else "not in"
+            verdict = "always FAILS" if isinstance(op, ast.In) else "always PASSES"
+            found.append(
+                (
+                    node.lineno,
+                    f"assert {ast.unparse(test)} — every membership candidate of the container "
+                    f"literal is a fresh non-deterministic value, so no value the code under "
+                    f"test produced can match and {op_name} {verdict}; assert against a "
+                    "captured bound name instead",
+                )
+            )
+    return found
+
+
+def test_no_fresh_value_in_container_asserts():
+    """``assert result == {'id': uuid.uuid4()}`` (and the ``!=``/``in``/``not in``
+    twins, either operand order) nests a fresh non-deterministic value inside a
+    container literal that is a comparison operand. Every evaluation re-mints the
+    UUID/token/wall-clock/``datetime.now()`` call, so the freshly built container
+    can never equal the one the code under test produced and stored:
+    ``==`` ALWAYS FAILS, ``!=`` ALWAYS PASSES, and membership against a container
+    whose *every* candidate is a fresh call can never match, so ``in`` ALWAYS
+    FAILS and ``not in`` ALWAYS PASSES. This is the container-nested twin of the
+    assert-position fresh-value lens (which owns only direct positions, exactly
+    as the container-nested Mock lens complements the Mock-constructor lens).
+    Capture the generated value in a variable first, feed it into the code under
+    test, and compare against that same bound name."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _fresh_value_container_assert_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} container-nested fresh value assertion(s).\n"
+        "A fresh UUID/token/wall-clock/datetime.now() call nested inside a container literal is\n"
+        "re-minted on every evaluation, so the freshly built container can never equal the one the\n"
+        "code under test produced: == always FAILS, != always PASSES, and all-fresh membership\n"
+        "always FAILS/PASSES. Capture the value in a variable first, feed it into the code under\n"
+        "test, and assert against that bound name.\n" + "\n".join(violations)
+    )
+
+
+def test_fresh_value_container_lens_flags_nested_fresh_values():
+    """Synthetic positive/negative control for the container-nested fresh-value
+    lens: it must flag an ``assert`` comparison that nests a fresh non-
+    deterministic call inside a list/dict/tuple/set literal in either equality
+    operand order, plus full-fresh membership containers, and ignore the direct
+    positions owned by the fresh-value lens (bare/``not``/single-comparison-
+    operand), bound names, mixed/``*``/``**``-spread membership containers,
+    fresh values in a dict *value* slot under ``in``, Mock constructors, and
+    call-assertion expected arguments."""
+    positive_sources = [
+        "def test_foo():\n    assert result == {'id': uuid.uuid4()}\n",
+        "def test_foo():\n    assert result != [token_hex()]\n",
+        "def test_foo():\n    assert result == [datetime.now(UTC)]\n",
+        "def test_foo():\n    assert {'ts': time.time()} == result\n",
+        "def test_foo():\n    assert result == [uuid.uuid4(), 'fallback']\n",
+        "def test_foo():\n    assert result in (time.monotonic(),)\n",
+        "def test_foo():\n    assert result not in {secrets.token_urlsafe()}\n",
+        "def test_foo():\n    assert result not in [token_bytes(16), uuid.uuid1()]\n",
+        "def test_foo():\n    assert [uuid.uuid4()] in result\n",
+        "def test_foo():\n    assert result == {'payload': {'id': uuid.uuid4()}}\n",
+        "def test_foo():\n    assert result == {**base, 'id': uuid.uuid4()}\n",
+        "def test_foo():\n    assert result != [uuid.uuid4()]\n",
+        "def test_foo():\n    assert result == [time.perf_counter(), time.process_time()]\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _fresh_value_container_assert_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert result == uuid.uuid4()\n",
+        "def test_foo():\n    assert uuid.uuid4()\n",
+        "def test_foo():\n    assert not uuid.uuid4()\n",
+        "def test_foo():\n    assert result == {'id': expected_id}\n",
+        "def test_foo():\n    assert result == {'id': 'abc'}\n",
+        "def test_foo():\n    assert uuid.uuid4() in keys\n",
+        "def test_foo():\n    assert result in [uuid.uuid4(), 'fallback']\n",
+        "def test_foo():\n    assert result in {'k': uuid.uuid4()}\n",
+        "def test_foo():\n    assert result in []\n",
+        "def test_foo():\n    assert result == [Mock()]\n",
+        "def test_foo():\n    assert result == [1, 2]\n",
+        "def test_foo():\n    assert result in [*items, uuid.uuid4()]\n",
+        "def test_foo():\n    assert result in {**mapping, uuid.uuid4(): 1}\n",
+        "def test_foo():\n    assert x < time.monotonic()\n",
+        "def test_foo():\n    assert result == call(uuid.uuid4())\n",
+        "def test_foo():\n    mock.assert_called_with({'id': uuid.uuid4()})\n",
+        "def test_foo():\n    assert result == {'a': 1, 'b': 2}\n",
+        "def test_foo():\n    assert load({'id': uuid.uuid4()}) == expected\n",
+        "def test_foo():\n    assert get({'k': uuid.uuid4()}) != result\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _fresh_value_container_assert_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _random_draw_call_assertion_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every fresh *random-value draw*
+    passed as an *expected* argument to a mock call-assertion
+    (``assert_called_with``, ``assert_called_once_with``, ``assert_any_call``,
+    and their awaited twins).
+
+    Every ``random.<fn>`` draw returns a *new* value on each evaluation, so the
+    recorded call — whatever the code under test actually passed — can never
+    equal the re-drawn expectation: the assertion is dead code that always FAILS
+    (and ``assert_any_call`` can never match any recorded call either). This is
+    the expected-argument twin of the assert-position random-draw lens in
+    ``_random_draw_assert_violations``, just as ``_fresh_value_call_assertion_
+    violations`` is the expected-argument twin of the fresh-value lens. Only
+    *direct* positional/keyword argument positions are checked, mirroring the
+    fresh-value twin: a draw nested inside a container or ``call(...)`` wrapper
+    is a less direct shape and is deliberately left alone."""
+    found: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr not in _MOCK_CALL_VERIFY_METHODS:
+            continue
+        for arg in node.args:
+            if _is_random_draw_call(arg):
+                found.append(
+                    (
+                        arg.lineno,
+                        f"{ast.unparse(arg)} passed as an expected-call argument to "
+                        f"{node.func.attr}() — a fresh random value is drawn on every evaluation, "
+                        "so the recorded call can never equal it and the assertion always FAILS; "
+                        "capture the drawn value in a variable first, feed it into the code under "
+                        "test, and assert against that bound name",
+                    )
+                )
+        for kw in node.keywords:
+            if kw.arg and _is_random_draw_call(kw.value):
+                found.append(
+                    (
+                        kw.value.lineno,
+                        f"{kw.arg}={ast.unparse(kw.value)} passed as an expected-call argument to "
+                        f"{node.func.attr}() — a fresh random value is drawn on every evaluation, "
+                        "so the recorded call can never equal it and the assertion always FAILS; "
+                        "capture the drawn value in a variable first, feed it into the code under "
+                        "test, and assert against that bound name",
+                    )
+                )
+    return found
+
+
+def test_no_random_draw_in_call_assertions():
+    """``<mock>.assert_called_with(random.randint(0, 9))`` (and ``assert_called_once_with``,
+    ``assert_any_call``, plus the awaited twins) declares a fresh *random-value
+    draw* as the expected call argument — the expected-argument twin of the
+    random-draw lens, in the same relationship the fresh-value-in-call-assertion
+    lens holds to the fresh-value lens. Every ``random.<fn>`` draw returns a new
+    value on each evaluation, so the recorded call (whatever the code under test
+    actually passed) can never equal the re-drawn expectation: the assertion
+    always FAILS, and an ``assert_any_call`` can never match any recorded call
+    either. These are the flaky expected-value variant of comparing code output
+    against a value the test itself draws at verify time. Capture the drawn value
+    in a variable first, feed it into the code under test (or the mock), then
+    pass that same bound name."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _random_draw_call_assertion_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} random draw(s) in call-assertion expected arguments.\n"
+        "A random draw (randint/random/choice/sample/...) returns a fresh value on every\n"
+        "evaluation, so the recorded call can never equal it and the assertion ALWAYS FAILS.\n"
+        "Capture the drawn value in a variable first, feed it into the code under test (or the\n"
+        "mock), and assert against that bound name.\n" + "\n".join(violations)
+    )
+
+
+def test_random_draw_call_assertion_lens_flags_flaky_expectations():
+    """Synthetic positive/negative control for the random-draw-in-call-assertion
+    lens: it must flag a random draw in any expected-argument position
+    (positional, keyword, sync or awaited method, module-qualified or bare-name
+    spelling) and ignore bound names holding a previously captured draw, injected
+    ``rng`` instances, non-assertion mock calls, draws nested inside container/
+    call wrappers, and draws anywhere outside the verify methods."""
+    positive_sources = [
+        "def test_foo():\n    mock.assert_called_with(random.randint(0, 9))\n",
+        "def test_foo():\n    mock.assert_called_once_with(random.randint(1, 6))\n",
+        "def test_foo():\n    mock.assert_any_call(random.random())\n",
+        "def test_foo():\n    mock_async.assert_awaited_with(payload=random.uniform(0, 1))\n",
+        "def test_foo():\n    mock_async.assert_awaited_once_with(random.sample(items, 2))\n",
+        "def test_foo():\n    mock_async.assert_awaited_any_call(random.choice(names))\n",
+        "def test_foo():\n    mocker.thing.assert_called_once_with(random.getrandbits(32))\n",
+        "def test_foo():\n    mock.assert_called_with(limit=random.randrange(10))\n",
+        "from random import randint\ndef test_foo():\n    mock.assert_called_with(randint(0, 9))\n",
+        "from random import random\ndef test_foo():\n    mock.assert_called_with(random())\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _random_draw_call_assertion_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    roll = random.randint(1, 6)\n    mock.assert_called_with(roll)\n",
+        "def test_foo():\n    mock.assert_called_with(drawn_value)\n",
+        "def test_foo():\n    mock.assert_called_with(ANY)\n",
+        "def test_foo():\n    rng = random.Random(42)\n    mock.assert_called_with(rng.randint(0, 9))\n",
+        "def test_foo():\n    mock.assert_called_with(request.get('retries'))\n",
+        "def test_foo():\n    mock.assert_called()\n",
+        "def test_foo():\n    mock.assert_not_called()\n",
+        "def test_foo():\n    mock.assert_called_with({'payload': random.randint(0, 9)})\n",
+        "def test_foo():\n    mock.assert_called_with(call(random.randint(0, 9)))\n",
+        "def test_foo():\n    assert result == random.randint(0, 9)\n",
+        "def test_foo():\n    random.seed(7)\n",
+        "def test_foo():\n    mock.assert_called_with(random_seed)\n",
+        "def test_foo():\n    mock.assert_called_with([1, 2, 3])\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _random_draw_call_assertion_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+#: Iterator-producing builtin names. Unlike list/dict/set/tuple (which have a
+#: real truthiness/length contract) and ``range`` (which implements ``__len__``
+#: so ``bool(range(0))`` is False), the object these calls return is a lazy
+#: iterator with neither ``__bool__`` nor ``__len__``, so it is ALWAYS truthy no
+#: matter how many items it will eventually produce (including zero).
+_ITERATOR_PRODUCING_BUILTINS = frozenset({"map", "filter", "zip", "iter", "reversed", "enumerate"})
+
+
+def _iterator_object(node: ast.AST) -> str | None:
+    """Return a short label for an expression that is statically an iterator
+    object, or ``None``.
+
+    Two shapes are recognised: a generator expression (``ast.GeneratorExp`` —
+    the body never runs until the first ``next()``, so even a generator that
+    yields nothing is a real object) and an iterator-producing builtin call in
+    the ``map``/``filter``/``zip``/``iter``/``reversed``/``enumerate`` set. Only
+    the bare builtin-name spelling is matched: an attribute spelling such as
+    ``df.map`` or ``conn.iter`` is a method with an unknown return type and is
+    deliberately left alone, mirroring the bare-name discipline of the
+    random-draw lens."""
+    if isinstance(node, ast.GeneratorExp):
+        return "generator expression"
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ITERATOR_PRODUCING_BUILTINS:
+        return f"{node.func.id}() iterator"
+    return None
+
+
+def _fresh_container_literal(node: ast.AST) -> bool:
+    """True for a list/tuple/set/dict literal with no ``*``/``**`` unpacking.
+
+    A starred element (``[*x]`` / ``{**d}``) makes the literal dynamic by
+    nature, mirroring how the container-literal lenses exclude unpacked
+    shapes."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return not any(isinstance(elt, ast.Starred) for elt in node.elts)
+    if isinstance(node, ast.Dict):
+        return not any(key is None for key in node.keys)
+    return False
+
+
+def _iterator_object_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``assert`` whose operand is
+    a freshly-built iterator object.
+
+    Two shapes are owned:
+
+    - *truthiness*: the assert's test (possibly ``not``-wrapped) is a generator
+      expression or an iterator-producing builtin call. The object is ALWAYS
+      truthy, so ``assert <iterator>`` always PASSES (a silent false green when
+      the code under test produced an empty iterator) and ``assert not
+      <iterator>`` always FAILS.
+    - *equality*: an ``==``/``!=`` comparison where one side is a fresh iterator
+      object and the other side is a freshly-allocated container literal
+      (``map(...) == [...]`` always FAILS; ``!=`` always PASSES), or where both
+      sides are fresh iterator objects (always FAILS for ``==``, always PASSES
+      for ``!=`` — iterators compare by identity, so two freshly-constructed
+      ones can never be equal).
+
+    A comparison against a *name* is left alone: the name may hold a mock whose
+    ``__eq__`` always returns a truthy sentinel, so the outcome is not provable
+    statically (the mock-equality shapes are owned by the mock lenses), and two
+    *syntactically identical* iterator calls are left alone — that is the
+    self-comparison lens's determinism-check territory."""
+    found: list[tuple[int, str]] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            label = _iterator_object(test.operand)
+            if label is None:
+                continue
+            found.append(
+                (
+                    node.lineno,
+                    f"assert not {ast.unparse(test.operand)} — a {label} is ALWAYS truthy "
+                    "(iterator objects have no __bool__/__len__), so the assert ALWAYS FAILS; "
+                    "consume the iterator (list(...)/next(...)) or reduce it (any(...)/all(...)) "
+                    "and assert on its contents",
+                )
+            )
+            continue
+        if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], (ast.Eq, ast.NotEq)):
+            left = _iterator_object(test.left)
+            right = _iterator_object(test.comparators[0])
+            if not (left or right):
+                continue
+            if left and right:
+                if ast.unparse(test.left) == ast.unparse(test.comparators[0]):
+                    continue
+                found.append(
+                    (
+                        node.lineno,
+                        f"assert {ast.unparse(test)} — two freshly-constructed iterator objects "
+                        "compare by identity, so they can never be equal: == ALWAYS FAILS / != "
+                        "ALWAYS PASSES regardless of the data; materialize or reduce the iterators "
+                        "(list(...)/any(...)) before comparing",
+                    )
+                )
+                continue
+            if left and _fresh_container_literal(test.comparators[0]):
+                other = ast.unparse(test.comparators[0])
+            elif right and _fresh_container_literal(test.left):
+                other = ast.unparse(test.left)
+            else:
+                continue
+            found.append(
+                (
+                    node.lineno,
+                    f"assert {ast.unparse(test)} — a {left or right} can never compare equal to the "
+                    f"freshly-allocated {other}: == ALWAYS FAILS / != ALWAYS PASSES no matter what "
+                    "the code under test produced; materialize the iterator "
+                    "(list(...)/tuple(...)/sorted(...)) before comparing",
+                )
+            )
+            continue
+        label = _iterator_object(test)
+        if label is None:
+            continue
+        found.append(
+            (
+                node.lineno,
+                f"assert {ast.unparse(test)} — a {label} is ALWAYS truthy (iterator objects have no "
+                "__bool__/__len__), so the assert always PASSES even when the code under test "
+                "produced an empty result (silent false green); materialize the iterator "
+                "(list(...)/next(...)) or reduce it (any(...)/all(...)) before asserting",
+            )
+        )
+    return found
+
+
+def test_no_iterator_object_asserts():
+    """An ``assert`` whose operand is a freshly-built iterator object — a
+    generator expression (``assert (x for x in results)``) or an
+    iterator-producing builtin call (``map``/``filter``/``zip``/``iter``/
+    ``reversed``/``enumerate``) — is dead code: the object is ALWAYS truthy no
+    matter what it will produce, so ``assert <iterator>`` always PASSES (a
+    silent false green when the code under test produced an empty result) and
+    ``assert not <iterator>`` always FAILS, while ``assert <iterator> ==
+    [...]`` always FAILS (a fresh iterator can never equal a freshly-allocated
+    container literal) and ``assert <iterator> != [...]`` always PASSES. These
+    are almost always a forgotten materialization — ``list(map(...))``,
+    ``any(x for x in y)`` — and are the lazy-iterator twin of the
+    container-literal-truthiness lens.
+    """
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _iterator_object_assert_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} assertion(s) against a freshly-built iterator object.\n"
+        "An iterator object is ALWAYS truthy (no __bool__/__len__), and can never compare equal to\n"
+        "a freshly-allocated container literal, so the verdict is fixed at source time.\n"
+        "Materialize or reduce the iterator (list(...)/any(...)/all(...)/next(...)) first.\n" + "\n".join(violations)
+    )
+
+
+def test_iterator_object_lens_flags_dead_asserts():
+    """Synthetic positive/negative control for the iterator-object lens: it must
+    flag a generator expression or iterator-producing builtin call standing as
+    the assertion (bare, ``not``-wrapped, or compared against a container
+    literal / another fresh iterator) and ignore materialized calls
+    (``list(...)``/``any(...)``/``sorted(...)``), container comprehensions
+    (which have real truthiness), ``range``, attribute spellings, and compares
+    against a name."""
+    positive_sources = [
+        "def test_foo():\n    assert (x for x in items)\n",
+        "def test_foo():\n    assert (item.name for item in rows)\n",
+        "def test_foo():\n    assert not (x for x in items)\n",
+        "def test_foo():\n    assert map(str, items)\n",
+        "def test_foo():\n    assert filter(None, items)\n",
+        "def test_foo():\n    assert zip(a, b)\n",
+        "def test_foo():\n    assert not iter(items[0])\n",
+        "def test_foo():\n    assert reversed(items)\n",
+        "def test_foo():\n    assert enumerate(sorted_keys)\n",
+        "def test_foo():\n    assert map(str, items) == ['a', 'b']\n",
+        "def test_foo():\n    assert ['a', 'b'] != filter(None, items)\n",
+        "def test_foo():\n    assert {'k': 'v'} == filter(None, items)\n",
+        "def test_foo():\n    assert map(f, a) == filter(g, b)\n",
+        "def test_foo():\n    assert (x for x in a) != (y for y in b)\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _iterator_object_assert_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert list(map(str, items))\n",
+        "def test_foo():\n    assert any(x for x in items)\n",
+        "def test_foo():\n    assert all(flag for flag in flags)\n",
+        "def test_foo():\n    assert [x for x in items]\n",
+        "def test_foo():\n    assert {x for x in items}\n",
+        "def test_foo():\n    assert {k: v for k, v in pairs}\n",
+        "def test_foo():\n    assert sorted(map(str, items)) == ['a']\n",
+        "def test_foo():\n    assert range(5)\n",
+        "def test_foo():\n    assert not range(0)\n",
+        "def test_foo():\n    assert len(iter(x)) == 0\n",
+        "def test_foo():\n    assert next(iter(items)) == 7\n",
+        "def test_foo():\n    assert result == stored_map\n",
+        "def test_foo():\n    assert map(str, items) != stored\n",
+        "def test_foo():\n    assert reporter.map(str, items)\n",
+        "def test_foo():\n    assert mapper(str, items)\n",
+        "def test_foo():\n    assert map(str, x) == map(str, x)\n",
+        "def test_foo():\n    assert x == map_result\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _iterator_object_assert_violations(tree), f"lens should NOT flag:\n{source}"
+
+
+def _type_equality_violations(tree: ast.AST) -> list[tuple[int, str]]:
+    """Return ``(lineno, detail)`` pairs for every ``==``/``!=`` comparison
+    whose operand is a single-argument ``type(...)`` call.
+
+    ``type(x) == X`` checks the *exact* runtime class with equality semantics,
+    so an instance of a subclass of ``X`` silently fails the check even though
+    ``isinstance(x, X)`` is what such a test almost always wants, and a mocked
+    or replaced class defeats the check outright — equality on a class object
+    is the unidiomatic-typecheck spelling of ``type(x) is X``. ``is``/``is
+    not`` on a class object is identity-safe (the blessed exact-type spelling,
+    mirroring how the None lens blesses ``is None`` over ``== None``). Only the
+    builtin ``type`` name with a single argument is matched — the
+    three-argument ``type(name, bases, ns)`` form *creates* a class and is left
+    alone. An identical ``type(x) == type(x)`` comparison is a tautology and is
+    flagged separately."""
+    found: list[tuple[int, str]] = []
+
+    def _is_type_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "type"
+            and len(node.args) == 1
+            and not node.keywords
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or len(node.ops) != 1:
+            continue
+        op = node.ops[0]
+        if not isinstance(op, (ast.Eq, ast.NotEq)):
+            continue
+        op_name = "==" if isinstance(op, ast.Eq) else "!="
+        for side in (node.left, *node.comparators):
+            if not _is_type_call(side):
+                continue
+            other = node.comparators[0] if side is node.left else node.left
+            if _is_type_call(other):
+                if ast.dump(side, include_attributes=False) == ast.dump(other, include_attributes=False):
+                    found.append(
+                        (
+                            node.lineno,
+                            f"assert {ast.unparse(node)} — two identical type() calls always compare "
+                            "equal (a tautology that passes no matter how broken the code under test is); "
+                            "assert against a real expected type",
+                        )
+                    )
+                else:
+                    found.append(
+                        (
+                            node.lineno,
+                            f"assert {ast.unparse(node)} — compares the exact type of two values with "
+                            f"{op_name}; a subclass instance fails silently and a mocked class defeats "
+                            "the check, prefer 'type(a) is type(b)' (exact-type identity) or "
+                            "isinstance(a, type(b)) (subclass-aware)",
+                        )
+                    )
+            else:
+                found.append(
+                    (
+                        node.lineno,
+                        f"assert {ast.unparse(node)} — compares {op_name} the exact type via type(); "
+                        "an instance of a subclass of the expected class fails silently and a mocked "
+                        "class defeats the check, prefer isinstance(x, X) (subclass-aware) or "
+                        "'type(x) is X' (exact type)",
+                    )
+                )
+            break
+    return found
+
+
+def test_no_type_equality_comparisons():
+    """``type(x) == X`` / ``type(x) != X`` compare the *exact* runtime class
+    with equality semantics, so an instance of a subclass of ``X`` silently
+    fails the check and a mocked or replaced class defeats it outright — the
+    unidiomatic typecheck spelling where ``isinstance(x, X)`` (subclass-aware)
+    or the identity-safe ``type(x) is X`` (exact type) was intended. ``is``/``is
+    not`` are the blessed spellings and left alone, as is the three-argument
+    ``type(name, bases, ns)`` class-creation form."""
+    violations = []
+    for path in _iter_test_modules():
+        tree = _parse(path)
+        if tree is None:
+            continue
+        rel = path.relative_to(TESTS)
+        for lineno, detail in _type_equality_violations(tree):
+            violations.append(f"  {rel}:{lineno}  {detail}")
+    assert not violations, (
+        f"Found {len(violations)} type() equality comparison(s).\n"
+        "type(x) == X compares the exact runtime class with equality semantics, so a subclass\n"
+        "instance fails silently and a mocked class defeats the check. Use isinstance(x, X) for\n"
+        "subclass-aware checks, or the identity-safe 'type(x) is X' for an exact-type check.\n" + "\n".join(violations)
+    )
+
+
+def test_type_equality_lens_flags_fragile_exact_type_checks():
+    """Synthetic positive/negative control for the type-equality lens: it must
+    flag ``==``/``!=`` on a one-argument ``type(...)`` call (either operand
+    order, ``type(a) == type(b)`` included, in assert or helper code) and ignore
+    the ``is``/``is not`` exact-type spellings, ``isinstance``, ``__class__``
+    identity, the three-argument class-creation form, subscripts/attributes, and
+    comparisons against a captured type name."""
+    positive_sources = [
+        "def test_foo():\n    assert type(err) == ValueError\n",
+        "def test_foo():\n    assert type(result) != SomeModel\n",
+        "def test_foo():\n    assert ValueError == type(err)\n",
+        "def test_foo():\n    assert SomeModel != type(result)\n",
+        "def test_foo():\n    assert type(a) == type(b)\n",
+        "def test_foo():\n    assert type(model) != models.BaseModel\n",
+        "def test_foo():\n    assert type(x) == type(x)\n",
+        "def _is_ok(v):\n    return type(v) == int\n",
+        "def test_foo():\n    assert type(result) == SomeModule.Result\n",
+    ]
+    for source in positive_sources:
+        tree = ast.parse(source)
+        assert _type_equality_violations(tree), f"lens should flag:\n{source}"
+
+    negative_sources = [
+        "def test_foo():\n    assert type(err) is ValueError\n",
+        "def test_foo():\n    assert type(result) is not SomeModel\n",
+        "def test_foo():\n    assert isinstance(err, ValueError)\n",
+        "def test_foo():\n    assert not isinstance(x, (int, float))\n",
+        "def test_foo():\n    assert x.__class__ is int\n",
+        "def test_foo():\n    assert x.__class__ == int\n",
+        "def test_foo():\n    C = type('C', (object,), {})\n",
+        "def test_foo():\n    t = type(obj)\n    assert t == SomeClass\n",
+        "def test_foo():\n    assert obj.type == SomeClass\n",
+        "def test_foo():\n    assert SomeClass == other_type\n",
+        "def test_foo():\n    assert type(x) in (int, float)\n",
+        "def test_foo():\n    assert result_type == SomeClass\n",
+        "def test_foo():\n    return type(value)\n",
+    ]
+    for source in negative_sources:
+        tree = ast.parse(source)
+        assert not _type_equality_violations(tree), f"lens should NOT flag:\n{source}"
