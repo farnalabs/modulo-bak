@@ -57,9 +57,9 @@ def test_credential_values_collects_and_sorts_longest_first() -> None:
 
 
 def test_credential_values_ignores_short_values_and_empty() -> None:
-    assert credential_values(None) == ()
-    assert credential_values({}) == ()
-    assert credential_values({"x": "ab"}) == ()
+    assert not credential_values(None)
+    assert not credential_values({})
+    assert not credential_values({"x": "ab"})
 
 
 def test_redact_text_strips_every_credential_value() -> None:

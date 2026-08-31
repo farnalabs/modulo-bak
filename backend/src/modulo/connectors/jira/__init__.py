@@ -318,13 +318,13 @@ class JiraConnector(ConnectorBase):
                 if q.cursor:
                     params["startAt"] = int(q.cursor)
                 r = await self._call_api("POST", "/search", json=params)
-                body: dict[str, Any] = await self._parse_json(r)
-                issues = body.get("issues", [])
+                payload: dict[str, Any] = await self._parse_json(r)
+                issues = payload.get("issues", [])
                 if not isinstance(issues, list):
                     issues = []
-                total = _safe_int(body.get("total"), len(issues))
-                start_at = _safe_int(body.get("startAt"), 0)
-                max_results = _safe_int(body.get("maxResults"), max_results)
+                total = _safe_int(payload.get("total"), len(issues))
+                start_at = _safe_int(payload.get("startAt"), 0)
+                max_results = _safe_int(payload.get("maxResults"), max_results)
                 next_cursor: str | None = None
                 if start_at + max_results < total:
                     next_cursor = str(start_at + max_results)

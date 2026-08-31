@@ -67,11 +67,11 @@ class TrelloConnector(ConnectorBase):
         if r.status_code != 200:
             return HealthResult(ok=False, detail=self._redactor.redact(f"HTTP {r.status_code}: {r.text[:200]}"))
 
-        body: dict[str, Any] = r.json()
-        if "id" not in body:
+        payload: dict[str, Any] = r.json()
+        if "id" not in payload:
             return HealthResult(ok=False, detail="Unexpected response — no 'id' in member profile")
 
-        display_name = body.get("fullName") or body.get("username") or ""
+        display_name = payload.get("fullName") or payload.get("username") or ""
         return HealthResult(ok=True, detail=display_name)
 
     @redacting
