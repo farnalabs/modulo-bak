@@ -1,7 +1,7 @@
 """TrelloConnector — async Trello REST API v1 connector."""
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -118,16 +118,49 @@ class TrelloConnector(ConnectorBase):
                 redacted = redacted.replace(secret, "***")
         return redacted
 
+    def _scrub_request(self, request: httpx.Request) -> httpx.Request:
+        """Rebuild *request* with a copy of the credential-bearing URL scrubbed.
+
+        ``key``/``token`` live in the query string (``_client`` applies them as
+        client-level params), so ``request.url`` carries the LIVE credentials.
+        httpx sinks (OTel/Sentry/debug logging) auto-capture ``request.url``, so
+        the redaction must happen at the request/response level too — not just in
+        ``__str__``. Rebuilding a new ``httpx.Request`` with a redacted URL means
+        the stored exception never holds a credential-bearing URL.
+        """
+        url = httpx.URL(self._redact(str(request.url)))
+        return httpx.Request(request.method, url, content=request.content, headers=request.headers)
+
+    def _scrub_response(self, response: httpx.Response, request: httpx.Request) -> httpx.Response:
+        """Rebuild *response* so ``response.request.url`` points at the scrubbed request."""
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            content=response.content,
+            request=request,
+            extensions=response.extensions,
+        )
+
     def _sanitize_status_error(self, exc: httpx.HTTPStatusError) -> TrelloHTTPStatusError:
+        """Wrap a status error so neither its message, nor its request/response
+        URLs, nor its chained cause can leak the credentials.
+
+        The original ``exc`` is NOT retained as ``__cause__``: a full-traceback
+        render would otherwise print the credential-bearing URL from the chained
+        raw exception. The wrapper carries a redacted message + scrubbed
+        request/response instead.
+        """
+        scrubbed_request = self._scrub_request(exc.request)
+        scrubbed_response = self._scrub_response(exc.response, scrubbed_request)
         return TrelloHTTPStatusError(
-            str(exc),
-            request=exc.request,
-            response=exc.response,
+            self._redact(str(exc)),
+            request=scrubbed_request,
+            response=scrubbed_response,
             redact=self._redact,
         )
 
     def _sanitize_transport_error(self, exc: httpx.HTTPError) -> TrelloHTTPError:
-        return TrelloHTTPError(str(exc), redact=self._redact)
+        return TrelloHTTPError(self._redact(str(exc)), redact=self._redact)
 
     async def _request(
         self,
@@ -142,19 +175,20 @@ class TrelloConnector(ConnectorBase):
         Every request URL carries ``?key=<api_key>&token=<token>`` (client-level
         params), so a raw ``httpx.HTTPStatusError``/transport message would leak
         the LIVE credentials into run/error detail. This wrapper re-raises a
-        redacted exception so ``str(exc)`` is clean; the original is preserved as
-        the ``__cause__``.
+        redacted exception so ``str(exc)`` is clean; the original is never chained
+        as ``__cause__`` (``from None``) so a full-traceback render cannot print
+        the credential-bearing URL either.
         """
         async with self._client() as client:
             try:
                 resp = await client.request(method, path, **kwargs)
             except httpx.HTTPError as exc:
-                raise self._sanitize_transport_error(exc) from exc
+                raise self._sanitize_transport_error(exc) from None
             if raise_on_status:
                 try:
                     resp.raise_for_status()
                 except httpx.HTTPStatusError as exc:
-                    raise self._sanitize_status_error(exc) from exc
+                    raise self._sanitize_status_error(exc) from None
         return resp
 
     async def health_check(self) -> HealthResult:
@@ -253,14 +287,14 @@ class TrelloConnector(ConnectorBase):
         match payload.resource:
             case "card":
                 r = await self._request("POST", "/cards", json=payload.data)
-                return r.json()
+                return cast(dict[str, Any], r.json())
 
             case "card_update":
                 if "id" not in payload.data:
                     raise ValueError("Trello card_update requires 'id' in data")
                 card_id = payload.data["id"]
                 r = await self._request("PUT", f"/cards/{card_id}", json=payload.data)
-                return r.json()
+                return cast(dict[str, Any], r.json())
 
             case "comment":
                 if "card_id" not in payload.data:
@@ -268,7 +302,7 @@ class TrelloConnector(ConnectorBase):
                 card_id = payload.data["card_id"]
                 text = payload.data.get("text", "")
                 r = await self._request("POST", f"/cards/{card_id}/actions/comments", json={"text": text})
-                return r.json()
+                return cast(dict[str, Any], r.json())
 
             case _:
                 raise ValueError(f"Unsupported Trello write resource: {payload.resource!r}")
