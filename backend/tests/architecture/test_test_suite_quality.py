@@ -7461,6 +7461,49 @@ def _is_fresh_value_call(node: ast.AST) -> bool:
     )
 
 
+#: Name-based UUIDs that are *deterministic*: ``uuid3``/``uuid5`` hash their
+#: inputs, so they return the SAME value on every call. They must never drive an
+#: "always FAILS/PASSES" membership/equality verdict (such an assertion is
+#: satisfiable), even though they are still freshly-constructed objects for the
+#: direct truthy-assert purpose.
+_DETERMINISTIC_UUID_NAMES = frozenset({"uuid3", "uuid5"})
+
+
+def _is_non_deterministic_fresh_call(node: ast.AST) -> bool:
+    """Like :func:`_is_fresh_value_call` but excludes deterministic name-based
+    UUIDs (``uuid3``/``uuid5``), which return the SAME value on every call.
+
+    A membership/equality verdict built on a deterministic UUID is satisfiable
+    (not always-failing), so it must not be flagged as a dead always-FAILS/always-
+    PASSES assertion. The direct truthy-assert lens keeps treating ``uuid3``/
+    ``uuid5`` as fresh (a freshly built UUID object is still a silent false
+    green), but the container-nested and membership lenses use this stricter
+    check instead."""
+    if not _is_fresh_value_call(node):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else (func.id if isinstance(func, ast.Name) else None)
+    return name not in _DETERMINISTIC_UUID_NAMES
+
+
+def _walk_operand(node: ast.AST):
+    """Yield ``node`` and its descendants, but never descend into ``Call``,
+    ``Subscript``, or comprehension (``ListComp``/``SetComp``/``DictComp``/
+    ``GeneratorExp``) boundaries.
+
+    This keeps a comparison-operand search scoped to the operand's OWN container
+    literals: a fresh value hidden behind a ``call(...)`` wrapper, a subscript,
+    or a comprehension is left alone, exactly as the container lens documents
+    its own contract — so ``assert load({'id': uuid.uuid4()}) == expected`` is
+    NOT flagged (the fresh value is an argument to ``load``, not the compared
+    container itself)."""
+    yield node
+    if isinstance(node, (ast.Call, ast.Subscript, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+        return
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_operand(child)
+
+
 def _fresh_value_assert_violations(tree: ast.AST) -> list[tuple[int, str]]:
     """Return ``(lineno, detail)`` pairs for every ``assert`` whose test
     expression — or a single equality-comparison operand — is a freshly
@@ -10349,14 +10392,17 @@ def _fresh_value_container_assert_violations(tree: ast.AST) -> list[tuple[int, s
         else:
             candidates = list(container.elts)
         for candidate in candidates:
-            if _is_fresh_value_call(candidate):
+            if _is_non_deterministic_fresh_call(candidate):
                 return candidate
         return None
 
     def _contains_direct_fresh_value(expr: ast.AST) -> ast.Call | None:
         """Return the first fresh-value call nested directly inside any container
-        literal findable within ``expr``, else None."""
-        for container in ast.walk(expr):
+        literal findable within ``expr`` — WITHOUT descending through Call/
+        Subscript/comprehension boundaries, so a fresh value buried inside a
+        ``call(...)`` wrapper (e.g. ``load({'id': uuid.uuid4()})``) is left
+        alone, as documented."""
+        for container in _walk_operand(expr):
             if not isinstance(container, (ast.List, ast.Dict, ast.Tuple, ast.Set)):
                 continue
             fresh = _container_direct_fresh_value(container)
@@ -10366,17 +10412,20 @@ def _fresh_value_container_assert_violations(tree: ast.AST) -> list[tuple[int, s
 
     def _membership_only_fresh_candidates(expr: ast.AST) -> bool:
         """True when ``expr`` is a non-empty list/tuple/set/dict literal whose
-        *every* membership candidate (element, or dict key) is a fresh-value
-        call — so no value the code under test produced can ever match."""
+        *every* membership candidate (element, or dict key) is a non-
+        deterministic fresh-value call — so no value the code under test produced
+        can ever match. Deterministic name-based UUIDs (``uuid3``/``uuid5``) are
+        excluded: they return the same value every call, so the verdict is
+        satisfiable and must not be flagged as always-failing."""
         if isinstance(expr, ast.Dict):
             if not expr.keys or any(key is None for key in expr.keys):
                 return False
-            return all(_is_fresh_value_call(key) for key in expr.keys)
+            return all(_is_non_deterministic_fresh_call(key) for key in expr.keys)
         if not isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
             return False
         if not expr.elts or any(isinstance(elt, ast.Starred) for elt in expr.elts):
             return False
-        return all(_is_fresh_value_call(elt) for elt in expr.elts)
+        return all(_is_non_deterministic_fresh_call(elt) for elt in expr.elts)
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assert):
@@ -10406,8 +10455,12 @@ def _fresh_value_container_assert_violations(tree: ast.AST) -> list[tuple[int, s
                 )
             )
         elif isinstance(op, (ast.In, ast.NotIn)):
-            container = test.comparators[0]
-            if not _membership_only_fresh_candidates(container):
+            container = None
+            for candidate in (test.left, test.comparators[0]):
+                if _membership_only_fresh_candidates(candidate):
+                    container = candidate
+                    break
+            if container is None:
                 continue
             op_name = "in" if isinstance(op, ast.In) else "not in"
             verdict = "always FAILS" if isinstance(op, ast.In) else "always PASSES"
@@ -10471,8 +10524,8 @@ def test_fresh_value_container_lens_flags_nested_fresh_values():
         "def test_foo():\n    assert result == [uuid.uuid4(), 'fallback']\n",
         "def test_foo():\n    assert result in (time.monotonic(),)\n",
         "def test_foo():\n    assert result not in {secrets.token_urlsafe()}\n",
-        "def test_foo():\n    assert tag in {uuid.uuid5(uuid.NAMESPACE_DNS, 'x'): 'v'}\n",
         "def test_foo():\n    assert result not in [token_bytes(16), uuid.uuid1()]\n",
+        "def test_foo():\n    assert [uuid.uuid4()] in result\n",
         "def test_foo():\n    assert result == {'payload': {'id': uuid.uuid4()}}\n",
         "def test_foo():\n    assert result == {**base, 'id': uuid.uuid4()}\n",
         "def test_foo():\n    assert result != [uuid.uuid4()]\n",
@@ -10500,6 +10553,8 @@ def test_fresh_value_container_lens_flags_nested_fresh_values():
         "def test_foo():\n    assert result == call(uuid.uuid4())\n",
         "def test_foo():\n    mock.assert_called_with({'id': uuid.uuid4()})\n",
         "def test_foo():\n    assert result == {'a': 1, 'b': 2}\n",
+        "def test_foo():\n    assert load({'id': uuid.uuid4()}) == expected\n",
+        "def test_foo():\n    assert get({'k': uuid.uuid4()}) != result\n",
     ]
     for source in negative_sources:
         tree = ast.parse(source)
