@@ -2431,10 +2431,10 @@ async def test_sandbox_generic_exception_envelope_includes_error_type_and_messag
     assert result["output"]["status"] == "failed"
     # The failure envelope must now carry the exception type and message.
     inner = result["artifacts"][0]["output"]
-    assert inner["error_type"] == "_Boom"
+    assert inner["error_type"] == "_BoomError"
     assert "connection reset" in inner["error_message"]
     # And the reduced top-level output view must surface them too (not masked).
-    assert result["output"]["error_type"] == "_Boom"
+    assert result["output"]["error_type"] == "_BoomError"
     assert "connection reset" in result["output"]["error_message"]
 
 
