@@ -99,47 +99,11 @@ _LOCALHOST_9000: str = "http://localhost:9000"
 # so legacy bare-token ciphertext rows for those types always failed
 # instantiation with "Missing credential key 'token'". The bare-scalar fallback
 # wrap in ``initialise()`` therefore wraps a decrypted bare scalar under the
-# connector type's OWN single credential key (this map), healing legacy rows at
-# read time — no write-side migration needed. Multi-key types (jira, trello,
-# jenkins, confluence, datadog, rest, ticket-tracker) require JSON-dict
-# credentials and keep the legacy "api_key" default, as do plugin types.
-_CREDENTIAL_KEY_BY_TYPE: dict[str, str] = {
-    "github": "token",
-    "gitlab": "token",
-    "gitea": "token",
-    "azure_repos": "token",
-    "bitbucket": "token",
-    "github_actions_ci": "token",
-    "gitlab_ci": "token",
-    "linear": "token",
-    "sharepoint": "token",
-    "shortcut": "token",
-    "youtrack": "token",
-    "notion": "token",
-    "npm": "token",
-    "pypi": "token",
-    "dropbox_paper": "token",
-    "buildkite": "token",
-    "circleci": "token",
-    "teamcity": "token",
-    "azure_key_vault": "token",
-    "azure_pipelines": "token",
-    "sentry": "token",
-    "pagerduty": "token",
-    "grafana": "token",
-    "microsoft_teams": "token",
-    "discord": "token",
-    "onepassword": "token",
-    "sonarqube": "token",
-    "codeclimate": "token",
-    "snyk": "token",
-    "trivy": "token",
-    "n8n": "token",
-    "slack": "bot_token",
-    "asana": "personal_access_token",
-    "monday": "api_key",
-    "opsgenie": "api_key",
-}
+# connector type's OWN single credential key (see ``_bare_credential_key``),
+# healing legacy rows at read time — no write-side migration needed. Multi-key
+# types (jira, trello, jenkins, confluence, datadog, rest, ticket-tracker)
+# require JSON-dict credentials and keep the legacy "api_key" default, as do
+# plugin types.
 
 
 class ConnectorNotFoundError(KeyError):
@@ -433,7 +397,7 @@ class ConnectorHub:
                                 # api_key/...); a bare scalar is wrapped under the
                                 # connector type's own single credential key
                                 # (FAR-496 read-side heal — see
-                                # _CREDENTIAL_KEY_BY_TYPE), falling back to the
+                                # _bare_credential_key), falling back to the
                                 # legacy single api_key wrapper for unlisted types.
                                 try:
                                     parsed_plain = json.loads(plaintext)
@@ -442,9 +406,13 @@ class ConnectorHub:
                                 if isinstance(parsed_plain, dict):
                                     raw_str = plaintext
                                 else:
-                                    raw_str = json.dumps(
-                                        {_CREDENTIAL_KEY_BY_TYPE.get(ci.connector_type_id, "api_key"): plaintext}
-                                    )
+                                    # Wrap the bare scalar under the connector
+                                    # type's OWN credential key so token-keyed
+                                    # types (github, linear, slack, ...) heal
+                                    # instead of failing with
+                                    # "Missing credential key 'token'" (FAR-496).
+                                    cred_key = _bare_credential_key(ci.connector_type_id)
+                                    raw_str = json.dumps({cred_key: plaintext})
                             except Exception:
                                 logger.warning(
                                     "Failed to decrypt credentials_ciphertext for connector %s", ci.id, exc_info=True
@@ -723,6 +691,73 @@ def _in_fetch_scope(instance: ConnectorInstance, fetch_scope: set[str]) -> bool:
     anything not named is never decrypted.
     """
     return str(instance.id) in fetch_scope or instance.connector_type_id in fetch_scope
+
+
+# Token-keyed connector types whose single credential is read under the key
+# "token" (see the `_get_cred(creds, "token", type_id)` calls in `_build_connector`
+# below). A bare (non-JSON) ciphertext scalar for these types must be wrapped
+# under "token" on the read-side fallback, NOT the legacy "api_key" wrapper
+# (FAR-496).
+_TOKEN_CRED_TYPES: frozenset[str] = frozenset(
+    {
+        "gitea",
+        "azure_repos",
+        "bitbucket",
+        "github",
+        "github_actions_ci",
+        "gitlab_ci",
+        "gitlab",
+        "linear",
+        "sharepoint",
+        "shortcut",
+        "youtrack",
+        "notion",
+        "npm",
+        "pypi",
+        "dropbox_paper",
+        "buildkite",
+        "circleci",
+        "teamcity",
+        "azure_key_vault",
+        "azure_pipelines",
+        "sentry",
+        "pagerduty",
+        "grafana",
+        "microsoft_teams",
+        "discord",
+        "onepassword",
+        "sonarqube",
+        "codeclimate",
+        "snyk",
+        "trivy",
+        "n8n",
+    }
+)
+
+# Single-key overrides for token-keyed types whose credential key is not "token".
+_BARE_CRED_KEY_OVERRIDES: dict[str, str] = {
+    "slack": "bot_token",
+    "asana": "personal_access_token",
+}
+
+
+def _bare_credential_key(type_id: str) -> str:
+    """Return the credential key a bare (non-JSON) ciphertext scalar is wrapped under.
+
+    Token-keyed connectors read a credential key other than "api_key" (FAR-496):
+    wrapping a bare token under "api_key" guarantees instantiation failure with
+    ``Missing credential key 'token'``. We therefore wrap under the connector
+    type's OWN credential key. api_key-keyed single types (monday, opsgenie, ...)
+    and multi-key types (jira, datadog, rest, confluence, trello, jenkins,
+    ticket-tracker, ...) keep the legacy "api_key" default — multi-key types
+    require a JSON-dict credential anyway, so a bare scalar can never be valid
+    for them and their shape must not change.
+    """
+    if type_id in _BARE_CRED_KEY_OVERRIDES:
+        return _BARE_CRED_KEY_OVERRIDES[type_id]
+    if type_id in _TOKEN_CRED_TYPES:
+        return "token"
+    return "api_key"
 
 
 def _get_cred(creds: dict[str, Any], key: str, type_id: str) -> Any:
