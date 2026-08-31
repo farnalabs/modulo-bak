@@ -391,6 +391,9 @@ def _build_list_item(run: Run, ctx: _ListPageContext) -> dict[str, Any]:
         "status": run.status,
         "trigger_type": run.trigger_type,
         "run_number": run.run_number,
+        # FAR-490: snapshot the run executes (None only for legacy/pre-FK rows)
+        # so run→snapshot verification is one GET, not pagination archaeology.
+        "snapshot_id": str(run.snapshot_id) if getattr(run, "snapshot_id", None) else None,
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
@@ -586,6 +589,12 @@ class RunResponse(BaseModel):
     run_number: int | None = None
     pipeline_name: str | None = None
     langgraph_thread_id: str
+    # FAR-490: the immutable snapshot this run executes. Every run-start path
+    # creates a fresh snapshot from the committed live graph, so the snapshot
+    # (fetchable via GET /pipelines/{id}/snapshots/{snapshot_id}) is the
+    # authoritative record of what the run ACTUALLY executed — expose the link
+    # so staleness investigations never have to diff the live graph instead.
+    snapshot_id: uuid.UUID | None = None
     error_detail: str | None = None
     error_code: str | None = None
     total_cost_usd: Decimal | None = None
@@ -752,6 +761,7 @@ def _build_run_response(
         run_number=run.run_number,
         pipeline_name=pipeline_name,
         langgraph_thread_id=run.langgraph_thread_id,
+        snapshot_id=getattr(run, "snapshot_id", None),
         error_detail=error_detail,
         error_code=error_code,
         total_cost_usd=run.total_cost_usd,
