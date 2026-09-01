@@ -238,40 +238,133 @@ def test_extract_bundle_rejects_missing_manifest() -> None:
 
 def test_sanitize_retry_policy_keeps_valid_dict() -> None:
     policy = {"on": ["stall", "timeout", "failure"], "max_retries": 3}
-    assert _sanitize_retry_policy(policy) == policy
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == policy
+    assert fault is None
 
 
 def test_sanitize_retry_policy_keeps_minimal_valid_dict() -> None:
     policy = {"on": ["timeout"], "max_retries": 1}
-    assert _sanitize_retry_policy(policy) == policy
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == policy
+    assert fault is None
 
 
 def test_sanitize_retry_policy_drops_unknown_event() -> None:
-    assert not _sanitize_retry_policy({"on": ["bogus"], "max_retries": 2})
+    sanitized, fault = _sanitize_retry_policy({"on": ["bogus"], "max_retries": 2})
+    assert not sanitized
+    assert fault == "core"
 
 
 def test_sanitize_retry_policy_drops_out_of_range_budget() -> None:
-    assert not _sanitize_retry_policy({"on": ["failure"], "max_retries": 9})
+    sanitized, fault = _sanitize_retry_policy({"on": ["failure"], "max_retries": 9})
+    assert not sanitized
+    assert fault == "core"
 
 
 def test_sanitize_retry_policy_drops_non_integer_budget() -> None:
-    assert not _sanitize_retry_policy({"on": ["failure"], "max_retries": "lots"})
+    sanitized, fault = _sanitize_retry_policy({"on": ["failure"], "max_retries": "lots"})
+    assert not sanitized
+    assert fault == "core"
 
 
 def test_sanitize_retry_policy_drops_non_dict_values() -> None:
-    assert not _sanitize_retry_policy("stall")
-    assert not _sanitize_retry_policy(["stall"])
+    for bad in ("stall", ["stall"], None, 42):
+        sanitized, fault = _sanitize_retry_policy(bad)
+        assert not sanitized
+        assert fault == "core"
 
 
 def test_sanitize_retry_policy_keeps_empty_policy() -> None:
-    assert not _sanitize_retry_policy({})
+    sanitized, fault = _sanitize_retry_policy({})
+    assert not sanitized
+    assert fault is None
 
 
 def test_sanitize_retry_policy_returns_copy_not_reference() -> None:
     policy = {"on": ["failure"], "max_retries": 2}
-    sanitized = _sanitize_retry_policy(policy)
+    sanitized, _fault = _sanitize_retry_policy(policy)
     assert sanitized is not policy
     assert sanitized == policy
+
+
+# ---------------------------------------------------------------------------
+# FAR-525 — backoff_schedule sanitisation (fault-classed)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_retry_policy_keeps_valid_schedule() -> None:
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 30, "multiplier": 1.5}}
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == policy
+    assert fault is None
+
+
+def test_sanitize_retry_policy_nested_drops_malformed_schedule_keeps_core() -> None:
+    """A schedule-level fault removes ONLY backoff_schedule — on/max_retries are KEPT."""
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 0}}
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == {"on": ["failure"], "max_retries": 2}
+    assert fault == "schedule"
+
+
+def test_sanitize_retry_policy_whole_drops_mixed_error() -> None:
+    """Mixed core + schedule faults WHOLE-DROP (the core fault is fatal)."""
+    policy = {"on": ["bogus"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 0}}
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == {}
+    assert fault == "core"
+
+
+def test_sanitize_retry_policy_canonicalization_only_delta_does_not_fault() -> None:
+    """A canonicalisation-only delta (300.0 -> 300, int multiplier -> float)
+    is NOT a fault: the policy is kept and no warning-worthy fault class is
+    returned."""
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 300.0, "multiplier": 2}}
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == {
+        "on": ["failure"],
+        "max_retries": 2,
+        "backoff_schedule": {"delay_seconds": 300, "multiplier": 2.0},
+    }
+    assert fault is None
+
+
+def test_apply_imported_retry_policy_schedule_fault_emits_schedule_warning() -> None:
+    """The warning site derives warnings from the fault class: a nested drop
+    emits the schedule-specific message, NOT the 'dropped to {}' message."""
+    from modulo.core.workflow_import_export import _apply_imported_retry_policy
+
+    pipeline = MagicMock()
+    pipeline_info = {"retry_policy": {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"nope": 1}}}
+    warnings: list[str] = []
+    _apply_imported_retry_policy(pipeline, pipeline_info, warnings)
+    assert pipeline.retry_policy == {"on": ["failure"], "max_retries": 2}
+    assert len(warnings) == 1
+    assert "backoff_schedule" in warnings[0]
+    assert "dropped to the no-policy default" not in warnings[0]
+
+
+def test_apply_imported_retry_policy_core_fault_emits_legacy_warning() -> None:
+    from modulo.core.workflow_import_export import _apply_imported_retry_policy
+
+    pipeline = MagicMock()
+    pipeline_info = {"retry_policy": {"on": ["bogus"], "max_retries": 2}}
+    warnings: list[str] = []
+    _apply_imported_retry_policy(pipeline, pipeline_info, warnings)
+    assert pipeline.retry_policy == {}
+    assert warnings == ["Imported pipeline 'retry_policy' was malformed; dropped to the no-policy default ({})."]
+
+
+def test_apply_imported_retry_policy_canonicalization_only_no_warning() -> None:
+    from modulo.core.workflow_import_export import _apply_imported_retry_policy
+
+    pipeline = MagicMock()
+    pipeline_info = {"retry_policy": {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45.0}}}
+    warnings: list[str] = []
+    _apply_imported_retry_policy(pipeline, pipeline_info, warnings)
+    assert pipeline.retry_policy == {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45}}
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------

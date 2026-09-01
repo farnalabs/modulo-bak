@@ -318,3 +318,173 @@ def test_update_pipeline_rejects_max_retries_over_budget(client: TestClient) -> 
     )
 
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# FAR-525 — backoff_schedule (run-level re-dispatch pacing) at the write sites
+# ---------------------------------------------------------------------------
+
+
+_SCHEDULE_OK = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 30, "multiplier": 1.5}}
+
+
+def test_create_pipeline_accepts_backoff_schedule(client: TestClient) -> None:
+    pipeline = _make_pipeline()
+    pipeline.retry_policy = _SCHEDULE_OK
+
+    with (
+        patch("modulo.api.routes.pipelines.create_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = client.post("/api/v1/pipelines", json={"name": "Pipeline", "retry_policy": _SCHEDULE_OK})
+
+    assert resp.status_code == 201
+    assert resp.json()["retry_policy"] == _SCHEDULE_OK
+
+
+def test_create_pipeline_rejects_out_of_bounds_delay_seconds(client: TestClient) -> None:
+    resp = client.post(
+        "/api/v1/pipelines",
+        json={
+            "name": "Pipeline",
+            "retry_policy": {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 301}},
+        },
+    )
+    assert resp.status_code == 422
+    assert "delay_seconds" in resp.json()["detail"]
+
+
+def test_create_pipeline_rejects_schedule_missing_delay_seconds(client: TestClient) -> None:
+    resp = client.post(
+        "/api/v1/pipelines",
+        json={
+            "name": "Pipeline",
+            "retry_policy": {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"multiplier": 2.0}},
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_create_pipeline_rejects_unknown_schedule_inner_key(client: TestClient) -> None:
+    resp = client.post(
+        "/api/v1/pipelines",
+        json={
+            "name": "Pipeline",
+            "retry_policy": {
+                "on": ["failure"],
+                "max_retries": 2,
+                "backoff_schedule": {"delay_seconds": 45, "backof": 2},
+            },
+        },
+    )
+    assert resp.status_code == 422
+    assert "backof" in resp.json()["detail"]
+
+
+def test_create_pipeline_rejects_out_of_bounds_multiplier(client: TestClient) -> None:
+    resp = client.post(
+        "/api/v1/pipelines",
+        json={
+            "name": "Pipeline",
+            "retry_policy": {
+                "on": ["failure"],
+                "max_retries": 2,
+                "backoff_schedule": {"delay_seconds": 45, "multiplier": 10.1},
+            },
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_create_pipeline_accepts_legacy_backoff_alongside_new_validation(client: TestClient) -> None:
+    """Write-side legacy coexistence: the legacy numeric `backoff` key passes
+    the NEW validation untouched (it is node-default-inherited, not run-level)."""
+    pipeline = _make_pipeline()
+    legacy = {"on": ["failure"], "max_retries": 2, "backoff": 1.5}
+    pipeline.retry_policy = legacy
+
+    with (
+        patch("modulo.api.routes.pipelines.create_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = client.post("/api/v1/pipelines", json={"name": "Pipeline", "retry_policy": legacy})
+
+    assert resp.status_code == 201
+
+
+def test_update_pipeline_canonicalizes_integral_float_delay(client: TestClient) -> None:
+    """PATCH delay 300.0 -> stored 300 (type-stable storage so the topology
+    hash cannot flip on a float/int spelling)."""
+    pipeline = _make_pipeline()
+    pipeline.retry_policy = {
+        "on": ["failure"],
+        "max_retries": 2,
+        "backoff_schedule": {"delay_seconds": 300, "multiplier": 2.0},
+    }
+
+    with (
+        patch("modulo.api.routes.pipelines.get_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.update_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+        patch("modulo.api.routes.pipelines._assert_team_transition_allowed", new=AsyncMock()),
+        patch("modulo.api.routes.pipelines.append_audit_event", new=AsyncMock()),
+    ):
+        resp = client.patch(
+            f"/api/v1/pipelines/{_PIPELINE_ID}",
+            json={
+                "retry_policy": {
+                    "on": ["failure"],
+                    "max_retries": 2,
+                    "backoff_schedule": {"delay_seconds": 300.0, "multiplier": 2},
+                }
+            },
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["retry_policy"] == {
+        "on": ["failure"],
+        "max_retries": 2,
+        "backoff_schedule": {"delay_seconds": 300, "multiplier": 2.0},
+    }
+
+
+def test_update_pipeline_unknown_top_level_key_warns_but_writes(client: TestClient) -> None:
+    """A typo'd top-level key is accepted NON-blocking with a warning log."""
+    pipeline = _make_pipeline()
+    pipeline.retry_policy = {"on": ["failure"], "max_retries": 2}
+
+    with (
+        patch("modulo.api.routes.pipelines.get_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.update_pipeline", return_value=pipeline),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+        patch("modulo.api.routes.pipelines._assert_team_transition_allowed", new=AsyncMock()),
+        patch("modulo.api.routes.pipelines.append_audit_event", new=AsyncMock()),
+        patch("modulo.api.routes.pipelines.logger.warning") as warn_mock,
+    ):
+        resp = client.patch(
+            f"/api/v1/pipelines/{_PIPELINE_ID}",
+            json={"retry_policy": {"on": ["failure"], "max_retries": 2, "backof_schedule": {"delay_seconds": 45}}},
+        )
+
+    assert resp.status_code == 200
+    warn_calls = [c for c in warn_mock.call_args_list if c.args and c.args[0] == "pipeline.retry_policy_unknown_keys"]
+    assert warn_calls, warn_mock.call_args_list
+    assert warn_calls[0].kwargs["extra"]["keys"] == ["backof_schedule"]
+
+
+def test_validate_retry_policy_graph_validator_parity_for_valid_legacy_payload() -> None:
+    """GraphValidator emits NO error for a legacy payload the API accepts —
+    the delegation cannot silently tighten the accepted surface."""
+    from modulo.api.routes.pipelines import _validate_retry_policy
+    from modulo.core.graph_validator import GraphValidator, ValidationResult
+
+    legacy = {"on": ["failure"], "max_retries": 2, "backoff": 1.5}
+    result = ValidationResult()
+    GraphValidator.check_retry_policy(legacy, result)
+    GraphValidator.check_retry_policy_schedule(legacy, result)
+    assert result.is_valid
+    assert _validate_retry_policy(legacy) == legacy

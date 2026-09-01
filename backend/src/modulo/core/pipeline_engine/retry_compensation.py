@@ -26,6 +26,8 @@ Nothing here imports the executor or the ORM — it is DB-free and unit-testable
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,6 +37,13 @@ __all__ = [
     "RETRY_BACKOFF_CAP_SECONDS",
     "RETRY_EVENTS",
     "RETRY_MAX_ATTEMPTS_BOUND",
+    "RETRY_SCHEDULE_ALLOWED_KEYS",
+    "RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS",
+    "RETRY_SCHEDULE_DEFAULT_MULTIPLIER",
+    "RETRY_SCHEDULE_MAX_DELAY_SECONDS",
+    "RETRY_SCHEDULE_MAX_MULTIPLIER",
+    "RETRY_SCHEDULE_MIN_DELAY_SECONDS",
+    "RETRY_SCHEDULE_MIN_MULTIPLIER",
     "NodeRetryPolicy",
     "RetryConfigError",
     "build_run_ref",
@@ -47,8 +56,10 @@ __all__ = [
     "node_retries_on",
     "parse_edge_retry",
     "parse_node_retry",
+    "resolve_backoff_schedule",
     "resolve_node_retry",
     "run_idempotency_key",
+    "sanitize_retry_policy_snippet",
     "validate_compensation_acyclic",
     "validate_compensation_target_exists",
     "validate_edge_mutual_exclusion",
@@ -71,6 +82,23 @@ RETRY_MAX_ATTEMPTS_BOUND = 5
 # Maximum sane backoff (seconds) for a node / edge retry. Kept conservative so a
 # malformed ``backoff`` (e.g. ``1e9``) cannot pin a worker in a sleep loop.
 RETRY_BACKOFF_CAP_SECONDS = 300.0
+
+# ---------------------------------------------------------------------------
+# Run-level retry_policy ``backoff_schedule`` bounds (FAR-525)
+# ---------------------------------------------------------------------------
+# ``backoff_schedule`` is a RUN-LEVEL re-dispatch pacing key ONLY — it does NOT
+# participate in the node-default inheritance path (`_policy_from_pipeline_default`
+# reads ONLY the legacy numeric ``backoff``). The bounds are hosted here because
+# this module is DB-free and already lazily imported by GraphValidator; the 300s
+# code-held CAP below is the same value as ``RETRY_BACKOFF_CAP_SECONDS`` (kept a
+# separate name so the two layers cannot silently re-couple).
+RETRY_SCHEDULE_MIN_DELAY_SECONDS = 1
+RETRY_SCHEDULE_MAX_DELAY_SECONDS = 300
+RETRY_SCHEDULE_MIN_MULTIPLIER = 1.0
+RETRY_SCHEDULE_MAX_MULTIPLIER = 10.0
+RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS = 45.0
+RETRY_SCHEDULE_DEFAULT_MULTIPLIER = 2.0
+RETRY_SCHEDULE_ALLOWED_KEYS = frozenset({"delay_seconds", "multiplier"})
 
 
 class RetryConfigError(ValueError):
@@ -211,6 +239,101 @@ def _policy_from_pipeline_default(pipeline_retry_policy: Any) -> NodeRetryPolicy
     backoff = pipeline_retry_policy.get("backoff", 0.0)
     backoff_sec = min(float(max(backoff, 0.0)), RETRY_BACKOFF_CAP_SECONDS) if isinstance(backoff, (int, float)) else 0.0
     return NodeRetryPolicy(max_attempts=max_attempts, backoff_seconds=backoff_sec, events=frozenset(node_events))
+
+
+def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | None]:
+    """Resolve the run-level ``backoff_schedule`` from a ``retry_policy`` (FAR-525).
+
+    Pure, DB-free, TOTAL fail-open: any structural fault (non-dict policy,
+    non-dict / empty-object schedule, unknown inner key, bool-typed or
+    out-of-bounds ``delay_seconds`` / ``multiplier``, NaN / Infinity) yields the
+    hardcoded DEFAULT schedule (``45s x 2.0`` — identical to the executor's
+    pre-FAR-525 behaviour) plus a fail-open ``reason`` the CALLER logs. The
+    fail-open is ALL-OR-NOTHING: no partial application of a partially valid
+    schedule.
+
+    Returns ``(schedule_present, delay_seconds, multiplier, fail_open_reason)``:
+      - absent (``backoff_schedule`` is ``None``/``{}``/missing, or the policy
+        is not a dict): ``(False, 45.0, 2.0, None)`` — the caller uses the
+        executor's own hardcoded defaults via ``_retry_backoff_seconds``.
+      - valid: ``(True, delay_seconds, multiplier, None)`` with types
+        canonicalised (integral floats -> int, ints -> float) so a re-resolve
+        is deterministic and the topology hash stays stable.
+      - invalid: ``(True, 45.0, 2.0, reason)`` — present but unusable, so the
+        caller logs the structured fail-open warning and re-dispatch falls
+        back to the hardcoded default schedule.
+    """
+    base = float(RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS)
+    default_multiplier = RETRY_SCHEDULE_DEFAULT_MULTIPLIER
+    if not isinstance(policy, dict):
+        return (False, base, default_multiplier, None)
+    schedule = policy.get("backoff_schedule")
+    if schedule is None or (isinstance(schedule, dict) and not schedule):
+        return (False, base, default_multiplier, None)
+
+    def _fail_open(reason: str) -> tuple[bool, float, float, str | None]:
+        return (True, base, default_multiplier, reason)
+
+    if not isinstance(schedule, dict):
+        return _fail_open("backoff_schedule must be an object")
+    unknown = set(schedule) - RETRY_SCHEDULE_ALLOWED_KEYS
+    if unknown:
+        return _fail_open(f"backoff_schedule contains unknown keys {sorted(str(k) for k in unknown)}")
+
+    delay_raw = schedule.get("delay_seconds")
+    if isinstance(delay_raw, bool) or not isinstance(delay_raw, (int, float)):
+        return _fail_open("backoff_schedule 'delay_seconds' must be a number of seconds")
+    delay = float(delay_raw)
+    # NaN/Infinity fail the range comparison (not <= bound / not < bound), so
+    # they land in the same fail-open bucket as any other out-of-bounds value.
+    if not RETRY_SCHEDULE_MIN_DELAY_SECONDS <= delay <= RETRY_SCHEDULE_MAX_DELAY_SECONDS:
+        return _fail_open(
+            f"backoff_schedule 'delay_seconds' out of bounds "
+            f"[{RETRY_SCHEDULE_MIN_DELAY_SECONDS}, {RETRY_SCHEDULE_MAX_DELAY_SECONDS}]"
+        )
+    delay_seconds: int = int(delay)  # integral by the range+type contract
+
+    mult_raw = schedule.get("multiplier", default_multiplier)
+    if isinstance(mult_raw, bool) or not isinstance(mult_raw, (int, float)):
+        return _fail_open("backoff_schedule 'multiplier' must be a number")
+    multiplier = float(mult_raw)
+    if not RETRY_SCHEDULE_MIN_MULTIPLIER <= multiplier <= RETRY_SCHEDULE_MAX_MULTIPLIER:
+        return _fail_open(
+            f"backoff_schedule 'multiplier' out of bounds "
+            f"[{RETRY_SCHEDULE_MIN_MULTIPLIER}, {RETRY_SCHEDULE_MAX_MULTIPLIER}]"
+        )
+    return (True, float(delay_seconds), multiplier, None)
+
+
+_TOKENISH_KEY_RE = re.compile(r"token|secret|password|credential|api[-_]?key|authorization", re.IGNORECASE)
+_SNIPPET_LIMIT = 120
+
+
+def sanitize_retry_policy_snippet(value: Any, limit: int = _SNIPPET_LIMIT) -> str:
+    """A BOUNDED, REDACTED string snippet of an offending config value (FAR-525).
+
+    Used for fail-open warning logs: the offending input is operator-supplied
+    JSON, so it must never reach a log line raw or unbounded. Only scalar
+    fields are rendered, values whose KEY looks token-like are redacted, and
+    the result is truncated to ``limit`` characters. Never raises.
+    """
+    try:
+        if isinstance(value, dict):
+            safe: dict[str, str] = {}
+            for k, v in value.items():
+                key = str(k)
+                if _TOKENISH_KEY_RE.search(key):
+                    safe[key] = "[REDACTED]"
+                elif isinstance(v, (int, float, bool)) or v is None:
+                    safe[key] = repr(v)
+                else:
+                    safe[key] = f"<{type(v).__name__}>"
+            rendered = json.dumps(safe, sort_keys=True)
+        else:
+            rendered = f"<{type(value).__name__}>"
+        return rendered[:limit]
+    except Exception:  # pragma: no cover - never raise from a log helper
+        return "<unrenderable>"
 
 
 def node_retries_on(policy: NodeRetryPolicy, event: str) -> bool:

@@ -348,16 +348,23 @@ async def _handle_graph_write_denials(
 
 
 def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Validate a ``retry_policy`` payload, returning it unchanged.
+    """Validate a ``retry_policy`` payload, returning it canonicalised.
 
     ``None`` is accepted (treated as "no retry policy"). Raises ValueError with
-    a clear message when the policy shape is malformed.
+    a clear message when the core policy shape is malformed.
 
     FAR-525 refactor: the shape rules live in ONE place
-    (``GraphValidator.check_retry_policy``) so the API layer, the graph
-    validator, and the import sanitiser cannot drift. Issues are mapped to
-    ``ValueError`` with the SAME message strings the inline implementation
-    raised (first-issue parity �?" byte-identical 422 details).
+    (``GraphValidator.check_retry_policy`` + ``check_retry_policy_schedule``)
+    so the API layer, the graph validator, and the import sanitiser cannot
+    drift. Issues are mapped to ``ValueError`` with the SAME message strings
+    the inline implementation raised (first-issue parity — byte-identical 422
+    details).
+
+    FAR-525: the OPTIONAL ``backoff_schedule`` key (run-level re-dispatch
+    pacing) is validated at the SAME write severity (ERROR -> 422). Integral
+    floats are canonicalised to ints and int multipliers to floats so the
+    stored JSON is type-stable (the retry-aware topology hash must not flip
+    because ``300.0`` became ``300``).
     """
     if value is None:
         return value
@@ -365,8 +372,37 @@ def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | Non
 
     result = ValidationResult()
     GraphValidator.check_retry_policy(value, result)
+    GraphValidator.check_retry_policy_schedule(value, result)
     for issue in result.issues:
         raise ValueError(issue.message)
+
+    # Non-blocking typo surface: an unrecognized TOP-LEVEL key (e.g. a
+    # typo'd "backof_schedule") is accepted-but-warned so the write succeeds
+    # while the mistake is visible in logs. The legacy numeric ``backoff`` key
+    # is exempt (it is a real, node-default-inherited key).
+    unknown_top = set(value) - {"on", "max_retries", "backoff", "backoff_schedule"}
+    if unknown_top:
+        logger.warning(
+            "pipeline.retry_policy_unknown_keys",
+            extra={"keys": sorted(unknown_top)},
+        )
+
+    # Canonicalize type-stable storage: integral-float delay_seconds -> int,
+    # int multiplier -> float (validator and resolver coerce IDENTICALLY).
+    schedule = value.get("backoff_schedule")
+    if isinstance(schedule, dict) and schedule:
+        delay = schedule.get("delay_seconds")
+        if (
+            isinstance(delay, (int, float))
+            and not isinstance(delay, bool)
+            and float(delay).is_integer()
+            and not isinstance(delay, int)
+        ):
+            schedule = {**schedule, "delay_seconds": int(delay)}
+        mult = schedule.get("multiplier")
+        if isinstance(mult, int) and not isinstance(mult, bool):
+            schedule = {**schedule, "multiplier": float(mult)}
+        value = {**value, "backoff_schedule": schedule}
     return value
 
 
@@ -396,9 +432,16 @@ class PipelineCreate(TeamVisibilityMixin):
     retry_policy: dict[str, Any] | None = Field(
         None,
         description=(
-            "Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. "
+            "Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5, "
+            "backoff: seconds?, backoff_schedule?: {delay_seconds: 1-300, multiplier?: 1.0-10.0}}. "
             "When a run ends in a configured state and retries remain, the run is "
-            "re-dispatched automatically instead of terminal-failing."
+            "re-dispatched automatically instead of terminal-failing. "
+            "'backoff' is the legacy NODE-level inherited retry delay (node retries inherit "
+            "this value; default 0). 'backoff_schedule' paces ONLY the run-level re-dispatch: "
+            "the in-job sleep is min(delay_seconds * multiplier^(attempt-1), 300) plus up to "
+            "+25% jitter (cap and jitter are code-held, not configurable); multiplier defaults "
+            "to 2.0 (1.0 = fixed delay). The effective re-dispatch gap is the sleep plus "
+            "settings.saq_retry_delay plus queue wait."
         ),
     )
 
@@ -442,7 +485,14 @@ class PipelineUpdate(TeamVisibilityMixin):
     )
     retry_policy: dict[str, Any] | None = Field(
         None,
-        description="Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.",
+        description=(
+            "Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5, "
+            "backoff: seconds?, backoff_schedule?: {delay_seconds: 1-300, multiplier?: 1.0-10.0}}. "
+            "Set to {} to clear. 'backoff' = node-level inherited retry delay; "
+            "'backoff_schedule' = run-level re-dispatch pacing only "
+            "(min(delay_seconds * multiplier^(attempt-1), 300) + up to 25% jitter; "
+            "multiplier default 2.0). Effective gap = sleep + settings.saq_retry_delay + queue wait."
+        ),
     )
     graph_json: PipelineGraphUpdate | None = Field(
         None,

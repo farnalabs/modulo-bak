@@ -323,3 +323,141 @@ def test_policy_from_pipeline_default_fail_closed_on_missing_vocabulary() -> Non
         policy = rc._policy_from_pipeline_default(bad)
         assert policy.max_attempts == 1
         assert not policy.events
+
+
+# ---------------------------------------------------------------------------
+# FAR-525 — resolve_backoff_schedule (run-level backoff_schedule, total fail-open)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_backoff_schedule_absent_variants() -> None:
+    """null / {} / missing key / non-dict policy = NO schedule (absent)."""
+    for policy in (
+        None,
+        {},
+        {"on": ["failure"], "max_retries": 2},
+        {"backoff_schedule": None},
+        {"backoff_schedule": {}},
+    ):
+        present, delay, mult, reason = rc.resolve_backoff_schedule(policy)
+        assert present is False
+        assert reason is None
+        # Absent hands the executor's own hardcoded defaults back.
+        assert delay == 45.0
+        assert mult == 2.0
+
+
+def test_resolve_backoff_schedule_valid_fixed_and_growth() -> None:
+    present, delay, mult, reason = rc.resolve_backoff_schedule(
+        {"backoff_schedule": {"delay_seconds": 30, "multiplier": 1.0}}
+    )
+    assert (present, delay, mult, reason) == (True, 30.0, 1.0, None)
+
+    present, delay, mult, reason = rc.resolve_backoff_schedule(
+        {"backoff_schedule": {"delay_seconds": 10, "multiplier": 3}}
+    )
+    assert (present, delay, mult, reason) == (True, 10.0, 3.0, None)
+
+
+def test_resolve_backoff_schedule_multiplier_defaults_to_2() -> None:
+    present, delay, mult, reason = rc.resolve_backoff_schedule({"backoff_schedule": {"delay_seconds": 45}})
+    assert (present, delay, mult, reason) == (True, 45.0, 2.0, None)
+
+
+def test_resolve_backoff_schedule_canonicalizes_types() -> None:
+    """Integral floats -> int-valued floats; ints -> floats — the resolved
+    values are type-stable so a re-resolve is deterministic."""
+    _present, delay, mult, _reason = rc.resolve_backoff_schedule(
+        {"backoff_schedule": {"delay_seconds": 300.0, "multiplier": 2}}
+    )
+    assert delay == 300.0
+    assert isinstance(mult, float) and mult == 2.0
+
+
+def test_resolve_backoff_schedule_fail_open_matrix() -> None:
+    """ANY structural fault -> the hardcoded default schedule + a reason.
+    ALL-OR-NOTHING: no partial application of a partially valid schedule."""
+    fail_cases = [
+        {"delay_seconds": 0},
+        {"delay_seconds": -5},
+        {"delay_seconds": 1000},
+        {"delay_seconds": 0.5},
+        {"delay_seconds": 301},
+        {"delay_seconds": True},
+        {"delay_seconds": "45"},
+        {"delay_seconds": None},
+        {"multiplier": 2.0},  # missing delay_seconds
+        {"delay_seconds": 45, "multiplier": 0.5},
+        {"delay_seconds": 45, "multiplier": 100},
+        {"delay_seconds": 45, "multiplier": True},
+        {"delay_seconds": 45, "multiplier": "2"},
+        {"delay_seconds": 45, "nope": 1},  # unknown inner key
+        {"delay_seconds": float("nan")},
+        {"delay_seconds": float("inf")},
+    ]
+    for schedule in fail_cases:
+        present, delay, mult, reason = rc.resolve_backoff_schedule({"backoff_schedule": schedule})
+        assert present is True, schedule
+        assert delay == 45.0, schedule
+        assert mult == 2.0, schedule
+        assert reason, schedule
+
+
+def test_resolve_backoff_schedule_fail_open_non_dict_schedule() -> None:
+    present, delay, mult, reason = rc.resolve_backoff_schedule({"backoff_schedule": 45})
+    assert (present, delay, mult) == (True, 45.0, 2.0)
+    assert reason
+
+
+def test_resolve_backoff_schedule_legacy_backoff_coexistence() -> None:
+    """The legacy numeric `backoff` key coexists: the resolver ignores it (it
+    is node-default-inherited), and the node-inheritance path still reads it."""
+    policy = {"on": ["failure"], "max_retries": 2, "backoff": 1.5}
+    present, _delay, _mult, reason = rc.resolve_backoff_schedule(policy)
+    assert present is False and reason is None
+    node_policy = rc._policy_from_pipeline_default(policy)
+    assert node_policy.backoff_seconds == 1.5  # node inheritance path UNCHANGED
+
+
+def test_resolve_backoff_schedule_accepted_resolves_cross_check() -> None:
+    """Property: every schedule the WRITE-SITE validator accepts, the resolver
+    resolves without fail-open (and vice versa for well-typed in-bounds rows)."""
+    from modulo.core.graph_validator import GraphValidator
+    from modulo.core.graph_validator._types import ValidationResult
+
+    for delay in (1, 45, 300, 300.0):
+        for mult in (1, 2, 10, 10.0):
+            policy = {"backoff_schedule": {"delay_seconds": delay, "multiplier": mult}}
+            result = ValidationResult()
+            GraphValidator.check_retry_policy_schedule(policy, result)
+            assert result.is_valid, (delay, mult)
+            present, _delay, _mult, reason = rc.resolve_backoff_schedule(policy)
+            assert present is True and reason is None, (delay, mult)
+
+
+def test_sanitize_retry_policy_snippet_bounded_and_redacted() -> None:
+    from modulo.core.pipeline_engine.retry_compensation import sanitize_retry_policy_snippet
+
+    snippet = sanitize_retry_policy_snippet({"delay_seconds": 1000, "api_key": "sk-super-secret", "nested": {"a": 1}})
+    assert len(snippet) <= 120
+    assert "sk-super-secret" not in snippet
+    assert "[REDACTED]" in snippet
+    assert "1000" in snippet
+    # Non-dict input renders a type tag only (never raw unbounded input).
+    assert sanitize_retry_policy_snippet("x" * 10000) == "<str>"
+    assert len(sanitize_retry_policy_snippet({"a": {"deep": {"deeper": 1}}})) <= 120
+
+
+def test_resolve_backoff_schedule_default_schedule_value_matches_executor_defaults(monkeypatch) -> None:
+    """The fail-open defaults ARE the hardcoded executor schedule: pinning the
+    jitter seam, the resolved deterministic component reproduces the legacy
+    exponential exactly."""
+    from modulo.core.pipeline_engine import executor as executor_module
+
+    monkeypatch.setattr(executor_module.random, "uniform", lambda a, b: 0.0)
+    for attempt in (1, 2, 3, 4, 5):
+        _present, delay, mult, _reason = rc.resolve_backoff_schedule({"backoff_schedule": {"delay_seconds": 0}})
+        assert (delay, mult) == (45.0, 2.0)
+        assert executor_module._retry_backoff_seconds(attempt, base=delay, multiplier=mult) == min(
+            45.0 * 2.0 ** (attempt - 1), 300.0
+        )
