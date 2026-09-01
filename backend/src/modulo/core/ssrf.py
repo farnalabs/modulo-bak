@@ -121,6 +121,8 @@ import httpcore
 import httpx
 from httpcore._backends.base import SOCKET_OPTION
 
+from modulo.core import egress_metrics
+
 _log = logging.getLogger(__name__)
 
 Network = ipaddress.IPv4Network | ipaddress.IPv6Network
@@ -432,6 +434,39 @@ def _warn_if_proxied(trust_env: bool) -> None:
             "ssrf.pinned_transport_proxy_env",
             extra={"proxy_vars": ",".join(present)},
         )
+
+
+def _eh_label_host(url: str) -> str:
+    """Extract a stable ``host`` label from a URL for egress metric records.
+
+    Mirrors :func:`normalize_url_host` (lowercase, trailing-dot stripped, no
+    brackets) but degrades to ``"unknown"`` on any parse problem so a metric
+    record never blocks the egress path.
+    """
+    try:
+        return normalize_url_host(url)
+    except Exception:
+        return "unknown"
+
+
+def _classify_reject_reason(exc: BaseException, url: str) -> str:
+    """Classify a resolve/validate ``ValueError`` into a stable egress reason.
+
+    The egress factory records why a pinned client could not be built. The
+    scheme check is derived from ``url`` (the first syntax gate); timeout /
+    resolution-failure are read from the stable failure messages raised by this
+    module. Anything else is a destination policy rejection (``blocked``):
+    private/internal address, non-canonical IP literal, embedded userinfo, or a
+    malformed host.
+    """
+    if urlparse(url).scheme not in ("http", "https"):
+        return egress_metrics.REASON_BAD_SCHEME
+    message = str(exc)
+    if "DNS resolution timed out" in message:
+        return egress_metrics.REASON_DNS_TIMEOUT
+    if "DNS resolution failed" in message:
+        return egress_metrics.REASON_DNS_FAILED
+    return egress_metrics.REASON_BLOCKED
 
 
 def _reject_noncanonical_ip_literal(host: str) -> None:
@@ -814,6 +849,7 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
         allow_networks: Sequence[str] | None = None,
         re_resolve: bool = True,
         resolve_ttl_seconds: float | None = None,
+        connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
     ) -> None:
         super().__init__()
         self._pinned_hosts: dict[str, tuple[str, ...]] = {
@@ -821,6 +857,7 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
         }
         self._allow_networks = normalize_allow_networks(allow_networks)
         self._re_resolve = re_resolve
+        self._connector_type = connector_type or egress_metrics.DEFAULT_CONNECTOR_TYPE
         self._resolve_ttl = _get_resolve_ttl() if resolve_ttl_seconds is None else resolve_ttl_seconds
         # Per-host state: round-robin cursor + the time the pinned set was resolved.
         self._cursor: dict[str, int] = {}
@@ -906,6 +943,11 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
         key = _normalize_host(host)
         ips = self._pinned_hosts.get(key)
         if ips is None:
+            _log.warning(
+                "ssrf.reject_unpinned_host",
+                extra={"host": host, "connector_type": self._connector_type},
+            )
+            egress_metrics.record_rejected(self._connector_type, host, egress_metrics.REASON_UNPINNED)
             raise UnpinnedHostError(
                 f"SSRF: refusing to connect to unpinned host {host!r}. The pinned transport only "
                 "connects to addresses it validated up front; a redirect or secondary request "
@@ -962,6 +1004,7 @@ class PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
         re_resolve: bool = True,
         resolve_ttl_seconds: float | None = None,
         loudness_guard: bool = False,
+        connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
     ) -> None:
         # ``trust_env`` is ``None`` by default and resolves to the process-wide
         # SSRF_TRUST_PROXY setting. When true, honoring a proxy (HTTP_PROXY /
@@ -998,6 +1041,7 @@ class PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
             allow_networks=allow_networks,
             re_resolve=re_resolve,
             resolve_ttl_seconds=resolve_ttl_seconds,
+            connector_type=connector_type,
         )
         self._pool._network_backend = self._pin_backend
         self._loudness_guard = loudness_guard
@@ -1051,6 +1095,7 @@ async def pinned_async_transport(
     re_resolve: bool = True,
     resolve_ttl_seconds: float | None = None,
     loudness_guard: bool = False,
+    connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
 ) -> httpx.AsyncHTTPTransport:
     """Build a pinned-IP async transport for ``url``.
 
@@ -1077,9 +1122,18 @@ async def pinned_async_transport(
     backend was never consulted. Off by default because an intercepted transport
     (e.g. an HTTP mock at the pool layer) legitimately never consults it; enable
     on long-lived real-egress clients (model backends).
+
+    ``connector_type`` (default :data:`egress_metrics.DEFAULT_CONNECTOR_TYPE`)
+    labels the emitted ``modulo_egress_pinned_total`` /
+    ``modulo_egress_rejected_total`` records so the egress layer is attributable
+    to the connector (or model backend) that built it.
     """
-    target = await resolve_pinned_ip(url, allow_networks=allow_networks)
-    return PinnedAsyncHTTPTransport(
+    try:
+        target = await resolve_pinned_ip(url, allow_networks=allow_networks)
+    except ValueError as exc:
+        egress_metrics.record_rejected(connector_type, _eh_label_host(url), _classify_reject_reason(exc, url))
+        raise
+    transport = PinnedAsyncHTTPTransport(
         {target.host: target.ips},
         verify=verify,
         http2=http2,
@@ -1089,7 +1143,10 @@ async def pinned_async_transport(
         re_resolve=re_resolve,
         resolve_ttl_seconds=resolve_ttl_seconds,
         loudness_guard=loudness_guard,
+        connector_type=connector_type,
     )
+    egress_metrics.record_pinned(connector_type, target.host)
+    return transport
 
 
 async def pinned_async_client(
@@ -1102,6 +1159,7 @@ async def pinned_async_client(
     follow_redirects: bool = False,
     limits: httpx.Limits | None = None,
     loudness_guard: bool = False,
+    connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
     **client_kwargs: Any,
 ) -> httpx.AsyncClient:
     """Build a pinned-IP ``httpx.AsyncClient`` for ``url``.
@@ -1136,6 +1194,7 @@ async def pinned_async_client(
         trust_env=trust_env,
         limits=limits,
         loudness_guard=loudness_guard,
+        connector_type=connector_type,
     )
     resolved_trust = _default_trust_env() if trust_env is None else trust_env
     return httpx.AsyncClient(
@@ -1213,6 +1272,7 @@ def pinned_async_transport_sync(
     re_resolve: bool = True,
     resolve_ttl_seconds: float | None = None,
     loudness_guard: bool = False,
+    connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
 ) -> httpx.AsyncHTTPTransport:
     """Synchronous :func:`pinned_async_transport` for sync ``_client()`` builders.
 
@@ -1222,10 +1282,15 @@ def pinned_async_transport_sync(
     the host at connect time (closing the DNS-rebinding window). ``trust_env`` is
     ``None`` by default and resolves to the ``SSRF_TRUST_PROXY`` setting
     (``False`` unless set; a proxy defeats pinning). ``loudness_guard`` defaults
-    ``False`` (see :func:`pinned_async_transport`).
+    ``False`` (see :func:`pinned_async_transport`). ``connector_type`` labels the
+    egress metric records (see :func:`pinned_async_transport`).
     """
-    target = _resolve_pinned_ip_sync(url, allow_networks=allow_networks)
-    return PinnedAsyncHTTPTransport(
+    try:
+        target = _resolve_pinned_ip_sync(url, allow_networks=allow_networks)
+    except ValueError as exc:
+        egress_metrics.record_rejected(connector_type, _eh_label_host(url), _classify_reject_reason(exc, url))
+        raise
+    transport = PinnedAsyncHTTPTransport(
         {target.host: target.ips},
         verify=verify,
         http2=http2,
@@ -1235,7 +1300,10 @@ def pinned_async_transport_sync(
         re_resolve=re_resolve,
         resolve_ttl_seconds=resolve_ttl_seconds,
         loudness_guard=loudness_guard,
+        connector_type=connector_type,
     )
+    egress_metrics.record_pinned(connector_type, target.host)
+    return transport
 
 
 def pinned_async_client_sync(
@@ -1248,6 +1316,7 @@ def pinned_async_client_sync(
     follow_redirects: bool = False,
     limits: httpx.Limits | None = None,
     loudness_guard: bool = False,
+    connector_type: str = egress_metrics.DEFAULT_CONNECTOR_TYPE,
     **client_kwargs: Any,
 ) -> httpx.AsyncClient:
     """Synchronous :func:`pinned_async_client` for sync ``_client()`` builders.
@@ -1276,6 +1345,7 @@ def pinned_async_client_sync(
         trust_env=trust_env,
         limits=limits,
         loudness_guard=loudness_guard,
+        connector_type=connector_type,
     )
     resolved_trust = _default_trust_env() if trust_env is None else trust_env
     return httpx.AsyncClient(
