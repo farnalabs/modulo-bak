@@ -20,6 +20,7 @@ from modulo.auth.sso import (
     saml_get_auth_url,
     saml_process_response,
 )
+from modulo.core.feature_flags import CommunityTier, PlanContext, resolve_plan_context
 from modulo.core.sanitize_log import sanitise_log_value
 from modulo.db.crud.sso_provider import get_enabled_saml_provider, list_enabled_oidc_providers
 from modulo.settings import Settings, get_settings
@@ -101,8 +102,6 @@ async def _anonymous_plan_context(settings: Settings, session: AsyncSession) -> 
     Never raises auth errors — the login page calls the SSO discovery endpoint
     before any token exists.
     """
-    from modulo.core.feature_flags import CommunityTier, PlanContext, resolve_plan_context
-
     try:
         async with session.begin():
             ctx: PlanContext = await resolve_plan_context(settings, session, org=None)
