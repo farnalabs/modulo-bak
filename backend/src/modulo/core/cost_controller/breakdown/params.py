@@ -64,27 +64,27 @@ _PARAM_REGISTRY: dict[str, tuple[str, str, str]] = {
     "tokens_estimated": ("int", "estimated-only token total (formula input)", "llm_tokens basis"),
     "tokens_input_reported": (
         "int",
-        "sum of agent-reported input tokens (display-only, never a cost input)",
+        "sum of agent-reported input tokens (display-only; never a system money-math input; formula-visible)",
         "breakdown basis + operator formulas",
     ),
     "tokens_output_reported": (
         "int",
-        "sum of agent-reported output tokens (display-only, never a cost input)",
+        "sum of agent-reported output tokens (display-only; never a system money-math input; formula-visible)",
         "breakdown basis + operator formulas",
     ),
     "tokens_total_reported": (
         "int",
-        "sum of agent-reported total tokens (display-only, never a cost input)",
+        "sum of agent-reported total tokens (display-only; never a system money-math input; formula-visible)",
         "breakdown basis + operator formulas",
     ),
     "tokens_cache_read_reported": (
         "int",
-        "sum of agent-reported cache-read tokens (display-only, never a cost input)",
+        "sum of agent-reported cache-read tokens (display-only; never a system money-math input; formula-visible)",
         "breakdown basis + operator formulas",
     ),
     "tokens_cache_write_reported": (
         "int",
-        "sum of agent-reported cache-write tokens (display-only, never a cost input)",
+        "sum of agent-reported cache-write tokens (display-only; never a system money-math input; formula-visible)",
         "breakdown basis + operator formulas",
     ),
     "node_count": ("int", "count of completed nodes", "llm_tokens basis + operator formulas"),
@@ -147,7 +147,8 @@ class RunCostTelemetry:
     tokens_output: int = 0
     tokens_estimated: int = 0
     # Agent-reported token sums (FAR-491) — folded from the union's
-    # ``reported_*`` keys. DISPLAY-ONLY: never a cost input.
+    # ``reported_*`` keys. DISPLAY-ONLY: never an input to the system's
+    # built-in money math (operator formulas may reference them).
     tokens_input_reported: int = 0
     tokens_output_reported: int = 0
     tokens_total_reported: int = 0
@@ -248,7 +249,8 @@ def _record_reported_tokens(telemetry: RunCostTelemetry, entry: dict[str, Any]) 
 
     Sums the union's ``reported_*`` keys — validated tri-state (bool /
     non-int / negative are skipped; a valid ``0`` contributes 0). These
-    counters never feed a cost calculation.
+    counters never feed a cost calculation the system itself computes
+    (operator formulas may reference them).
     """
     for union_key, counter in (
         ("reported_input_tokens", "tokens_input_reported"),

@@ -266,6 +266,51 @@ class TestAgentReportedTokenUsage:
         assert not any(key.startswith("model_tokens_") for key in quiet_envelope["artifacts"][0]["output"])
         assert not any(key.startswith("model_tokens_") for key in quiet_envelope["output"])
 
+    def test_schema_drift_suppresses_token_report(self) -> None:
+        """A truthy producer ``schema_drift`` flag suppresses the token report
+        entirely (returns ``{}``) — mirroring ``_extract_reported_cost``: a
+        drifted-schema node reports NO tokens."""
+        assert (
+            _build_token_usage_fields({"schema_drift": True, "token_usage": {"input": 10, "output": 5, "total": 15}})
+            == {}
+        )
+
+    def test_clean_producer_report_extracts_normally(self) -> None:
+        fields = _build_token_usage_fields(
+            {"schema_drift": False, "token_usage": {"input": 10, "output": 5, "total": 15}}
+        )
+        assert fields == {"model_tokens_input": 10, "model_tokens_output": 5, "model_tokens_total": 15}
+
+    def test_drifted_producer_tokens_not_folded_into_envelope(self) -> None:
+        """A drifted producer's ``token_usage`` is NOT folded into the node
+        output (no ``model_tokens_*`` in either view — so no ``reported_*``
+        keys ever fold downstream), while a clean producer's is."""
+        drifted = nr._SandboxNodeOutput(
+            status="completed",
+            summary="drifted producer",
+            exit_code=0,
+            wall_clock_time_ms=1200,
+            cost_estimate_usd=0.01,
+            cost_source={"schema_drift": True, "token_usage": {"input": 1234, "output": 567, "total": 1801}},
+        )
+        drifted_envelope = _build_sandbox_node_envelope(node_id="n1", output=drifted)
+        for view in (drifted_envelope["artifacts"][0]["output"], drifted_envelope["output"]):
+            assert not any(key.startswith("model_tokens_") for key in view)
+
+        clean = nr._SandboxNodeOutput(
+            status="completed",
+            summary="clean producer",
+            exit_code=0,
+            wall_clock_time_ms=1200,
+            cost_estimate_usd=0.01,
+            cost_source={"schema_drift": False, "token_usage": {"input": 1234, "output": 567, "total": 1801}},
+        )
+        clean_envelope = _build_sandbox_node_envelope(node_id="n2", output=clean)
+        for view in (clean_envelope["artifacts"][0]["output"], clean_envelope["output"]):
+            assert view["model_tokens_input"] == 1234
+            assert view["model_tokens_output"] == 567
+            assert view["model_tokens_total"] == 1801
+
 
 # ---------------------------------------------------------------------------
 # _compute_sandbox_cost

@@ -595,14 +595,19 @@ def _build_token_usage_fields(output_json: Any) -> dict[str, Any]:
     Reads ``token_usage`` from the sandbox agent's output.json (the same
     ``cost_source`` the self-reported cost extraction reads) and extracts
     ``model_tokens_input`` / ``model_tokens_output`` / ``model_tokens_total``
-    / ``model_tokens_cache_read`` / ``model_tokens_cache_write``. Tri-state
-    per key: absent / non-int / bool / negative → the key is OMITTED (never a
-    ``0`` or ``null`` placeholder — mirrors ``_build_model_cost_fields``).
-    A valid ``0`` report is a real report and IS written. These fields are
-    DISPLAY-ONLY: they feed ``node_telemetry_json`` and the union's
-    ``reported_*`` analytics fields, never any money math.
+    / ``model_tokens_cache_read`` / ``model_tokens_cache_write``. A truthy
+    producer ``schema_drift`` flag returns ``{}`` (no report) — a
+    drifted-schema node reports NO tokens, mirroring
+    ``_extract_reported_cost``. Tri-state per key: absent / non-int / bool /
+    negative → the key is OMITTED (never a ``0`` or ``null`` placeholder —
+    mirrors ``_build_model_cost_fields``). A valid ``0`` report is a real
+    report and IS written. These fields are DISPLAY-ONLY: they feed
+    ``node_telemetry_json`` and the union's ``reported_*`` analytics fields,
+    never any money math.
     """
     if not isinstance(output_json, dict):
+        return {}
+    if output_json.get("schema_drift"):
         return {}
     usage = output_json.get("token_usage")
     if not isinstance(usage, dict):

@@ -188,6 +188,16 @@ def test_reported_token_params_registered_and_formula_allowed() -> None:
     assert "tokens_total" in _DEAD_PARAMS
     assert "tokens_input_reported" not in _DEAD_PARAMS
     assert "tokens_output_reported" not in _DEAD_PARAMS
+    # The precise trust-boundary claim: display-only means never an input to
+    # the SYSTEM's own money math — NOT "never a cost input" (operator
+    # formulas may legitimately reference the family via
+    # CALCULATED_ALLOWED_IDENTS; operator-formula visibility is pinned by the
+    # rows' v1-consumer field).
+    for name in reported_family:
+        meaning, consumer = _PARAM_REGISTRY[name][1], _PARAM_REGISTRY[name][2]
+        assert "never a system money-math input" in meaning
+        assert "never a cost input" not in meaning
+        assert "operator formulas" in consumer
 
 
 def test_registry_has_expected_identifiers() -> None:
