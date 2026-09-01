@@ -1,6 +1,6 @@
 """Add residual missing foreign-key constraints on internal reference columns.
 
-Revision ID: 0169_add_residual_foreign_keys
+Revision ID: 0170_add_residual_foreign_keys
 Revises: 0168_add_soft_delete_org_indexes
 Create Date: 2026-09-01
 
@@ -24,8 +24,8 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision: str = "0169_add_residual_foreign_keys"
-down_revision: str | None = "0168_add_soft_delete_org_indexes"
+revision: str = "0170_add_residual_foreign_keys"
+down_revision: str | None = "0169_connector_instance_degraded"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
