@@ -254,6 +254,56 @@ def test_auth_api_key_query() -> None:
     assert captured["params"] == {"api_key": "k456"}
 
 
+def test_auth_api_key_empty_header_name_falls_back_to_default() -> None:
+    """An empty-string ``header_name`` is UNSET, not a name: it must fall back to
+    the ``X-API-Key`` default instead of passing through (httpx rejects an empty
+    header name, which would brick every request the connector issues)."""
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(dict(request.headers))
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "api_key", "api_key": "k789", "in": "header", "header_name": ""},
+    )
+    c._transport = httpx.MockTransport(handler)
+    asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert captured.get("x-api-key") == "k789"
+
+
+def test_auth_api_key_whitespace_query_param_name_falls_back_to_default() -> None:
+    """A whitespace-only ``query_param_name`` is UNSET: it must fall back to the
+    ``api_key`` default instead of being used verbatim as a query key."""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(200, json={})
+
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "api_key", "api_key": "k456", "in": "query", "query_param_name": "   "},
+    )
+    c._transport = httpx.MockTransport(handler)
+    asyncio_run(c.query(ConnectorQuery(resource="default")))
+    assert captured["params"] == {"api_key": "k456"}
+
+
+def test_auth_api_key_explicit_non_empty_names_pass_through() -> None:
+    """Explicit non-empty ``header_name``/``query_param_name`` values pass
+    through verbatim — the empty/whitespace coercion never touches a real name."""
+    auth = RestConnector._normalise_auth(
+        {"auth_mode": "api_key", "api_key": "k1", "in": "header", "header_name": "X-Custom-Auth"}
+    )
+    assert auth["header_name"] == "X-Custom-Auth"
+    auth = RestConnector._normalise_auth(
+        {"auth_mode": "api_key", "api_key": "k1", "in": "query", "query_param_name": "auth_token"}
+    )
+    assert auth["query_param_name"] == "auth_token"
+
+
 def test_api_key_query_secret_not_screened() -> None:
     """A query-mode api_key with filter-triggering chars must never hit the injection filter.
 
@@ -268,11 +318,11 @@ def test_api_key_query_secret_not_screened() -> None:
             super().__init__(validate_url=self._noop_validate, filter_strings=self._track_filter)
 
         @staticmethod
-        async def _noop_validate(url: str) -> None:
+        async def _noop_validate(_url: str) -> None:
             return None
 
         @staticmethod
-        def _track_filter(values: list[str], resource: str) -> None:
+        def _track_filter(values: list[str], _resource: str) -> None:
             screened.extend(values)
 
     captured: dict[str, Any] = {}
@@ -369,11 +419,11 @@ def test_query_benign_injection_phrase_not_rejected() -> None:
             super().__init__(validate_url=self._noop_validate, filter_strings=self._reject)
 
         @staticmethod
-        async def _noop_validate(url: str) -> None:
+        async def _noop_validate(_url: str) -> None:
             return None
 
         @staticmethod
-        def _reject(values: list[str], resource: str) -> None:
+        def _reject(values: list[str], _resource: str) -> None:
             for value in values:
                 for trigger in ("import os", "eval(", "ignore previous instructions"):
                     if trigger in value:
@@ -2058,11 +2108,11 @@ def test_write_surface_screens_injection_terms() -> None:
             super().__init__(validate_url=self._noop_validate, filter_strings=self._reject)
 
         @staticmethod
-        async def _noop_validate(url: str) -> None:
+        async def _noop_validate(_url: str) -> None:
             return None
 
         @staticmethod
-        def _reject(values: list[str], resource: str) -> None:
+        def _reject(values: list[str], _resource: str) -> None:
             for value in values:
                 if "ignore previous instructions" in value:
                     raise OutputRejectedError("rejected injection")
@@ -2099,6 +2149,83 @@ def test_config_defaults_preserved_when_absent() -> None:
     )
     assert c._timeout == 30.0
     assert c._verify_tls is True
+
+
+# ── per-op ``on_unknown`` idempotency mode (FAR-458) ────────────────────────
+
+
+def test_on_unknown_defaults_to_fail_open() -> None:
+    """Absent ``on_unknown`` defaults to ``fail_open`` across every op."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c.on_unknown_for("default") == "fail_open"
+
+
+def test_on_unknown_top_level_applies_to_each_op() -> None:
+    """A top-level ``on_unknown`` is the default for every op."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "on_unknown": "fail_closed"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c.on_unknown_for("default") == "fail_closed"
+
+
+def test_on_unknown_per_resource_override() -> None:
+    """A per-resource operation's ``on_unknown`` overrides the top-level default."""
+    c = _make_connector(
+        {
+            "base_url": "https://api.example.com",
+            "on_unknown": "fail_open",
+            "operations": {"users": {"path": "/items", "on_unknown": "off"}},
+        },
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c.on_unknown_for("users") == "off"
+    # An unrelated resource (no per-op override, but the top-level applies) is fail_open.
+    assert c.on_unknown_for("default") == "fail_open"
+
+
+def test_on_unknown_case_and_whitespace_normalised() -> None:
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "on_unknown": "  Fail_Closed  "},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c.on_unknown_for("default") == "fail_closed"
+
+
+def test_on_unknown_invalid_top_level_rejected_at_config_parse() -> None:
+    """An invalid top-level ``on_unknown`` is a loud config error at construction
+    time (config-parse), never silently adopted."""
+    with pytest.raises(ValueError, match="on_unknown"):
+        _make_connector(
+            {"base_url": "https://api.example.com", "path": "/items", "on_unknown": "bogus"},
+            {"auth_mode": "bearer", "token": "t"},
+        )
+
+
+def test_on_unknown_invalid_per_resource_rejected_at_config_parse() -> None:
+    """An invalid per-resource operation ``on_unknown`` is also rejected at
+    config-parse time (fail fast on a config error)."""
+    with pytest.raises(ValueError, match="on_unknown"):
+        _make_connector(
+            {
+                "base_url": "https://api.example.com",
+                "operations": {"users": {"path": "/items", "on_unknown": "always"}},
+            },
+            {"auth_mode": "bearer", "token": "t"},
+        )
+
+
+def test_off_bypasses_marker_never_dedupes() -> None:
+    """``off`` is the default-free bypass: the write is never deduped. The
+    RestConnector surfaces it so the gate can short-circuit before any read."""
+    c = _make_connector(
+        {"base_url": "https://api.example.com", "path": "/items", "on_unknown": "off"},
+        {"auth_mode": "bearer", "token": "t"},
+    )
+    assert c.on_unknown_for("default") == "off"
 
 
 def asyncio_run(coro: Any) -> Any:

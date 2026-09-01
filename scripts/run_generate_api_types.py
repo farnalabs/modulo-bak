@@ -27,10 +27,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BACKEND_DIR = os.path.join(REPO_ROOT, "backend")
-FRONTEND_DIR = os.path.join(REPO_ROOT, "frontend")
-OUTPUT_FILE = os.path.join(FRONTEND_DIR, "src", "lib", "api", "schema.ts")
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+BACKEND_DIR = str(Path(REPO_ROOT) / "backend")
+FRONTEND_DIR = str(Path(REPO_ROOT) / "frontend")
+OUTPUT_FILE = str(Path(FRONTEND_DIR) / "src" / "lib" / "api" / "schema.ts")
 
 _TEMPLATE_ENV = {
     "DATABASE_URL": "sqlite+aiosqlite:///TEMPLATE_DB",
@@ -49,16 +49,16 @@ def _run(cmd: list[str], cwd: str) -> int:
         exe = shutil.which(cmd[0])
         if exe and exe.lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c", *cmd]
-    return subprocess.run(cmd, cwd=cwd).returncode
+    return subprocess.run(cmd, cwd=cwd, check=False).returncode
 
 
 def main() -> int:
     tempdir = tempfile.mkdtemp(prefix="modulo_gen_api_")
     try:
-        schema_path = os.path.join(tempdir, "openapi.json")
-        db_path = os.path.join(tempdir, "gen-test.db")
+        schema_path = str(Path(tempdir) / "openapi.json")
+        db_path = str(Path(tempdir) / "gen-test.db")
 
-        py_script = os.path.join(tempdir, "gen_openapi.py")
+        py_script = str(Path(tempdir) / "gen_openapi.py")
         py_content = (
             "import os, json, sys\n"
             "sys.tracebacklimit = 0\n"
@@ -71,7 +71,7 @@ def main() -> int:
             "    json.dump(app.openapi(), f, ensure_ascii=False)\n"
             f'print(f"Schema: {{os.path.getsize(r"{schema_path.replace(os.sep, "/")}")}} bytes")\n'
         )
-        with open(py_script, "w", encoding="utf-8") as fh:
+        with Path(py_script).open("w", encoding="utf-8") as fh:
             fh.write(py_content)
 
         print("=== Generating OpenAPI schema from backend...")
@@ -83,7 +83,7 @@ def main() -> int:
             print("Backend schema generation failed", file=sys.stderr)
             return rc
 
-        if not os.path.isfile(schema_path):
+        if not Path(schema_path).is_file():
             print("Schema file was not created", file=sys.stderr)
             return 1
 

@@ -33,14 +33,13 @@ of the staged files. Exit 0 clean, 1 collision.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-VERSIONS_DIR = os.path.join(REPO_ROOT, "backend", "src", "modulo", "db", "migrations", "versions")
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+VERSIONS_DIR = str(Path(REPO_ROOT, "backend", "src", "modulo", "db", "migrations", "versions"))
 
 _RE_REVISION = re.compile(r"(?m)^revision:\s*str\s*=\s*\"([^\"]+)\"")
 _RE_DOWN_STRING = re.compile(r"(?m)^down_revision:.*=\s*\"([^\"]+)\"")
@@ -52,7 +51,7 @@ def _resolve_repo_root() -> str:
     # Prefer the git repo containing the current directory (so this works from
     # worktree branches, where the branch's new migration files live); fall
     # back to the repo root (tools/ is one level below the repo root).
-    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False)
     if result.returncode == 0:
         cwd_top = result.stdout.strip()
         if cwd_top and Path(cwd_top, "backend", "src", "modulo", "db", "migrations", "versions").is_dir():
@@ -69,12 +68,14 @@ def _changed_names(diff_range: str | None) -> list[str]:
             ["git", "diff", "--name-only", "--diff-filter=ACMR", diff_range],
             capture_output=True,
             text=True,
+            check=False,
         )
     else:
         result = subprocess.run(
             ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             capture_output=True,
             text=True,
+            check=False,
         )
     prefix = "backend/src/modulo/db/migrations/versions/"
     names = []
@@ -87,7 +88,7 @@ def _changed_names(diff_range: str | None) -> list[str]:
 
 def _read(path: str) -> str:
     try:
-        with open(path, encoding="utf-8") as fh:
+        with Path(path).open(encoding="utf-8") as fh:
             return fh.read()
     except OSError:
         return ""
@@ -98,7 +99,7 @@ def _collect_merge_parent_revisions(files: list[str]) -> tuple[set[str], dict[st
     merge_parent_revisions: set[str] = set()
     file_revisions: dict[str, str] = {}
     for name in files:
-        content = _read(os.path.join(VERSIONS_DIR, name))
+        content = _read(str(Path(VERSIONS_DIR) / name))
         m = _RE_REVISION.search(content)
         if m:
             file_revisions[name] = m.group(1)
@@ -133,7 +134,7 @@ def _main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = _resolve_repo_root()
-    versions_dir = os.path.join(repo_root, "backend", "src", "modulo", "db", "migrations", "versions")
+    versions_dir = str(Path(repo_root, "backend", "src", "modulo", "db", "migrations", "versions"))
 
     if not Path(versions_dir).is_dir():
         print(f"check-migration-heads: versions dir not found at {versions_dir} - skipping", file=sys.stderr)
@@ -184,7 +185,7 @@ def _main(argv: list[str] | None = None) -> int:
     revisions: dict[str, list[str]] = {}
     down_revisions: dict[str, list[str]] = {}
     for name in files:
-        content = _read(os.path.join(versions_dir, name))
+        content = _read(str(Path(versions_dir) / name))
         m = _RE_REVISION.search(content)
         if m:
             revisions.setdefault(m.group(1), []).append(name)
@@ -225,7 +226,7 @@ def _main(argv: list[str] | None = None) -> int:
         return 1
 
     # ---- 3. Non-fatal: multiple alembic heads ----
-    backend_dir = os.path.join(repo_root, "backend")
+    backend_dir = str(Path(repo_root, "backend"))
     try:
         result = subprocess.run(
             ["uv", "run", "python", "-m", "alembic", "heads"],
@@ -233,6 +234,7 @@ def _main(argv: list[str] | None = None) -> int:
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
         head_count = sum(1 for line in result.stdout.splitlines() if "(head)" in line or "(effective head)" in line)
         if head_count > 1:

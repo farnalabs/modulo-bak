@@ -17,24 +17,24 @@ Exit 0 clean, 1 missing keys.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
 _RE_NAV_LABEL = re.compile(r"components\.SidebarNav\.([^']+)")
 _RE_LOCALE_KEY = re.compile(r'"(item_[^"]+)"')
 _DIFF_RANGE_RE = re.compile(r"^[A-Za-z0-9._~^/\-]+$")
 
-_NAV_PATH = os.path.join("frontend", "src", "config", "navigation.ts")
-_LOCALE_PATH = os.path.join("frontend", "src", "locales", "en-US.js")
+_NAV_PATH = str(Path("frontend") / "src" / "config" / "navigation.ts")
+_LOCALE_PATH = str(Path("frontend") / "src" / "locales" / "en-US.js")
 
 
 def _read(path: str) -> str:
     try:
-        with open(path, encoding="utf-8") as fh:
+        with Path(path).open(encoding="utf-8") as fh:
             return fh.read()
     except OSError:
         return ""
@@ -50,12 +50,14 @@ def _files_changed(diff_range: str | None) -> bool:
             ["git", "diff", "--name-only", "--diff-filter=ACMR", diff_range],
             capture_output=True,
             text=True,
+            check=False,
         )
     else:
         result = subprocess.run(
             ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
             capture_output=True,
             text=True,
+            check=False,
         )
     changed = set()
     for line in result.stdout.splitlines():
@@ -82,8 +84,8 @@ def _main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    nav_path = os.path.join(REPO_ROOT, _NAV_PATH)
-    locale_path = os.path.join(REPO_ROOT, _LOCALE_PATH)
+    nav_path = str(Path(REPO_ROOT) / _NAV_PATH)
+    locale_path = str(Path(REPO_ROOT) / _LOCALE_PATH)
 
     nav_content = _read(nav_path)
     if not nav_content:

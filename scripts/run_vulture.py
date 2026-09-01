@@ -97,13 +97,13 @@ _IGNORE_NAMES = (
 
 def _repo_root() -> str:
     """Return the repository root (the parent of this script's directory)."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return str(Path(__file__).resolve().parent.parent)
 
 
 def main() -> int:
     root = _repo_root()
-    src = os.path.join(root, "backend", "src", "modulo")
-    whitelist = os.path.join(root, ".vulture_whitelist.py")
+    src = str(Path(root) / "backend" / "src" / "modulo")
+    whitelist = str(Path(root) / ".vulture_whitelist.py")
     if not Path(src).is_dir() or not Path(whitelist).is_file():
         print(
             f"run_vulture.py: could not resolve repo layout (src={src!r}, whitelist={whitelist!r})",
@@ -131,7 +131,7 @@ def main() -> int:
     # Pin the uv subprocess cwd to the repo root so `--project backend`
     # resolves identically whether this wrapper was invoked from the repo root
     # (pre-commit) or from backend/ (CI's working-directory).
-    result = subprocess.run(cmd, env=env, cwd=root, capture_output=True, text=True)
+    result = subprocess.run(cmd, env=env, cwd=root, capture_output=True, text=True, check=False)
 
     # `unused variable` findings are framework-metaclass noise (Pydantic /
     # dataclass / SQLAlchemy / Alembic-consumed names) — report but never block.

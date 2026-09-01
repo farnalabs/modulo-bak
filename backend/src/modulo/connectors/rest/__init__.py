@@ -24,14 +24,24 @@ the runtime variables supplied per call:
     operations:           { "<resource>": { "method": ..., "path": ..., "headers": {},
                                              "params": {}, "body": {}, "records_path": ...,
                                              "next_cursor_path": ..., "passthrough": ...,
-                                             "idempotency_header": ... } }
+                                             "idempotency_header": ..., "on_unknown": ... } }
     records_path:         "data.items"                         # JMESPath expression into JSON response for records
     next_cursor_path:     "data.next_cursor"                   # optional pagination cursor (JMESPath)
     allowed_hosts:        ["api.example.com"]                  # optional scheme/host allowlist
     passthrough:          false                                # force single-record wrap of the raw body when set
     max_response_size:    <bytes>                              # optional max response body size (default 10 MiB)
     idempotency_header:   <header-name>                        # optional header that makes a
-                                                                 #   non-GET/HEAD request safe to retry
+                                                                  #   non-GET/HEAD request safe to retry
+    on_unknown:           "fail_open"                          # optional per-op idempotency gate mode for the
+                                                                  #   UNKNOWN (couldn't-confirm-delivery) case
+                                                                  #   (FAR-458): "fail_open" (DEFAULT — re-fire on
+                                                                  #   ambiguity, possible duplicate), "fail_closed"
+                                                                  #   (SUPPRESS on ambiguity, possible silent miss),
+                                                                  #   or "off" (never deduped — write always fires).
+                                                                  #   Top-level value applies to every op unless a
+                                                                  #   per-resource op overrides it. A CONFIRMED-
+                                                                  #   delivered write (delivery_done + matching key)
+                                                                  #   is suppressed in every mode except `off`.
     timeout_seconds:      <number>                             # per-request timeout (default 30.0)
     verify_tls:           true                                 # verify the server TLS cert (default true)
     fan_out:              {                                     # optional fan-out / iterator mode (FAR-411)
@@ -171,6 +181,8 @@ from modulo.connectors._rate_bucket import PerDestinationRateLimiter, TokenBucke
 from modulo.connectors._retry_headers import parse_retry_after
 from modulo.connectors._safe_page import safe_records_list
 from modulo.connectors.base import (
+    DEFAULT_ON_UNKNOWN,
+    ON_UNKNOWN_MODES,
     ConnectorBase,
     ConnectorPayload,
     ConnectorQuery,
@@ -185,6 +197,16 @@ _log = logging.getLogger(__name__)
 
 # Standard HTTP verbs the connector will issue (all else is rejected).
 _ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+# FAR-458 connector-write idempotency gate: the per-op ``on_unknown`` modes and
+# default live in ONE place — ``modulo.connectors.base`` (a stdlib-only leaf
+# both this connector's config validation and the pipeline engine's gate read
+# import) so the mode set can never drift between the two. ``fail_open``
+# (default) re-fires a write whose prior delivery could not be confirmed
+# (possible duplicate, usually recoverable), ``fail_closed`` SUPPRESSES that
+# re-fire (possible silent miss; operator reconciles), and ``off`` bypasses the
+# gate entirely. Invalid values are rejected at config-parse time (never
+# silently adopted), so a typo is a loud configuration error rather than a
+# surprise.
 
 # Auth/transport headers the user/agent must never be able to override through a
 # rendered request header (FAR-408 injection guard). ``host``/``content-length``
@@ -225,6 +247,24 @@ _DOT_INDEX = re.compile(r"\.\d+(?![A-Za-z_])")
 _SHORT_CREDENTIAL_LEN = 8
 
 SsrfValidator = Callable[[str], Awaitable[None] | None]
+
+
+def _normalise_on_unknown(value: Any) -> str:
+    """Validate a REST ``on_unknown`` config value and return its canonical form.
+    ``None`` (absent) defaults to ``DEFAULT_ON_UNKNOWN`` (``"fail_open"`` — the
+    fail-open gate contract). Any other value is normalised (lowercased,
+    stripped) and must be one of ``ON_UNKNOWN_MODES`` — an invalid value raises
+    ``ValueError`` so a misconfigured ``on_unknown`` is a loud config error,
+    never silently adopted. Called at config-parse time (``__init__``) and
+    per-operation (``_operation_spec``) so BOTH a top-level and a
+    per-resource override are validated.
+    """
+    if value is None:
+        return DEFAULT_ON_UNKNOWN
+    v = str(value).strip().lower()
+    if v not in ON_UNKNOWN_MODES:
+        raise ValueError(f"REST on_unknown must be one of {sorted(ON_UNKNOWN_MODES)} — got {value!r}")
+    return v
 
 
 def _canonical_rate_key(base_url: str, path_template: str | None) -> str:
@@ -541,6 +581,19 @@ class RestConnector(ConnectorBase):
         self._max_connections = int(max_connections)
         self._max_keepalive = int(max_keepalive_connections)
         self._cached_client: httpx.AsyncClient | None = None
+
+        # FAR-458: the connector-write idempotency gate's ``on_unknown`` mode,
+        # validated at config-parse time. The top-level value is the default for
+        # every op (re-applied per-op via the ``_operation_spec`` merge); a
+        # per-resource ``operations[<resource>]`` override is also validated here
+        # (fail fast on a config error), and the effective value is resolved
+        # per-op via :meth:`on_unknown_for` / ``_operation_spec``.
+        _normalise_on_unknown(self._config.get("on_unknown"))
+        _ops = self._config.get("operations")
+        if isinstance(_ops, dict):
+            for _spec in _ops.values():
+                if isinstance(_spec, dict) and "on_unknown" in _spec:
+                    _normalise_on_unknown(_spec["on_unknown"])
 
         # FAR-411 fan-out / iterator config. ``fan_out`` is optional; when absent
         # or disabled the connector behaves exactly as before (single call).
@@ -947,7 +1000,23 @@ class RestConnector(ConnectorBase):
             "next_cursor_path": merged.get("next_cursor_path"),
             "passthrough": bool(merged.get("passthrough", False)),
             "idempotency_header": merged.get("idempotency_header"),
+            "on_unknown": _normalise_on_unknown(merged.get("on_unknown")),
         }
+
+    def on_unknown_for(self, resource: str) -> str:
+        """Effective ``on_unknown`` mode for a write to *resource* (FAR-458).
+
+        Resolved per-op via the same ``_operation_spec`` merge the write path
+        uses, so a top-level default applies to every op unless a per-resource
+        operation overrides it. Returns ``"fail_open"`` (the fail-open gate
+        contract) on any resolution error — a config problem is surfaced loud
+        during the actual write (``_build_request`` re-derives the spec), never
+        silently changed here. See :meth:`ConnectorBase.on_unknown_for`.
+        """
+        try:
+            return cast(str, self._operation_spec(resource, default_method="POST")["on_unknown"])
+        except ValueError:
+            return DEFAULT_ON_UNKNOWN
 
     # ── Auth ───────────────────────────────────────────────────────────────
 
@@ -978,9 +1047,18 @@ class RestConnector(ConnectorBase):
                 raise ValueError(f"REST api_key auth 'in' must be 'header' or 'query' — got {auth['in']!r}")
             if auth["in"] == "header":
                 header_name = creds.get("header_name")
+                # An empty/whitespace-only name is UNSET, not a name: an empty
+                # header name makes every request fail (httpx rejects it), so
+                # coerce it to None and fall back to the default instead.
+                if isinstance(header_name, str) and not header_name.strip():
+                    header_name = None
                 auth["header_name"] = str(header_name) if header_name is not None else "X-API-Key"
             else:
                 query_param_name = creds.get("query_param_name")
+                # Same unset treatment for the query parameter name: an empty
+                # value must never be used verbatim as a query key.
+                if isinstance(query_param_name, str) and not query_param_name.strip():
+                    query_param_name = None
                 auth["query_param_name"] = str(query_param_name) if query_param_name is not None else "api_key"
         return auth
 

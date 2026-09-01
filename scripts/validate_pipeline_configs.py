@@ -13,7 +13,6 @@ Checks for known bug patterns in sandbox_agent pipeline configs:
 from __future__ import annotations
 
 import ast
-import glob
 import json
 import sys
 from pathlib import Path
@@ -26,14 +25,18 @@ _DEFAULT_FALLBACKS = [
     (
         "timeout_seconds",
         600,
-        "sandbox_agent timeout_seconds defaults to 600 — "
-        "too short for complex tasks like rebase + lint fix + push. Use 1200 (20 min).",
+        (
+            "sandbox_agent timeout_seconds defaults to 600 — "
+            "too short for complex tasks like rebase + lint fix + push. Use 1200 (20 min)."
+        ),
     ),
     (
         "template_id",
         "base",
-        "sandbox_agent template_id defaults to 'base' — use 'opencode' (default, has opencode CLI) "
-        "or 'modulo-opencode' (managed cache-warmed template).",
+        (
+            "sandbox_agent template_id defaults to 'base' — use 'opencode' (default, has opencode CLI) "
+            "or 'modulo-opencode' (managed cache-warmed template)."
+        ),
     ),
 ]
 
@@ -76,12 +79,11 @@ def _scan_pipeline_config_files() -> None:
         "**/pipelines/*.yml",
         "**/pipeline*config*.json",
     ]
-    found_files = set()
+    found_files: set[Path] = set()
     for pattern in patterns:
-        found_files.update(glob.glob(pattern, recursive=True))
+        found_files.update(Path.cwd().glob(pattern))
 
-    for path_str in sorted(found_files):
-        path = Path(path_str)
+    for path in sorted(found_files):
         content = path.read_text(encoding="utf-8")
         data: dict | list | None = None
         try:

@@ -1158,6 +1158,13 @@ export interface paths {
          * Sso Providers
          * @description List configured SSO providers (OIDC) and whether SAML is enabled.
          *
+         *     Pre-auth discovery endpoint: the login page fetches it BEFORE any user is
+         *     authenticated, so it must never require a user and must never surface an
+         *     auth error. Plan/feature resolution is anonymous (via
+         *     ``_anonymous_plan_context``); when the SSO feature is not enabled /
+         *     unlicensed the endpoint answers a normal 200 with an EMPTY provider list
+         *     (no 401/402) so the login page simply renders no SSO options.
+         *
          *     OIDC providers are merged from the sso_providers DB table (preferred) and
          *     the env-var fallback, deduplicated by provider_id. The DB read goes through
          *     the system session (``modulo_system`` role, instance-global) so the login
@@ -9420,6 +9427,10 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+            /** Degraded At */
+            degraded_at?: string | null;
+            /** Last Skip Error */
+            last_skip_error?: string | null;
         };
         /** ConnectorTypeItem */
         ConnectorTypeItem: {
@@ -12985,7 +12996,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing.
              */
             retry_policy?: {
                 [key: string]: unknown;
@@ -13367,6 +13378,11 @@ export interface components {
              * @default 0
              */
             snapshot_count: number;
+            /**
+             * Node Count
+             * @default 0
+             */
+            node_count: number;
             /** Archived At */
             archived_at?: string | null;
             /** Owner Team Id */
@@ -13449,7 +13465,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. Set to {} to clear.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.
              */
             retry_policy?: {
                 [key: string]: unknown;
