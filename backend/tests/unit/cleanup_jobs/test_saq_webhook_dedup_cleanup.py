@@ -51,7 +51,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -60,6 +60,7 @@ class TestWebhookDedupCleanup:
         ):
             result = await sw.webhook_dedup_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": BATCH_SIZE * 2 + 3}
         assert mock_cleanup.await_count == 3
 
@@ -67,7 +68,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -76,6 +77,7 @@ class TestWebhookDedupCleanup:
         ):
             result = await sw.webhook_dedup_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 0}
         mock_cleanup.assert_awaited_once()
 
@@ -84,7 +86,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -93,6 +95,8 @@ class TestWebhookDedupCleanup:
             pytest.raises(RuntimeError, match="db down"),
         ):
             await sw.webhook_dedup_cleanup({})
+
+        mock_factory.assert_called()
 
 
 class TestWebhookDedupCleanupAutobeginTransaction:
@@ -138,15 +142,17 @@ class TestWebhookDedupCleanupAutobeginTransaction:
         async with autobegin_false_factory() as session, session.begin():
             session.add(old_event)
 
-        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory) as mock_factory:
             result = await sw.webhook_dedup_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 1}
 
     async def test_cron_zero_batch_against_autobegin_false_session(self, autobegin_false_factory) -> None:
         """Even an empty table must not raise: the SELECT needs an active
         transaction on an autobegin=False session."""
-        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory) as mock_factory:
             result = await sw.webhook_dedup_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 0}

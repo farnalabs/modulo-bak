@@ -160,7 +160,7 @@ class TestSaqTriggerEventsCleanup:
         factory, _ = self._make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.trigger_events_cleanup.cleanup_old_trigger_events",
                 new_callable=AsyncMock,
@@ -169,6 +169,7 @@ class TestSaqTriggerEventsCleanup:
         ):
             result = await sw.trigger_events_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": BATCH_SIZE * 2 + 3}
         assert mock_cleanup.await_count == 3
 
@@ -176,7 +177,7 @@ class TestSaqTriggerEventsCleanup:
         factory, _ = self._make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.trigger_events_cleanup.cleanup_old_trigger_events",
                 new_callable=AsyncMock,
@@ -185,6 +186,7 @@ class TestSaqTriggerEventsCleanup:
         ):
             result = await sw.trigger_events_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 0}
         mock_cleanup.assert_awaited_once()
 
@@ -192,7 +194,7 @@ class TestSaqTriggerEventsCleanup:
         factory, _ = self._make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_system_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory) as mock_factory,
             patch(
                 "modulo.core.cleanup_jobs.trigger_events_cleanup.cleanup_old_trigger_events",
                 new_callable=AsyncMock,
@@ -201,6 +203,8 @@ class TestSaqTriggerEventsCleanup:
             pytest.raises(RuntimeError, match="db down"),
         ):
             await sw.trigger_events_cleanup({})
+
+        mock_factory.assert_called()
 
 
 class TestSaqTriggerEventsCleanupAutobeginTransaction:
@@ -240,9 +244,10 @@ class TestSaqTriggerEventsCleanupAutobeginTransaction:
         async with autobegin_false_factory() as session, session.begin():
             session.add(old_event)
 
-        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory) as mock_factory:
             result = await sw.trigger_events_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 1}
         async with autobegin_false_factory() as session, session.begin():
             remaining = list((await session.execute(select(TriggerEvent))).scalars().all())
@@ -261,9 +266,10 @@ class TestSaqTriggerEventsCleanupAutobeginTransaction:
         async with autobegin_false_factory() as session, session.begin():
             session.add(recent_event)
 
-        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory) as mock_factory:
             result = await sw.trigger_events_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 0}
         async with autobegin_false_factory() as session, session.begin():
             remaining = list((await session.execute(select(TriggerEvent))).scalars().all())
@@ -272,7 +278,8 @@ class TestSaqTriggerEventsCleanupAutobeginTransaction:
     async def test_cron_zero_batch_against_autobegin_false_session(self, autobegin_false_factory) -> None:
         """Even an empty table must not raise: the SELECT needs an active
         transaction on an autobegin=False session."""
-        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory) as mock_factory:
             result = await sw.trigger_events_cleanup({})
 
+        mock_factory.assert_called()
         assert result == {"deleted": 0}
