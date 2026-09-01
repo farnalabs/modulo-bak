@@ -674,21 +674,16 @@
               <dt class="text-muted-foreground text-xs uppercase tracking-wider">{{ $t('views.PipelineEditorView.template') }}</dt>
               <dd class="font-mono text-xs select-all" :title="selectedNodeData.template_id">{{ shortId(selectedNodeData.template_id) }}</dd>
             </div>
-            <div v-if="selectedNodeData.agent_command">
+            <div data-testid="pipeline-editor-node-commands">
               <dt class="text-muted-foreground text-xs uppercase tracking-wider">{{ $t('views.PipelineEditorView.command') }}</dt>
-              <dd class="font-mono text-xs break-all">{{ selectedNodeData.agent_command }}</dd>
-            </div>
-            <template v-else-if="selectedNodeData.agent_commands && selectedNodeData.agent_commands.length > 0">
-              <dt class="text-muted-foreground text-xs uppercase tracking-wider">{{ $t('views.PipelineEditorView.commands') }}</dt>
-              <dd>
-                <ul class="list-inside list-decimal text-xs font-mono text-muted-foreground">
-                  <li v-for="(cmd, idx) in selectedNodeData.agent_commands" :key="idx">{{ cmd }}</li>
-                </ul>
-                <div v-if="selectedNodeData.commands_concatenation_string" class="text-[10px] text-muted-foreground mt-1">
-                  Concatenated with: <code class="font-mono">{{ selectedNodeData.commands_concatenation_string }}</code>
-                </div>
+              <dd class="mt-1">
+                <SandboxCommandsEditor
+                  v-model:scalar-command="selectedNodeData.agent_command"
+                  v-model:commands="selectedNodeData.agent_commands"
+                  v-model:joiner="selectedNodeData.commands_concatenation_string"
+                />
               </dd>
-            </template>
+            </div>
             <div v-if="selectedNodeData.timeout_seconds">
               <dt class="text-muted-foreground text-xs uppercase tracking-wider">{{ $t('views.PipelineEditorView.timeout') }}</dt>
               <dd>{{ selectedNodeData.timeout_seconds }}s</dd>
@@ -1173,6 +1168,7 @@ import { usePlanStore } from '../stores/planStore'
 
 import FormDialog from '../components/shared/FormDialog.vue'
 import PipelineSnapshotTimeline from '../components/pipeline/PipelineSnapshotTimeline.vue'
+import SandboxCommandsEditor from '../components/pipeline/SandboxCommandsEditor.vue'
 import { shortId } from '../utils/format'
 import { api } from '../lib/api/client'
 import { useApi } from '../composables/useApi'
@@ -2215,6 +2211,35 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onRunDialogKeydown)
 })
 
+// Sandbox command authoring → graph-save payload. The graph save REPLACES
+// graph_nodes_json wholesale, so every command field must be serialised here
+// or it is wiped. Mirrors the backend contract (routes/pipelines.py +
+// sandbox_mode): agent_command XOR agent_commands on sandbox_agent nodes
+// (the save clears the scalar when a non-empty list is present; empty list ==
+// no commands), and the joiner is persisted as a non-empty string — a null or
+// empty joiner would crash the runtime join, so an unset joiner saves the
+// " && " default.
+function nodeCommandFields(n: any): {
+  agent_command: string | null
+  agent_commands: string[] | null
+  commands_concatenation_string: string | null
+} {
+  const scalar = typeof n.agent_command === 'string' && n.agent_command.trim() !== '' ? n.agent_command : null
+  if (n.node_type !== 'sandbox_agent') {
+    return { agent_command: scalar, agent_commands: null, commands_concatenation_string: null }
+  }
+  const rows = (Array.isArray(n.agent_commands) ? n.agent_commands : [])
+    .map((c: unknown) => (typeof c === 'string' ? c : String(c ?? '')))
+    .filter((c: string) => c.trim() !== '')
+  if (rows.length === 0) {
+    return { agent_command: scalar, agent_commands: null, commands_concatenation_string: null }
+  }
+  const joiner = typeof n.commands_concatenation_string === 'string' && n.commands_concatenation_string.length > 0
+    ? n.commands_concatenation_string
+    : ' && '
+  return { agent_command: null, agent_commands: rows, commands_concatenation_string: joiner }
+}
+
 async function saveGraph() {
   savingGraph.value = true
   saveGraphError.value = null
@@ -2238,6 +2263,9 @@ async function saveGraph() {
           label: n.label || null,
           description: n.description || null,
           agent_id: n.agent_id || null,
+          ...nodeCommandFields(n),
+          agent_prompt: n.agent_prompt || null,
+          script_command: n.script_command || null,
           connector_binding: n.connector_binding || null,
           output_schema_id: n.output_schema_id || null,
           model_backend_id: n.model_backend_id || null,

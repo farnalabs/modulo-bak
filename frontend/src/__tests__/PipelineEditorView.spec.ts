@@ -61,6 +61,8 @@ vi.mock('../lib/api/client', () => {
   }
 })
 
+import { api } from '../lib/api/client'
+
 vi.mock('../composables/useDataFetch', async () => {
   const { ref } = await import('vue')
   return {
@@ -198,5 +200,167 @@ describe('PipelineEditorView', () => {
     expect((wrapper.vm as any).retryPolicyEvents).toEqual(['eval_failed', 'stall'])
     const stallCheckbox = wrapper.find('[data-testid="pipeline-editor-retry-event-stall"]')
     expect((stallCheckbox.element as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('shows the sandbox commands editor for a node with a pre-existing command list', async () => {
+    router.push('/pipelines/test-pipeline-id/editor')
+    await router.isReady()
+    const wrapper = mountEditor()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    vm.rawNodes = [
+      {
+        id: 'node-1',
+        node_type: 'sandbox_agent',
+        template_id: 'opencode',
+        agent_prompt: 'do the thing',
+        agent_command: null,
+        agent_commands: ['opencode run', '--model oxf'],
+        commands_concatenation_string: ' ; ',
+        label: 'Sandbox',
+        description: '',
+        position: { x: 0, y: 0 },
+      },
+    ]
+    vm.flowNodes = [{ id: 'node-1', type: 'agent', data: { label: 'Sandbox', description: '' } }]
+    vm.onNodeClick({ node: { id: 'node-1' } })
+    await nextTick()
+
+    // pre-existing rows are legible in the editor (one input per command)
+    expect(wrapper.find('[data-testid="pipeline-editor-node-commands-editor"]').exists()).toBe(true)
+    const row0 = wrapper.find('[data-testid="pipeline-editor-node-command-row-0"]')
+    expect((row0.element as HTMLInputElement).value).toBe('opencode run')
+    const row1 = wrapper.find('[data-testid="pipeline-editor-node-command-row-1"]')
+    expect((row1.element as HTMLInputElement).value).toBe('--model oxf')
+  })
+
+  it('saves the authored command list + join operator on the node config', async () => {
+    router.push('/pipelines/test-pipeline-id/editor')
+    await router.isReady()
+    const wrapper = mountEditor()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    const rawNode = {
+      id: 'node-1',
+      node_type: 'sandbox_agent',
+      template_id: 'opencode',
+      agent_prompt: 'do the thing',
+      agent_command: 'legacy-scalar',
+      agent_commands: ['opencode run', '--model oxf'],
+      commands_concatenation_string: ' ; ',
+      label: 'Sandbox',
+      description: '',
+      position: { x: 0, y: 0 },
+    }
+    vm.rawNodes = [rawNode]
+    vm.flowNodes = [{ id: 'node-1', type: 'agent', data: { label: 'Sandbox', description: '' } }]
+    vm.onNodeClick({ node: { id: 'node-1' } })
+    await nextTick()
+
+    await vm.saveGraph()
+
+    const patchMock = vi.mocked(api.PATCH)
+    expect(patchMock).toHaveBeenCalled()
+    const savedNode = (patchMock.mock.calls[0][1] as any).body.nodes[0]
+    // list + custom joiner survive the save payload (round-trip)
+    expect(savedNode.agent_commands).toEqual(['opencode run', '--model oxf'])
+    expect(savedNode.commands_concatenation_string).toBe(' ; ')
+    // mutual exclusion: the scalar is cleared when a non-empty list is authored
+    expect(savedNode.agent_command).toBeNull()
+  })
+
+  it('saves a scalar-only sandbox command without inventing a list', async () => {
+    router.push('/pipelines/test-pipeline-id/editor')
+    await router.isReady()
+    const wrapper = mountEditor()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    vm.rawNodes = [
+      {
+        id: 'node-1',
+        node_type: 'sandbox_agent',
+        template_id: 'opencode',
+        agent_prompt: 'do the thing',
+        agent_command: 'opencode run --auto',
+        label: 'Sandbox',
+        description: '',
+        position: { x: 0, y: 0 },
+      },
+    ]
+    vm.flowNodes = [{ id: 'node-1', type: 'agent', data: { label: 'Sandbox', description: '' } }]
+    vm.onNodeClick({ node: { id: 'node-1' } })
+    await nextTick()
+
+    await vm.saveGraph()
+
+    const savedNode = (vi.mocked(api.PATCH).mock.calls[0][1] as any).body.nodes[0]
+    expect(savedNode.agent_command).toBe('opencode run --auto')
+    expect(savedNode.agent_commands).toBeNull()
+    expect(savedNode.commands_concatenation_string).toBeNull()
+  })
+
+  it('falls back the join operator to the default when a list is saved without one', async () => {
+    router.push('/pipelines/test-pipeline-id/editor')
+    await router.isReady()
+    const wrapper = mountEditor()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    vm.rawNodes = [
+      {
+        id: 'node-1',
+        node_type: 'sandbox_agent',
+        template_id: 'opencode',
+        agent_prompt: 'do the thing',
+        agent_command: 'legacy-scalar',
+        agent_commands: ['opencode run', '--model oxf'],
+        label: 'Sandbox',
+        description: '',
+        position: { x: 0, y: 0 },
+      },
+    ]
+    vm.flowNodes = [{ id: 'node-1', type: 'agent', data: { label: 'Sandbox', description: '' } }]
+    vm.onNodeClick({ node: { id: 'node-1' } })
+    await nextTick()
+
+    await vm.saveGraph()
+
+    const savedNode = (vi.mocked(api.PATCH).mock.calls[0][1] as any).body.nodes[0]
+    // unset joiner saves as the runtime default; the scalar is cleared by the
+    // list's presence (mutual exclusion at the payload boundary too)
+    expect(savedNode.commands_concatenation_string).toBe(' && ')
+    expect(savedNode.agent_commands).toEqual(['opencode run', '--model oxf'])
+    expect(savedNode.agent_command).toBeNull()
+  })
+
+  it('filters empty command rows and keeps a scalar-only node intact on save', async () => {
+    router.push('/pipelines/test-pipeline-id/editor')
+    await router.isReady()
+    const wrapper = mountEditor()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    vm.rawNodes = [
+      {
+        id: 'node-1',
+        node_type: 'sandbox_agent',
+        template_id: 'opencode',
+        agent_prompt: 'do the thing',
+        agent_command: 'opencode run --auto',
+        agent_commands: ['cmd-a', '   ', ''],
+        commands_concatenation_string: ' ; ',
+        label: 'Sandbox',
+        description: '',
+        position: { x: 0, y: 0 },
+      },
+    ]
+    vm.flowNodes = [{ id: 'node-1', type: 'agent', data: { label: 'Sandbox', description: '' } }]
+    vm.onNodeClick({ node: { id: 'node-1' } })
+    await nextTick()
+
+    await vm.saveGraph()
+    const savedNode = (vi.mocked(api.PATCH).mock.calls[0][1] as any).body.nodes[0]
+    // empty/whitespace rows are dropped; the remaining list wins over the scalar
+    expect(savedNode.agent_commands).toEqual(['cmd-a'])
+    expect(savedNode.agent_command).toBeNull()
+    expect(savedNode.commands_concatenation_string).toBe(' ; ')
   })
 })
