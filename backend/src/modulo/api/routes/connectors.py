@@ -584,9 +584,10 @@ async def update_connector_endpoint(
                 updates["config_json"] = merged_cfg
             if credentials_updated and existing is not None:
                 # ``credentials_updated is True`` here implies ``new_credentials is
-                # not None``: the sole-field ``credentials: null`` case raised 422
-                # before this block, and the multi-field ``credentials: null`` case
-                # set ``credentials_updated = False`` pre-transaction.
+                # not None``: any explicit ``credentials: null`` (sole- or
+                # multi-field) was demoted to "no credential change"
+                # (``credentials_updated = False``) pre-transaction, so the only
+                # way to reach this block is with a non-null ``new_credentials``.
                 assert new_credentials is not None
                 if existing.connector_type_id == "rest":
                     # Partial credential update (FAR-466) — REST connector only.
