@@ -197,6 +197,74 @@ describe('AdminConnectorsView', () => {
     expect(body?.config_json.path).toBe('/v2/items')
   })
 
+  it('still sends the parsed allowed_hosts array when the allowlist is edited on a REST connector', async () => {
+    mockGet.mockResolvedValue({
+      data: {
+        items: [
+          restConnectorItem('rest-1', 'REST Connector', {
+            base_url: 'https://api.example.com',
+            method: 'GET',
+            timeout_seconds: 30,
+            verify_tls: true,
+            on_unknown: 'fail_open',
+            allowed_hosts: ['api.example.com'],
+            auth_mode: 'bearer',
+          }),
+        ],
+      },
+      error: undefined,
+    })
+    const wrapper = mountView()
+    await nextTick()
+    await nextTick()
+
+    await openEdit(wrapper, 'rest-1')
+    await wrapper.find('[data-testid="rest-connector-allowed-hosts"]').setValue('host-a.com, host-b.com')
+    await wrapper.find('form').trigger('submit')
+    await nextTick()
+
+    expect(mockPatch).toHaveBeenCalledTimes(1)
+    expect(patchBody()?.config_json.allowed_hosts).toEqual(['host-a.com', 'host-b.com'])
+  })
+
+  it('sends an explicit empty allowed_hosts array so clearing the allowlist persists', async () => {
+    // The backend PATCH config merge only overrides keys PRESENT in the
+    // payload. Omitting allowed_hosts when the field is cleared would silently
+    // keep the stored egress allowlist, making the restriction unremovable
+    // from the form. buildRestConfig must ALWAYS send the parsed array — []
+    // when cleared (FAR-466 QA fix).
+    mockGet.mockResolvedValue({
+      data: {
+        items: [
+          restConnectorItem('rest-1', 'REST Connector', {
+            base_url: 'https://api.example.com',
+            method: 'GET',
+            timeout_seconds: 30,
+            verify_tls: true,
+            on_unknown: 'fail_open',
+            allowed_hosts: ['api.example.com', 'cdn.example.com'],
+            auth_mode: 'bearer',
+          }),
+        ],
+      },
+      error: undefined,
+    })
+    const wrapper = mountView()
+    await nextTick()
+    await nextTick()
+
+    await openEdit(wrapper, 'rest-1')
+    // The stored allowlist is prefilled, then cleared by the admin.
+    const hostsField = wrapper.find('[data-testid="rest-connector-allowed-hosts"]')
+    expect((hostsField.element as HTMLInputElement).value).toBe('api.example.com, cdn.example.com')
+    await hostsField.setValue('')
+    await wrapper.find('form').trigger('submit')
+    await nextTick()
+
+    expect(mockPatch).toHaveBeenCalledTimes(1)
+    expect(patchBody()?.config_json.allowed_hosts).toEqual([])
+  })
+
   it('remounts the edit form per target so switching A to B drops the stale baselines', async () => {
     // Without a :key on the edit block, switching Edit from connector A to B
     // reuses the component instance: B's form inherits A's onMounted baselines,

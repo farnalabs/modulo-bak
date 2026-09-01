@@ -438,9 +438,14 @@ function buildRestConfig(): Record<string, unknown> {
     on_unknown: restConfig.value.on_unknown,
     records_path: restConfig.value.records_path.trim(),
   }
-  if (restConfig.value.allowed_hosts.trim()) {
-    cfg.allowed_hosts = restConfig.value.allowed_hosts.split(',').map(s => s.trim()).filter(Boolean)
-  }
+  // ALWAYS send allowed_hosts (FAR-466 QA fix): the backend PATCH config merge
+  // only overrides keys present in the payload, so omitting it when the field
+  // is cleared would silently keep the stored egress allowlist. An empty array
+  // is a valid "no restriction" value for the REST connector (falsy check).
+  cfg.allowed_hosts = restConfig.value.allowed_hosts
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
   // Echo the NON-SECRET auth identity into config_json so a subsequent edit can
   // prefill it. The secret VALUES are protected — they live only in the
   // credentials payload, never here. The connector reads auth from the
