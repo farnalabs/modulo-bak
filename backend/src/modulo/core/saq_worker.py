@@ -773,10 +773,14 @@ async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: s
             if run is None:
                 _log.warning("SAQ execute_suite_run: suite_run %s not found", rid)
                 return {"status": "missing"}
-            # modulo_app is BYPASSRLS, so ``session.get`` is NOT org-scoped — the
-            # explicit predicate is the isolation control. Verify the loaded run
-            # belongs to the job's org before executing it (defense-in-depth):
-            # a cross-org suite_run_id must never be executed.
+            # modulo_app is NOBYPASSRLS (bootstrap_role.py asserts
+            # ``rolbypassrls = false``), so on PostgreSQL ``session.get`` IS
+            # org-scoped by the ``rls_org_isolation`` policy via the org
+            # context set above — a cross-org row would already be invisible.
+            # The explicit predicate is defense-in-depth for non-RLS backends
+            # (SQLite/MariaDB, where the get is NOT org-scoped): verify the
+            # loaded run belongs to the job's org before executing it — a
+            # cross-org suite_run_id must never be executed.
             if run.organisation_id != oid:
                 _log.warning("SAQ execute_suite_run: suite_run %s belongs to a different org", rid)
                 return {"status": "missing"}
