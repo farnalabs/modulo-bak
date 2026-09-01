@@ -5,7 +5,9 @@ import { nextTick } from 'vue'
 
 // Spies for the VueFlow store surface the editor consumes. The editor must
 // call fitView automatically once the pane is ready and nodes exist (Fix:
-// fit the view before first render) — these mocks prove it.
+// fit the view before first render), latch its guard only on a SUCCESSFUL
+// fit, and keep re-attempting on pane-ready / node changes while fitView
+// keeps resolving false — these mocks prove it.
 const { fitViewSpy, paneReadyHandlers } = vi.hoisted(() => ({
   fitViewSpy: vi.fn(),
   paneReadyHandlers: [] as Array<() => void>,
@@ -81,6 +83,10 @@ function componentByTestid(wrapper: VueWrapper, testid: string): { props: (name:
 describe('PipelineEditorView toolbar & fit-on-load', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    // clearAllMocks keeps implementations, so reset the spy fully and restore
+    // the real contract: fitView resolves true on a successful fit.
+    fitViewSpy.mockReset()
+    fitViewSpy.mockResolvedValue(true)
     paneReadyHandlers.length = 0
   })
 
@@ -110,6 +116,46 @@ describe('PipelineEditorView toolbar & fit-on-load', () => {
     // Simulate VueFlow emitting its paneReady lifecycle hook.
     paneReadyHandlers[paneReadyHandlers.length - 1]()
     await vi.waitFor(() => expect(fitViewSpy).toHaveBeenCalled())
+  })
+
+  it('re-attempts the fit on pane-ready when the first attempt resolves false', async () => {
+    // First (nodes-watch) attempt fails per VueFlow's contract: fitView
+    // resolves false when the viewport has nothing measurable to fit.
+    fitViewSpy.mockResolvedValueOnce(false)
+    const wrapper = mountEditor()
+    await flushPromises()
+
+    ;(wrapper.vm as any).flowNodes = seededFlowNodes
+    await vi.waitFor(() => expect(fitViewSpy).toHaveBeenCalledTimes(1))
+
+    // A failed attempt must NOT latch the guard — pane-ready re-attempts.
+    paneReadyHandlers[paneReadyHandlers.length - 1]()
+    await vi.waitFor(() => expect(fitViewSpy).toHaveBeenCalledTimes(2))
+
+    // The retry succeeds and latches: further triggers stay no-ops.
+    paneReadyHandlers[paneReadyHandlers.length - 1]()
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(fitViewSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not re-attempt the fit once a successful fit has latched', async () => {
+    const wrapper = mountEditor()
+    await flushPromises()
+
+    ;(wrapper.vm as any).flowNodes = seededFlowNodes
+    await vi.waitFor(() => expect(fitViewSpy).toHaveBeenCalledTimes(1))
+    // waitFor observes the call; give the resolved true a tick to latch.
+    await nextTick()
+
+    // Later pane-ready emissions and node-count changes must be no-ops now.
+    paneReadyHandlers[paneReadyHandlers.length - 1]()
+    ;(wrapper.vm as any).flowNodes = [
+      ...seededFlowNodes,
+      { id: 'node-2', type: 'agent', position: { x: 10, y: 10 }, data: { label: 'Second', description: '' } },
+    ]
+    // A duplicate attempt would fire after nextTick + two animation frames.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(fitViewSpy).toHaveBeenCalledTimes(1)
   })
 
   it('renders the docked toolbar with grouped controls and the Fit to View label', async () => {

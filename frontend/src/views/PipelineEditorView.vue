@@ -1227,14 +1227,19 @@ function nextFrame(): Promise<void> {
 }
 async function runInitialFitView() {
   if (initialFitDone || flowNodes.value.length === 0) return
-  initialFitDone = true
   await nextTick()
   await nextFrame()
   try {
-    fitView({ padding: 0.1 })
-  } catch {
-    // Pane not measurable (e.g. zero-size canvas in tests) — the manual
-    // Fit to View button still works.
+    // fitView resolves false when the viewport has nothing measurable to fit,
+    // and is a noop resolving undefined before the viewport initialises, so
+    // the guard latches only on a truthy result. Until a fit succeeds,
+    // pane-ready and the nodes watch keep re-attempting.
+    const ok = await fitView({ padding: 0.1 })
+    if (ok) initialFitDone = true
+  } catch (error) {
+    // fitView signals an unmeasured pane via its resolved value, so a
+    // rejection here is a genuine error — surface it instead of swallowing.
+    console.warn('[PipelineEditorView] initial fitView failed; retry paths remain armed', error)
   }
 }
 onPaneReady(() => { void runInitialFitView() })
