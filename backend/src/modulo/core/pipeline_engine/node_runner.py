@@ -1483,8 +1483,14 @@ def _canonical_coerce(obj: Any) -> Any:
     """
     if isinstance(obj, dict):
         return {str(k): _canonical_coerce(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
-    if isinstance(obj, (list, tuple, set, frozenset)):
+    if isinstance(obj, (list, tuple)):
         return [_canonical_coerce(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        # Set iteration order is nondeterministic across processes
+        # (PYTHONHASHSEED); sort the coerced members so the serialisation stays
+        # byte-identical between the gate and stamp sides — otherwise two
+        # invocations could derive DIFFERENT keys and silently defeat the dedup.
+        return sorted((_canonical_coerce(v) for v in obj), key=str)
     return str(obj)
 
 

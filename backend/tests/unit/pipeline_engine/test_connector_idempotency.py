@@ -766,3 +766,18 @@ class TestConnectorFailedWriteNoStamp:
         h2 = _connector_write_payload_hash(resource="command", filters={"provider_ref": None}, data=hash_data)
         assert h1 == h2
         assert "weird" in h1
+
+    def test_payload_hash_set_order_deterministic(self) -> None:
+        """Set/frozenset members must be sorted in the deterministic fallback so
+        the hash is byte-identical across processes (PYTHONHASHSEED) — otherwise
+        the gate and stamp sides could derive DIFFERENT keys and silently defeat
+        the dedup."""
+        from modulo.core.pipeline_engine.node_runner import _canonical_coerce
+
+        s = {"gamma", "alpha", "beta", frozenset({"z", "a"})}
+        out = _canonical_coerce(s)
+        # Stable, sorted, str-coerced — independent of Python's set iteration order.
+        # (The nested frozenset coerces to a list whose str sorts before the
+        # plain strings, so it leads the sorted output.)
+        assert out == [["a", "z"], "alpha", "beta", "gamma"], out
+        assert len({str(_canonical_coerce(s)) for _ in range(50)}) == 1
