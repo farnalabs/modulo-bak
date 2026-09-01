@@ -781,3 +781,52 @@ class TestConnectorFailedWriteNoStamp:
         # plain strings, so it leads the sorted output.)
         assert out == [["a", "z"], "alpha", "beta", "gamma"], out
         assert len({str(_canonical_coerce(s)) for _ in range(50)}) == 1
+
+    def test_payload_hash_set_level_cross_pythonhashseed(self) -> None:
+        """Hash-level proof of the MAJOR finding: ``_connector_write_payload_hash``
+        must derive an identical key for set-valued ``data`` across two different
+        ``PYTHONHASHSEED`` values (i.e. across separate worker processes). The
+        primary ``json.dumps(..., default=str)`` path stringifies sets via
+        ``str(set)``, whose order is PYTHONHASHSEED-dependent — so we re-derive the
+        hash under two seeds in subprocesses and assert they match. This exercises
+        the observable invariant end-to-end, not just the ``_canonical_coerce``
+        fallback."""
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        backend_src = str(Path(__file__).parents[3] / "src")
+        payload_src = (
+            "from modulo.core.pipeline_engine.node_runner import "
+            "_connector_write_payload_hash as h; "
+            "data={'items': {'z', 'a', 'm'}, 'scopes': frozenset({'read', 'write'}), "
+            "'nested': {'k': {'x', 'y'}}}; "
+            "print(h(resource='command', filters={'provider_ref': None}, data=data))"
+        )
+
+        def _hash_under_seed(seed: str) -> str:
+            proc = subprocess.run(  # noqa: S603 - payload_src is a trusted literal constant
+                [sys.executable, "-c", payload_src],
+                env={**os.environ, "PYTHONHASHSEED": seed, "PYTHONPATH": backend_src},
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            assert proc.returncode == 0, proc.stderr
+            return proc.stdout.strip()
+
+        assert _hash_under_seed("0") == _hash_under_seed("1")
+        # And the value must be genuinely canonical: the same set rebuilt under a
+        # different insertion order yields the identical key within this process.
+        h_a = _connector_write_payload_hash(
+            resource="command",
+            filters={"provider_ref": None},
+            data={"items": {"z", "a", "m"}, "scopes": frozenset({"read", "write"})},
+        )
+        h_b = _connector_write_payload_hash(
+            resource="command",
+            filters={"provider_ref": None},
+            data={"items": {"m", "z", "a"}, "scopes": frozenset({"write", "read"})},
+        )
+        assert h_a == h_b
