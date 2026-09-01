@@ -298,6 +298,12 @@ select = [
     # __name__ (LOG001/LOG002), never the deprecated WARN constant (LOG009),
     # never a root-logger call (LOG015).
     "LOG001", "LOG002", "LOG009", "LOG015",
+    # Sixth wave of defensive gate-strengthening (verified zero current
+    # violations in non-test code with ruff==0.16.5: `ruff check src
+    # --select DTZ --statistics`). flake8-datetimez: production time handling
+    # must be timezone-aware; remaining violations are intentional naive
+    # datetime fixtures in tests/, covered by the tests/** per-file-ignore.
+    "DTZ",
 ]
 ignore = [
     "S101",     # assert allowed in tests
@@ -307,7 +313,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/modulo/api/mcp_server.py" = ["RET503"]
-"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008", "PERF", "ISC"]
+"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008", "PERF", "ISC", "DTZ"]
 
 "src/modulo/api/routes/scim.py" = ["N815", "N803"]
 "tests/unit/scim/test_scim_provisioning.py" = ["N815", "N803"]
