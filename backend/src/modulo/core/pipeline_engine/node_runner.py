@@ -66,6 +66,7 @@ from jinja2.sandbox import SandboxedEnvironment
 from langchain_core.messages import HumanMessage
 from langgraph.types import interrupt
 
+from modulo.connectors.base import DEFAULT_ON_UNKNOWN, ON_UNKNOWN_MODES
 from modulo.core.secret_patterns import AWS_ACCESS_KEY_PATTERN, GITHUB_PAT_PATTERN
 
 if TYPE_CHECKING:
@@ -327,14 +328,15 @@ _IDEMPOTENCY_GATE_READ_TIMEOUT = 3.0
 # FAR-228: best-effort marker persist bounded inside a caught CancelledError
 # (5s — the node is being cancelled, the write must not delay the re-raise).
 _IDEMPOTENCY_GATE_CANCEL_PERSIST_TIMEOUT = 5.0
-# FAR-458: the per-connector-per-write ``on_unknown`` default. Governs the
-# connector-write idempotency gate's AMBIGUOUS (couldn't-confirm-delivery)
-# decision: ``fail_open`` (default) re-fires the write on ambiguity (possible
-# duplicate, usually recoverable); ``fail_closed`` SUPPRESSES it (possible
-# silent miss; the operator reconciles); ``off`` bypasses the gate entirely.
-# A CONFIRMED-delivered write (delivery_done + matching key) is ALWAYS suppressed
-# regardless of the mode (that is the point of dedup).
-_DEFAULT_CONNECTOR_ON_UNKNOWN = "fail_open"
+# FAR-458: the per-connector-per-write ``on_unknown`` modes and default live in
+# ONE place — ``modulo.connectors.base`` (a stdlib-only leaf imported by both
+# the pipeline engine's gate read and the REST connector's config validation)
+# so the mode set can never drift between the two. The default
+# ``DEFAULT_ON_UNKNOWN`` (``"fail_open"``) re-fires the write on ambiguity
+# (possible duplicate, usually recoverable); ``fail_closed`` SUPPRESSES it
+# (possible silent miss; the operator reconciles); ``off`` bypasses the gate
+# entirely. A CONFIRMED-delivered write (delivery_done + matching key) is
+# ALWAYS suppressed regardless of the mode (that is the point of dedup).
 _SANDBOX_IO_TIMEOUT = 30.0  # max seconds for a single sandbox file read/write
 _SANDBOX_IDLE_TIMEOUT = 300.0  # max seconds of agent silence before treating the command as stalled (FAR-97)
 _STREAM_FLUSH_INTERVAL = 1.0  # min seconds between live stdout/stderr chunk publishes per node (FAR-98)
@@ -1513,7 +1515,7 @@ def _connector_on_unknown(connector: Any, resource: str) -> str:
     """
     reader = getattr(connector, "on_unknown_for", None)
     if not callable(reader):
-        return _DEFAULT_CONNECTOR_ON_UNKNOWN
+        return DEFAULT_ON_UNKNOWN
     try:
         mode = reader(resource)
     except Exception:
@@ -1521,8 +1523,8 @@ def _connector_on_unknown(connector: Any, resource: str) -> str:
             "connector.idempotency_gate.on_unknown_read_failed",
             extra={"resource": resource},
         )
-        return _DEFAULT_CONNECTOR_ON_UNKNOWN
-    return mode if mode in ("fail_open", "fail_closed", "off") else _DEFAULT_CONNECTOR_ON_UNKNOWN
+        return DEFAULT_ON_UNKNOWN
+    return mode if mode in ON_UNKNOWN_MODES else DEFAULT_ON_UNKNOWN
 
 
 async def _stamp_connector_write_delivered(
