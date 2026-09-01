@@ -27,7 +27,7 @@ from modulo.settings import Settings, get_settings
 
 # Re-exported so API-layer callers can import from the documented location.
 # Required because mypy runs under `strict` (no_implicit_reexport = True).
-__all__ = ["SENSITIVE_VALUE_MASK"]
+__all__ = ["SENSITIVE_VALUE_MASK", "merge_masked_config"]
 
 _log = logging.getLogger(__name__)
 
@@ -83,6 +83,26 @@ def mask_config_json(config: dict[str, Any]) -> dict[str, Any]:
     return {
         k: (mask_sensitive_value(v) if isinstance(v, str) and is_sensitive_key(k) else v) for k, v in config.items()
     }
+
+
+def merge_masked_config(current: dict[str, Any] | None, update: dict[str, Any]) -> dict[str, Any]:
+    """MERGE *update* into *current* without clobbering masked secrets.
+
+    A masked placeholder (``SENSITIVE_VALUE_MASK``) never overwrites the stored
+    secret (read-modify-write round-trip guard); an explicit ``None`` clears the
+    key; a missing key is left intact. The merge is shallow. This is the single
+    shared implementation previously duplicated in ``triggers.py``,
+    ``connectors.py``, ``error_forwarder_config.py`` and ``mcp_server.py``.
+    """
+    merged = dict(current or {})
+    for k, v in update.items():
+        if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
+            continue
+        if v is None:
+            merged.pop(k, None)
+        else:
+            merged[k] = v
+    return merged
 
 
 SensitiveValue = Annotated[

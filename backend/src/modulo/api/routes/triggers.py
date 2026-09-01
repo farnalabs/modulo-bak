@@ -25,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from modulo.api.constants import MSG_DB_OPERATION_FAILED, MSG_FEATURE_NOT_AVAILABLE, MSG_INTERNAL_SERVER_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_permission
-from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK, mask_config_json
+from modulo.api.middleware.sensitive_mask import (
+    SENSITIVE_VALUE_MASK,
+    mask_config_json,
+    merge_masked_config,
+)
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.secret_storage import _is_encrypted_token, encrypt_stored_secret
 from modulo.core.cron_helpers import (
@@ -201,15 +205,7 @@ def _merge_trigger_config(current: dict[str, Any] | None, update: dict[str, Any]
     round-trip guard); an explicit ``None`` clears the key; a missing key leaves
     it intact.
     """
-    merged_cfg = dict(current or {})
-    for k, v in update.items():
-        if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
-            continue
-        if v is None:
-            merged_cfg.pop(k, None)
-        else:
-            merged_cfg[k] = v
-    return merged_cfg
+    return merge_masked_config(current, update)
 
 
 _SECRET_CONFIG_KEYS = frozenset({"hmac_secret", "signing_secret"})

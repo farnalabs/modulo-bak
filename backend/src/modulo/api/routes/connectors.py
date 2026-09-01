@@ -19,7 +19,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from modulo.api.constants import MSG_RESOURCE_ALREADY_EXISTS
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_in_dev_operator, require_permission
-from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK, mask_config_json
+from modulo.api.middleware.sensitive_mask import (
+    mask_config_json,
+    merge_masked_config,
+)
 from modulo.api.models.team_visibility import TeamVisibilityMixin
 from modulo.auth.jwt import TenantPrincipal
 from modulo.connectors.base import ConnectorType
@@ -412,18 +415,9 @@ async def update_connector_endpoint(
             if existing is None or existing.organisation_id != principal.organisation_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             if existing is not None and "config_json" in updates and updates["config_json"] is not None:
-                current_cfg = existing.config_json or {}
-                merged_cfg = dict(current_cfg)
-                for k, v in updates["config_json"].items():
-                    if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
-                        # A masked placeholder must never clobber the stored secret
-                        # (read-modify-write round-trip guard). Keep the existing value.
-                        continue
-                    if v is None:
-                        merged_cfg.pop(k, None)
-                    else:
-                        merged_cfg[k] = v
-                updates["config_json"] = merged_cfg
+                # A masked placeholder must never clobber the stored secret
+                # (read-modify-write round-trip guard). Keep the existing value.
+                updates["config_json"] = merge_masked_config(existing.config_json, updates["config_json"])
             if existing is not None and existing.connector_type_id == "github" and credentials_updated:
                 temp = GitHubConnector(token=new_credentials)
                 try:
