@@ -603,7 +603,8 @@ def _build_token_usage_fields(output_json: Any) -> dict[str, Any]:
     mirrors ``_build_model_cost_fields``). A valid ``0`` report is a real
     report and IS written. These fields are DISPLAY-ONLY: they feed
     ``node_telemetry_json`` and the union's ``reported_*`` analytics fields,
-    never any money math.
+    never an input to the system's built-in money math (operator-defined
+    formulas may reference them).
     """
     if not isinstance(output_json, dict):
         return {}
