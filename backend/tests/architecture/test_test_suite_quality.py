@@ -11682,7 +11682,7 @@ def _dict_keys_membership_violations(tree: ast.AST) -> list[tuple[int, str]]:
         test = node.test
         if not isinstance(test, ast.Compare):
             continue
-        for op, comp in zip(test.ops, test.comparators):
+        for op, comp in zip(test.ops, test.comparators, strict=True):
             if not isinstance(op, (ast.In, ast.NotIn)):
                 continue
             if not _is_keys_view(comp):
@@ -11726,8 +11726,7 @@ def test_no_dict_keys_membership():
         "and the extra call is one typo away from the value-view confusion "
         "('k in d.values()')\n"
         "that silently flips the meaning. Assert against the mapping directly "
-        "(assert key in mapping).\n"
-        + "\n".join(violations)
+        "(assert key in mapping).\n" + "\n".join(violations)
     )
 
 
