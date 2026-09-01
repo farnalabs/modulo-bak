@@ -111,6 +111,23 @@ def _is_masked_echo(value: Any) -> bool:
     return isinstance(value, str) and SENSITIVE_VALUE_MASK in value
 
 
+def _contains_masked_echo(value: Any) -> bool:
+    """Recursively detect any masked-echo string anywhere in *value*.
+
+    Unlike :func:`_is_masked_echo` (top-level string only), this walks dict
+    and list containers so a list-of-dicts whose elements carry a masked secret
+    (e.g. a round-tripped ``operations`` entry) is correctly recognised as a
+    partial GET->PATCH payload rather than a fully-specified value.
+    """
+    if isinstance(value, str):
+        return _is_masked_echo(value)
+    if isinstance(value, dict):
+        return any(_contains_masked_echo(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_masked_echo(v) for v in value)
+    return False
+
+
 def merge_masked_config_json(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge *incoming* into *current*, refusing to persist the DOM mask.
 
@@ -118,8 +135,13 @@ def merge_masked_config_json(current: dict[str, Any], incoming: dict[str, Any]) 
     handed by a prior GET. Persisting that mask literal would clobber the real
     stored secret, so any incoming string containing
     :data:`SENSITIVE_VALUE_MASK` is skipped at every nesting depth (the existing
-    value is preserved). ``None`` values delete the key; nested dicts and
-    matching lists are merged recursively rather than replaced wholesale.
+    value is preserved). ``None`` values delete the key; nested dicts are merged
+    recursively rather than replaced wholesale. A list value that contains NO
+    masked echo is treated as the caller's complete intended value and replaces
+    the stored list wholesale (so non-secret scalar lists such as the
+    ``allowed_hosts`` SSRF egress allowlist can be shrunk or cleared); a list
+    that DOES contain a masked echo is merged positionally so stored secrets
+    are never clobbered.
     """
     return cast(dict[str, Any], _deep_merge(current, incoming))
 
@@ -155,6 +177,18 @@ def _merge_list(current: Any, incoming: list[Any]) -> list[Any]:
     are merged recursively rather than replaced wholesale. An incoming list
     that is entirely masked echoes therefore leaves the stored list intact.
     """
+    if not isinstance(incoming, list):
+        return incoming
+    # A fully-specified (non-secret) list is a WHOLE-LIST REPLACEMENT, not a
+    # positional merge. The GET->PATCH round-trip only re-emits masked echoes
+    # for list elements that actually contain secrets; any list that carries NO
+    # masked echo is the caller's complete intended value, so honour shrink and
+    # removal (e.g. narrowing the ``allowed_hosts`` SSRF/egress allowlist) rather
+    # than silently preserving stale tail elements. Only a list that DOES
+    # contain a masked echo falls through to the position-preserving merge, so a
+    # stored secret can never be clobbered by a round-tripped mask literal.
+    if not _contains_masked_echo(incoming):
+        return list(incoming)
     merged_list: list[Any] = list(current) if isinstance(current, list) else []
     for idx, item in enumerate(incoming):
         if isinstance(item, dict):

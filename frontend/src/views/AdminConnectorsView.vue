@@ -414,9 +414,16 @@ function buildRestConfig(): Record<string, unknown> {
     on_unknown: restConfig.value.on_unknown,
     records_path: restConfig.value.records_path.trim(),
   }
-  if (restConfig.value.allowed_hosts.trim()) {
-    cfg.allowed_hosts = restConfig.value.allowed_hosts.split(',').map(s => s.trim()).filter(Boolean)
-  }
+  // Always emit allowed_hosts (never omit) so an empty field is an explicit
+  // clear signal. The recursive masked-merge treats a fully-specified
+  // non-secret list as a whole-list replacement, so sending [] here lets a
+  // user shrink or empty the SSRF/egress allowlist via the UI (it can no
+  // longer be widened-but-never-narrowed). An absent key would instead
+  // preserve the stale stored value.
+  cfg.allowed_hosts = restConfig.value.allowed_hosts
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
   if (restConfig.value.advanced_json.trim()) {
     try {
       Object.assign(cfg, JSON.parse(restConfig.value.advanced_json) as Record<string, unknown>)

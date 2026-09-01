@@ -280,6 +280,51 @@ class TestMergeMaskedConfigJson:
         result = merge_masked_config_json(stored, incoming)
         assert result["refs"] == ["backend", "frontend"]
 
+    def test_list_shrink_narrows_stored_non_secret_list(self) -> None:
+        """A PATCH that SHORTENS a non-secret list must narrow the stored value.
+
+        Regression for the MAJOR review finding: ``_merge_list`` used to merge
+        positionally, so a PATCH sending a shorter ``allowed_hosts`` (SSRF egress
+        allowlist) silently preserved the stale tail elements and the allowlist
+        could be widened but never narrowed. A list with no masked echo is now a
+        whole-list replacement.
+        """
+        stored = {"allowed_hosts": ["a.example.com", "b.example.com"]}
+        incoming = {"allowed_hosts": ["a.example.com"]}
+        result = merge_masked_config_json(stored, incoming)
+        assert result["allowed_hosts"] == ["a.example.com"]
+
+    def test_list_clear_replaces_with_empty(self) -> None:
+        """A PATCH sending an empty non-secret list must clear the stored value."""
+        stored = {"allowed_hosts": ["a.example.com", "b.example.com"]}
+        incoming = {"allowed_hosts": []}
+        result = merge_masked_config_json(stored, incoming)
+        assert result["allowed_hosts"] == []
+
+    def test_list_of_dicts_without_masked_echo_replaces_whole(self) -> None:
+        """A fully-specified list-of-dicts (no masked echo) replaces wholesale.
+
+        Demonstrates the same narrowing semantics apply to list-of-dicts whose
+        elements carry no secrets: removing a dict element from the incoming
+        list removes it from the stored value.
+        """
+        stored = {"operations": [{"name": "get"}, {"name": "post"}]}
+        incoming = {"operations": [{"name": "get"}]}
+        result = merge_masked_config_json(stored, incoming)
+        assert result["operations"] == [{"name": "get"}]
+
+    def test_masked_list_still_preserves_stored_secrets(self) -> None:
+        """A list containing a masked echo still preserves the stored value.
+
+        Guards the original secret-clobbering fix: once ANY element is a masked
+        echo the merge stays positional, so a round-tripped mask literal never
+        overwrites a real secret.
+        """
+        stored = {"tokens": ["real-A", "real-B"]}
+        incoming = {"tokens": [SENSITIVE_VALUE_MASK, SENSITIVE_VALUE_MASK]}
+        result = merge_masked_config_json(stored, incoming)
+        assert result["tokens"] == ["real-A", "real-B"]
+
 
 # ---------------------------------------------------------------------------
 # Unit: SensitiveValue Pydantic type
