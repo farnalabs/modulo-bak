@@ -908,7 +908,13 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
         socket_options: Iterable[SOCKET_OPTION] | None,
     ) -> httpcore.AsyncNetworkStream:
         """Try each IP in the set round-robin from the cursor, failing over on error."""
-        last_exc: OSError | None = None
+        # httpcore maps OS connect/read/write failures to its own exception
+        # hierarchy (ConnectError / ConnectTimeout / ReadError / ...), NOT to
+        # OSError. Catching only OSError left the failover loop dead — a connect
+        # error never advanced to the next pinned IP. Catch the two httpcore
+        # bases (NetworkError = connect/read/write errors, TimeoutException =
+        # all timeouts) so any transport failure advances the failover.
+        last_exc: Exception | None = None
         start = self._cursor.get(host_key, 0)
         for offset in range(len(ips)):
             idx = (start + offset) % len(ips)
@@ -917,7 +923,7 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
                 stream = await self._connect_to_ip(
                     ip, port, timeout=timeout, local_address=local_address, socket_options=socket_options
                 )
-            except OSError as exc:
+            except (httpcore.NetworkError, httpcore.TimeoutException) as exc:
                 last_exc = exc
                 self._cursor[host_key] = idx + 1
                 continue
@@ -966,7 +972,7 @@ class _PinnedAsyncNetworkBackend(httpcore.AnyIOBackend):
             return await self._try_set(
                 key, ips, port, timeout=timeout, local_address=local_address, socket_options=socket_options
             )
-        except OSError:
+        except (httpcore.NetworkError, httpcore.TimeoutException):
             if not self._re_resolve:
                 raise
             # All pinned IPs failed at connect: self-heal by re-resolving and
@@ -1075,11 +1081,9 @@ class PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         # Only check the loudness guard after a COMPLETED request (not when the
         # request raised), so a genuine connect/DNS error surfaces as itself and
-        # never gets masked by the guard.
-        try:
-            response = await super().handle_async_request(request)
-        except Exception:
-            raise
+        # never gets masked by the guard. A raising request propagates directly
+        # from ``super().handle_async_request``, which skips the guard for free.
+        response = await super().handle_async_request(request)
         self._enforce_pin_live()
         return response
 

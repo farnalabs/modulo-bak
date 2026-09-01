@@ -22,6 +22,7 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpcore
 import httpx
 import pytest
 from cryptography import x509
@@ -944,9 +945,12 @@ _CONNECT_OK = object()
 def _fake_connect(attempted: list[str], fail_first: bool = False):
     """Return an async ``_connect_to_ip`` replacement that records IP attempts.
 
-    ``fail_first`` raises ``OSError`` for the first attempted address then
-    succeeds — the failover seam. Returns the recorded list so a test can assert
-    the order of IPs tried.
+    ``fail_first`` raises ``httpcore.ConnectError`` for the first attempted
+    address then succeeds — the failover seam. ``ConnectError`` mirrors what
+    httpcore actually raises for an OS connect failure (it is a ``NetworkError``,
+    NOT ``OSError``), so the test guards the production exception the failover
+    loop catches. Returns the recorded list so a test can assert the order of IPs
+    tried.
     """
 
     async def fake(
@@ -959,7 +963,7 @@ def _fake_connect(attempted: list[str], fail_first: bool = False):
     ) -> object:
         attempted.append(ip)
         if fail_first and ip == attempted[0]:
-            raise OSError("connection refused")
+            raise httpcore.ConnectError("connection refused")
         return _CONNECT_OK
 
     return fake
@@ -1044,7 +1048,7 @@ async def test_connect_error_re_resolves_and_retries_fresh(monkeypatch: pytest.M
     ) -> object:
         attempted.append(ip)
         if ip == "1.1.1.1":
-            raise OSError("decommissioned")
+            raise httpcore.ConnectError("decommissioned")
         return _CONNECT_OK
 
     backend._connect_to_ip = fake_connect  # type: ignore[method-assign]
