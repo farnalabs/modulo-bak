@@ -22,8 +22,11 @@ import asyncio
 import pytest
 
 import modulo.core.ssrf as ssrf
+from modulo.connectors.ci_runner.github_actions import GitHubActionsCIRunner
 from modulo.connectors.gitlab import GitLabConnector
 from modulo.connectors.rest import RestConnector
+from modulo.connectors.ticket_tracker.github import GitHubTicketTracker
+from modulo.connectors.ticket_tracker.trello import TrelloTicketTracker
 
 # Resolver flip: first validation resolves PUBLIC (accepted), any later lookup
 # answers with the cloud-metadata address (what an attacker's rebinding DNS
@@ -69,7 +72,7 @@ def test_gitlab_client_pins_validated_ip_despite_resolver_flip(monkeypatch: pyte
 
     client = connector._client()
     try:
-        assert _pinned_hosts(client) == {"gitlab.example.com": _VALIDATED_PUBLIC}
+        assert _pinned_hosts(client) == {"gitlab.example.com": (_VALIDATED_PUBLIC,)}
     finally:
         _aclose(client)
 
@@ -90,7 +93,7 @@ def test_gitlab_client_pins_per_validation_and_fails_closed_on_rebind(
 
     first = connector._client()
     try:
-        assert _pinned_hosts(first) == {"gitlab.example.com": _VALIDATED_PUBLIC}
+        assert _pinned_hosts(first) == {"gitlab.example.com": (_VALIDATED_PUBLIC,)}
     finally:
         _aclose(first)
 
@@ -115,7 +118,7 @@ def test_rest_client_pins_base_url_host(monkeypatch: pytest.MonkeyPatch) -> None
 
     client = connector._client()
     try:
-        assert _pinned_hosts(client) == {"rest-target.example.com": _VALIDATED_PUBLIC}
+        assert _pinned_hosts(client) == {"rest-target.example.com": (_VALIDATED_PUBLIC,)}
     finally:
         _aclose(client)
 
@@ -154,7 +157,7 @@ def test_sync_pinned_helpers_wire_correctly(monkeypatch: pytest.MonkeyPatch) -> 
     transport = ssrf.pinned_async_transport_sync("https://pinned-target.example.com/")
     try:
         backend = transport._pool._network_backend
-        assert backend._pinned_hosts == {"pinned-target.example.com": _VALIDATED_PUBLIC}
+        assert backend._pinned_hosts == {"pinned-target.example.com": (_VALIDATED_PUBLIC,)}
     finally:
         asyncio.run(transport.aclose())
 
@@ -169,3 +172,43 @@ def test_sync_pinned_client_still_blocks_internal_target(monkeypatch: pytest.Mon
     monkeypatch.setattr(ssrf, "_resolve_all_sync", lambda _host: ["10.0.0.5"])
     with pytest.raises(ValueError, match="private/internal"):
         ssrf.pinned_async_client_sync("https://blocked.example.com/")
+
+
+# --- FAR-526B: widen pinning to the last raw-httpx egress sites match -------------
+
+
+def test_ticket_tracker_github_pins_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(f) GitHubTicketTracker now builds its client through the pinned transport."""
+    _flip_resolver(monkeypatch)
+    tracker = GitHubTicketTracker(
+        config={"repo": "owner/repo", "base_url": "https://api.github.com"},
+        creds={"token": "ghp_fake"},
+    )
+    client = tracker._client()
+    try:
+        assert _pinned_hosts(client) == {"api.github.com": (_VALIDATED_PUBLIC,)}
+    finally:
+        _aclose(client)
+
+
+def test_ticket_tracker_trello_pins_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(f) TrelloTicketTracker builds its client through the pinned transport
+    (its key/token stay in the query string, redaction preserved)."""
+    _flip_resolver(monkeypatch)
+    tracker = TrelloTicketTracker(config={"board_id": "board123"}, creds={"api_key": "k", "token": "t"})
+    client = tracker._client()
+    try:
+        assert _pinned_hosts(client) == {"api.trello.com": (_VALIDATED_PUBLIC,)}
+    finally:
+        _aclose(client)
+
+
+def test_ci_runner_github_actions_pins_api_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(f) GitHubActionsCIRunner pins the hardcoded api.github.com address."""
+    _flip_resolver(monkeypatch)
+    runner = GitHubActionsCIRunner(token="ghp_test")
+    client = runner._client()
+    try:
+        assert _pinned_hosts(client) == {"api.github.com": (_VALIDATED_PUBLIC,)}
+    finally:
+        _aclose(client)

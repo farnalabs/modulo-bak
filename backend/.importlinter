@@ -175,3 +175,10 @@ ignore_imports =
     # (connector_hub passes config['base_url'] straight through), so it is on the
     # same external trust boundary as the connectors above and needs the guard.
     modulo.connectors.ci_runner.gitlab_ci -> modulo.core.ssrf
+    # FAR-526B: the GitHub Actions CI runner pins the hardcoded api.github.com via
+    # the shared SSRF primitive, and the GitHub/Trello ticket-tracker connectors
+    # pin their base_url host. Same narrow exception for the shared security
+    # primitive as the other base_url-bearing connectors.
+    modulo.connectors.ci_runner.github_actions -> modulo.core.ssrf
+    modulo.connectors.ticket_tracker.github -> modulo.core.ssrf
+    modulo.connectors.ticket_tracker.trello -> modulo.core.ssrf
