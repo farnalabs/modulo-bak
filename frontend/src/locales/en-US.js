@@ -956,6 +956,7 @@ export default {
       "commands_join_operator_hint": "Inserted between commands when the pipeline runs",
       "commands_join_operator_placeholder": " && ",
       "commands_effective_preview": "Effective command",
+      "commands_concatenated_with": "Concatenated with:",
       "timeout": "Timeout",
       "stall_timeout": "Stall Timeout",
       "heartbeat": "Heartbeat",

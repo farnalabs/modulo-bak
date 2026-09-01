@@ -775,10 +775,11 @@ class PipelineGraphNode(BaseModel):
         """Normalise an absent/empty/null joiner to the runtime default.
 
         sandbox_mode resolves the joiner with ``node_def.get("commands_concatenation_string", " && ")``
-        — the default only applies when the KEY is absent, so a persisted ``null``
-        or empty string would crash the run-time join. Coercing them to " && "
-        keeps "no joiner configured" and "the default joiner" the same state at
-        rest, for every writer (REST, MCP, templates).
+        — the default only applies when the KEY is absent, so a persisted
+        ``null`` would crash the run-time join (``None.join(...)``) and an
+        empty string would join the commands with no separator at all.
+        Coercing both to " && " keeps "no joiner configured" and "the default
+        joiner" the same state at rest, for every writer (REST, MCP, templates).
         """
         return v if isinstance(v, str) and v else " && "
 
