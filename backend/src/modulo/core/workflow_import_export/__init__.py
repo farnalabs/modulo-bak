@@ -856,19 +856,23 @@ def _sanitize_retry_policy(imported: Any) -> tuple[dict[str, Any], str | None]:
     pipeline's runs.
 
     Returns ``(policy, fault_class)``:
+      - absent (``None``): ``({}, None)`` — "no policy" is NOT a fault (the
+        legacy warning only fired for a PRESENT malformed policy).
       - no fault: ``(canonicalised copy, None)`` — canonicalisation-only deltas
         (e.g. ``300.0`` -> ``300``) are NOT faults.
       - schedule-level fault (the OPTIONAL ``backoff_schedule`` is malformed):
         NESTED DROP — the schedule key is removed but ``on``/``max_retries``/
         ``backoff`` are KEPT (``"schedule"``). A bad pacing schedule must not
         cost the caller its entire retry policy.
-      - any TOP-LEVEL core fault (``on``/``max_retries``/non-dict): WHOLE DROP
-        to ``{}`` UNCHANGED from the legacy behaviour (``"core"``).
+      - any TOP-LEVEL core fault (``on``/``max_retries``/present non-dict):
+        WHOLE DROP to ``{}`` UNCHANGED from the legacy behaviour (``"core"``).
 
     A mixed-error payload (core AND schedule faults) whole-drops: the core
     fault is the fatal one, and keeping ``on``/``max_retries`` beside a
     schedule we had to drop anyway buys nothing.
     """
+    if imported is None:
+        return {}, None
     if not isinstance(imported, dict):
         return {}, "core"
     core_check = ValidationResult()

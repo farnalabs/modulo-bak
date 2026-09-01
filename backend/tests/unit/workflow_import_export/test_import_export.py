@@ -268,11 +268,19 @@ def test_sanitize_retry_policy_drops_non_integer_budget() -> None:
     assert fault == "core"
 
 
-def test_sanitize_retry_policy_drops_non_dict_values() -> None:
-    for bad in ("stall", ["stall"], None, 42):
+def test_sanitize_retry_policy_drops_present_non_dict_values() -> None:
+    for bad in ("stall", ["stall"], 42):
         sanitized, fault = _sanitize_retry_policy(bad)
         assert not sanitized
         assert fault == "core"
+
+
+def test_sanitize_retry_policy_absent_is_not_a_fault() -> None:
+    """``None`` (no retry_policy on the imported pipeline) is NOT a fault class
+    of "core" — the legacy warning only fired for a PRESENT malformed policy."""
+    sanitized, fault = _sanitize_retry_policy(None)
+    assert not sanitized
+    assert fault is None
 
 
 def test_sanitize_retry_policy_keeps_empty_policy() -> None:
@@ -364,6 +372,18 @@ def test_apply_imported_retry_policy_canonicalization_only_no_warning() -> None:
     warnings: list[str] = []
     _apply_imported_retry_policy(pipeline, pipeline_info, warnings)
     assert pipeline.retry_policy == {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45}}
+    assert warnings == []
+
+
+def test_apply_imported_retry_policy_absent_policy_no_warning() -> None:
+    """A pipeline WITHOUT a retry_policy imports silently: the legacy behaviour
+    never warned for an absent policy — only for a PRESENT malformed one."""
+    from modulo.core.workflow_import_export import _apply_imported_retry_policy
+
+    pipeline = MagicMock()
+    warnings: list[str] = []
+    _apply_imported_retry_policy(pipeline, {}, warnings)
+    assert pipeline.retry_policy == {}
     assert warnings == []
 
 

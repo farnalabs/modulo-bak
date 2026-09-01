@@ -247,7 +247,7 @@ def _retry_backoff_seconds(
     The schedule is bounded by the retry budget at the decision site: the
     executor only re-dispatches while ``node_attempt_count <= max_retries``,
     so the last scheduled attempt (attempt == budget) cannot extend beyond the
-    policy's ``max_retries``. This is a pure function of the attempt number �?"
+    policy's ``max_retries``. This is a pure function of the attempt number —
     unit-testable without touching the async retry path.
     """
     n = max(int(attempt_n), 1)
