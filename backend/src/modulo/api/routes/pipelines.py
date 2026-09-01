@@ -347,37 +347,26 @@ async def _handle_graph_write_denials(
     ) from None
 
 
-_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure", "eval_failed"})
-_RETRY_POLICY_MAX_RETRIES = 5
-
-
 def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | None:
     """Validate a ``retry_policy`` payload, returning it unchanged.
 
     ``None`` is accepted (treated as "no retry policy"). Raises ValueError with
     a clear message when the policy shape is malformed.
+
+    FAR-525 refactor: the shape rules live in ONE place
+    (``GraphValidator.check_retry_policy``) so the API layer, the graph
+    validator, and the import sanitiser cannot drift. Issues are mapped to
+    ``ValueError`` with the SAME message strings the inline implementation
+    raised (first-issue parity �?" byte-identical 422 details).
     """
     if value is None:
         return value
-    if not isinstance(value, dict):
-        raise ValueError(
-            "retry_policy must be an object like "
-            "{'on': ['stall','timeout','failure','eval_failed'], 'max_retries': 0-5}"
-        )
-    on = value.get("on", [])
-    if not isinstance(on, list) or any(not isinstance(e, str) for e in on):
-        raise ValueError("retry_policy 'on' must be a list of strings from ['stall','timeout','failure','eval_failed']")
-    unknown = set(on) - _RETRY_POLICY_EVENTS
-    if unknown:
-        raise ValueError(
-            f"retry_policy 'on' contains unknown values {sorted(unknown)}; "
-            "allowed values are ['stall','timeout','failure','eval_failed']"
-        )
-    max_retries = value.get("max_retries", 0)
-    if isinstance(max_retries, bool) or not isinstance(max_retries, int):
-        raise ValueError("retry_policy 'max_retries' must be an integer between 0 and 5")
-    if not 0 <= max_retries <= _RETRY_POLICY_MAX_RETRIES:
-        raise ValueError("retry_policy 'max_retries' must be an integer between 0 and 5")
+    from modulo.core.graph_validator._types import ValidationResult
+
+    result = ValidationResult()
+    GraphValidator.check_retry_policy(value, result)
+    for issue in result.issues:
+        raise ValueError(issue.message)
     return value
 
 

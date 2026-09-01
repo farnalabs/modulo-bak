@@ -95,6 +95,63 @@ def client() -> Generator[TestClient, None, None]:
 
 
 # ---------------------------------------------------------------------------
+# FAR-525 delegation parity — _validate_retry_policy raises GraphValidator
+# messages BYTE-IDENTICAL to the retired inline implementation
+# ---------------------------------------------------------------------------
+
+
+_OBJ_MSG = "retry_policy must be an object like {'on': ['stall','timeout','failure','eval_failed'], 'max_retries': 0-5}"
+_ON_LIST_MSG = "retry_policy 'on' must be a list of strings from ['stall','timeout','failure','eval_failed']"
+_BOGUS_MSG = (
+    "retry_policy 'on' contains unknown values ['bogus']; "
+    "allowed values are ['stall','timeout','failure','eval_failed']"
+)
+_BUDGET_MSG = "retry_policy 'max_retries' must be an integer between 0 and 5"
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_message"),
+    [
+        ("stall", _OBJ_MSG),
+        (["stall"], _OBJ_MSG),
+        ({"on": "stall", "max_retries": 2}, _ON_LIST_MSG),
+        ({"on": ["stall", 42], "max_retries": 2}, _ON_LIST_MSG),
+        ({"on": ["bogus"], "max_retries": 2}, _BOGUS_MSG),
+        ({"on": ["stall"], "max_retries": "lots"}, _BUDGET_MSG),
+        ({"on": ["stall"], "max_retries": True}, _BUDGET_MSG),
+        ({"on": ["stall"], "max_retries": 6}, _BUDGET_MSG),
+    ],
+)
+def test_validate_retry_policy_message_parity(payload: object, expected_message: str) -> None:
+    """Each failure class raises the EXACT message the pre-refactor inline
+    validator raised (first-issue parity — the delegation must not change a
+    single 422 detail byte)."""
+    from modulo.api.routes.pipelines import _validate_retry_policy
+
+    with pytest.raises(ValueError) as exc_info:
+        _validate_retry_policy(payload)
+    assert str(exc_info.value) == expected_message
+
+
+def test_validate_retry_policy_delegation_equivalence_multi_error_payload() -> None:
+    """A payload with MULTIPLE faults surfaces the FIRST issue only (the inline
+    validator raised on first fault — no error aggregation was introduced)."""
+    from modulo.api.routes.pipelines import _validate_retry_policy
+
+    # 'on' fault comes before the max_retries fault — 'on' message wins.
+    with pytest.raises(ValueError, match=r"'on' contains unknown values"):
+        _validate_retry_policy({"on": ["bogus"], "max_retries": 9})
+
+
+def test_validate_retry_policy_delegates_valid_payloads_unchanged() -> None:
+    from modulo.api.routes.pipelines import _validate_retry_policy
+
+    valid = {"on": ["stall", "timeout", "failure", "eval_failed"], "max_retries": 5}
+    assert _validate_retry_policy(valid) is valid
+    assert _validate_retry_policy(None) is None
+
+
+# ---------------------------------------------------------------------------
 # POST /api/v1/pipelines — retry_policy create + validation
 # ---------------------------------------------------------------------------
 
