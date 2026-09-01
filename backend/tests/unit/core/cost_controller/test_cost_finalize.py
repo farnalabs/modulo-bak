@@ -345,7 +345,9 @@ def test_fold_token_usage_prove_the_fix_end_to_end() -> None:
         merged_telemetry={"node-a": telemetry},
     )
     entry = union["node-a"]
-    assert entry["input_tokens"] == 0 and entry["output_tokens"] == 0 and entry["total_tokens"] == 0
+    assert entry["input_tokens"] == 0
+    assert entry["output_tokens"] == 0
+    assert entry["total_tokens"] == 0
     assert entry["reported_input_tokens"] == 1234
     assert entry["reported_output_tokens"] == 567
     assert entry["reported_total_tokens"] == 1801

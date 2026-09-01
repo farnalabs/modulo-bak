@@ -178,15 +178,15 @@ class TestSelfReportedCost:
 
 class TestAgentReportedTokenUsage:
     def test_non_dict_output_json_omits_everything(self) -> None:
-        assert _build_token_usage_fields(None) == {}
-        assert _build_token_usage_fields("nope") == {}
-        assert _build_token_usage_fields(42) == {}
+        assert not _build_token_usage_fields(None)
+        assert not _build_token_usage_fields("nope")
+        assert not _build_token_usage_fields(42)
 
     def test_token_usage_absent_or_non_dict_omits_everything(self) -> None:
-        assert _build_token_usage_fields({}) == {}
-        assert _build_token_usage_fields({"other": 1}) == {}
-        assert _build_token_usage_fields({"token_usage": "not-a-dict"}) == {}
-        assert _build_token_usage_fields({"token_usage": None}) == {}
+        assert not _build_token_usage_fields({})
+        assert not _build_token_usage_fields({"other": 1})
+        assert not _build_token_usage_fields({"token_usage": "not-a-dict"})
+        assert not _build_token_usage_fields({"token_usage": None})
 
     def test_valid_report_full_including_cache_keys(self) -> None:
         fields = _build_token_usage_fields(
@@ -270,9 +270,8 @@ class TestAgentReportedTokenUsage:
         """A truthy producer ``schema_drift`` flag suppresses the token report
         entirely (returns ``{}``) — mirroring ``_extract_reported_cost``: a
         drifted-schema node reports NO tokens."""
-        assert (
-            _build_token_usage_fields({"schema_drift": True, "token_usage": {"input": 10, "output": 5, "total": 15}})
-            == {}
+        assert not _build_token_usage_fields(
+            {"schema_drift": True, "token_usage": {"input": 10, "output": 5, "total": 15}}
         )
 
     def test_clean_producer_report_extracts_normally(self) -> None:
