@@ -550,8 +550,8 @@ def test_single_migration_head() -> None:
         revisions[path] = rev
         parents[path] = parent
 
-    def _basename(path: str) -> str:
-        return path.replace("\\", "/").rsplit("/", 1)[-1]
+    def _basename(path: Any) -> str:
+        return str(path).replace("\\", "/").rsplit("/", 1)[-1]
 
     # The linear chain, integrated with main's run_evidence + dismissals RL
     # migrations + main's status_check_constraints + rename_remy migrations:
