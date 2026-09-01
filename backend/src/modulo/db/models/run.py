@@ -134,6 +134,23 @@ class Run(OrgScoped):
         # shared by every run fired together; the (variant_group_id, batch_id)
         # composite powers the batch compare read. Migration 0118.
         Index("ix_runs_variant_group_batch", "variant_group_id", "batch_id"),
+        # Runs-page / dispatch active-run counts (migration 0171) —
+        # count_active_runs_for_org / _for_pipeline filter org + status IN
+        # (...). No prior index contains status, so every admission-gate check
+        # and every GET /api/v1/runs request scanned ALL org runs. Active runs
+        # are rare, so (organisation_id, status) makes the count O(active).
+        Index("ix_runs_org_status", "organisation_id", "status"),
+        # Runs-page list total COUNT (migration 0171) — the list's count query
+        # filters org + join pipelines (needs pipeline_id per run). The INCLUDE
+        # column keeps that COUNT index-only (no heap fetch per run) without
+        # widening the (organisation_id, created_at) key that also serves the
+        # created_at DESC page ordering.
+        Index(
+            "ix_runs_org_created_pipeline",
+            "organisation_id",
+            "created_at",
+            postgresql_include=["pipeline_id"],
+        ),
     )
 
     pipeline_id: Mapped[uuid.UUID] = mapped_column(
