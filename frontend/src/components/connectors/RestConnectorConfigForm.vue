@@ -432,6 +432,14 @@ onMounted(() => {
   credsBaseline.value = secretSnapshot()
   identityBaseline.value = identitySnapshot()
   baselineAuthMode.value = credentials.value.auth_mode ?? null
+  // A fresh mount's prefill state IS the baseline, so dirtiness at mount time
+  // is definitionally false. Reset the shared flags here: when the parent
+  // remounts this form per edit target (:key), the PREVIOUS instance's
+  // watchers can flip them against ITS stale baseline before the remount
+  // lands, and without this reset B's untouched prefill would re-send
+  // credentials (silently clobbering B's stored secret) (FAR-466 QA fix 4).
+  credsDirty.value = false
+  credsIdentityDirty.value = false
 })
 watch(
   () => secretSnapshot(),
