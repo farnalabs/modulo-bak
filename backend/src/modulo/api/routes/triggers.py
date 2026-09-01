@@ -28,7 +28,7 @@ from modulo.api.dependencies import deny_break_glass_mint, get_db_session, requi
 from modulo.api.middleware.sensitive_mask import (
     SENSITIVE_VALUE_MASK,
     mask_config_json,
-    merge_masked_config,
+    merge_masked_config_json,
 )
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.secret_storage import _is_encrypted_token, encrypt_stored_secret
@@ -203,9 +203,12 @@ def _merge_trigger_config(current: dict[str, Any] | None, update: dict[str, Any]
 
     A masked placeholder must never clobber the stored secret (read-modify-write
     round-trip guard); an explicit ``None`` clears the key; a missing key leaves
-    it intact.
+    it intact. Delegates to :func:`merge_masked_config_json` so nested masked
+    values (``headers.Authorization``, list elements, ``operations`` params) are
+    skipped at every depth — the trigger GET emits a recursive mask, so the
+    PATCH merge must be recursive too (previously top-level exact-equality only).
     """
-    return merge_masked_config(current, update)
+    return merge_masked_config_json(current or {}, update)
 
 
 _SECRET_CONFIG_KEYS = frozenset({"hmac_secret", "signing_secret"})
