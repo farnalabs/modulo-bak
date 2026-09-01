@@ -115,7 +115,7 @@ class TestEgressFactoryWiring:
         # but must never have been incremented).
         assert counters["modulo_egress_rejected_total"].add.call_count == 0
 
-    def test_blocked_literal_emits_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_blocked_literal_emits_rejected(self) -> None:
         """A blocked (private/link-local) destination emits ``rejected`` with reason=blocked."""
         meter, counters = _storage_meter()
         with patch.object(egress_metrics, "_get_meter", return_value=meter), pytest.raises(ValueError):
