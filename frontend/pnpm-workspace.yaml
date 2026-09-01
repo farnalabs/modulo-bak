@@ -10,7 +10,7 @@ overrides:
   "@hono/node-server": ">=2.0.5"
   js-yaml: "^4.3.0"
   "postcss>nanoid": "^3.3.17"
-  rollup: "4.63.0"
+  rollup: "4.63.1"
   "@tanstack/query-core": "5.102.8"
   "@tanstack/vue-query": "5.102.8"
 minimumReleaseAgeExclude:
