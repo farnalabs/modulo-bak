@@ -171,6 +171,25 @@ def test_param_registry_dead_params_absent() -> None:
         assert dead not in _PARAM_REGISTRY, f"dead param {dead} must be absent from the registry"
 
 
+def test_reported_token_params_registered_and_formula_allowed() -> None:
+    """FAR-491: the agent-reported token family was RETIRED from _DEAD_PARAMS
+    and is registered (display-only) — formula-visible for calculated
+    components and surfaced in the breakdown basis. ``tokens_total`` (the
+    ambiguous server-measured total) stays dead."""
+    reported_family = {
+        "tokens_input_reported",
+        "tokens_output_reported",
+        "tokens_total_reported",
+        "tokens_cache_read_reported",
+        "tokens_cache_write_reported",
+    }
+    assert reported_family <= set(_PARAM_REGISTRY)
+    assert reported_family <= CALCULATED_ALLOWED_IDENTS
+    assert "tokens_total" in _DEAD_PARAMS
+    assert "tokens_input_reported" not in _DEAD_PARAMS
+    assert "tokens_output_reported" not in _DEAD_PARAMS
+
+
 def test_registry_has_expected_identifiers() -> None:
     expected = {
         "rate",
@@ -181,6 +200,12 @@ def test_registry_has_expected_identifiers() -> None:
         "tokens_input",
         "tokens_output",
         "tokens_estimated",
+        # FAR-491 agent-reported token sums (display-only).
+        "tokens_input_reported",
+        "tokens_output_reported",
+        "tokens_total_reported",
+        "tokens_cache_read_reported",
+        "tokens_cache_write_reported",
         "node_count",
         "nodes_estimated",
         "reported",
