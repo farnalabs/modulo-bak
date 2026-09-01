@@ -1,0 +1,41 @@
+rules:
+  - id: no-raw-httpx-client
+    patterns:
+      - pattern-either:
+          - pattern: httpx.AsyncClient(...)
+          - pattern: httpx.Client(...)
+    message: >
+      Raw httpx client construction bypasses the pinned-IP egress transport and
+      re-opens the DNS-rebinding window: a hostname is validated at one moment
+      then re-resolved by a fresh httpx pool at connect time. Build every
+      outbound client through the shared egress factory in
+      modulo.core.ssrf (pinned_async_client_sync / pinned_async_client) so the
+      validated address is pinned onto the connection. The only legitimate
+      constructions are the factory module itself (core/ssrf.py) and the REST
+      connector's injected/pinned transport seam (it always receives a pinned or
+      mock transport, never a raw pool). Everything else must pin.
+    languages: [python]
+    severity: ERROR
+    paths:
+      include:
+        - "**/backend/src/modulo/**"
+      exclude:
+        # The pinned-egress factory — the single allowlisted construction site.
+        - "**/backend/src/modulo/core/ssrf.py"
+        # REST always receives a pinned transport (production) or an injected
+        # MockTransport (test seam) via `kwargs["transport"]`; the raw
+        # `httpx.AsyncClient(**kwargs)` here never builds an unpinned pool.
+        - "**/backend/src/modulo/connectors/rest/**"
+        # FAR-526C honest-scope residual (see the scope note in core/ssrf.py):
+        # these support modules build their own clients toward operator-config /
+        # multi-host endpoints (notification forwarders can reach per-org
+        # endpoints; library_sync already validate-then-connects). They are
+        # excluded so this gate stays green while they remain un-migrated, but
+        # they are documented residual — NOT accepted raw egress. A new raw
+        # construction anywhere else in the tree is still caught.
+        - "**/backend/src/modulo/core/error_tracking/**"
+        - "**/backend/src/modulo/core/product_analytics/**"
+        - "**/backend/src/modulo/core/notifier/**"
+        - "**/backend/src/modulo/core/watchdog/**"
+        - "**/backend/src/modulo/core/library_sync/**"
+        - "**/backend/src/modulo/core/reports/**"

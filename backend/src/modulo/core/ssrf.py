@@ -68,6 +68,37 @@ then forces the TCP connection to the validated address while keeping the
 **original** hostname for TLS SNI and certificate verification. This closes the
 DNS-rebinding window that a validate-then-connect pattern leaves open (see the
 note on :func:`validate_outbound_url`).
+
+FAR-526C — honest scope of the ``no-raw-httpx-client`` import gate
+------------------------------------------------------------------
+The semgrep rule ``no-raw-httpx-client`` forbids ``httpx.AsyncClient`` /
+``httpx.Client`` CONSTRUCTION outside this factory module (``core/ssrf.py``) and
+the REST connector's injected/pinned transport seam. That gate deliberately
+covers the **connector egress surface** — every connector's ``_client()`` now
+builds through :func:`pinned_async_client_sync` / :func:`pinned_async_client`
+(Part A/B + FAR-526C migrations). The following are explicitly OUT OF SCOPE and
+are **known residual**, documented here so the gate is honest about what it does
+and does not cover:
+
+* **SDK-internal clients.** ``langchain_openai``, the provider SDKs
+  (``anthropic``, ``openai``), and similar third-party clients construct their
+  own ``httpx`` pools internally; the rule cannot see their construction and does
+  not attempt to. They are mitigated by injecting a pinned client where the SDK
+  supports it (``model_backends`` wire the validated transport in) — i.e. the
+  SDK is told to reuse OUR pinned client rather than building its own.
+* **Core support modules that build their own client.** ``core/notifier``,
+  ``core/error_tracking/**`` (forwarders + ``alert_dispatcher``),
+  ``core/product_analytics/vendor_client``, ``core/watchdog/worker_liveness``,
+  ``core/library_sync/client`` and ``core/reports/scheduler`` construct raw
+  clients toward operator-config / per-org / multi-host endpoints. Several are
+  genuinely multi-host (the notifier fans out to per-org notification
+  endpoints), so a single pinned client cannot cover them — they need either a
+  per-host pin or per-request validation. ``core/library_sync`` already
+  validate-then-connects (an accepted residual, see the note on
+  :func:`validate_outbound_url`); the others are pending a per-call-site pin and
+  are excluded from the semgrep gate so it does not go red while they remain
+  un-migrated. A NEW raw ``httpx`` construction anywhere else in the tree is
+  still caught by the rule.
 """
 
 from __future__ import annotations
@@ -1071,6 +1102,7 @@ async def pinned_async_client(
     follow_redirects: bool = False,
     limits: httpx.Limits | None = None,
     loudness_guard: bool = False,
+    **client_kwargs: Any,
 ) -> httpx.AsyncClient:
     """Build a pinned-IP ``httpx.AsyncClient`` for ``url``.
 
@@ -1085,7 +1117,17 @@ async def pinned_async_client(
     setting (``False`` unless set; a proxy defeats pinning). Opt in only when the
     proxy is trusted. ``loudness_guard`` defaults ``False`` (see
     :func:`pinned_async_transport`).
+
+    ``**client_kwargs`` (``headers``, ``timeout``, ``auth``, ``base_url``, …) are
+    forwarded to :class:`httpx.AsyncClient`, mirroring
+    :func:`pinned_async_client_sync`; a caller-supplied ``transport`` key is
+    rejected so a caller cannot silently bypass the pinned transport.
     """
+    if "transport" in client_kwargs:
+        raise ValueError(
+            "pinned_async_client: 'transport' must not be passed via client_kwargs "
+            "— it would bypass the pinned transport. Use the pinned transport built here."
+        )
     transport = await pinned_async_transport(
         url,
         allow_networks=allow_networks,
@@ -1102,6 +1144,7 @@ async def pinned_async_client(
         http2=http2,
         trust_env=resolved_trust,
         follow_redirects=follow_redirects,
+        **client_kwargs,
     )
 
 

@@ -34,7 +34,6 @@ from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from httpx import AsyncClient
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -68,6 +67,7 @@ from modulo.auth.secret_storage import decode_stored_secret_scoped
 from modulo.core.feature_flags import get_registry
 from modulo.core.remy.config_service import RemyConfig, RemyConfigService
 from modulo.core.remy.skill_loader import SkillLoader
+from modulo.core.ssrf import pinned_async_client
 from modulo.db.models.model_backend import ModelBackend
 from modulo.db.models.remy_message import ChatMessage
 from modulo.db.models.remy_session import ChatSession
@@ -357,7 +357,10 @@ async def _call_mcp_tool(
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            async with AsyncClient(timeout=60.0) as client:
+            async with await pinned_async_client(
+                f"{base_url}/mcp/tools/call",
+                timeout=60.0,
+            ) as client:
                 resp = await client.post(
                     f"{base_url}/mcp/tools/call",
                     json={"tool": tool_name, "arguments": arguments},
