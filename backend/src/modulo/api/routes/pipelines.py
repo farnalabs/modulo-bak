@@ -347,7 +347,7 @@ async def _handle_graph_write_denials(
     ) from None
 
 
-_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure"})
+_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure", "eval_failed"})
 _RETRY_POLICY_MAX_RETRIES = 5
 
 
@@ -361,16 +361,17 @@ def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | Non
         return value
     if not isinstance(value, dict):
         raise ValueError(
-            "retry_policy must be an object like {'on': ['stall','timeout','failure'], 'max_retries': 0-5}"
+            "retry_policy must be an object like "
+            "{'on': ['stall','timeout','failure','eval_failed'], 'max_retries': 0-5}"
         )
     on = value.get("on", [])
     if not isinstance(on, list) or any(not isinstance(e, str) for e in on):
-        raise ValueError("retry_policy 'on' must be a list of strings from ['stall','timeout','failure']")
+        raise ValueError("retry_policy 'on' must be a list of strings from ['stall','timeout','failure','eval_failed']")
     unknown = set(on) - _RETRY_POLICY_EVENTS
     if unknown:
         raise ValueError(
             f"retry_policy 'on' contains unknown values {sorted(unknown)}; "
-            "allowed values are ['stall','timeout','failure']"
+            "allowed values are ['stall','timeout','failure','eval_failed']"
         )
     max_retries = value.get("max_retries", 0)
     if isinstance(max_retries, bool) or not isinstance(max_retries, int):
@@ -406,7 +407,7 @@ class PipelineCreate(TeamVisibilityMixin):
     retry_policy: dict[str, Any] | None = Field(
         None,
         description=(
-            "Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. "
+            "Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. "
             "When a run ends in a configured state and retries remain, the run is "
             "re-dispatched automatically instead of terminal-failing."
         ),
@@ -452,7 +453,7 @@ class PipelineUpdate(TeamVisibilityMixin):
     )
     retry_policy: dict[str, Any] | None = Field(
         None,
-        description="Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. Set to {} to clear.",
+        description="Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.",
     )
     graph_json: PipelineGraphUpdate | None = Field(
         None,
@@ -1305,12 +1306,12 @@ async def _resolve_graph_references(
 @router.get("", responses={401: {"description": "Unauthorized"}})
 @handle_db_errors("pipelines.list")
 async def list_pipelines_endpoint(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    cursor: str | None = Query(default=None),
-    include_archived: bool = Query(default=False),
-    folder_id: uuid.UUID | None = Query(default=None),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: Annotated[str | None, Query()] = None,
+    include_archived: Annotated[bool, Query()] = False,
+    folder_id: Annotated[uuid.UUID | None, Query()] = None,
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
 ) -> PipelineListResponse:
     try:
@@ -1341,7 +1342,7 @@ async def list_pipelines_endpoint(
 @handle_db_errors("pipelines.create")
 async def create_pipeline_endpoint(
     req: PipelineCreate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.create"),
 ) -> PipelineResponse:
     try:
@@ -1378,7 +1379,7 @@ async def create_pipeline_endpoint(
 @handle_db_errors("pipelines.get")
 async def get_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineResponse:
@@ -1398,7 +1399,7 @@ async def get_pipeline_endpoint(
 @handle_db_errors("pipelines.get_graph")
 async def get_pipeline_graph_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.graph.read"),
 ) -> PipelineGraphResponse:
     try:
@@ -1538,7 +1539,7 @@ async def _sync_agent_row_commands(
 async def replace_pipeline_graph_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineGraphUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineGraphResponse:
@@ -1789,7 +1790,7 @@ def _raise_active_runs_conflict(exc: PipelineHasActiveRunsError) -> None:
 async def update_pipeline_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineResponse:
@@ -1854,7 +1855,7 @@ async def update_pipeline_endpoint(
 @handle_db_errors("pipelines.delete")
 async def delete_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.delete"),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> None:
@@ -1873,7 +1874,7 @@ async def delete_pipeline_endpoint(
 @handle_db_errors("pipelines.restore")
 async def restore_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
@@ -1896,7 +1897,7 @@ async def restore_pipeline_endpoint(
 @handle_db_errors("pipelines.archive")
 async def archive_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
@@ -1917,7 +1918,7 @@ async def archive_pipeline_endpoint(
 @handle_db_errors("pipelines.unarchive")
 async def unarchive_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
@@ -2017,7 +2018,7 @@ async def _clone_pipeline_into_org(
 async def clone_pipeline_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineCloneRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.create"),
 ) -> PipelineResponse:
     logger.info(
@@ -2115,8 +2116,8 @@ async def _detect_parameter_ports(
 async def save_as_composite_endpoint(
     pipeline_id: uuid.UUID,
     req: SaveAsCompositeRequest,
-    session: AsyncSession = Depends(get_db_session),
-    principal: TenantPrincipal = Depends(get_current_tenant_user),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    principal: Annotated[TenantPrincipal, Depends(get_current_tenant_user)],
 ) -> dict[str, Any]:
     try:
         async with session.begin():
@@ -2236,7 +2237,7 @@ async def _quality_report_recipient_urls(
 @handle_db_errors("pipelines.trigger_quality_report")
 async def trigger_quality_report(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> QualityReportResponse:
     try:
@@ -2385,9 +2386,9 @@ def _snapshot_to_detail_response(s: Any) -> SnapshotDetailResponse:
 @handle_db_errors("pipelines.list_snapshots")
 async def list_snapshot_endpoint(
     pipeline_id: uuid.UUID,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotListResponse:
@@ -2415,7 +2416,7 @@ async def list_snapshot_endpoint(
 async def save_edit_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     req: SnapshotCreateEdit,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotResponse:
@@ -2460,7 +2461,7 @@ async def save_edit_snapshot_endpoint(
 async def get_snapshot_detail_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotDetailResponse:
@@ -2487,7 +2488,7 @@ async def tag_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
     req: SnapshotTagUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotResponse:
@@ -2511,7 +2512,7 @@ async def tag_snapshot_endpoint(
 async def rollback_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotResponse:
@@ -2557,7 +2558,7 @@ async def rollback_snapshot_endpoint(
 async def delete_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.delete"),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> None:
@@ -2596,7 +2597,7 @@ async def delete_snapshot_endpoint(
 async def diff_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     req: SnapshotDiffQuery,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotDiffResponse:
@@ -2629,7 +2630,7 @@ class PipelineFolderMoveRequest(BaseModel):
 async def move_pipeline_to_folder_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineFolderMoveRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
@@ -2747,7 +2748,7 @@ async def convert_node_to_agent_endpoint(
     pipeline_id: uuid.UUID,
     node_id: uuid.UUID,
     req: ConvertToAgentRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
 ) -> PipelineGraphResponse:
     try:
@@ -2848,8 +2849,8 @@ async def convert_node_to_agent_endpoint(
 async def revert_node_to_manual_endpoint(
     pipeline_id: uuid.UUID,
     node_id: uuid.UUID,
-    snapshot_id: uuid.UUID = Query(...),
-    session: AsyncSession = Depends(get_db_session),
+    snapshot_id: Annotated[uuid.UUID, Query()],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
 ) -> PipelineGraphResponse:
     try:

@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from modulo.api.constants import MSG_RESOURCE_ALREADY_EXISTS
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_in_dev_operator, require_permission
-from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK, mask_config_json
+from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK, mask_config_json, merge_masked_config_json
 from modulo.api.models.team_visibility import TeamVisibilityMixin
 from modulo.auth.jwt import TenantPrincipal
 from modulo.connectors.base import ConnectorType
@@ -88,6 +88,13 @@ def _encrypt(credentials: str, fernet_key: str) -> bytes:
 # A credential dict splits into "secret" fields (replaced only when a real value
 # is supplied) and everything else (identity + legacy keys, always overlaid).
 _CRED_SECRET_FIELDS = {"token", "api_key", "username", "password"}
+# The secret fields that legitimately belong to each REST ``auth_mode``. Used by
+# ``_credential_overlay`` to drop stale secrets left behind by an auth-mode switch.
+_AUTH_MODE_SECRET_FIELDS: dict[str, set[str]] = {
+    "bearer": {"token"},
+    "basic": {"username", "password"},
+    "api_key": {"api_key"},
+}
 
 
 class StoredCredentialDecryptError(Exception):
@@ -130,6 +137,12 @@ def _credential_overlay(previous: dict[str, Any], incoming: dict[str, Any]) -> d
     request supplies a real, non-empty, non-masked value; otherwise the stored
     secret is left intact. Keys outside both groups (legacy/unknown payloads)
     are overlaid as-is, preserving the historical replace-all behaviour.
+    Switching ``auth_mode`` drops any secret that belongs to the PREVIOUS mode
+    but not the incoming one (e.g. a ``bearer -> api_key`` switch clears the
+    stale ``token``), so a mode change never leaves an orphaned secret encrypted
+    at rest — it is ignored by ``_normalise_auth`` and only a source of
+    confusion. A secret that is still valid for the new mode is preserved
+    (subject to the replace-only-on-real-value rule above).
     """
     merged = dict(previous)
     for key, value in incoming.items():
@@ -138,6 +151,12 @@ def _credential_overlay(previous: dict[str, Any], incoming: dict[str, Any]) -> d
                 merged[key] = value
         else:
             merged[key] = value
+    new_mode = str(incoming.get("auth_mode", "")).strip().lower()
+    allowed_secrets = _AUTH_MODE_SECRET_FIELDS.get(new_mode)
+    if allowed_secrets is not None:
+        for key in _CRED_SECRET_FIELDS:
+            if key not in allowed_secrets and key in merged and key not in incoming:
+                merged.pop(key, None)
     return merged
 
 
@@ -235,6 +254,8 @@ class ConnectorResponse(BaseModel):
     tier: str
     created_at: datetime
     updated_at: datetime
+    degraded_at: datetime | None = None
+    last_skip_error: str | None = None
 
     model_config = {"from_attributes": True, "populate_by_name": True}
 
@@ -278,6 +299,8 @@ def _to_response(ci: Any) -> ConnectorResponse:
         tier=ci.tier,
         created_at=ci.created_at,
         updated_at=ci.updated_at,
+        degraded_at=ci.degraded_at,
+        last_skip_error=ci.last_skip_error,
     )
 
 
@@ -509,28 +532,28 @@ async def connector_health_endpoint(
         await set_rls_org(session, principal.organisation_id)
         await set_rls_user_context(session, principal.account_id, principal.org_role)
         ci = await get_connector_instance(session, connector_id)
-    if ci is None or ci.organisation_id != principal.organisation_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found")
-    try:
-        secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key)
-        async with ConnectorHub(secrets_backend=secrets_backend) as hub:
-            await hub.initialise([ci])
-            connector = hub.get(connector_id)
-            result = await connector.health_check()
-    except ConnectorDecryptError:
-        logger.exception("connectors.connector_health_endpoint")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to decrypt connector credentials.",
-        ) from None
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Unexpected error checking connector health")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to check connector health.",
-        ) from None
+        if ci is None or ci.organisation_id != principal.organisation_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found")
+        try:
+            secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
+            async with ConnectorHub(secrets_backend=secrets_backend) as hub:
+                await hub.initialise([ci])
+                connector = hub.get(connector_id)
+                result = await connector.health_check()
+        except ConnectorDecryptError:
+            logger.exception("connectors.connector_health_endpoint")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to decrypt connector credentials.",
+            ) from None
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Unexpected error checking connector health")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Failed to check connector health.",
+            ) from None
     return ConnectorHealthResponse(ok=result.ok, detail=result.detail)
 
 
@@ -548,6 +571,7 @@ async def update_connector_endpoint(
     new_credentials: str | None = None
     if credentials_updated:
         new_credentials = updates.pop("credentials")
+
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
@@ -557,17 +581,7 @@ async def update_connector_endpoint(
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             if existing is not None and "config_json" in updates and updates["config_json"] is not None:
                 current_cfg = existing.config_json or {}
-                merged_cfg = dict(current_cfg)
-                for k, v in updates["config_json"].items():
-                    if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
-                        # A masked placeholder must never clobber the stored secret
-                        # (read-modify-write round-trip guard). Keep the existing value.
-                        continue
-                    if v is None:
-                        merged_cfg.pop(k, None)
-                    else:
-                        merged_cfg[k] = v
-                updates["config_json"] = merged_cfg
+                updates["config_json"] = merge_masked_config_json(current_cfg, updates["config_json"])
             if credentials_updated and existing is not None:
                 if new_credentials is None:
                     # No credential change supplied (e.g. an empty config textarea
@@ -575,6 +589,10 @@ async def update_connector_endpoint(
                     # 500 on a null credentials payload.
                     credentials_updated = False
                 elif existing.connector_type_id == "rest":
+                    # Fresh credentials clear the degraded marker (FAR-495) — the
+                    # stored skip error described the OLD credentials, not the new ones.
+                    updates["degraded_at"] = None
+                    updates["last_skip_error"] = None
                     incoming: dict[str, Any] | None = None
                     try:
                         parsed = json.loads(new_credentials)
@@ -649,6 +667,9 @@ async def update_connector_endpoint(
                                 detail="Invalid REST credentials: REST connector credentials must be a JSON object.",
                             )
                 else:
+                    # Fresh credentials clear the degraded marker (FAR-495).
+                    updates["degraded_at"] = None
+                    updates["last_skip_error"] = None
                     # Non-REST connector: historical FULL-REPLACE (no overlay) —
                     # whatever credential payload is supplied replaces the stored
                     # credential outright.

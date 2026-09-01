@@ -146,6 +146,17 @@ select = [
     "RUF009", "RUF012", "RUF013",
     "TD004", "TD006", "TD007",
     "FIX001",
+    # flake8-datetimez: production time handling must be timezone-aware;
+    # remaining violations are intentional naive datetime fixtures in tests/,
+    # covered by the tests/** per-file-ignore.
+    "DTZ",
+    # Seventh wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5 under both this gate and the
+    # backend/pyproject.toml gate: `ruff check . --select PT023,PT026`).
+    # Mirrors the backend/pyproject.toml gate. Upon any future regression the
+    # newly-flagged decorators must be normalized rather than re-ignored.
+    "PT023",  # consistent @pytest.mark.<marker>() parentheses style
+    "PT026",  # reject useless arg-free @pytest.mark.usefixtures()
 ]
 ignore = [
     "S101",
@@ -158,7 +169,7 @@ ignore = [
 "backend/scripts/*" = ["T20"]
 ".github/scripts/*" = ["T20"]
 "deploy/*" = ["T20", "S108"]
-"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008"]
+"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008", "DTZ"]
 "docs/**" = ["T20"]
 ".semgrep/**" = ["F821"]
 "docs/api/examples/**" = ["T20", "S108"]

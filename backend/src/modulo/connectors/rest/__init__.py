@@ -197,7 +197,6 @@ _log = logging.getLogger(__name__)
 
 # Standard HTTP verbs the connector will issue (all else is rejected).
 _ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
-
 # FAR-458 connector-write idempotency gate: the per-op ``on_unknown`` modes and
 # default live in ONE place — ``modulo.connectors.base`` (a stdlib-only leaf
 # both this connector's config validation and the pipeline engine's gate read
@@ -252,7 +251,6 @@ SsrfValidator = Callable[[str], Awaitable[None] | None]
 
 def _normalise_on_unknown(value: Any) -> str:
     """Validate a REST ``on_unknown`` config value and return its canonical form.
-
     ``None`` (absent) defaults to ``DEFAULT_ON_UNKNOWN`` (``"fail_open"`` — the
     fail-open gate contract). Any other value is normalised (lowercased,
     stripped) and must be one of ``ON_UNKNOWN_MODES`` — an invalid value raises

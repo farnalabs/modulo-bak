@@ -446,6 +446,7 @@ function buildRestConfig(): Record<string, unknown> {
     .split(',')
     .map(s => s.trim())
     .filter(Boolean)
+
   // Echo the NON-SECRET auth identity into config_json so a subsequent edit can
   // prefill it. The secret VALUES are protected — they live only in the
   // credentials payload, never here. The connector reads auth from the
