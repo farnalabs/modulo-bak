@@ -344,7 +344,7 @@ def _reject_control_chars(value: str, *, what: str) -> None:
 def _is_secret_effectively_missing(value: Any) -> bool:
     """True when *value* is absent, whitespace-only, or the sensitive-mask sentinel.
 
-    FAR-504: a MASKED placeholder (``SENSITIVE_VALUE_MASK``) or a whitspace-only
+    FAR-504: a MASKED placeholder (``SENSITIVE_VALUE_MASK``) or a whitespace-only
     string is NOT a real secret. Accepting one on CREATE would persist the literal
     placeholder as the stored secret — a guaranteed runtime auth failure at
     ``_normalise_auth``/request time. The PATCH overlay substitutes the real secret
@@ -356,6 +356,24 @@ def _is_secret_effectively_missing(value: Any) -> bool:
     if not isinstance(value, str):
         return not value
     return not value.strip() or value == _SENSITIVE_VALUE_MASK
+
+
+def _required_secret_error(message: str, fields: tuple[str, ...], creds: dict[str, Any]) -> ValueError:
+    """Build the required-secret rejection, with a dedicated masked-placeholder variant.
+
+    FAR-504 review minor: "REST bearer auth requires creds['token']" is misleading
+    when a token WAS supplied and it is the redaction mask
+    (``SENSITIVE_VALUE_MASK``) — the key was not absent, the VALUE is not a real
+    secret. When any checked field holds the mask sentinel, return a message that
+    says exactly that; otherwise return the historical "requires ..." message.
+    """
+    masked = [f for f in fields if creds.get(f) == _SENSITIVE_VALUE_MASK]
+    if masked:
+        names = " and ".join(f"creds['{f}']" for f in masked)
+        return ValueError(
+            f"{message} — {names} holds the redaction-mask placeholder, not a real secret; supply the actual secret"
+        )
+    return ValueError(message)
 
 
 class RESTError(ValueError):
@@ -1097,15 +1115,19 @@ class RestConnector(ConnectorBase):
             )
         if mode == "bearer":
             if _is_secret_effectively_missing(creds.get("token")):
-                raise ValueError("REST bearer auth requires creds['token']")
+                raise _required_secret_error("REST bearer auth requires creds['token']", ("token",), creds)
         elif mode == "basic":
             if _is_secret_effectively_missing(creds.get("username")) or _is_secret_effectively_missing(
                 creds.get("password")
             ):
-                raise ValueError("REST basic auth requires creds['username'] and creds['password']")
+                raise _required_secret_error(
+                    "REST basic auth requires creds['username'] and creds['password']",
+                    ("username", "password"),
+                    creds,
+                )
         else:  # api_key
             if _is_secret_effectively_missing(creds.get("api_key")):
-                raise ValueError("REST api_key auth requires creds['api_key']")
+                raise _required_secret_error("REST api_key auth requires creds['api_key']", ("api_key",), creds)
             auth_in = creds.get("in")
             if auth_in is not None and str(auth_in).lower() not in {"header", "query"}:
                 raise ValueError(f"REST api_key auth 'in' must be 'header' or 'query' — got {auth_in!r}")

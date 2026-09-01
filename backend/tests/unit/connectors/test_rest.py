@@ -421,11 +421,16 @@ def test_validate_credentials_rejects_masked_secret() -> None:
     masked_bearer = {"auth_mode": "bearer", "token": SENSITIVE_VALUE_MASK}
     masked_basic = {"auth_mode": "basic", "username": "u", "password": SENSITIVE_VALUE_MASK}
     masked_api_key = {"auth_mode": "api_key", "api_key": SENSITIVE_VALUE_MASK}
-    with pytest.raises(ValueError, match="requires creds\\['token'\\]"):
+    # A masked value gets the DEDICATED message (FAR-504 review minor): the plain
+    # "requires creds['token']" wording would wrongly imply the key was absent,
+    # when in fact a (placeholder) value WAS supplied.
+    with pytest.raises(ValueError, match=r"requires creds\['token'\].*redaction-mask placeholder"):
         RestConnector.validate_credentials(masked_bearer)
-    with pytest.raises(ValueError, match="requires creds\\['username'\\] and creds\\['password'\\]"):
+    with pytest.raises(
+        ValueError, match=r"requires creds\['username'\] and creds\['password'\].*redaction-mask placeholder"
+    ):
         RestConnector.validate_credentials(masked_basic)
-    with pytest.raises(ValueError, match="requires creds\\['api_key'\\]"):
+    with pytest.raises(ValueError, match=r"requires creds\['api_key'\].*redaction-mask placeholder"):
         RestConnector.validate_credentials(masked_api_key)
 
 
