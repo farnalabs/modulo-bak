@@ -1,9 +1,15 @@
 <template>
-  <!-- App-shell layout: the page is capped at the viewport height so the
-       folder sidebar and the table column each fill exactly the height the
-       viewport offers and scroll internally, instead of the page scrolling
-       the (sticky) sidebar away next to a long table. -->
-  <div class="h-screen bg-background flex flex-col">
+  <div class="h-[calc(100vh-3.5rem)] bg-background flex flex-col">
+    <!-- App-shell layout: the page height is capped at the viewport minus the
+         AppLayout chrome offset (h-[calc(100vh-3.5rem)] — the same convention as
+         PipelineEditorView/SchemaEditorView/CompositeEditorView), so the folder
+         sidebar and the table column fill the remaining viewport height and
+         scroll internally instead of the page scrolling the sidebar away next
+         to a long table. The comment lives inside the root div so the template
+         stays single-root (AppLayout's <Transition> requires an element root).
+         When the onboarding banner or the mobile fixed header are present the
+         chrome is taller than this offset and the page overflows into
+         AppLayout's scroll area — accepted trade-off. -->
     <header class="bg-card border-b border-border px-6 py-4">
       <div class="mx-auto flex flex-wrap items-center justify-between gap-3 max-w-6xl">
         <PageHeader :title="$t('views.PipelineListView.title')">

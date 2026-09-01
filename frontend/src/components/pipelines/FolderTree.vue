@@ -1,6 +1,8 @@
 <template>
-  <!-- Height chain: the parent row is flex-1 min-h-0 inside a viewport-height
-       page shell, so h-full fills the full column height next to a long table
+  <!-- Height chain: the parent row is flex-1 min-h-0 inside a page shell
+       capped at the remaining viewport height below the AppLayout chrome
+       (h-[calc(100vh-3.5rem)], the editor-view convention — not the full
+       viewport), so h-full fills the full column height next to a long table
        and the flex-1 min-h-0 body below scrolls internally when its content
        exceeds the column. Hidden below md (a mobile folder <select> is
        offered instead). -->

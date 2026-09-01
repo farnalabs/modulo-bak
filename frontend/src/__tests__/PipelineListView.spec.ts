@@ -76,6 +76,24 @@ describe('PipelineListView', () => {
     expect(wrapper.exists()).toBe(true)
   })
 
+  it('sizes the page to the viewport minus the AppLayout chrome (sibling calc convention, never bare h-screen)', async () => {
+    // PipelineEditorView/SchemaEditorView/CompositeEditorView all use
+    // h-[calc(100vh-3.5rem)] because /pipelines renders below AppLayout's
+    // breadcrumb/banner chrome — a bare h-screen root pushes the bottom of
+    // the folder tree and table below the fold.
+    await router.push('/pipelines')
+    await router.isReady()
+    const wrapper = mount(PipelineListView, {
+      global: {
+        plugins: [router],
+        stubs: { ErrorAlert: true, FolderTree: true },
+      },
+    })
+    const classes = (wrapper.element as HTMLElement).className.split(/\s+/)
+    expect(classes).toContain('h-[calc(100vh-3.5rem)]')
+    expect(classes).not.toContain('h-screen')
+  })
+
   it('renders the search bar with correct testid', async () => {
     await router.push('/pipelines')
     await router.isReady()
