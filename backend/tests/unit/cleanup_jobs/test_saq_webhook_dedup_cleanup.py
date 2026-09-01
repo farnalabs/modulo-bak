@@ -3,7 +3,7 @@
 The ``webhook_dedup_cleanup`` job in ``modulo.core.saq_worker`` wraps
 ``cleanup_old_webhook_events`` in a drain loop and reports the total deleted
 count. It previously had no coverage — the direct module tests only exercised
-``cleanup_old_webhook_events`` and the in-process scheduler loop.
+``cleanup_old_webhook_events``.
 
 Every test here also pins the session factory: the job must drain on the
 SYSTEM session factory (``_make_system_session_factory``, FAR-523) because the

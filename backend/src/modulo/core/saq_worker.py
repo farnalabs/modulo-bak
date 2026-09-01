@@ -1417,7 +1417,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
             retries=2,
             ttl=300,
         ),
-        # webhook-dedup cleanup: hourly (matches _CLEANUP_INTERVAL_SECONDS).
+        # webhook-dedup cleanup: hourly.
         CronJob(
             webhook_dedup_cleanup,
             cron=_CRON_HOURLY,
