@@ -20,17 +20,29 @@ Pinned here:
 They run without a database (mock session, statement capture).
 """
 
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import JSON, Text
 
+from modulo.db.crud.pagination import CursorPaginator
 from modulo.db.crud.run import _RUNS_LIST_DEFERRED_COLUMNS
 from modulo.db.crud.run import list_runs as db_list_runs
 from modulo.db.models.run import Run
 
 _MUST_STAY_LOADED = ("input_payload", "cost_breakdown")
+
+# Both pagination modes must defer: the offset/limit page path and the keyset
+# cursor path (the cursor branch rebuilds the statement through
+# CursorPaginator, so the deferral options must survive it too).
+_CURSOR = CursorPaginator.encode_cursor(datetime(2026, 9, 1, tzinfo=UTC), uuid.UUID(int=1))
+_PAGINATION_MODES = (
+    pytest.param({}, id="offset-page"),
+    pytest.param({"cursor": _CURSOR}, id="keyset-cursor"),
+)
 
 
 def _compile(stmt: Any) -> str:
@@ -46,7 +58,10 @@ def _make_capturing_session() -> tuple[AsyncMock, list[Any]]:
     count_result = MagicMock()
     count_result.scalar_one_or_none.return_value = 0
     rows_result = MagicMock()
-    rows_result.scalars.return_value = []
+    # The offset path iterates .scalars() directly; the keyset-cursor path
+    # calls .scalars().all(). MagicMock is iterable (empty by default) and the
+    # explicit .all.return_value covers the cursor path.
+    rows_result.scalars.return_value.all.return_value = []
 
     async def fake_execute(stmt: Any, *a: Any, **k: Any) -> Any:
         captured.append(stmt)
@@ -62,11 +77,12 @@ def _items_statement(captured: list[Any]) -> Any:
     return next(stmt for stmt in captured if "count(" not in str(stmt).lower())
 
 
+@pytest.mark.parametrize("pagination_kwargs", _PAGINATION_MODES)
 @pytest.mark.parametrize("column", _RUNS_LIST_DEFERRED_COLUMNS)
-async def test_list_runs_select_omits_heavy_payload_column(column: str) -> None:
+async def test_list_runs_select_omits_heavy_payload_column(pagination_kwargs: dict[str, Any], column: str) -> None:
     session, captured = _make_capturing_session()
 
-    page = await db_list_runs(session, page=1, page_size=20)
+    page = await db_list_runs(session, page=1, page_size=20, **pagination_kwargs)
 
     assert page.total == 0
     assert captured, "list_runs must execute its queries through the session"
@@ -77,10 +93,11 @@ async def test_list_runs_select_omits_heavy_payload_column(column: str) -> None:
     )
 
 
-async def test_list_runs_select_keeps_contract_columns() -> None:
+@pytest.mark.parametrize("pagination_kwargs", _PAGINATION_MODES)
+async def test_list_runs_select_keeps_contract_columns(pagination_kwargs: dict[str, Any]) -> None:
     session, captured = _make_capturing_session()
 
-    await db_list_runs(session, page=1, page_size=20)
+    await db_list_runs(session, page=1, page_size=20, **pagination_kwargs)
 
     items_sql = _compile(_items_statement(captured)).lower()
     for column in _MUST_STAY_LOADED:

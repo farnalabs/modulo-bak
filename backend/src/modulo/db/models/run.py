@@ -134,17 +134,16 @@ class Run(OrgScoped):
         # shared by every run fired together; the (variant_group_id, batch_id)
         # composite powers the batch compare read. Migration 0118.
         Index("ix_runs_variant_group_batch", "variant_group_id", "batch_id"),
-        # Runs-page / dispatch active-run counts (migration 0171) —
-        # count_active_runs_for_org / _for_pipeline filter org + status IN
-        # (...). No prior index contains status, so every admission-gate check
-        # and every GET /api/v1/runs request scanned ALL org runs. Active runs
-        # are rare, so (organisation_id, status) makes the count O(active).
-        Index("ix_runs_org_status", "organisation_id", "status"),
         # Runs-page list total COUNT (migration 0171) — the list's count query
         # filters org + join pipelines (needs pipeline_id per run). The INCLUDE
         # column keeps that COUNT index-only (no heap fetch per run) without
         # widening the (organisation_id, created_at) key that also serves the
-        # created_at DESC page ordering.
+        # created_at DESC page ordering. Active-run counts (org/pipeline +
+        # status IN (...)) are already served by migration 0155's
+        # ix_runs_organisation_status / ix_runs_pipeline_status, which — like
+        # 0155's other hot-query indexes — are intentionally NOT declared here;
+        # a duplicate org+status index would tax the hottest write path of the
+        # biggest table (status is updated on every run transition).
         Index(
             "ix_runs_org_created_pipeline",
             "organisation_id",
