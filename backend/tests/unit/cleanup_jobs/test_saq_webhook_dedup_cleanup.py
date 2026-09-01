@@ -200,7 +200,7 @@ class TestCleanupSessionFactory:
     plain factory; the system engine is never touched.
     """
 
-    async def test_postgres_uses_system_factory(self) -> None:
+    def test_postgres_uses_system_factory(self) -> None:
         sentinel = MagicMock(name="system_factory")
 
         with (
@@ -213,7 +213,7 @@ class TestCleanupSessionFactory:
         assert factory is sentinel
 
     @pytest.mark.parametrize("non_pg_db", ["sqlite", "mariadb", "mysql", "SQLite", "MariaDB"])
-    async def test_non_postgres_uses_plain_factory(self, non_pg_db: str) -> None:
+    def test_non_postgres_uses_plain_factory(self, non_pg_db: str) -> None:
         sentinel = MagicMock(name="plain_factory")
 
         with (
@@ -227,7 +227,7 @@ class TestCleanupSessionFactory:
         mock_system.assert_not_called()
         assert factory is sentinel
 
-    async def test_postgres_with_unset_system_url_fails_loud(self) -> None:
+    def test_postgres_with_unset_system_url_fails_loud(self) -> None:
         """The PG fail-closed path is preserved: an unset
         ``MODULO_SYSTEM_DATABASE_URL`` raises RuntimeError instead of silently
         running the cross-org purge as modulo_app."""
