@@ -33,7 +33,6 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, cast
 
 import httpx
-from cryptography.fernet import Fernet
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from httpx import AsyncClient
 from langchain_core.messages import (
@@ -65,6 +64,7 @@ from modulo.api.ui_tools import (
 )
 from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
+from modulo.auth.secret_storage import decode_stored_secret_scoped
 from modulo.core.feature_flags import get_registry
 from modulo.core.remy.config_service import RemyConfig, RemyConfigService
 from modulo.core.remy.skill_loader import SkillLoader
@@ -342,8 +342,7 @@ async def _resolve_api_key(
     if backend is None:
         return None
     try:
-        fernet = Fernet(fernet_key.encode())
-        return fernet.decrypt(backend.credentials_ciphertext).decode()
+        return await decode_stored_secret_scoped(session, backend.credentials_ciphertext, fernet_key, org_id=org_id)
     except Exception:
         logger.exception("Failed to decrypt credentials for provider %r", provider)
         return None
