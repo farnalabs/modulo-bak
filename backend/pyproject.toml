@@ -167,12 +167,12 @@ exclude = ["*.feature", "tests/connectors/__init__.py", ".semgrep/tests/"]
 [tool.ruff.lint]
 select = [
     "E", "W",   # pycodestyle
-    "F",        # pyflakes (dead code, unused imports ├óÔé¼ÔÇØ F841 catches uncovered vars, F811 catches redefs)
+    "F",        # pyflakes (dead code, unused imports — F841 catches uncovered vars, F811 catches redefs)
     "I",        # isort
     "N",        # pep8-naming
     "UP",       # pyupgrade
-    "B",        # flake8-bugbear (real bugs ├óÔé¼ÔÇØ B006 mutating defaults, B023 loop var in closure)
-    "S",        # flake8-bandit (security ├óÔé¼ÔÇØ S608 detects raw f-string SQL injection)
+    "B",        # flake8-bugbear (real bugs — B006 mutating defaults, B023 loop var in closure)
+    "S",        # flake8-bandit (security — S608 detects raw f-string SQL injection)
     "ASYNC",    # flake8-async (ASYNC251 catches unclosed event loops, ASYNC109 sync in async)
     "RUF",      # ruff-specific rules (RUF012 mutable class defaults)
     "SIM",      # flake8-simplify (SIM115 `open()` without context manager, SIM222 bool expr)
@@ -180,8 +180,8 @@ select = [
     "T20",      # flake8-print (T201 bare print in production code)
     "RET",      # flake8-return (RET503 missing explicit return)
     "PYI",      # flake8-pyi (PYI041 redundant `Optional` on union)
-     "FURB",     # refurb (FURB125 `while` ├óÔÇáÔÇÖ `for` loop, FURB163 unnecessary `None` check)
-     "PERF",     # perflint (PERF401 manual list-building loop ├óÔÇÜÔÇô use comprehension/extend)
+     "FURB",     # refurb (FURB125 `while` → `for` loop, FURB163 unnecessary `None` check)
+     "PERF",     # perflint (PERF401 manual list-building loop — use comprehension/extend)
      "ISC",      # flake8-implicit-str-concat (ISC003/ISC004 inconsistent string concatenation)
      "PIE",      # flake8-pie (PIE810 single startswith/endswith tuple, PIE807 useless lambda)
     # Defensive gate-strengthening: every rule below was verified to have zero
@@ -206,127 +206,78 @@ select = [
     "PLW2901",
     "PYI025",
     "UP032",
-
     # Third wave of defensive gate-strengthening (verified zero current
-
     # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
-
     # --statistics`). Mirrors the repo-root ruff.toml gate. Combines the two
-
     # independent third-wave additions from this branch and origin/main.
-
     "B017",
-
     "B019",
-
     "B025",
-
     "B905",
-
     "SIM105",
-
     "SIM107",
-
     "SIM108",
-
     "SIM115",
-
     "SIM118",
-
     "SIM201",
-
     "SIM202",
-
     "SIM210",
-
     "SIM211",
-
     "SIM212",
-
     "SIM220",
-
     "SIM221",
-
     "SIM222",
-
     "SIM223",
-
     "SIM300",
-
     "SIM910",
-
     "C401",
-
     "C408",
-
     "C409",
-
     "C410",
-
     "C411",
-
     "C413",
-
     "C414",
-
     "C415",
-
     "C416",
-
     "C417",
-
     "C418",
-
     "C419",
-
     "C420",
-
     "PGH",
-
     "RUF005",
-
     "RUF010",
-
     "RUF015",
-
     "RUF016",
-
     "RUF018",
-
     "RUF019",
-
     "RUF022",
-
     "RUF026",
-
     "RUF051",
-
     "TRY400",
-
     "RSE102",
-
     "PLW0406",
-
     "PLR0124",
-
     "PLR1714",
-
     "PLR0133",
-
     "PLW1508",
-
     "PLC0414",
-
     "PLC0205",
-
     "PLR1730",
-
     "PLR1733",
-
     "PLR1736",
-
     "PLC2401",
-
+    # Fourth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate.
+    "PLC0105",
+    "PLC0131",
+    "PLC0206",
+    "PLC2403",
+    "PLR1716",
+    "PLW0129",
+    "PLW0133",
+    "PLW0245",
+    "PLW0604",
 ]
 ignore = [
     "S101",     # assert allowed in tests
@@ -407,7 +358,7 @@ markers = [
     "e2e: marks tests as end-to-end (require browser + running app)",
     "slow: marks tests as slow",
     "awaiting-implementation: marks scenarios that define desired behaviour not yet delivered",
-    "connector_conformance: connector contract conformance suite ├óÔé¼ÔÇØ every ConnectorType must pass",
+    "connector_conformance: connector contract conformance suite — every ConnectorType must pass",
     "breakglass_gate: break-glass admin recovery deploy-gate regression (boot allow-list posture + connectivity smoke)",
     "real_ssrf_dns: opt out of the autouse SSRF DNS shim so the real fail-closed guard runs",
 ]
