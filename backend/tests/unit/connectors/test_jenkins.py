@@ -131,8 +131,8 @@ def test_parse_build_zero_duration(jenkins):
 
 def test_parse_build_null_id_and_timestamp_map_to_empty_strings(jenkins):
     run = jenkins._parse_build({"id": None, "timestamp": None})
-    assert run.id == ""
-    assert run.created_at == ""
+    assert not run.id
+    assert not run.created_at
     assert "None" not in run.id
     assert "None" not in run.created_at
 

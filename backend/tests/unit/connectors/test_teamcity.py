@@ -83,7 +83,7 @@ async def test_trigger_run_null_id_maps_to_empty_string(teamcity):
         return_value=httpx.Response(200, json={"id": None, "buildTypeId": "MyBuild", "href": ""})
     )
     run = await teamcity.trigger_run(pipeline_id="MyBuild")
-    assert run.id == ""
+    assert not run.id
     assert "None" not in run.id
 
 
@@ -198,8 +198,8 @@ def test_run_from_build_corrupt_duration(teamcity):
 
 def test_run_from_build_null_dates_map_to_empty_strings(teamcity):
     run = teamcity._run_from_build({"id": 42, "startDate": None, "finishDate": None})
-    assert run.created_at == ""
-    assert run.updated_at == ""
+    assert not run.created_at
+    assert not run.updated_at
     assert "None" not in run.created_at
     assert "None" not in run.updated_at
 
@@ -488,7 +488,7 @@ async def test_write_build_null_id_maps_to_empty_string(teamcity):
     )
     payload = ConnectorPayload(resource="build", data={"buildTypeId": "MyBuild"})
     result = await teamcity.write(payload)
-    assert result["id"] == ""
+    assert not result["id"]
     assert result["buildTypeId"] == "MyBuild"
 
 

@@ -189,7 +189,7 @@ def test_parse_run_corrupt_actor(cc_runner):
 
 def test_parse_run_null_id_maps_to_empty_string(cc_runner):
     run = cc_runner._parse_run({"id": None, "project_slug": "gh/owner/repo"})
-    assert run.id == ""
+    assert not run.id
     assert "None" not in run.id
 
 

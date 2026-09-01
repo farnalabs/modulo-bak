@@ -200,7 +200,7 @@ def test_parse_run_non_dict_template_parameters(ap_runner):
 
 def test_parse_run_null_id_maps_to_empty_string(ap_runner):
     run = ap_runner._parse_run({"id": None})
-    assert run.id == ""
+    assert not run.id
     assert "None" not in run.id
 
 

@@ -114,7 +114,7 @@ class TestToTicket:
     def test_null_number_maps_to_empty_string(self, tracker: GitHubTicketTracker) -> None:
         raw = _make_mock_issue({"number": None})
         ticket = tracker._to_ticket(raw)
-        assert ticket.id == ""
+        assert not ticket.id
         assert "None" not in ticket.id
 
     def test_falsy_number_is_preserved(self, tracker: GitHubTicketTracker) -> None:

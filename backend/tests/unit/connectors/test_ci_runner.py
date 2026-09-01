@@ -293,7 +293,7 @@ async def test_gh_list_runs_non_list_workflow_runs_no_crash(gh_runner):
 
 def test_gh_parse_run_null_id_maps_to_empty_string(gh_runner):
     run = gh_runner._parse_run({"id": None})
-    assert run.id == ""
+    assert not run.id
     assert "None" not in run.id
 
 
@@ -391,8 +391,8 @@ async def test_gl_get_run_status_invalid_id_raises(gl_runner):
 
 def test_gl_parse_run_null_id_and_project_id_map_to_empty_strings(gl_runner):
     run = gl_runner._parse_run({"id": None, "project_id": None})
-    assert run.id == ""
-    assert run.pipeline_id == ""
+    assert not run.id
+    assert not run.pipeline_id
     assert "None" not in run.id
     assert "None" not in run.pipeline_id
 
