@@ -982,6 +982,14 @@ async def retention_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
 async def webhook_dedup_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — purge old webhook trigger events (30-day retention).
 
+    The purge is CROSS-ORG by design (age-based retention over every org's
+    events), so it runs on the system session factory (modulo_system role,
+    LOGIN, BYPASSRLS — FAR-523). ``trigger_events`` carries the
+    ``rls_org_isolation`` policy and ``modulo_app`` is NOBYPASSRLS, so the
+    previous plain-factory session — which never set ``app.organisation_id`` —
+    silently matched ZERO rows and deleted nothing: an invisible no-op that
+    let retention grow unbounded. Do NOT swap back to ``_make_session_factory``.
+
     The system session factory is ``autobegin=False`` (the codebase DI
     convention), so every batch needs an explicit transaction: the first
     ``session.execute`` would otherwise raise ``InvalidRequestError: Autobegin
@@ -992,7 +1000,7 @@ async def webhook_dedup_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     from modulo.core.cleanup_jobs.webhook_dedup_cleanup import BATCH_SIZE, cleanup_old_webhook_events
 
     total = 0
-    async with _make_session_factory()() as session:
+    async with _make_system_session_factory()() as session:
         while True:
             async with session.begin():
                 deleted = await cleanup_old_webhook_events(session)
@@ -1010,6 +1018,14 @@ async def trigger_events_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     in bounded batches. The retention comfortably exceeds the webhook replay
     window, so replayable events are never purged.
 
+    The purge is CROSS-ORG by design, so it runs on the system session factory
+    (modulo_system role, LOGIN, BYPASSRLS — FAR-523). ``trigger_events`` is an
+    ``OrgScoped`` table under the ``rls_org_isolation`` policy and ``modulo_app``
+    is NOBYPASSRLS: the previous plain-factory session never set
+    ``app.organisation_id``, so every batch silently matched ZERO rows and the
+    retention never deleted anything. Do NOT swap back to
+    ``_make_session_factory``.
+
     Mirrors ``webhook_dedup_cleanup``: the system session factory is
     ``autobegin=False`` (the codebase DI convention), so every batch needs an
     explicit transaction — the first ``session.execute`` would otherwise raise
@@ -1020,7 +1036,7 @@ async def trigger_events_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     from modulo.core.cleanup_jobs.trigger_events_cleanup import BATCH_SIZE, cleanup_old_trigger_events
 
     total = 0
-    async with _make_session_factory()() as session:
+    async with _make_system_session_factory()() as session:
         while True:
             async with session.begin():
                 deleted = await cleanup_old_trigger_events(session)

@@ -4,6 +4,11 @@ The ``webhook_dedup_cleanup`` job in ``modulo.core.saq_worker`` wraps
 ``cleanup_old_webhook_events`` in a drain loop and reports the total deleted
 count. It previously had no coverage — the direct module tests only exercised
 ``cleanup_old_webhook_events`` and the in-process scheduler loop.
+
+Every test here also pins the session factory: the job must drain on the
+SYSTEM session factory (``_make_system_session_factory``, FAR-523) because the
+purge is cross-org by design and the plain ``modulo_app`` factory is
+NOBYPASSRLS — under it the retention silently matched zero rows.
 """
 
 import uuid
@@ -46,7 +51,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory),
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -62,7 +67,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory),
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -79,7 +84,7 @@ class TestWebhookDedupCleanup:
         factory, _ = _make_factory_with_session()
 
         with (
-            patch.object(sw, "_make_session_factory", return_value=factory),
+            patch.object(sw, "_make_system_session_factory", return_value=factory),
             patch(
                 "modulo.core.cleanup_jobs.webhook_dedup_cleanup.cleanup_old_webhook_events",
                 new_callable=AsyncMock,
@@ -133,7 +138,7 @@ class TestWebhookDedupCleanupAutobeginTransaction:
         async with autobegin_false_factory() as session, session.begin():
             session.add(old_event)
 
-        with patch.object(sw, "_make_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
             result = await sw.webhook_dedup_cleanup({})
 
         assert result == {"deleted": 1}
@@ -141,7 +146,7 @@ class TestWebhookDedupCleanupAutobeginTransaction:
     async def test_cron_zero_batch_against_autobegin_false_session(self, autobegin_false_factory) -> None:
         """Even an empty table must not raise: the SELECT needs an active
         transaction on an autobegin=False session."""
-        with patch.object(sw, "_make_session_factory", return_value=autobegin_false_factory):
+        with patch.object(sw, "_make_system_session_factory", return_value=autobegin_false_factory):
             result = await sw.webhook_dedup_cleanup({})
 
         assert result == {"deleted": 0}
