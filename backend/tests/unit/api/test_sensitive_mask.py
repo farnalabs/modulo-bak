@@ -299,7 +299,9 @@ class TestMergeMaskedConfigJson:
         stored = {"allowed_hosts": ["a.example.com", "b.example.com"]}
         incoming = {"allowed_hosts": []}
         result = merge_masked_config_json(stored, incoming)
-        assert result["allowed_hosts"] == []
+        cleared = result["allowed_hosts"]
+        assert isinstance(cleared, list)
+        assert not cleared
 
     def test_list_of_dicts_without_masked_echo_replaces_whole(self) -> None:
         """A fully-specified list-of-dicts (no masked echo) replaces wholesale.
