@@ -983,12 +983,15 @@ async def webhook_dedup_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — purge old webhook trigger events (30-day retention).
 
     The purge is CROSS-ORG by design (age-based retention over every org's
-    events), so it runs on the system session factory (modulo_system role,
-    LOGIN, BYPASSRLS — FAR-523). ``trigger_events`` carries the
-    ``rls_org_isolation`` policy and ``modulo_app`` is NOBYPASSRLS, so the
-    previous plain-factory session — which never set ``app.organisation_id`` —
-    silently matched ZERO rows and deleted nothing: an invisible no-op that
-    let retention grow unbounded. Do NOT swap back to ``_make_session_factory``.
+    events), so on PostgreSQL it runs on the system session factory
+    (modulo_system role, LOGIN, BYPASSRLS — FAR-523). ``trigger_events``
+    carries the ``rls_org_isolation`` policy and ``modulo_app`` is
+    NOBYPASSRLS, so the previous plain-factory session — which never set
+    ``app.organisation_id`` — silently matched ZERO rows and deleted nothing:
+    an invisible no-op that let retention grow unbounded. Do NOT swap back to
+    ``_make_session_factory`` on PostgreSQL. On non-PostgreSQL backends (no
+    RLS, no modulo_system role) the plain factory is correct and used instead
+    (see ``_cleanup_session_factory``).
 
     The system session factory is ``autobegin=False`` (the codebase DI
     convention), so every batch needs an explicit transaction: the first
@@ -1000,7 +1003,7 @@ async def webhook_dedup_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     from modulo.core.cleanup_jobs.webhook_dedup_cleanup import BATCH_SIZE, cleanup_old_webhook_events
 
     total = 0
-    async with _make_system_session_factory()() as session:
+    async with _cleanup_session_factory()() as session:
         while True:
             async with session.begin():
                 deleted = await cleanup_old_webhook_events(session)
@@ -1018,13 +1021,15 @@ async def trigger_events_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     in bounded batches. The retention comfortably exceeds the webhook replay
     window, so replayable events are never purged.
 
-    The purge is CROSS-ORG by design, so it runs on the system session factory
-    (modulo_system role, LOGIN, BYPASSRLS — FAR-523). ``trigger_events`` is an
-    ``OrgScoped`` table under the ``rls_org_isolation`` policy and ``modulo_app``
-    is NOBYPASSRLS: the previous plain-factory session never set
-    ``app.organisation_id``, so every batch silently matched ZERO rows and the
-    retention never deleted anything. Do NOT swap back to
-    ``_make_session_factory``.
+    The purge is CROSS-ORG by design, so on PostgreSQL it runs on the system
+    session factory (modulo_system role, LOGIN, BYPASSRLS — FAR-523).
+    ``trigger_events`` is an ``OrgScoped`` table under the
+    ``rls_org_isolation`` policy and ``modulo_app`` is NOBYPASSRLS: the
+    previous plain-factory session never set ``app.organisation_id``, so every
+    batch silently matched ZERO rows and the retention never deleted anything.
+    Do NOT swap back to ``_make_session_factory`` on PostgreSQL. On
+    non-PostgreSQL backends (no RLS, no modulo_system role) the plain factory
+    is correct and used instead (see ``_cleanup_session_factory``).
 
     Mirrors ``webhook_dedup_cleanup``: the system session factory is
     ``autobegin=False`` (the codebase DI convention), so every batch needs an
@@ -1036,7 +1041,7 @@ async def trigger_events_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     from modulo.core.cleanup_jobs.trigger_events_cleanup import BATCH_SIZE, cleanup_old_trigger_events
 
     total = 0
-    async with _make_system_session_factory()() as session:
+    async with _cleanup_session_factory()() as session:
         while True:
             async with session.begin():
                 deleted = await cleanup_old_trigger_events(session)
@@ -1319,6 +1324,29 @@ def _make_system_session_factory() -> Any:
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
     return async_sessionmaker(_get_system_async_engine(), expire_on_commit=False, autobegin=False)
+
+
+def _cleanup_session_factory() -> Any:
+    """Session factory for the age-based retention cleanup crons
+    (``webhook_dedup_cleanup`` / ``trigger_events_cleanup``).
+
+    On PostgreSQL the purge is CROSS-ORG by design, so it MUST run on the
+    system session factory (modulo_system role, LOGIN, BYPASSRLS — FAR-523):
+    the plain ``modulo_app`` factory is NOBYPASSRLS and a batch without
+    ``app.organisation_id`` silently matches zero rows. Do NOT swap back on
+    PostgreSQL. On non-PostgreSQL backends (SQLite/MariaDB/MySQL) there is no
+    RLS and no modulo_system role, so the plain factory is both correct and
+    the only option — the cross-org purge is exactly right there.
+
+    The dialect is read from ``settings.modulo_db`` — the same signal
+    :func:`_get_async_engine` uses — WITHOUT connecting: on PostgreSQL the
+    system-engine path still fails LOUD when ``MODULO_SYSTEM_DATABASE_URL``
+    is unset (RuntimeError from :func:`_get_system_async_engine`), while
+    non-PostgreSQL backends never touch the system engine at all.
+    """
+    if get_settings().modulo_db.lower() != "postgres":
+        return _make_session_factory()
+    return _make_system_session_factory()
 
 
 def _runs_functions() -> list[tuple[str, Any]]:
