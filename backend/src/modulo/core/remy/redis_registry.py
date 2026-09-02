@@ -17,11 +17,9 @@ logger = logging.getLogger(__name__)
 JsonObject = dict[str, Any]
 
 
-async def _redis_result[T](result: Awaitable[T] | T) -> T:
-    """Resolve redis-py's sync-or-async stub union for the async client."""
-    if isinstance(result, Awaitable):
-        return await result
-    return result
+async def _redis_result[T](result: Awaitable[T]) -> T:
+    """Resolve redis-py's async client awaitable result."""
+    return await result
 
 
 def _json_object(value: object) -> JsonObject | None:
