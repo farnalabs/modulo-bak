@@ -113,7 +113,7 @@ def db_url(
 
 
 @pytest.fixture(scope="session")
-def migrated_db_url(db_url: str) -> str:
+def migrated_db_url(db_url: str, session_monkeypatch: pytest.MonkeyPatch) -> str:
     config = Config(BACKEND_ROOT / "alembic.ini")
     config.set_main_option("sqlalchemy.url", db_url)
     # script_location is CWD-relative in alembic.ini; pin it to the absolute
@@ -157,31 +157,60 @@ def migrated_db_url(db_url: str) -> str:
             await conn.commit()
         await eng.dispose()
 
-    asyncio.run(_provision_break_glass_roles())
-
     app_url = _with_credentials(db_url, "modulo_app", "apppass")
     bg_url = _with_credentials(db_url, "modulo_breakglass", "bgpass")
+    # modulo_system: cross-org system-cron role (fail-closed since #2162 —
+    # cron_helpers/saq_worker raise RuntimeError when MODULO_SYSTEM_DATABASE_URL
+    # is unset). Provision it with a KNOWN password (bootstrap_role.py parses
+    # the role/password out of this URL) and expose it to the session so
+    # get_settings() resolves the system engine exactly as in production.
+    sys_url = _with_credentials(db_url, "modulo_system", "syspass")
 
-    # Run the PRODUCTION bootstrap_role.py BEFORE and AFTER alembic (deliverable
-    # A: the boundary must survive every boot). Before alembic it only creates
-    # the roles (tables don't exist yet, so the allow-list re-apply no-ops via
-    # to_regclass); after alembic it re-applies the accounts UPDATE allow-list,
-    # the modulo_breakglass grants, and the SECURITY DEFINER EXECUTE grants.
     from modulo.db.bootstrap_role import bootstrap_roles
 
-    with patch.dict(
-        os.environ,
-        {
-            "DATABASE_URL": db_url,
-            "DATABASE_ADMIN_URL": db_url,
-            "MODULO_BREAK_GLASS_DATABASE_URL": bg_url,
-        },
-    ):
-        asyncio.run(bootstrap_roles(db_url, app_url))
-        # Override DATABASE_URL so alembic env.py uses the testcontainer, not any
-        # CI env var pointing at the service postgres.
-        command.upgrade(config, "heads")
-        asyncio.run(bootstrap_roles(db_url, app_url))
+    async def _migrate_shared_db() -> None:
+        """Apply the full schema setup once, serialised across xdist workers.
+
+        Under ``-n 2`` each worker runs this session fixture against the SAME
+        shared Postgres. ``alembic upgrade`` is already serialised by env.py's
+        own advisory lock, but the surrounding ``bootstrap_role`` grants and the
+        ``FORCE ROW LEVEL SECURITY`` schema patch were not — so two workers
+        mutated the shared schema concurrently, and a half-applied setup left the
+        DB in a state that cascaded into 503s (app DB reads) and FK/unique
+        violations across the integration suite. A second session advisory lock
+        (distinct from env.py's) makes a single worker perform the entire setup
+        while the other blocks until it commits.
+        """
+        eng = create_async_engine(db_url)
+        async with eng.connect() as lock_conn:
+            await lock_conn.execution_options(isolation_level="AUTOCOMMIT")
+            await lock_conn.execute(text("SELECT pg_advisory_lock(72002, 1)"))
+            try:
+                await _provision_break_glass_roles()
+                with patch.dict(
+                    os.environ,
+                    {
+                        "DATABASE_URL": db_url,
+                        "DATABASE_ADMIN_URL": db_url,
+                        "MODULO_BREAK_GLASS_DATABASE_URL": bg_url,
+                        "MODULO_SYSTEM_DATABASE_URL": sys_url,
+                    },
+                ):
+                    await bootstrap_roles(db_url, app_url)
+                    # Override DATABASE_URL so alembic env.py uses the
+                    # testcontainer, not any CI env var pointing at the service
+                    # postgres.
+                    command.upgrade(config, "heads")
+                    await bootstrap_roles(db_url, app_url)
+                await _patch_schema()
+            finally:
+                await lock_conn.execute(text("SELECT pg_advisory_unlock(72002, 1)"))
+        await eng.dispose()
+
+    # Persist for the session: settings consumers (cron_helpers/saq_worker
+    # system engine) read get_settings().modulo_system_database_url at test
+    # time, after the per-test get_settings.cache_clear().
+    session_monkeypatch.setenv("MODULO_SYSTEM_DATABASE_URL", sys_url)
 
     async def _patch_schema() -> None:
         """Add the test-only schema surface the migrations don't cover.
@@ -241,7 +270,7 @@ def migrated_db_url(db_url: str) -> str:
             await conn.commit()
         await eng.dispose()
 
-    asyncio.run(_patch_schema())
+    asyncio.run(_migrate_shared_db())
     return db_url
 
 
