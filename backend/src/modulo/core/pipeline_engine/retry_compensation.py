@@ -182,7 +182,14 @@ def parse_node_retry(raw: Any) -> NodeRetryPolicy | None:
     # Nevers retry when the event set is empty.
     if not events:
         return NodeRetryPolicy(max_attempts=1, backoff_seconds=0.0, events=frozenset())
-    backoff_sec = min(float(max(backoff, 0.0)), RETRY_BACKOFF_CAP_SECONDS)
+    # A huge un-representable int (e.g. 10**400, direct graph JSON) overflows
+    # float(); raise the SAME typed error as any other non-numeric backoff so
+    # validate_node_retry_config's `except RetryConfigError` handles it (typed
+    # 422, not a 500).
+    backoff_f = safe_float(max(backoff, 0.0))
+    if backoff_f is None:
+        raise RetryConfigError("retry 'backoff' must be a number of seconds", "RETRY_CONFIG_MALFORMED")
+    backoff_sec = min(backoff_f, RETRY_BACKOFF_CAP_SECONDS)
     return NodeRetryPolicy(max_attempts=max_attempts, backoff_seconds=backoff_sec, events=events)
 
 
@@ -238,8 +245,27 @@ def _policy_from_pipeline_default(pipeline_retry_policy: Any) -> NodeRetryPolicy
         return NodeRetryPolicy(max_attempts=1, backoff_seconds=0.0, events=frozenset())
     max_attempts = min(max_retries + 1, RETRY_MAX_ATTEMPTS_BOUND)
     backoff = pipeline_retry_policy.get("backoff", 0.0)
-    backoff_sec = min(float(max(backoff, 0.0)), RETRY_BACKOFF_CAP_SECONDS) if isinstance(backoff, (int, float)) else 0.0
+    # A huge un-representable int (e.g. 10**400, direct-DB-written) overflows
+    # float(); treat it like any other non-numeric backoff — the documented
+    # 0.0 default (the else branch below) — instead of bricking graph compile.
+    backoff_f = safe_float(backoff) if isinstance(backoff, (int, float)) else None
+    backoff_sec = min(max(backoff_f, 0.0), RETRY_BACKOFF_CAP_SECONDS) if backoff_f is not None else 0.0
     return NodeRetryPolicy(max_attempts=max_attempts, backoff_seconds=backoff_sec, events=frozenset(node_events))
+
+
+def safe_float(value: float) -> float | None:
+    """``float(value)`` with :class:`OverflowError` contained (None on overflow).
+
+    A JSON int literal with more digits than float can represent (e.g.
+    ``10**400``) parses to an arbitrary-precision int whose ``float()``
+    conversion raises OverflowError. Callers treat ``None`` as "unusable
+    value" and apply their own documented default (fail-open) or typed
+    error (:class:`RetryConfigError`).
+    """
+    try:
+        return float(value)
+    except OverflowError:
+        return None
 
 
 def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | None]:
@@ -286,19 +312,10 @@ def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | Non
     if unknown:
         return _fail_open(f"backoff_schedule contains unknown keys {sorted(str(k) for k in unknown)}")
 
-    def _safe_float(value: float) -> float | None:
-        # A JSON int literal with more digits than float can represent (e.g.
-        # 10**400) parses to an arbitrary-precision int whose float()
-        # conversion raises OverflowError — contain it in the fail-open.
-        try:
-            return float(value)
-        except OverflowError:
-            return None
-
     delay_raw = schedule.get("delay_seconds")
     if isinstance(delay_raw, bool) or not isinstance(delay_raw, (int, float)):
         return _fail_open("backoff_schedule 'delay_seconds' must be a number of seconds")
-    delay_f = _safe_float(delay_raw)
+    delay_f = safe_float(delay_raw)
     if delay_f is None:
         return _fail_open("'delay_seconds' is out of representable range")
     # NaN/Infinity fail the range comparison (not <= bound / not < bound), so
@@ -317,7 +334,7 @@ def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | Non
     mult_raw = schedule.get("multiplier", default_multiplier)
     if isinstance(mult_raw, bool) or not isinstance(mult_raw, (int, float)):
         return _fail_open("backoff_schedule 'multiplier' must be a number")
-    multiplier = _safe_float(mult_raw)
+    multiplier = safe_float(mult_raw)
     if multiplier is None:
         return _fail_open("'multiplier' is out of representable range")
     if not RETRY_SCHEDULE_MIN_MULTIPLIER <= multiplier <= RETRY_SCHEDULE_MAX_MULTIPLIER:

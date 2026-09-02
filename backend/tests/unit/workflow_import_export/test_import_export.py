@@ -345,6 +345,49 @@ def test_sanitize_retry_policy_unexpected_schedule_exception_degrades_to_schedul
     assert fault == "schedule"
 
 
+def test_sanitize_retry_policy_canonicalise_valueerror_degrades_to_schedule_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAR-525 iteration 2 containment completeness: the canonicalise call sits
+    INSIDE the same containment try as the schedule validator, so a canonicalise
+    ValueError (e.g. an un-representable value the validator let through) is
+    classified as the SCHEDULE fault (nested drop, core kept) — never an import
+    break."""
+    from modulo.core.pipeline_engine import retry_compensation
+
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45}}
+
+    def _boom(schedule: object) -> None:
+        raise ValueError("simulated canonicalise fault")
+
+    monkeypatch.setattr(retry_compensation, "canonicalise_backoff_schedule", _boom)
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == {"on": ["failure"], "max_retries": 2}
+    assert fault == "schedule"
+
+
+def test_sanitize_retry_policy_containment_logs_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FAR-525 iteration 2 observability: an unexpected exception inside the
+    containment try logs a distinguishable warning (exc_info attached) so a
+    genuine validator defect is separable from malformed bundled data."""
+    import logging
+
+    from modulo.core.graph_validator import GraphValidator
+
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45}}
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated validator defect")
+
+    monkeypatch.setattr(GraphValidator, "check_retry_policy_schedule", _boom)
+    with caplog.at_level(logging.WARNING, logger="modulo.core.workflow_import_export"):
+        _sanitized, fault = _sanitize_retry_policy(policy)
+    assert fault == "schedule"
+    assert "workflow_import.retry_policy_schedule_check_failed" in caplog.text
+
+
 def test_sanitize_retry_policy_canonicalization_only_delta_does_not_fault() -> None:
     """A canonicalisation-only delta (300.0 -> 300, int multiplier -> float)
     is NOT a fault: the policy is kept and no warning-worthy fault class is

@@ -448,6 +448,38 @@ def test_resolve_backoff_schedule_legacy_backoff_coexistence() -> None:
     assert node_policy.backoff_seconds == 1.5  # node inheritance path UNCHANGED
 
 
+def test_policy_from_pipeline_default_huge_backoff_overflows_to_zero_default() -> None:
+    """FAR-525 iteration 2: the legacy numeric `backoff` key has the same
+    OverflowError hole as `backoff_schedule` — a direct-DB-written
+    ``10**400`` must fail open to the documented invalid-backoff default
+    (0.0, the same treatment as a non-numeric backoff), never escape as a
+    raw OverflowError that bricks every pipeline run at graph compile."""
+    policy = {"on": ["stall"], "max_retries": 3, "backoff": 10**400}
+    policy_obj = rc._policy_from_pipeline_default(policy)
+    assert policy_obj.backoff_seconds == 0.0
+    assert policy_obj.max_attempts == 4  # retry budget path UNCHANGED
+    assert policy_obj.events == frozenset({"stall"})
+
+
+def test_parse_node_retry_huge_backoff_raises_typed_error() -> None:
+    """FAR-525 iteration 2: a node-level ``retry.backoff`` of ``10**400``
+    (graph JSON) must raise the TYPED RetryConfigError — the same message
+    shape as the other invalid-backoff cases — so
+    ``validate_node_retry_config``'s ``except RetryConfigError`` surfaces a
+    validation error, never a raw OverflowError (graph-save 500)."""
+    with pytest.raises(rc.RetryConfigError, match="must be a number of seconds"):
+        rc.parse_node_retry({"max_attempts": 3, "backoff": 10**400, "on": ["timeout"]})
+
+
+def test_validate_node_retry_config_huge_backoff_emits_validation_error_not_exception() -> None:
+    """End-to-end through the validator entry point: the overflow backoff
+    becomes a typed graph-validation error, not an escaping exception."""
+    node = {"id": "n1", "retry": {"max_attempts": 3, "backoff": 10**400, "on": ["timeout"]}}
+    result = ValidationResult()
+    rc.validate_node_retry_config(node, "n1", result)
+    assert not result.is_valid
+
+
 def test_resolve_backoff_schedule_accepted_resolves_cross_check() -> None:
     """Property: every schedule the WRITE-SITE validator accepts, the resolver
     resolves without fail-open (and vice versa for well-typed in-bounds rows).

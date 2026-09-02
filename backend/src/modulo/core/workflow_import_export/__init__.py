@@ -882,22 +882,31 @@ def _sanitize_retry_policy(imported: Any) -> tuple[dict[str, Any], str | None]:
     if not core_check.is_valid:
         return {}, "core"
     schedule_check = ValidationResult()
+    canonical_schedule: dict[str, Any] | None = None
+    schedule_valid = True
     try:
         GraphValidator.check_retry_policy_schedule(imported, schedule_check)
         schedule_valid = schedule_check.is_valid
+        if schedule_valid:
+            # Canonicalise type-stable storage via the SINGLE shared helper
+            # (retry_compensation.canonicalise_backoff_schedule): integral float
+            # -> int, int -> float — identical to the API write site. Inside the
+            # same containment try: a canonicalise ValueError (an
+            # un-representable value the validator let through) is a SCHEDULE
+            # fault — the schedule key drops, the core policy survives.
+            canonical_schedule = retry_compensation.canonicalise_backoff_schedule(imported.get("backoff_schedule"))
     except Exception:
-        # Defense-in-depth (FAR-525 qa gate): the schedule validator must never
-        # break the import with an unexpected exception — ANY escape degrades
-        # to the schedule-fault class (nested drop + schedule warning). The
-        # CORE check above keeps its exact semantics (a core fault whole-drops,
-        # unchanged) — only unexpected-exception containment is broadened.
+        # Defense-in-depth (FAR-525 qa gate): neither the schedule validator nor
+        # the canonicaliser may break the import with an unexpected exception —
+        # ANY escape degrades to the schedule-fault class (nested drop +
+        # schedule warning). The warning distinguishes a genuine validator
+        # defect from malformed bundled data. The CORE check above keeps its
+        # exact semantics (a core fault whole-drops, unchanged) — only
+        # unexpected-exception containment is broadened.
+        logger.warning("workflow_import.retry_policy_schedule_check_failed", exc_info=True)
         schedule_valid = False
     policy = dict(imported)
     if schedule_valid:
-        # Canonicalise type-stable storage via the SINGLE shared helper
-        # (retry_compensation.canonicalise_backoff_schedule): integral float
-        # -> int, int -> float — identical to the API write site.
-        canonical_schedule = retry_compensation.canonicalise_backoff_schedule(policy.get("backoff_schedule"))
         if canonical_schedule is not None:
             policy["backoff_schedule"] = canonical_schedule
         return policy, None
