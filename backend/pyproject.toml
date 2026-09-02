@@ -513,7 +513,9 @@ dev = [
     # Pinned to the pytest-9.1 fix for the _register_fixture(nodeid=...) deprecation
     # (pytest-dev/pytest-bdd#823): no PyPI release carries it yet (8.1.0 is latest).
     # Replace with a >=8.1.1 PyPI pin once the fix is released.
-    "pytest-bdd @ git+https://github.com/pytest-dev/pytest-bdd@refs/pull/827/head",
+    # Pinned to the resolved commit SHA (not a floating refs/pull/827/head ref) so the
+    # lock stays fetchable if GitHub GCs the PR ref after the PR is merged/closed.
+    "pytest-bdd @ git+https://github.com/pytest-dev/pytest-bdd@60f6625b71b5552af02a4830e3d520f5ab6838e4",
     "pytest-cov>=7.1.0",
     "pytest-playwright>=0.8.0",
     "pytest-timeout>=2.4.0",
