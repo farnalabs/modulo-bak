@@ -1,4 +1,5 @@
 import manifest from '@/manifest.yaml'
+import { isDemoSession } from '@/lib/api/auth'
 
 export interface NavItem {
   to: string
@@ -209,6 +210,12 @@ export interface NavVisibilityContext {
 
 export function isNavItemVisible(item: NavItem, ctx: NavVisibilityContext): boolean {
   if ((item.visibility === 'private_preview' || item.visibility === 'in_dev') && !ctx.devMode) return false
+  // FAR-535: demo sessions never see private_preview surfaces — even when the
+  // instance runs with dev mode enabled. Server-side mutation denial still
+  // holds; this keeps the nav consistent with the demo spec (read-only, no
+  // preview tools). Evaluated per call so every consumer of isNavItemVisible /
+  // getVisibleNavGroups inherits the guard without passing the flag through.
+  if (item.visibility === 'private_preview' && isDemoSession()) return false
   if (!item.requiredRoles && !item.requiredTier && !item.requiredPermissions) return true
   if (item.requiredTier && !ctx.tierInfoLoaded) return false
   return canSeeItem(

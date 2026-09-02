@@ -39,6 +39,10 @@ const clientState = vi.hoisted(() => {
   }
 })
 
+// FAR-535: mirrors the persisted demo-session flag so the App.vue mount can be
+// driven into the "demo marker set, no stored token" reload state.
+const demoState = vi.hoisted(() => ({ isDemo: false }))
+
 vi.mock('vue-router', () => ({
   useRoute: () => routeRef,
   useRouter: () => mockRouter,
@@ -60,6 +64,7 @@ vi.mock('@/lib/api/client', () => ({
     (wasAuthenticated: boolean, hasToken: boolean, hasAutoLogin: boolean) =>
       wasAuthenticated && !hasToken && hasAutoLogin,
   ),
+  isDemoSession: vi.fn(() => demoState.isDemo),
 }))
 
 vi.mock('@/lib/error-tracking', () => ({
@@ -91,6 +96,7 @@ beforeEach(() => {
   vi.restoreAllMocks()
   clientState.setToken(null)
   clientState.setHandler(null)
+  demoState.isDemo = false
   mockRouter.push.mockClear()
 })
 
@@ -183,5 +189,45 @@ describe('App auto-login recovery', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/')
     expect(wrapper.findComponent({ name: 'LoginView' }).exists()).toBe(false)
     expect(wrapper.findComponent({ name: 'AppLayout' }).exists()).toBe(true)
+  })
+})
+
+// FAR-535: on reload with a persisted demo marker but no stored token (the
+// short-lived demo session has ended), App must NOT silently auto-login as the
+// instance's auto-login account — it hands back to the /demo route, whose guard
+// re-issues a fresh demo session (or lands on /login when demo is disabled).
+describe('App demo reload guard (FAR-535)', () => {
+  it('redirects to /demo and never calls auto-login when the demo flag is set without a token', async () => {
+    demoState.isDemo = true
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: async () => ({}) }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = shallowMount(App)
+    await flushPromises()
+
+    expect(mockRouter.push).toHaveBeenCalledWith('/demo')
+    // The instance auto-login credential POST must never fire.
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/api/v1/auth/login',
+      expect.anything(),
+    )
+    // No session was established, so the unauthenticated shell stays rendered
+    // until the /demo guard's hand-off resolves.
+    expect(wrapper.findComponent({ name: 'LoginView' }).exists()).toBe(true)
+    expect(wrapper.findComponent({ name: 'AppLayout' }).exists()).toBe(false)
+  })
+
+  it('keeps first-mount auto-login unchanged when the demo flag is not set', async () => {
+    const deferredLogin = deferred<{ ok: boolean; json: () => Promise<Record<string, unknown>> }>()
+    mockLoginFetch(deferredLogin)
+
+    shallowMount(App)
+    await flushPromises()
+
+    // Auto-login ran (the login POST is in flight) and no /demo hand-off was requested.
+    expect(mockRouter.push).not.toHaveBeenCalledWith('/demo')
+    deferredLogin.resolve({ ok: true, json: async () => ({ access_token: 'fresh-token', refresh_token: 'fresh-refresh', user: { id: '1', email: 'demo@modulo', name: 'Demo' } }) })
+    await flushPromises()
+    expect(mockRouter.push).toHaveBeenCalledWith('/')
   })
 })
