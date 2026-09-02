@@ -369,6 +369,17 @@ select = [
     "Q001",    # multiline string quote style must follow the configured inline-quotes
     "Q002",    # docstring quote style must follow the configured inline-quotes
     "UP033",   # @lru_cache(maxsize=None) → @functools.cache
+    # Tenth wave (repo-root sync): T10/TID families block future regressions
+    # (verified zero current violations with ruff==0.16.5:
+    # `ruff check . --extend-select T10,TID --statistics`).
+    "T10",     # no committed debuggers (pdb/ipdb/breakpoint)
+    "TID",     # tidy imports — absolute imports only, no out-of-package relatives
+    # Eleventh wave of defensive gate-strengthening (a small fixed backlog, then
+    # pass-to-enable): PT006/PT013 had a handful of violations that this PR
+    # FIXED (verified zero remaining with ruff==0.16.5: `ruff check .
+    # --select PT006,PT013 --statistics`). Mirrors the repo-root ruff.toml gate.
+    "PT006",   # @pytest.mark.parametrize() names must be a tuple, not a bare str
+    "PT013",   # no shadowing `import pytest as _pytest` when `import pytest` exists
 ]
 ignore = [
     "S101",     # assert allowed in tests
