@@ -1377,7 +1377,7 @@ dev = [
     { name = "pre-commit", specifier = ">=4.6.0" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
-    { name = "pytest-bdd", git = "https://github.com/pytest-dev/pytest-bdd?rev=60f6625b71b5552af02a4830e3d520f5ab6838e4" },
+    { name = "pytest-bdd", git = "https://github.com/Sanjays2402/pytest-bdd?rev=60f6625b71b5552af02a4830e3d520f5ab6838e4" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "pytest-playwright", specifier = ">=0.8.0" },
     { name = "pytest-recording", specifier = ">=0.13.0" },
@@ -4673,7 +4673,7 @@ wheels = [
 [[package]]
 name = "pytest-bdd"
 version = "8.1.0"
-source = { git = "https://github.com/pytest-dev/pytest-bdd?rev=60f6625b71b5552af02a4830e3d520f5ab6838e4#60f6625b71b5552af02a4830e3d520f5ab6838e4" }
+source = { git = "https://github.com/Sanjays2402/pytest-bdd?rev=60f6625b71b5552af02a4830e3d520f5ab6838e4#60f6625b71b5552af02a4830e3d520f5ab6838e4" }
 dependencies = [
     { name = "gherkin-official" },
     { name = "mako" },
