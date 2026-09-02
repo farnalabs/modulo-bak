@@ -13,9 +13,11 @@
 # in this state for over two hours until a manual `fly machine restart`.
 # This workflow closes that gap: every 5 minutes it looks for a STARTED machine
 # in the "app" process group whose servicecheck-prefixed health check is
-# critical, and restarts that machine if both guards below pass. `warning`
-# checks, non-servicecheck checks (e.g. worker_health, which belongs to worker
-# machines) and non-app process groups are ignored.
+# critical, and restarts those machines if both guards below pass. Matches are
+# deduplicated by machine id, so a machine with several critical service
+# checks is restarted at most once per run. `warning` checks, non-servicecheck
+# checks (e.g. worker_health, which belongs to worker machines) and non-app
+# process groups are ignored.
 #
 # What a restart means
 # --------------------
@@ -32,10 +34,11 @@
 #    may simply still be booting; restarting it would risk a restart loop.
 #    An unparseable timestamp is treated as "too fresh" (skip; the next run
 #    retries).
-# 2. Deploy: skipped while any run of the deploy workflow is in progress -
-#    never restart a machine mid-rolling-deploy. If the deploy-run query
-#    itself fails, the restart is skipped too (fail-closed for a
-#    state-changing action; the next scheduled run retries in 5 minutes).
+# 2. Deploy: skipped while any run of the deploy workflow is in progress or
+#    queued (a queued deploy can transition to running between the check and
+#    the restart) - never restart a machine mid-rolling-deploy. If the
+#    deploy-run query itself fails, the restart is skipped too (fail-closed
+#    for a state-changing action; the next scheduled run retries in 5 minutes).
 #
 # Every handled outcome exits 0 and writes its reason to the job summary; the
 # next scheduled run retries naturally. GitHub runs scheduled workflows only
@@ -54,6 +57,8 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read   # gh run list (deploy-guard query) - without this the
+                  # Actions API returns 404 and the guard fails closed forever
 
 jobs:
   watchdog:
@@ -83,14 +88,16 @@ jobs:
 
           SUMMARY="${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY not set}"
 
-          # Deploy-guard query: number of in-progress deploy runs, or
-          # "unknown" when the query fails or returns anything non-numeric
+          # Deploy-guard query: number of deploy runs in progress or queued,
+          # or "unknown" when the query fails or returns anything non-numeric
           # (fail-closed below).
-          deploy_runs_in_progress() {
+          active_deploy_runs() {
             local count
             count="$(gh run list --repo "${GITHUB_REPOSITORY}" \
-              --workflow deploy.yml --status in_progress \
-              --json databaseId --jq 'length' 2>/dev/null || true)"
+              --workflow deploy.yml \
+              --json databaseId,status \
+              --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length' \
+              </dev/null 2>/dev/null || true)"
             case "$count" in
               '' | *[!0-9]*) echo "unknown" ;;
               *) echo "$count" ;;
@@ -116,36 +123,43 @@ jobs:
           fi
 
           cat > /tmp/wd-candidates.jq <<'JQ'
-          .[]
-          | select(((.state // "") | tostring) == "started")
-          | select((((.config.metadata.fly_process_group // .config.env.FLY_PROCESS_GROUP // "") | tostring)) == "app")
-          | . as $m
-          | (($m.checks // [])[])
-          | select((((.name // "") | tostring) | startswith("servicecheck")) and ((((.status // "") | tostring)) == "critical"))
-          | {machine_id: ($m.id // "?"), check_name: (.name // "?"), output: ((.output // "") | tostring), updated_at: ($m.updated_at // "")}
+          [
+            .[]
+            | select(((.state // "") | tostring) == "started")
+            | select((((.config.metadata.fly_process_group // .config.env.FLY_PROCESS_GROUP // "") | tostring)) == "app")
+            | . as $m
+            | (($m.checks // [])[])
+            | select((((.name // "") | tostring) | startswith("servicecheck")) and ((((.status // "") | tostring)) == "critical"))
+            | {machine_id: ($m.id // "?"), check_name: (.name // "?"), output: ((.output // "") | tostring), updated_at: ($m.updated_at // "")}
+          ]
+          | unique_by(.machine_id)
+          | .[]
           JQ
 
-          CANDIDATES="$(printf '%s' "$MACHINES_JSON" | jq -c -f /tmp/wd-candidates.jq 2>/dev/null || true)"
+          JQ_RC=0
+          CANDIDATES="$(printf '%s' "$MACHINES_JSON" | jq -c -f /tmp/wd-candidates.jq 2>/dev/null)" || JQ_RC=$?
+          if [ -z "$CANDIDATES" ] && [ "$JQ_RC" -ne 0 ]; then
+            # Empty filter output with a non-zero exit: the flyctl output
+            # could not be parsed or the filter itself failed - machine state
+            # is unknown, so never claim "all healthy" here.
+            echo "::warning::jq filter failed (exit ${JQ_RC}) on the flyctl machines output - machine state could not be determined; no action taken (next run retries)."
+            {
+              echo "### Recover: Web Machine"
+              echo ""
+              echo "no-op: app machine state could not be determined (flyctl output could not be parsed/filtered) - no action taken; the next scheduled run retries."
+            } >> "$SUMMARY"
+            exit 0
+          fi
           if [ -z "$CANDIDATES" ]; then
-            # Empty filter output: either genuinely healthy (no matches) or
-            # the JSON was unusable. Distinguish so the summary is accurate.
-            if ! printf '%s' "$MACHINES_JSON" | jq -e . >/dev/null 2>&1; then
-              echo "::warning::fly machines list returned non-JSON output - machine state unknown; no action taken (next run retries)."
-              {
-                echo "### Recover: Web Machine"
-                echo ""
-                echo "no-op: app machine state could not be determined (non-JSON flyctl output) - no action taken; the next scheduled run retries."
-              } >> "$SUMMARY"
-            else
-              echo "All app machines healthy - nothing to do."
-              echo "no-op: all app machines healthy" >> "$SUMMARY"
-            fi
+            # Filter exited 0 with no matches: valid JSON, genuinely healthy.
+            echo "All app machines healthy - nothing to do."
+            echo "no-op: all app machines healthy" >> "$SUMMARY"
             exit 0
           fi
 
           # --- Guards + restart -------------------------------------------
           NOW_TS="$(date -u +%s)"
-          DEPLOY_STATE="$(deploy_runs_in_progress)"
+          DEPLOY_STATE="$(active_deploy_runs)"
           RESTARTED=0
 
           {
@@ -174,21 +188,23 @@ jobs:
               continue
             fi
 
-            # Guard 2: no restart mid-rolling-deploy (fail-closed).
+            # Guard 2: no restart mid-rolling-deploy (fail-closed). Queued
+            # deploy runs count too - a queued run can transition to running
+            # between this check and the restart.
             if [ "$DEPLOY_STATE" = "unknown" ]; then
               echo "::warning::Machine ${MID} check ${CHECK_NAME} is critical but the deploy-run status could not be queried - skipping restart (fail-closed; retrying next run)."
               echo "- Skipped \`${MID}\` (check \`${CHECK_NAME}\` critical): deploy-run status unknown (query failed); retrying next run." >> "$SUMMARY"
               continue
             fi
             if [ "$DEPLOY_STATE" -gt 0 ] 2>/dev/null; then
-              echo "::warning::Machine ${MID} check ${CHECK_NAME} is critical but ${DEPLOY_STATE} deploy run(s) in progress - skipping restart (never restart mid-rolling-deploy)."
-              echo "- Skipped \`${MID}\` (check \`${CHECK_NAME}\` critical): deploy run(s) in progress (${DEPLOY_STATE}); retrying next run." >> "$SUMMARY"
+              echo "::warning::Machine ${MID} check ${CHECK_NAME} is critical but ${DEPLOY_STATE} deploy run(s) in progress or queued - skipping restart (never restart mid-rolling-deploy)."
+              echo "- Skipped \`${MID}\` (check \`${CHECK_NAME}\` critical): deploy run(s) in progress or queued (${DEPLOY_STATE}); retrying next run." >> "$SUMMARY"
               continue
             fi
 
             # --- Action -----------------------------------------------------
             echo "::notice::Restarting wedged machine ${MID} (check ${CHECK_NAME} critical)."
-            if fly machine restart "$MID" --app "$APP"; then
+            if fly machine restart "$MID" --app "$APP" </dev/null; then
               RESTARTED=$(( RESTARTED + 1 ))
               TRUNCATED_OUT="$(printf '%s' "$CHECK_OUT" | tr '\n\r\t' '   ' | tr -d '`' | cut -c1-300)"
               {
