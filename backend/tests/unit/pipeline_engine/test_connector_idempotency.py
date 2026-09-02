@@ -27,13 +27,24 @@ FAR-531 adds the INTENT markers that make the ambiguous state REACHABLE in
 production: an in-flight ``connector_write_intent`` marker is persisted after
 the gate proceeds and before the upstream write fires (same derived key, same
 marker slot); success promotes it in place to ``delivery_done: True`` and a
-definite failure resolves it to ``no_delivery_confirmed: True`` (never
-ambiguous — re-fires under BOTH modes). A crash/timeout leaves it in-flight —
+REPORTED failure — the connector's OWN result shape reporting failure via the
+``write_reported_failure`` hook — resolves it to ``no_delivery_confirmed:
+True`` (never ambiguous — re-fires under BOTH modes). A RAISED connector error
+is AMBIGUOUS (QA Fix 1: a raise cannot tell whether the write landed —
+read-timeout after dispatch vs pre-dispatch validation failure), so the
+in-flight intent is left AS-IS: fail_closed suppresses, fail_open re-fires.
+A crash/timeout also leaves it in-flight —
 ambiguous — so ``fail_closed`` finally suppresses the re-fire (previously the
 ambiguous state could never exist). See ``TestConnectorIntentMarkerLifecycle``,
-``TestConnectorIntentMarkerGateStates`` and ``TestConnectorNoDeliveryResolution``.
+``TestConnectorIntentMarkerGateStates``, ``TestConnectorNoDeliveryResolution``
+and ``TestRaisedConnectorErrorAmbiguous``.
 The envelope honesty (AC4) and the ``write_reported_failure`` hook (AC6) and
-the payload-hash determinism (AC5) are covered in their own classes.
+the payload-hash determinism (AC5) are covered in their own classes. QA-fix
+classes: ``TestSameKeyDeliveryEvidencePreserved`` (Fix 2 — same-key delivered
+evidence survives an intent/no-delivery persist), ``TestGateEligibilityPairing``
+(Fix 3 — gate and intent guard agree through ONE shared eligibility helper),
+``TestPersistRaiseBoundary`` (Fix 5 — a hostile payload never fails the node
+paths).
 
 The gate is unit-tested by monkeypatching the DB read
 (``_read_connector_idempotency_gate_state``) and the killswitch setting, so no
@@ -74,6 +85,7 @@ from modulo.core.pipeline_engine.idempotency import (
 )
 from modulo.core.pipeline_engine.node_runner import (
     _canonical_scalar,
+    _connector_gate_enabled,
     _connector_intent_marker_enabled,
     _connector_marker_attempt_key,
     _connector_on_unknown,
@@ -691,6 +703,16 @@ class TestWriteReportedFailureHook:
         assert connector.write_reported_failure({"stdout": "", "stderr": "boom", "exit_code": 1}) is True
         assert connector.write_reported_failure({"exit_code": 42}) is True
 
+    def test_shell_reports_failure_on_none_exit_code(self) -> None:
+        """QA Fix 4: ``exit_code: None`` IS a reported failure. E2B can produce
+        it (``CommandsExecResult.exit_code`` is Optional for killed /
+        failed-to-start commands; the runtime provider only defaults on a
+        MISSING attribute) — a killed command is NOT a confirmed delivery, so
+        the result must not stamp ``delivery_done`` and suppress the re-run in
+        every mode (main's not-delivered semantics for None)."""
+        connector = _shell_connector()
+        assert connector.write_reported_failure({"stdout": "", "stderr": "", "exit_code": None}) is True
+
     def test_shell_does_not_report_failure_on_success_shape(self) -> None:
         connector = _shell_connector()
         assert connector.write_reported_failure({"stdout": "hi", "exit_code": 0}) is False
@@ -703,6 +725,7 @@ class TestWriteReportedFailureHook:
         connector = _shell_connector()
         assert _connector_write_reported_failure(connector, {"exit_code": 1}) is True
         assert _connector_write_reported_failure(connector, {"exit_code": 0}) is False
+        assert _connector_write_reported_failure(connector, {"exit_code": None}) is True
 
     def test_defensive_reader_fails_open_without_hook(self) -> None:
         """A connector WITHOUT the hook (or a non-connector object) is treated
@@ -823,6 +846,67 @@ class TestConnectorFailedWriteRoutesToNoDelivery:
             )
         slot = _connector_marker_attempt_key("run-123", _NODE_ID)
         assert slot not in fake_run.raw_output_markers
+
+    async def test_none_exit_code_routes_to_no_delivery_never_stamps(self) -> None:
+        """QA Fix 4: ``exit_code: None`` (E2B killed / failed-to-start command)
+        is a REPORTED failure — it must never stamp ``delivery_done``. With
+        intent markers active it resolves to ``no_delivery_confirmed`` (the
+        re-run stays possible under BOTH modes); without them nothing is
+        stamped at all."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        connector = _shell_connector()
+        data = {"command": "killed-command"}
+        none_result = {"stdout": "", "stderr": "", "exit_code": None, "duration_ms": 0}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            # Without intent markers: no stamp at all (main's not-delivered
+            # semantics for None).
+            await _resolve_connector_write_outcome(
+                session_factory,
+                connector=connector,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result=none_result,
+                intent_active=False,
+            )
+            slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+            assert slot not in fake_run.raw_output_markers, "None exit_code must not stamp delivered"
+
+            # With intent markers: resolves to a definite no-delivery.
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+            )
+            await _resolve_connector_write_outcome(
+                session_factory,
+                connector=connector,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result=none_result,
+                intent_active=True,
+            )
+        persisted = fake_run.raw_output_markers[slot]
+        assert persisted["no_delivery_confirmed"] is True
+        assert persisted.get("delivery_done") is not True
 
 
 class TestConnectorIntentMarkerLifecycle:
@@ -1052,9 +1136,12 @@ class TestConnectorIntentMarkerGuard:
 
 
 class TestConnectorNoDeliveryResolution:
-    """FAR-531: a definite failure (connector raised / reported failure)
+    """FAR-531: a definite failure — ONLY the REPORTED-failure path (the
+    connector's own result shape, via the ``write_reported_failure`` hook) —
     resolves the in-flight intent to ``no_delivery_confirmed`` — NOT ambiguous,
-    re-fires under BOTH modes (never suppress a definite failure)."""
+    re-fires under BOTH modes (never suppress a definite failure). A RAISED
+    connector error is NOT routed here (QA Fix 1 — see
+    ``TestRaisedConnectorErrorAmbiguous``)."""
 
     async def test_no_delivery_marker_resolves_ambiguity(self) -> None:
         fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
@@ -1084,13 +1171,13 @@ class TestConnectorNoDeliveryResolution:
                 resource="command",
                 filters={},
                 data=data,
-                reason="connector_error",
+                reason="connector_reported_failure",
             )
         slot = _connector_marker_attempt_key("run-123", _NODE_ID)
         persisted = fake_run.raw_output_markers[slot]
         assert persisted["no_delivery_confirmed"] is True
         assert persisted["marker_kind"] == "connector_write_no_delivery"
-        assert persisted["summary"] == "connector write did not reach upstream (connector_error)"
+        assert persisted["summary"] == "connector write did not reach upstream (connector_reported_failure)"
         assert len(fake_run.raw_output_markers) == 1, "the intent is resolved in place, not duplicated"
 
     async def test_no_delivery_fails_open_on_missing_context(self) -> None:
@@ -1108,7 +1195,7 @@ class TestConnectorNoDeliveryResolution:
             resource="command",
             filters={},
             data={"name": "n1"},
-            reason="connector_error",
+            reason="connector_reported_failure",
         )
         await _mark_connector_write_no_delivery(
             session_factory,
@@ -1118,7 +1205,7 @@ class TestConnectorNoDeliveryResolution:
             resource="command",
             filters={},
             data={"name": "n1"},
-            reason="connector_error",
+            reason="connector_reported_failure",
         )
         assert marker_store == {}
 
@@ -1191,6 +1278,468 @@ class TestConnectorIntentMarkerGateStates:
             )
             is False
         )
+
+
+class TestRaisedConnectorErrorAmbiguous:
+    """QA Fix 1: a RAISED connector write error is AMBIGUOUS, not a definite
+    no-delivery — a read-timeout / connection-reset AFTER dispatch may still
+    have landed the write. The classification flows through
+    ``_resolve_connector_write_outcome`` (the single authority), which leaves
+    the in-flight intent AS-IS: fail_closed suppresses the re-fire ("possible
+    silent miss"), fail_open re-fires (unchanged). Only the connector's OWN
+    reported-failure shape (``write_reported_failure`` hook) is trusted as a
+    definite no-delivery."""
+
+    async def test_raised_exception_leaves_intent_in_flight_and_gate_classifies(self) -> None:
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        data = {"command": "slow-write"}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+            )
+            # The node's except path: the raised error resolves through the
+            # single authority, which classifies it AMBIGUOUS.
+            await _resolve_connector_write_outcome(
+                session_factory,
+                connector=_shell_connector(),
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result=None,
+                intent_active=True,
+                exception=RuntimeError("read timeout after dispatch"),
+            )
+        slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+        persisted = fake_run.raw_output_markers[slot]
+        assert persisted["marker_kind"] == "connector_write_intent", "left in-flight — NOT resolved to no-delivery"
+        assert persisted.get("no_delivery_confirmed") is not True, "a raise must not persist definite no-delivery"
+        assert persisted.get("delivery_done") is not True
+
+        # Gate classification of the surviving in-flight intent: fail_closed
+        # SUPPRESSES, fail_open re-fires.
+        with (
+            patch(
+                "modulo.settings.get_settings",
+                return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=True),
+            ),
+            patch(
+                "modulo.core.pipeline_engine.node_runner._read_connector_idempotency_gate_state",
+                new=AsyncMock(return_value=(fake_run.raw_output_markers, _PERSISTED_KEY)),
+            ),
+        ):
+            fail_closed = await _connector_write_gate(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                on_unknown="fail_closed",
+            )
+            fail_open = await _connector_write_gate(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                on_unknown="fail_open",
+            )
+        assert isinstance(fail_closed, dict), "a raised-error intent is ambiguous: fail_closed suppresses"
+        envelope = fail_closed["artifacts"][0]["output"]["output_json"]
+        assert envelope["idempotency_gate"] == "connector_write_fail_closed"
+        assert envelope["delivery_done"] is False
+        assert fail_open is None, "a raised-error intent re-fires under fail_open (unchanged)"
+
+    async def test_raised_exception_without_intent_writes_nothing(self) -> None:
+        """No intent marker in flight (killswitch off / query op): the raised
+        error persists NOTHING — the pre-FAR-531 behaviour (failed node, no
+        marker evidence) is preserved."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            await _resolve_connector_write_outcome(
+                session_factory,
+                connector=_shell_connector(),
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data={"name": "n1"},
+                result=None,
+                intent_active=False,
+                exception=RuntimeError("boom"),
+            )
+        assert fake_run.raw_output_markers == {}
+
+
+class TestSameKeyDeliveryEvidencePreserved:
+    """QA Fix 2: delivered evidence for the SAME derived key is monotone — an
+    intent / no-delivery persist arriving after a confirmed delivery stamp must
+    not wipe it (concurrent-attempt window, brownout re-run), while a
+    DIFFERENT-key (superseded content-version) persist still drops it."""
+
+    async def test_same_key_no_delivery_after_delivered_stamp_keeps_delivery_done(self) -> None:
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        data = {"command": "echo hi"}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            # Attempt A genuinely delivered.
+            await _stamp_connector_write_delivered(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result={"stdout": "hi", "exit_code": 0},
+            )
+            # Attempt B (concurrent window): the reported-failure resolution
+            # persists AFTER the delivery stamp, SAME derived key.
+            await _mark_connector_write_no_delivery(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                reason="connector_reported_failure",
+            )
+        slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+        persisted = fake_run.raw_output_markers[slot]
+        assert persisted["delivery_done"] is True, "same-key no-delivery persist must not wipe delivered evidence"
+        assert persisted["no_delivery_confirmed"] is True
+        assert persisted["idempotency_key"] == _applied_key(data)
+
+    async def test_same_key_intent_after_delivered_stamp_keeps_delivery_done(self) -> None:
+        """Brownout sequence: attempt 2's gate read times out (fail-open) but
+        its intent persist succeeds — the SAME-key intent must not wipe
+        attempt A's delivered evidence."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        data = {"command": "echo hi"}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            await _stamp_connector_write_delivered(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result={"stdout": "hi", "exit_code": 0},
+            )
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+            )
+        slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+        persisted = fake_run.raw_output_markers[slot]
+        assert persisted["delivery_done"] is True, "same-key intent persist must not wipe delivered evidence"
+
+    async def test_concurrent_window_delivered_stamp_survives_and_gate_suppresses(self) -> None:
+        """End-to-end brownout round-trip: delivered stamp → same-key intent →
+        the gate re-read SUPPRESSES (the delivered write is not re-fired)."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        data = {"command": "echo hi"}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            await _stamp_connector_write_delivered(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                result={"stdout": "hi", "exit_code": 0},
+            )
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+            )
+        with (
+            patch(
+                "modulo.settings.get_settings",
+                return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=True),
+            ),
+            patch(
+                "modulo.core.pipeline_engine.node_runner._read_connector_idempotency_gate_state",
+                new=AsyncMock(return_value=(fake_run.raw_output_markers, _PERSISTED_KEY)),
+            ),
+        ):
+            for mode in ("fail_open", "fail_closed"):
+                gate = await _connector_write_gate(
+                    session_factory,
+                    run_id="run-123",
+                    org_id_raw=_ORG_UUID,
+                    node_id=_NODE_ID,
+                    resource="command",
+                    filters={},
+                    data=data,
+                    on_unknown=mode,
+                )
+                assert isinstance(gate, dict), f"delivered evidence must suppress under {mode}"
+                assert gate["artifacts"][0]["output"]["output_json"]["idempotency_gate"] == "connector_write_suppressed"
+
+    async def test_different_key_intent_still_drops_delivery_done(self) -> None:
+        """The original rationale survives: a SUPERSEDED content-version's
+        delivered marker must not bleed into a NEW key's intent."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+        ):
+            await _stamp_connector_write_delivered(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data={"name": "v1"},
+                result={"ok": True},
+            )
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data={"name": "v2"},
+            )
+        slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+        persisted = fake_run.raw_output_markers[slot]
+        assert persisted.get("delivery_done") is not True, "a different key still drops delivered evidence"
+        assert persisted["marker_kind"] == "connector_write_intent"
+
+
+class TestGateEligibilityPairing:
+    """QA Fix 3: gate eligibility and the intent-marker guard are ONE shared
+    helper — the invariant "an intent marker is written ⟺ the gate can
+    suppress on ambiguity" must hold across killswitch / mode combinations."""
+
+    @pytest.mark.parametrize("mode", ["fail_open", "fail_closed", "off"])
+    def test_intent_guard_equals_gate_eligibility(self, mode: str) -> None:
+        with patch(
+            "modulo.settings.get_settings",
+            return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=True),
+        ):
+            assert _connector_intent_marker_enabled(mode) == _connector_gate_enabled(mode)
+        with patch(
+            "modulo.settings.get_settings",
+            return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=False),
+        ):
+            assert _connector_intent_marker_enabled(mode) == _connector_gate_enabled(mode)
+
+    def test_intent_guard_equals_gate_eligibility_when_settings_read_fails(self) -> None:
+        with patch("modulo.settings.get_settings", side_effect=RuntimeError("boom")):
+            assert _connector_gate_enabled("fail_closed") is False
+            assert _connector_intent_marker_enabled("fail_closed") is False
+
+    async def test_gate_proceeds_implies_intent_marker_written(self) -> None:
+        """Behavioural pairing through the real paths: killswitch ON + a
+        first-time fail_closed write → the gate PROCEEDS and the intent marker
+        is actually persisted. Killswitch OFF → the gate proceeds (disabled)
+        but the guard writes NOTHING (a marker nobody would read)."""
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        data = {"name": "n1"}
+        with (
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_org", new=AsyncMock()),
+            patch("modulo.core.pipeline_engine.node_runner.set_rls_execution_context", new=AsyncMock()),
+            patch(
+                "modulo.settings.get_settings",
+                return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=True),
+            ),
+            patch(
+                "modulo.core.pipeline_engine.node_runner._read_connector_idempotency_gate_state",
+                new=AsyncMock(return_value=(fake_run.raw_output_markers, _PERSISTED_KEY)),
+            ),
+        ):
+            gate = await _connector_write_gate(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                on_unknown="fail_closed",
+            )
+            assert gate is None, "a first-time write proceeds"
+            assert _connector_intent_marker_enabled("fail_closed") is True
+            await _persist_connector_write_intent(
+                session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+            )
+        slot = _connector_marker_attempt_key("run-123", _NODE_ID)
+        assert slot in fake_run.raw_output_markers, "gate proceeded ⇒ intent marker written"
+
+        # Killswitch OFF: the gate proceeds (eligibility disabled) but the
+        # guard says NO marker — the node would never persist one.
+        fresh_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def fresh_session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fresh_run)
+
+        with (
+            patch(
+                "modulo.settings.get_settings",
+                return_value=types.SimpleNamespace(modulo_connector_write_gate_enabled=False),
+            ),
+            patch(
+                "modulo.core.pipeline_engine.node_runner._read_connector_idempotency_gate_state",
+                new=AsyncMock(return_value=(fresh_run.raw_output_markers, _PERSISTED_KEY)),
+            ),
+        ):
+            gate = await _connector_write_gate(
+                fresh_session_factory,
+                run_id="run-123",
+                org_id_raw=_ORG_UUID,
+                node_id=_NODE_ID,
+                resource="command",
+                filters={},
+                data=data,
+                on_unknown="fail_closed",
+            )
+            assert gate is None, "killswitch off: the gate proceeds (disabled, cannot suppress)"
+            assert _connector_intent_marker_enabled("fail_closed") is False
+        assert fresh_run.raw_output_markers == {}, "gate disabled ⇒ no intent marker"
+
+
+class TestPersistRaiseBoundary:
+    """QA Fix 5: the connector persist helpers' payload-hash computation can
+    raise on an adversarial payload (a raising ``__str__`` escapes the hash's
+    ``except (TypeError, ValueError)``). The never-fails contract must hold:
+    any such failure degrades to "no marker" with a log — the node proceeds
+    (pre-write intent) / the original outcome is preserved (post-write
+    resolution, where a raise would otherwise mask the connector's error)."""
+
+    class _RaisingStr:
+        def __str__(self) -> str:
+            raise RuntimeError("str boom")
+
+    async def test_intent_persist_never_raises_on_hostile_payload(self) -> None:
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        await _persist_connector_write_intent(
+            session_factory,
+            run_id="run-123",
+            org_id_raw=_ORG_UUID,
+            node_id=_NODE_ID,
+            resource="command",
+            filters={},
+            data={"obj": self._RaisingStr()},
+        )
+        assert fake_run.raw_output_markers == {}, "hash/persist failure degrades to no marker; node proceeds"
+
+    async def test_no_delivery_persist_never_raises_on_hostile_payload(self) -> None:
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        await _mark_connector_write_no_delivery(
+            session_factory,
+            run_id="run-123",
+            org_id_raw=_ORG_UUID,
+            node_id=_NODE_ID,
+            resource="command",
+            filters={},
+            data={"obj": self._RaisingStr()},
+            reason="connector_reported_failure",
+        )
+        assert fake_run.raw_output_markers == {}, "original error/result preserved — persist never masks it"
+
+    async def test_delivered_stamp_never_raises_on_hostile_payload(self) -> None:
+        fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
+
+        def session_factory() -> _FakeConnectorSession:
+            return _FakeConnectorSession(fake_run)
+
+        await _stamp_connector_write_delivered(
+            session_factory,
+            run_id="run-123",
+            org_id_raw=_ORG_UUID,
+            node_id=_NODE_ID,
+            resource="command",
+            filters={},
+            data={"obj": self._RaisingStr()},
+            result={"ok": True},
+        )
+        assert fake_run.raw_output_markers == {}, "a hostile payload must not fail the node after a delivered write"
 
 
 class TestEnvelopeHonesty:

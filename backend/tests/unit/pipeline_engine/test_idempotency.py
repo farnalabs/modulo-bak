@@ -335,8 +335,9 @@ def test_read_before_write_ambiguous_true_on_intent_marker() -> None:
 
 def test_read_before_write_ambiguous_false_on_no_delivery_confirmed() -> None:
     """A DEFINITE no-delivery marker (``no_delivery_confirmed: True`` — the
-    connector raised, or its result reported failure) is NOT ambiguous: the
-    later attempt's gate must re-fire the write under BOTH modes (FAR-458:
+    connector's result REPORTED failure via the ``write_reported_failure``
+    hook; a raised error is ambiguous per FAR-531 QA Fix 1) is NOT ambiguous:
+    the later attempt's gate must re-fire the write under BOTH modes (FAR-458:
     never suppress a definite failure)."""
     persisted = run_idempotency_key(run_idempotency_ref(uuid.UUID("550e8400-1b24-4f1a-91d3-1f2b3c4d5e6f"), 9))
     derived = node_idempotency_key(persisted, "node-a", index=0)
@@ -355,7 +356,7 @@ def test_read_before_write_ambiguous_false_on_no_delivery_confirmed() -> None:
 def test_no_delivery_confirmed_resolves_after_in_flight_intent() -> None:
     """The intent → no-delivery transition REPLACES the in-flight state in the
     same slot: once resolved, the same key is no longer ambiguous (the exact
-    crash-then-definite-failure sequence a re-run observes)."""
+    reported-failure sequence a re-run observes)."""
     persisted = run_idempotency_key(run_idempotency_ref(uuid.UUID("550e8400-1b24-4f1a-91d3-1f2b3c4d5e6f"), 9))
     derived = node_idempotency_key(persisted, "node-a", index=0)
     slot = "run:r:node:n:connector"

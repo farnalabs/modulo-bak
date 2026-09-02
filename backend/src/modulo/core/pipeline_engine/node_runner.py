@@ -1303,13 +1303,27 @@ def _merge_existing_raw_output_marker(
     suppress its legitimate re-fire). The delivery stamp itself keeps the OR
     (it only fires after a genuine delivery, where the new marker already
     carries ``delivery_done: True`` itself).
+
+    QA Fix 2 (FAR-531): the drop is keyed on IDENTITY — delivery evidence is
+    dropped ONLY when the incoming marker carries a DIFFERENT derived key than
+    the existing marker (the superseded content-version case above). When the
+    keys MATCH, ``delivery_done`` is still OR'd even under
+    ``preserve_delivery_done=False``: a same-key intent / no-delivery persist
+    arriving AFTER a confirmed delivery stamp (concurrent-attempt window, or a
+    brownout re-run whose gate read timed out but whose persist succeeded) must
+    not WIPE the delivered evidence — wiping it let a later attempt re-fire a
+    write that had already delivered (a duplicate). Delivered evidence for the
+    same key is monotone: the gate suppresses on ``delivery_done`` + matching
+    key regardless of which kind of marker shares the slot.
     """
     if not isinstance(existing, dict):
         return marker
     preserved: dict[str, Any] = {}
     if existing.get("pr_url"):
         preserved["pr_url"] = existing["pr_url"]
-    if preserve_delivery_done and (existing.get("delivery_done") or marker.get("delivery_done")):
+    marker_key = marker.get("idempotency_key")
+    same_derived_key = marker_key is not None and existing.get("idempotency_key") == marker_key
+    if (preserve_delivery_done or same_derived_key) and (existing.get("delivery_done") or marker.get("delivery_done")):
         preserved["delivery_done"] = True
     if promote_newest_key:
         if marker.get("idempotency_key"):
@@ -1686,14 +1700,27 @@ async def _resolve_connector_write_outcome(
     resource: str,
     filters: dict[str, Any] | None,
     data: dict[str, Any],
-    result: Any,
+    result: Any = None,
     intent_active: bool,
+    exception: BaseException | None = None,
 ) -> None:
     """Post-write resolution for a connector write (FAR-458 + FAR-531 AC6).
 
-    The SINGLE place deciding what the marker slot records after the upstream
-    write returned without raising:
+    The SINGLE authority deciding what the marker slot records after the
+    upstream write — every terminal transition flows through here:
 
+    - A RAISED error (``exception`` is not None, QA Fix 1) is classified
+      AMBIGUOUS and the in-flight intent marker is left AS-IS — no
+      ``no_delivery_confirmed`` is persisted. A raised error cannot tell the
+      engine WHETHER the write reached upstream: a read-timeout /
+      connection-reset AFTER dispatch may have landed it, so persisting
+      definite no-delivery evidence would be a lie (and fail_closed's
+      documented "possible silent miss" suppression would never engage). Under
+      ``fail_closed`` the in-flight intent suppresses the re-fire; under
+      ``fail_open`` it re-fires (unchanged). Note a deterministic PRE-dispatch
+      failure (e.g. payload validation raising) therefore also stays ambiguous
+      under fail_closed — that IS the contract: only the connector's OWN
+      reported-failure shape is trusted as definite.
     - A reported failure (the connector's ``write_reported_failure`` hook,
       default False — connectors whose results carry a failure shape OPT IN) is
       a DEFINITE no-delivery: ``delivery_done`` is NEVER stamped (the
@@ -1704,6 +1731,19 @@ async def _resolve_connector_write_outcome(
     - Otherwise the write genuinely delivered: stamp ``delivery_done``
       (promoting the intent marker in place).
     """
+    if exception is not None:
+        # QA Fix 1: ambiguous — leave the in-flight intent AS-IS (if any).
+        if intent_active:
+            _log.warning(
+                "connector.idempotency_intent_left_in_flight_on_error",
+                extra={
+                    "run_id": run_id,
+                    "node_id": node_id,
+                    "error_type": type(exception).__name__,
+                    "hint": "raised_connector_error_is_ambiguous_fail_closed_suppresses",
+                },
+            )
+        return
     if _connector_write_reported_failure(connector, result):
         if intent_active:
             await _mark_connector_write_no_delivery(
@@ -1772,35 +1812,56 @@ async def _stamp_connector_write_delivered(
     (:func:`_persist_connector_write_intent`) already occupies — the merge
     promotes ``delivery_done: True`` over the intent, never a duplicate row.
 
-    DURABILITY (FAR-458 MAJOR 4): persistence is best-effort, so a lost marker
-    silently turns a delivered write into a potential double-submit on re-run.
-    Emits the structured ``connector.idempotency_marker_lost`` counter on any
-    non-persisted marker so the loss is observable in analytics/metrics; the
-    underlying failure is already logged by ``_persist_raw_output_marker``.
+    DURABILITY (FAR-458 MAJOR 4; mode-dependent per FAR-531 QA Fix 6):
+    persistence is best-effort, so a lost stamp's consequence depends on what
+    evidence survives. With an in-flight intent marker still in the slot
+    (killswitch on), a lost DELIVERY stamp leaves the write AMBIGUOUS:
+    ``fail_open`` re-fires the delivered write (potential double-submit) while
+    ``fail_closed`` SUPPRESSES the re-fire (possible silent miss — the operator
+    reconciles; NOT a double-submit). With no marker at all (killswitch off, or
+    the intent persist was lost too) the re-run re-fires in every mode
+    (potential double-submit). Emits the structured
+    ``connector.idempotency_marker_lost`` counter on any non-persisted marker
+    so the loss is observable in analytics/metrics; the underlying failure is
+    already logged by ``_persist_raw_output_marker``.
+
+    NEVER RAISES (QA Fix 5, FAR-531): the payload-hash computation and the
+    persist are bounded by this body — a hostile payload (``str(obj)`` raising
+    escapes the hash's ``except (TypeError, ValueError)``) or any persist
+    failure degrades to "no marker" with a log, never a node failure.
     """
     if session_factory is None or not run_id:
         return
-    payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
-    attempt_key = _connector_marker_attempt_key(run_id, node_id)
-    marker: dict[str, Any] = {
-        "_modulo_marker": True,
-        "status": "completed",
-        "summary": "connector write delivered (delivery_done)",
-        "node_id": node_id,
-        "attempt_key": attempt_key,
-        "delivery_done": True,
-    }
-    persisted = await _persist_raw_output_marker(
-        session_factory,
-        run_id=run_id,
-        org_id_raw=org_id_raw,
-        node_id=node_id,
-        attempt_key=attempt_key,
-        marker=marker,
-        index=None,
-        payload=payload,
-        promote_newest_key=True,
-    )
+    try:
+        payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
+        attempt_key = _connector_marker_attempt_key(run_id, node_id)
+        marker: dict[str, Any] = {
+            "_modulo_marker": True,
+            "status": "completed",
+            "summary": "connector write delivered (delivery_done)",
+            "node_id": node_id,
+            "attempt_key": attempt_key,
+            "delivery_done": True,
+        }
+        persisted = await _persist_raw_output_marker(
+            session_factory,
+            run_id=run_id,
+            org_id_raw=org_id_raw,
+            node_id=node_id,
+            attempt_key=attempt_key,
+            marker=marker,
+            index=None,
+            payload=payload,
+            promote_newest_key=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception(
+            "connector.idempotency_stamp_failed",
+            extra={"run_id": run_id, "node_id": node_id},
+        )
+        return
     if not persisted:
         _log.warning(
             "connector.idempotency_marker_lost",
@@ -1808,7 +1869,7 @@ async def _stamp_connector_write_delivered(
                 "run_id": run_id,
                 "node_id": node_id,
                 "attempt_key": attempt_key,
-                "hint": "delivery_marker_not_persisted_can_double_submit_on_rerun",
+                "hint": "delivery_marker_not_persisted_fail_open_double_submit_or_fail_closed_suppressed",
             },
         )
 
@@ -1827,30 +1888,53 @@ async def _stamp_connector_write_delivered(
 #   (absent) --gate proceed--> INTENT (in-flight, ambiguous)
 #   INTENT --write succeeds--> DELIVERED (delivery_done: True; suppressed in
 #                              every mode except ``off``)
-#   INTENT --definite failure-> NO_DELIVERY (no_delivery_confirmed: True;
-#                              NOT ambiguous — re-fires under BOTH modes)
+#   INTENT --reported failure-> NO_DELIVERY (no_delivery_confirmed: True;
+#                              NOT ambiguous — re-fires under BOTH modes; the
+#                              connector's OWN result shape reported the
+#                              failure via ``write_reported_failure`` so the
+#                              no-delivery is DEFINITE)
+#   INTENT --write raises-----> stays INTENT (AMBIGUOUS — QA Fix 1: a raised
+#                              error cannot tell whether the write landed (a
+#                              read-timeout AFTER dispatch vs a pre-dispatch
+#                              validation failure look identical), so it is
+#                              NOT trusted as a definite no-delivery:
+#                              fail_closed suppresses ("possible silent
+#                              miss"), fail_open re-fires. A deterministic
+#                              pre-dispatch failure therefore also stays
+#                              ambiguous under fail_closed — that IS the
+#                              contract.)
 #   INTENT --crash/timeout----> stays INTENT (ambiguous: fail_closed
 #                              suppresses — the headline FAR-531 fix; fail_open
 #                              re-fires, unchanged)
+#
+# RESIDUAL (killswitch flip-OFF orphan, QA Fix 7): intent written →
+# crash/timeout → operator flips the killswitch OFF → a re-run bypasses the
+# gate ENTIRELY (the write re-fires un-deduped) and the slot still holds the
+# in-flight intent → if that re-run's write fails, no resolution is persisted
+# (the intent path is disabled with the killswitch) → the ORPHANED in-flight
+# intent survives. Re-enabling the killswitch with ``fail_closed`` then
+# suppresses a re-run of a write that may have DEFINITELY failed (the slot
+# looks ambiguous) until an operator reconciles/clears the orphaned slot.
+# Accepted within fail_closed's documented "possible silent miss" contract.
 
 _CONNECTOR_INTENT_MARKER_KIND = "connector_write_intent"
 _CONNECTOR_NO_DELIVERY_MARKER_KIND = "connector_write_no_delivery"
 
 
-def _connector_intent_marker_enabled(on_unknown: str) -> bool:
-    """Whether an intent marker should be written for a connector write.
+def _connector_gate_enabled(on_unknown: str, *, node_id: str | None = None, run_id: str | None = None) -> bool:
+    """Whether the connector-write gate may act on this op's outcome (QA Fix 3).
 
-    An intent marker only exists to be consumed by the read-before-write gate,
-    so it is written ONLY when the gate could actually suppress on ambiguity:
-    the per-op ``on_unknown`` mode is not ``off`` (the op bypasses the gate
-    entirely) AND the opt-in killswitch ``modulo_connector_write_gate_enabled``
-    is enabled. Deliberate scope note: the marker is written for ``fail_open``
-    too, not only ``fail_closed`` — one uniform marker state machine, and the
-    evidence survives an operator later flipping the mode to fail_closed
-    (fail_open gate semantics are unchanged: the ambiguous branch still never
-    suppresses under fail_open). A killswitch-read failure disables the marker
-    write, matching the gate's fail-open direction (the gate proceeds on the
-    same failure).
+    The SINGLE authority for gate eligibility: the per-op ``on_unknown`` mode is
+    not ``off`` (the op bypasses the gate entirely) AND the opt-in killswitch
+    ``modulo_connector_write_gate_enabled`` is enabled. The killswitch read is
+    fail-open — an exception reads as disabled (the gate proceeds on the same
+    failure).
+
+    Consumed by BOTH ``_connector_write_gate`` (may I suppress?) and
+    ``_connector_intent_marker_enabled`` (should I persist an intent marker?),
+    so the feature's correctness invariant — an intent marker is written
+    if-and-only-if the gate could suppress on ambiguity — is enforced in ONE
+    place instead of parallel copies that can drift.
     """
     if on_unknown == "off":
         return False
@@ -1859,7 +1943,28 @@ def _connector_intent_marker_enabled(on_unknown: str) -> bool:
 
         return bool(getattr(get_settings(), "modulo_connector_write_gate_enabled", False))
     except Exception:
+        # Killswitch read failure must not block a write — proceed (fail-open).
+        _log.warning(
+            "connector.idempotency_gate_killswitch_check_failed",
+            extra={"node_id": node_id, "run_id": run_id},
+        )
         return False
+
+
+def _connector_intent_marker_enabled(on_unknown: str) -> bool:
+    """Whether an intent marker should be written for a connector write.
+
+    An intent marker only exists to be consumed by the read-before-write gate,
+    so it is written ONLY when the gate could actually suppress on ambiguity.
+    Delegates to :func:`_connector_gate_enabled` (QA Fix 3) — the same
+    killswitch + ``off``-bypass policy the gate itself evaluates, so the marker
+    write and the gate can never disagree. Deliberate scope note: the marker is
+    written for ``fail_open`` too, not only ``fail_closed`` — one uniform
+    marker state machine, and the evidence survives an operator later flipping
+    the mode to fail_closed (fail_open gate semantics are unchanged: the
+    ambiguous branch still never suppresses under fail_open).
+    """
+    return _connector_gate_enabled(on_unknown)
 
 
 def _connector_write_reported_failure(connector: Any, result: Any) -> bool:
@@ -1909,35 +2014,52 @@ async def _persist_connector_write_intent(
     ``delivery_done: True`` (no duplicate rows). Best-effort and bounded
     exactly like the delivery stamp — an intent-write failure must never fail
     the node (fail-open, logged).
+
+    NEVER RAISES (QA Fix 5, FAR-531): the payload-hash computation and the
+    persist are bounded by this body — a hostile payload (``str(obj)`` raising
+    escapes the hash's ``except (TypeError, ValueError)``) or any persist
+    failure degrades to "no marker" with a log. The node therefore always
+    proceeds to the write; the pre-write intent persist can never fail it.
     """
     if session_factory is None or not run_id:
         return
-    payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
-    attempt_key = _connector_marker_attempt_key(run_id, node_id)
-    marker: dict[str, Any] = {
-        "_modulo_marker": True,
-        "status": "running",
-        "summary": "connector write intent (in-flight, delivery unconfirmed)",
-        "node_id": node_id,
-        "attempt_key": attempt_key,
-        "marker_kind": _CONNECTOR_INTENT_MARKER_KIND,
-    }
-    await _persist_raw_output_marker(
-        session_factory,
-        run_id=run_id,
-        org_id_raw=org_id_raw,
-        node_id=node_id,
-        attempt_key=attempt_key,
-        marker=marker,
-        index=None,
-        payload=payload,
-        promote_newest_key=True,
-        # The intent describes a write that has NOT happened yet — it must never
-        # inherit ``delivery_done: True`` from a SUPERSEDED key's delivered
-        # marker sharing the slot (that would claim the new key was already
-        # delivered before the write fired).
-        preserve_delivery_done=False,
-    )
+    try:
+        payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
+        attempt_key = _connector_marker_attempt_key(run_id, node_id)
+        marker: dict[str, Any] = {
+            "_modulo_marker": True,
+            "status": "running",
+            "summary": "connector write intent (in-flight, delivery unconfirmed)",
+            "node_id": node_id,
+            "attempt_key": attempt_key,
+            "marker_kind": _CONNECTOR_INTENT_MARKER_KIND,
+        }
+        await _persist_raw_output_marker(
+            session_factory,
+            run_id=run_id,
+            org_id_raw=org_id_raw,
+            node_id=node_id,
+            attempt_key=attempt_key,
+            marker=marker,
+            index=None,
+            payload=payload,
+            promote_newest_key=True,
+            # The intent describes a write that has NOT happened yet — it must
+            # never inherit ``delivery_done: True`` from a SUPERSEDED key's
+            # delivered marker sharing the slot (that would claim the new key
+            # was already delivered before the write fired). A SAME-KEY
+            # delivered marker's evidence IS inherited (QA Fix 2): a
+            # concurrent-attempt intent persist must not wipe delivered
+            # evidence for the identical write.
+            preserve_delivery_done=False,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception(
+            "connector.idempotency_intent_persist_failed",
+            extra={"run_id": run_id, "node_id": node_id},
+        )
 
 
 async def _mark_connector_write_no_delivery(
@@ -1953,11 +2075,13 @@ async def _mark_connector_write_no_delivery(
 ) -> None:
     """Resolve the in-flight intent marker to a DEFINITE no-delivery state.
 
-    FAR-531: fired when the write DEFINITELY did not reach upstream — the
-    connector raised (``reason="connector_error"``; the error is surfaced to
-    the operator, delivery not ambiguous) or its result reported a failure
-    without raising (``reason="connector_reported_failure"`` via the
-    ``write_reported_failure`` hook, AC6). The marker flips to
+    FAR-531: fired when the write DEFINITELY did not reach upstream — ONLY the
+    non-raising path where the connector's OWN result shape reported the
+    failure (``reason="connector_reported_failure"`` via the
+    ``write_reported_failure`` hook, AC6). A RAISED connector error is NOT
+    routed here (QA Fix 1): a raise cannot tell whether the write reached
+    upstream, so it is classified AMBIGUOUS and the in-flight intent is left
+    as-is (fail_closed suppresses, fail_open re-fires). The marker flips to
     ``no_delivery_confirmed: True`` in the SAME slot, so a later attempt's gate
     treats the key as NOT ambiguous (``read_before_write_ambiguous`` excludes
     it) and RE-FIRES the write under BOTH modes — honouring FAR-458's "never
@@ -1968,34 +2092,51 @@ async def _mark_connector_write_no_delivery(
     leaves the in-flight intent marker → ambiguous → fail_closed suppresses a
     definitely-failed write ONCE ("possible silent miss"; the operator
     reconciles). Best-effort + bounded exactly like the delivery stamp.
+
+    NEVER RAISES (QA Fix 5, FAR-531): the payload-hash computation and the
+    persist are bounded by this body — a hostile payload (``str(obj)`` raising
+    escapes the hash's ``except (TypeError, ValueError)``) or any persist
+    failure degrades to "no marker" with a log; the connector's original error
+    or result is never masked by a persist failure.
     """
     if session_factory is None or not run_id:
         return
-    payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
-    attempt_key = _connector_marker_attempt_key(run_id, node_id)
-    marker: dict[str, Any] = {
-        "_modulo_marker": True,
-        "status": "failed",
-        "summary": f"connector write did not reach upstream ({reason})",
-        "node_id": node_id,
-        "attempt_key": attempt_key,
-        "marker_kind": _CONNECTOR_NO_DELIVERY_MARKER_KIND,
-        "no_delivery_confirmed": True,
-    }
-    await _persist_raw_output_marker(
-        session_factory,
-        run_id=run_id,
-        org_id_raw=org_id_raw,
-        node_id=node_id,
-        attempt_key=attempt_key,
-        marker=marker,
-        index=None,
-        payload=payload,
-        promote_newest_key=True,
-        # Same reasoning as the intent marker: a definite no-delivery for the
-        # newest key must not inherit a superseded key's delivery evidence.
-        preserve_delivery_done=False,
-    )
+    try:
+        payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
+        attempt_key = _connector_marker_attempt_key(run_id, node_id)
+        marker: dict[str, Any] = {
+            "_modulo_marker": True,
+            "status": "failed",
+            "summary": f"connector write did not reach upstream ({reason})",
+            "node_id": node_id,
+            "attempt_key": attempt_key,
+            "marker_kind": _CONNECTOR_NO_DELIVERY_MARKER_KIND,
+            "no_delivery_confirmed": True,
+        }
+        await _persist_raw_output_marker(
+            session_factory,
+            run_id=run_id,
+            org_id_raw=org_id_raw,
+            node_id=node_id,
+            attempt_key=attempt_key,
+            marker=marker,
+            index=None,
+            payload=payload,
+            promote_newest_key=True,
+            # Same reasoning as the intent marker: a definite no-delivery for
+            # the newest key must not inherit a SUPERSEDED key's delivery
+            # evidence — but a SAME-KEY delivered marker's evidence IS
+            # inherited (QA Fix 2): the delivery genuinely happened for this
+            # key, and wiping it would re-fire a delivered write.
+            preserve_delivery_done=False,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception(
+            "connector.idempotency_no_delivery_persist_failed",
+            extra={"run_id": run_id, "node_id": node_id},
+        )
 
 
 async def _connector_write_gate(
@@ -2065,22 +2206,12 @@ async def _connector_write_gate(
     """
     if session_factory is None or not run_id:
         return None
-    # FAR-458 per-op bypass: ``off`` never dedupes — the write always fires. This
-    # short-circuits BEFORE the killswitch and the marker read (the gate is
-    # bypassed entirely for this op).
-    if on_unknown == "off":
-        return None
-    try:
-        from modulo.settings import get_settings
-
-        if not getattr(get_settings(), "modulo_connector_write_gate_enabled", False):
-            return None
-    except Exception:
-        # Killswitch read failure must not block a write — proceed (fail-open).
-        _log.warning(
-            "connector.idempotency_gate_killswitch_check_failed",
-            extra={"node_id": node_id, "run_id": run_id},
-        )
+    # QA Fix 3: the per-op ``off`` bypass + the opt-in killswitch live in ONE
+    # shared eligibility helper (also consumed by the intent-marker writer), so
+    # "gate can act" and "intent marker written" can never drift apart. The
+    # ``off`` check short-circuits before the killswitch and the marker read
+    # (the gate is bypassed entirely for that op).
+    if not _connector_gate_enabled(on_unknown, node_id=node_id, run_id=run_id):
         return None
     payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
     markers, persisted_key = await _read_connector_idempotency_gate_state(
@@ -3523,13 +3654,15 @@ def make_connector_fn(
 
     FAR-531 intent markers: after the gate proceeds and BEFORE the upstream
     write fires, an IN-FLIGHT intent marker (same derived key, same marker
-    slot) is persisted when the killswitch is enabled and the mode is not
-    ``off``. Success promotes it in place to ``delivery_done: True``; a
-    definite failure (the connector raised, or its result reported failure via
-    the ``write_reported_failure`` hook) resolves it to
-    ``no_delivery_confirmed: True`` so a later attempt re-fires under BOTH
-    modes. A crash/timeout between the intent persist and the resolution leaves
-    it in-flight — the ambiguous state fail_closed suppresses (the previously
+    slot) is persisted when the shared gate-eligibility policy says the gate
+    could suppress (killswitch enabled, mode not ``off``). Success promotes it
+    in place to ``delivery_done: True``; a reported failure (the connector's
+    result shape reports failure via the ``write_reported_failure`` hook)
+    resolves it to ``no_delivery_confirmed: True`` so a later attempt re-fires
+    under BOTH modes. A RAISED connector error is AMBIGUOUS (QA Fix 1) — the
+    intent stays in-flight: fail_closed suppresses, fail_open re-fires. A
+    crash/timeout between the intent persist and the resolution leaves it
+    in-flight — the ambiguous state fail_closed suppresses (the previously
     unreachable protection) and fail_open re-fires (unchanged).
     """
     node_id: str = str(node_def["id"])
@@ -3607,37 +3740,50 @@ def make_connector_fn(
             # node.
             intent_active = _connector_intent_marker_enabled(on_unknown_mode)
             if intent_active:
-                await _persist_connector_write_intent(
-                    session_factory,
-                    run_id=run_id,
-                    org_id_raw=state.get("_org_id"),
-                    node_id=node_id,
-                    resource=resource,
-                    filters=filters,
-                    data=data,
-                )
+                # QA Fix 5: the intent persist (incl. its payload-hash
+                # computation) must never fail the node BEFORE the write — any
+                # failure degrades to "no marker" and the write still fires.
+                try:
+                    await _persist_connector_write_intent(
+                        session_factory,
+                        run_id=run_id,
+                        org_id_raw=state.get("_org_id"),
+                        node_id=node_id,
+                        resource=resource,
+                        filters=filters,
+                        data=data,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.exception(
+                        "connector.connector_write_intent_persist_failed",
+                        extra={"run_id": run_id, "node_id": node_id},
+                    )
 
         try:
             result = await _run_connector_action(connector, op, resource, filters, data)
         except Exception as exc:
-            # FAR-531: a raised connector error is a DEFINITE no-delivery (the
-            # error is surfaced to the operator; delivery not ambiguous) —
-            # resolve the in-flight intent marker so a later attempt's gate
-            # re-fires under BOTH modes (never suppress a definite failure).
-            # Best-effort: a crash before this persist leaves the intent
-            # in-flight → ambiguous → fail_closed suppresses once (documented
-            # residual, within fail_closed's contract).
-            if intent_active:
-                await _mark_connector_write_no_delivery(
-                    session_factory,
-                    run_id=str(state.get("_run_id", "") or ""),
-                    org_id_raw=state.get("_org_id"),
-                    node_id=node_id,
-                    resource=resource,
-                    filters=filters,
-                    data=data,
-                    reason="connector_error",
-                )
+            # QA Fix 1: the raised connector error is classified by the SINGLE
+            # authority (``_resolve_connector_write_outcome``) as AMBIGUOUS — a
+            # raise cannot tell whether the write landed (read-timeout after
+            # dispatch vs pre-dispatch validation failure), so the in-flight
+            # intent marker is left AS-IS: fail_closed suppresses the re-fire
+            # ("possible silent miss"), fail_open re-fires (unchanged). No
+            # no-delivery evidence is persisted for a raise.
+            await _resolve_connector_write_outcome(
+                session_factory,
+                connector=connector,
+                run_id=str(state.get("_run_id", "") or ""),
+                org_id_raw=state.get("_org_id"),
+                node_id=node_id,
+                resource=resource,
+                filters=filters,
+                data=data,
+                result=None,
+                intent_active=intent_active,
+                exception=exc,
+            )
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(exc)}]}
 
         # FAR-458: a successful connector WRITE genuinely reached upstream —
