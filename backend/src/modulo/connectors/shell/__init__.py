@@ -97,6 +97,14 @@ class ShellConnector(ConnectorBase):
     def connector_type(self) -> ConnectorType:
         return ConnectorType.SHELL
 
+    def write_reported_failure(self, result: Any) -> bool:
+        """FAR-531 (AC6): shell write results carry the executed command's
+        ``exit_code`` (both the ``command`` and ``file`` resources return it). A
+        non-zero exit code is a REPORTED failure without a raise — the write did
+        not reach upstream, so the idempotency stamp must not treat the
+        non-raising return as a delivery."""
+        return isinstance(result, dict) and result.get("exit_code") not in (None, 0)
+
     async def health_check(self) -> HealthResult:
         if self._runtime_provider is None and self._runtime_provider_hub is None:
             return HealthResult(ok=False, detail=_ERR_RUNTIME_NOT_CONFIGURED)
