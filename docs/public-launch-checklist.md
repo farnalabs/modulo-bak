@@ -6,7 +6,7 @@ Production deployment readiness checklist for the Modulo V1 Core public launch. 
 
 ## 1. Infrastructure
 
-- [ ] **PostgreSQL 16+** is provisioned and reachable
+- [ ] **PostgreSQL 18+** is provisioned and reachable
   - Connection string uses a least-privilege role (not superuser)
   - TLS enabled (`sslmode=require`)
 - [ ] **Redis 7+** is provisioned (required for multi-replica)

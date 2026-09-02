@@ -67,7 +67,7 @@ def fresh_migration_db(monkeypatch):
     tears the container down afterwards. This lets the test prove the 0155-0157
     chain applies cleanly without disturbing other integration tests.
     """
-    pg = PostgresContainer("postgres:16-alpine")
+    pg = PostgresContainer("postgres:18-alpine")
     pg.start()
     raw = pg.get_connection_url().replace("postgresql://", "postgresql+asyncpg://", 1)
 

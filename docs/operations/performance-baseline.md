@@ -12,7 +12,7 @@
 | **Disk** | 256 GB NVMe SSD |
 | **OS** | Ubuntu 22.04 LTS (Docker host) |
 | **Docker** | 24.0+ with Compose V2 |
-| **Postgres** | 16-alpine, shared_buffers=512MB, max_connections=200, work_mem=16MB |
+| **Postgres** | 18-alpine, shared_buffers=512MB, max_connections=200, work_mem=16MB |
 | **Redis** | 7-alpine, maxmemory=256mb, maxmemory-policy=allkeys-lru |
 | **Backend** | 4 uvicorn workers, 3 async DB pool connections per worker |
 | **Python** | 3.12+ |

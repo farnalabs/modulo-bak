@@ -5,6 +5,7 @@ services:
       POSTGRES_USER: modulo
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       POSTGRES_DB: modulo
+      PGDATA: /var/lib/postgresql/data
     ports:
       - "5434:5432"
       - "5432:5432"

@@ -89,7 +89,7 @@ def _with_credentials(database_url: str, user: str, password: str) -> str:
 
 @pytest.fixture(scope="session")
 def postgres_container() -> Generator[PostgresContainer, None, None]:
-    with PostgresContainer("postgres:16-alpine") as pg:
+    with PostgresContainer("postgres:18-alpine") as pg:
         yield pg
 
 

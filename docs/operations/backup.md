@@ -150,7 +150,7 @@ uv run scripts/restore.py --input /backups/latest.tar.gz.enc --data-only
 
 ### Scenario: Full server loss
 
-1. Provision new server with Postgres 16+
+1. Provision new server with Postgres 18+
 2. Install Python 3.12, uv, Postgres client tools, OpenSSL
 3. Copy backup archive to server
 4. Restore config first, then database:

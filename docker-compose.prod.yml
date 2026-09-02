@@ -5,6 +5,7 @@ services:
       POSTGRES_DB: modulo
       POSTGRES_USER: modulo
       POSTGRES_PASSWORD: ${MODULO_DB_PASSWORD:-changeme}
+      PGDATA: /var/lib/postgresql/data
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

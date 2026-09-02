@@ -8,7 +8,7 @@ Modulo is a self-hosted agent governance platform for building governed, repeata
 
 | Dependency | Version | Required For |
 |---|---|---|
-| **Docker Desktop** | 24+ | PostgreSQL 16 + Redis 7 (local dev) |
+| **Docker Desktop** | 24+ | PostgreSQL 18 + Redis 7 (local dev) |
 | **Python** | 3.12+ | Backend runtime |
 | **`uv`** | Latest | Python package manager ([install](https://docs.astral.sh/uv/getting-started/installation/)) |
 | **Node.js** | 20+ | Frontend development (optional) |
@@ -21,7 +21,7 @@ docker compose -f docker-compose.local.yml up -d
 ```
 
 This starts:
-- **PostgreSQL 16** on port `5434`
+- **PostgreSQL 18** on port `5434`
 - **Redis 7** on port `6380`
 
 ## 2. Set up the backend

@@ -996,7 +996,7 @@ class TestBackupCli:
         tmp_path: Path,
     ) -> None:
         mock_settings.return_value.fernet_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        mock_get_db_version.return_value = "PostgreSQL 16.0 (Debian 16.0-1)"
+        mock_get_db_version.return_value = "PostgreSQL 18.0 (Debian 16.0-1)"
         mock_get_schema_versions.return_value = ["abc123def456"]
         mock_export_blobs.return_value = []
         mock_export_creds.return_value = {"connector_instances": [], "model_backends": []}
@@ -1049,7 +1049,7 @@ class TestBackupCli:
     ) -> None:
         fernet_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         mock_settings.return_value.fernet_key = fernet_key
-        mock_get_db_version.return_value = "PostgreSQL 16.0"
+        mock_get_db_version.return_value = "PostgreSQL 18.0"
         mock_get_schema_versions.return_value = ["rev123"]
         mock_export_blobs.return_value = []
         mock_export_creds.return_value = {"connector_instances": [], "model_backends": []}
@@ -1070,7 +1070,7 @@ class TestBackupCli:
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["backup_type"] == "full"
-        assert manifest["db_version"] == "PostgreSQL 16.0"
+        assert manifest["db_version"] == "PostgreSQL 18.0"
         assert manifest["schema_versions"] == ["rev123"]
         assert manifest["fernet_key_hash"] == _fernet_key_hash(fernet_key)
         assert "timestamp" in manifest
@@ -1112,7 +1112,7 @@ class TestBackupCli:
         tmp_path: Path,
     ) -> None:
         mock_settings.return_value.fernet_key = "a" * 32
-        mock_get_db_version.return_value = "PostgreSQL 16.0"
+        mock_get_db_version.return_value = "PostgreSQL 18.0"
         mock_get_schema_versions.return_value = ["rev1"]
 
         def _fake_pg_dump(raw_url: str, output: Path, **kwargs: Any) -> None:
@@ -1185,7 +1185,7 @@ class TestBackupCli:
         tmp_path: Path,
     ) -> None:
         mock_settings.return_value.fernet_key = "a" * 32
-        mock_get_db_version.return_value = "PostgreSQL 16.0"
+        mock_get_db_version.return_value = "PostgreSQL 18.0"
         mock_get_schema_versions.return_value = ["rev1"]
 
         def _fake_pg_dump(raw_url: str, output: Path, **kwargs: Any) -> None:
@@ -1248,7 +1248,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": ["rev1"],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
         }
@@ -1306,7 +1306,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
         }
@@ -1345,7 +1345,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(old_fernet_key),
         }
@@ -1388,7 +1388,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(old_fernet_key),
         }
@@ -1446,7 +1446,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
         }
@@ -1488,7 +1488,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
         }
@@ -1542,7 +1542,7 @@ class TestRestoreCli:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(old_fernet_key),
         }
@@ -1617,7 +1617,7 @@ class TestRestoreIntegrity:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
             "file_checksums": {
@@ -1647,7 +1647,7 @@ class TestRestoreIntegrity:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": [],
             "fernet_key_hash": _fernet_key_hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "file_checksums": {
@@ -1794,7 +1794,7 @@ class TestRestoreIntegrity:
         manifest = {
             "timestamp": "2024-01-01T00:00:00+00:00",
             "backup_type": "full",
-            "db_version": "PostgreSQL 16.0",
+            "db_version": "PostgreSQL 18.0",
             "schema_versions": ["rev1"],
             "fernet_key_hash": _fernet_key_hash(fernet_key),
         }

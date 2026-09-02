@@ -222,7 +222,7 @@ jobs:
             -e POSTGRES_PASSWORD=modulo_test \
             -e POSTGRES_DB=modulo_test \
             -p 5433:5432 \
-            postgres:16-alpine
+            postgres:18-alpine
           for i in $(seq 1 60); do
             docker exec modulo-ci-pg pg_isready -U modulo_test 2>/dev/null && { echo "Postgres ready"; break; }
             sleep 2

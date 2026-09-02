@@ -43,7 +43,7 @@ Supported platforms, minimum resources, and database backends for running Modulo
 
 | Database | Version | Status | Production Ready | Notes |
 |----------|---------|--------|-----------------|-------|
-| **PostgreSQL** | 16+ | **Supported** | **Yes** | Primary production database |
+| **PostgreSQL** | 18+ | **Supported** | **Yes** | Primary production database |
 | **MySQL** | 8+ | Supported | Conformance | Via `MODULO_DB=mysql` (`aiomysql` driver) |
 | **MariaDB** | 11+ | Supported | Conformance | Via `MODULO_DB=mariadb` (`docker-compose.mariadb.yml`) |
 | **SQLite** | 3.x | Compatible | **No** | Dev-only: no RLS, no advisory locks |
@@ -51,7 +51,7 @@ Supported platforms, minimum resources, and database backends for running Modulo
 ### PostgreSQL Requirements
 
 - **Version**: 16 or later
-- **Extensions**: none required; `gen_random_uuid()` is built into PostgreSQL 16+ (core since PG 13)
+- **Extensions**: none required; `gen_random_uuid()` is built into PostgreSQL 18+ (core since PG 13)
 - **Connection**: Async via `asyncpg` driver
 - **TLS**: `sslmode=require` recommended for production
 - **Schema**: Alembic-managed migrations run on startup
@@ -75,7 +75,7 @@ See [`docs/troubleshooting.md`](./troubleshooting.md) §8 for known limitations.
 
 | Service | Version | Required | Purpose |
 |---------|---------|----------|---------|
-| PostgreSQL | 16+ | **Yes** (production) | Primary data store |
+| PostgreSQL | 18+ | **Yes** (production) | Primary data store |
 | Redis | 7+ | **Yes** (production) | SAQ task queue, rate limiting, event broker |
 | Python | 3.12+ | Yes | Application runtime |
 | `uv` | 0.11.x | Yes | Python package manager (pinned in Docker images) |

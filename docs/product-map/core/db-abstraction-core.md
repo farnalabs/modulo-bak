@@ -26,7 +26,7 @@ status: covered
 
 # Database Abstraction Core
 
-The multi-backend data layer (ADR 002): PostgreSQL 16 as the primary backend with
+The multi-backend data layer (ADR 002): PostgreSQL 18 as the primary backend with
 conformance support for SQLite and MariaDB/MySQL, repository + session plumbing,
 and org-scoped tenant context injection that is backend-aware.
 

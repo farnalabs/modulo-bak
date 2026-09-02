@@ -97,7 +97,7 @@ it.
 - Run history, evaluation, cost controls, and observability integrations
 - Role-based access controls, audit trails, single sign-on (SSO), and feature licensing
 - Extensible model backends, connectors, Model Context Protocol (MCP) tools, and runtime providers
-- PostgreSQL 16 as the primary database, with conformance support for SQLite and MariaDB/MySQL
+- PostgreSQL 18 as the primary database, with conformance support for SQLite and MariaDB/MySQL
 
 ## Quick start
 
@@ -153,7 +153,7 @@ covers pipeline graph and node configuration.
 | API | Python 3.12, FastAPI, SQLAlchemy, Alembic |
 | Agent orchestration | LangGraph and provider-specific LangChain packages |
 | Web application | Vue 3, TypeScript, Pinia, Vite |
-| Data services | PostgreSQL 16 and Redis 7 |
+| Data services | PostgreSQL 18 and Redis 7 |
 | Local deployment | Docker Compose |
 | Quality tooling | pytest, Vitest, Ruff, mypy, ESLint, Semgrep, Bandit |
 

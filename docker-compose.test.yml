@@ -5,6 +5,7 @@ services:
       POSTGRES_USER: modulo_test
       POSTGRES_PASSWORD: modulo_test
       POSTGRES_DB: modulo_test
+      PGDATA: /var/lib/postgresql/data
     ports:
       - "5433:5432"
     tmpfs:

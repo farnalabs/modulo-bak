@@ -36,7 +36,7 @@ Modulo is a self-hosted agent governance platform for building governed, repeata
                        │ LangGraph (StateGraph execution)
                        │ SQLAlchemy async (asyncpg)
 ┌──────────────────────▼───────────────────────────────────────┐
-│              PostgreSQL 16 + Redis 7                          │
+│              PostgreSQL 18 + Redis 7                          │
 │  Models → Migrations → RLS → LangGraph checkpoints            │
 │  SAQ worker jobs (Redis-backed)                                │
 │  Rate limiting (Redis token bucket or in-memory)              │
@@ -61,7 +61,7 @@ Modulo is a self-hosted agent governance platform for building governed, repeata
 | **UI primitives** | PrimeVue | Component library (themed via `primevue-theme.ts` token bridge) |
 | **Routing** | Vue Router | Client-side routing |
 | **Styling** | CSS custom properties | Theming (standard/agent) |
-| **Database** | PostgreSQL 16 | Primary data store |
+| **Database** | PostgreSQL 18 | Primary data store |
 | **Cache/queue** | Redis 7 | SAQ broker, rate limiting |
 | **Container** | Docker Compose | Local dev, production |
 | **Orchestration** | Docker Compose + Fly.io | Managed hosting (app.modulo.run) / self-hosted single-server |
@@ -325,12 +325,12 @@ Redis-backed sliding window (ZADD + ZREMRANGEBYSCORE). Falls back to in-memory n
 | Mode | Components | Use case |
 |------|-----------|----------|
 | **Standalone** | Single process + SQLite file | Local dev, quick evaluation |
-| **Docker Compose** | Backend + Frontend + PostgreSQL 16 + (optional) Redis 7 + (optional) OTel stack | Single-server production |
+| **Docker Compose** | Backend + Frontend + PostgreSQL 18 + (optional) Redis 7 + (optional) OTel stack | Single-server production |
 
 ### Docker Compose
 
 Four compose files:
-- `docker-compose.yml` – dev mode (builds from source, Postgres 16, Redis 7)
+- `docker-compose.yml` – dev mode (builds from source, Postgres 18, Redis 7)
 - `docker-compose.local.yml` – with observability profile (otel-collector, Prometheus, Grafana)
 - `docker-compose.test.yml` – CI test environment
 - `docker-compose.mariadb.yml` – MariaDB alternative (experimental multi-backend – **deprecated 2026-07-11**, not actively tested or maintained)

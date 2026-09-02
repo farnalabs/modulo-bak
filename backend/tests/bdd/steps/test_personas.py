@@ -1829,7 +1829,7 @@ def start_compose_stack(ctx):
     from modulo.api.main import app
 
     # Start Postgres
-    pg = PostgresContainer("postgres:16-alpine")
+    pg = PostgresContainer("postgres:18-alpine")
     pg.start()
     ctx["_pg_container"] = pg
     db_url = pg.get_connection_url().replace("postgresql://", "postgresql+asyncpg://", 1).replace("psycopg2", "asyncpg")

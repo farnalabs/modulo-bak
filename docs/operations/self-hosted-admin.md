@@ -191,7 +191,7 @@ transaction:
 ```bash
 # Restore from base backup, then replay WAL to target time
 pg_restore -d modulo /backups/base.dump
-cp /var/lib/postgresql/wal_archive/* /var/lib/postgresql/16/main/pg_wal/
+cp /var/lib/postgresql/wal_archive/* /var/lib/postgresql/18/main/pg_wal/
 pg_ctl promote
 ```
 

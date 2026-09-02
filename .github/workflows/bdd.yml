@@ -56,7 +56,7 @@ jobs:
             -e POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD || 'modulo' }} \
             -e POSTGRES_DB=modulo \
             -p 5432:5432 \
-            postgres:16-alpine
+            postgres:18-alpine
           echo "Waiting for Postgres..."
           for i in $(seq 1 60); do
             if docker exec modulo-bdd-pg pg_isready -U modulo >/dev/null 2>&1; then

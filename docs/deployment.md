@@ -3,8 +3,33 @@
 ## Prerequisites
 
 - Python 3.12+
-- PostgreSQL 16+
+- PostgreSQL 18+
 - Redis 7+ (for SAQ task queue, multi-replica coordination)
+
+## Upgrading PostgreSQL from 16 to 18
+
+Modulo now requires PostgreSQL 18. PostgreSQL 16 data directories are **not**
+binary-compatible with the PostgreSQL 18 binaries, so an in-place volume
+upgrade will not work — the server refuses to start against a PG16 cluster.
+
+For Docker Compose deployments the data directory changed as well: the
+`postgres:18` image sets `PGDATA=/var/lib/postgresql/18/docker`, so the compose
+files now pin `PGDATA=/var/lib/postgresql/data` and mount the named volume
+there. If you previously persisted data at `/var/lib/postgresql/data` under
+PG16, that directory is a PG16 cluster and cannot be opened by PG18 — migrate
+the data instead of reusing the old volume.
+
+Choose one migration path:
+
+- **Dump and restore (recommended, simplest):** start a temporary PG16
+  container against the old data, `pg_dumpall` the cluster, then restore it
+  into a fresh PG18 container / volume (`pg_restore` or `psql < dump.sql`).
+- **pg_upgrade:** run `pg_upgrade` with `--old-bindir` pointing at PG16 and
+  `--new-bindir` pointing at PG18, ideally via the `pg_upgrade` helper image
+  provided by the PostgreSQL image family.
+
+After the data is on PG18, drop the old PG16 volume and let compose recreate
+`postgres_data` against the new server.
 
 ## Installation
 
@@ -360,7 +385,7 @@ curl https://modulo.run/install.sh | bash
 
 | Component | How it runs |
 |---|---|
-| Database | PostgreSQL 16 (separate container) |
+| Database | PostgreSQL 18 (separate container) |
 | Task scheduling | In-process asyncio loops (default) or SAQ system worker cron (with Redis) |
 | Task queue | In-process (default) or SAQ workers (with Redis) |
 | Rate limiting | In-memory no-op (default) or Redis sliding window (with Redis) |

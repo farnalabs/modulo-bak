@@ -151,7 +151,7 @@ checkpoint_A  ←  checkpoint_B  ←  checkpoint_C  (head = latest)
 ## 3. Safe Query Examples
 
 All queries below are **read-only SELECT** and safe to run on a production
-database. They assume Postgres 16+ with `psql` connected as the application
+database. They assume Postgres 18+ with `psql` connected as the application
 role or a read-only replica role.
 
 ### 3.1 List all checkpoints for a pipeline run
