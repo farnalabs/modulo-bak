@@ -8,15 +8,21 @@ password re-stamping on MODULO_DEMO_PASSWORD rotation (including a corrupt
 stored hash re-stamping instead of crashing the seed), role/system-admin/
 must_change_password drift reset, the drift warning reporting the role captured
 BEFORE the overwrite, demo-org scoping of every seeded entity even with a
-second (non-demo) organisation present, and the seed_demo_runtime wrapper
-running the seed in its own transaction on a caller-provided session factory.
+second (non-demo) organisation present, the seed_demo_runtime wrapper
+running the seed in its own transaction on a caller-provided session factory,
+deterministic recovery when multiple soft-deleted 'demo'-slug orgs coexist
+(Postgres partial-index reality — no MultipleResultsFound, undelete applied to
+the chosen row), and savepoint IntegrityError recovery for every sample-data
+insert (concurrent-style duplicate ⇒ adopt the winner, seed still completes).
 """
 
 import logging
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import modulo.db.seed_demo as seed_demo_module
@@ -343,3 +349,245 @@ async def test_seed_demo_runtime_uses_provided_session_factory(monkeypatch: pyte
             assert await _count(check, Run) == 2
     finally:
         await eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency simulations (qa-iterate iteration 2): soft-deleted duplicate
+# slugs and savepoint IntegrityError recovery.
+# ---------------------------------------------------------------------------
+
+
+class _EmptyResult:
+    """Result stand-in whose lookups all answer 'no row'."""
+
+    def scalar_one_or_none(self) -> None:
+        return None
+
+    def scalars(self) -> "_EmptyResult":
+        return self
+
+    def first(self) -> None:
+        return None
+
+    def all(self) -> list[object]:
+        return []
+
+
+class _HideCheckOnce:
+    """Hide ONE existence-check for ``entity`` from the seed's SELECT.
+
+    Simulates a concurrent boot whose winner row commits AFTER the seed's
+    existence check ran: the check misses it, so the seed proceeds to INSERT
+    and (where a unique constraint exists) hits the real violation.
+    """
+
+    def __init__(self, session: AsyncSession, entity: type) -> None:
+        self._session = session
+        self._entity = entity
+        self._pending = True
+        self._real_execute = session.execute
+
+    def _is_check(self, stmt: object) -> bool:
+        descriptions = getattr(stmt, "column_descriptions", None)
+        if not descriptions:
+            return False
+        return descriptions[0].get("entity") is self._entity
+
+    async def _intercepted(self, stmt: object, *args: object) -> object:
+        if self._pending and self._is_check(stmt):
+            self._pending = False
+            return _EmptyResult()
+        return await self._real_execute(stmt, *args)  # type: ignore[arg-type]
+
+    def install(self) -> None:
+        self._session.execute = self._intercepted  # type: ignore[method-assign]
+
+    def uninstall(self) -> None:
+        self._session.execute = self._real_execute  # type: ignore[method-assign]
+
+
+class _FlakyFlush:
+    """Raise IntegrityError once on a flush that persists an ``entity`` row.
+
+    Simulates the unique-constraint failure itself for entities whose natural
+    key has no DB constraint in the SQLite test schema (e.g. pipelines), so
+    the recovery branch can be exercised uniformly.
+    """
+
+    def __init__(self, session: AsyncSession, entity: type) -> None:
+        self._session = session
+        self._entity = entity
+        self._real_flush = session.flush
+
+    async def _intercepted(self) -> object:
+        if any(isinstance(obj, self._entity) for obj in self._session.new):
+            raise IntegrityError("simulated concurrent duplicate", None, Exception("uq_conflict"))
+        return await self._real_flush()
+
+    def install(self) -> None:
+        self._session.flush = self._intercepted  # type: ignore[method-assign]
+
+    def uninstall(self) -> None:
+        self._session.flush = self._real_flush  # type: ignore[method-assign]
+
+
+async def test_seed_adopts_winner_after_real_slug_conflict(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Org insert hitting the live slug unique index recovers by adoption."""
+    await _run_seed(session, monkeypatch, _demo_settings())
+    hide = _HideCheckOnce(session, Organisation)
+    hide.install()
+    try:
+        summary = await _run_seed(session, monkeypatch, _demo_settings())
+    finally:
+        hide.uninstall()
+
+    assert summary == f"org={DEMO_ORG_SLUG} user={_DEMO_EMAIL}"
+    assert await _count(session, Organisation) == 1
+    org = (await session.execute(select(Organisation))).scalar_one()
+    assert org.slug == DEMO_ORG_SLUG
+    assert org.deleted_at is None
+
+
+async def test_seed_org_recovery_applies_undelete_repair(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The IntegrityError recovery path undeletes a soft-deleted winner too."""
+    await _run_seed(session, monkeypatch, _demo_settings())
+    org = (await session.execute(select(Organisation))).scalar_one()
+    org.deleted_at = datetime.now(UTC)
+    await session.commit()
+
+    hide = _HideCheckOnce(session, Organisation)
+    hide.install()
+    try:
+        summary = await _run_seed(session, monkeypatch, _demo_settings())
+    finally:
+        hide.uninstall()
+
+    assert summary == f"org={DEMO_ORG_SLUG} user={_DEMO_EMAIL}"
+    assert await _count(session, Organisation) == 1
+    recovered = (await session.execute(select(Organisation))).scalar_one()
+    assert recovered.id == org.id
+    assert recovered.deleted_at is None
+
+
+async def test_seed_handles_multiple_soft_deleted_demo_slug_orgs(
+    session: AsyncSession, engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two soft-deleted 'demo' orgs: deterministic pick, no MultipleResultsFound.
+
+    On Postgres the slug uniqueness is a PARTIAL index (deleted_at IS NULL), so
+    several soft-deleted 'demo' rows coexist and a bare scalar_one_or_none
+    would raise MultipleResultsFound every boot. SQLite renders the index as
+    FULL unique (postgresql_where is Postgres-only), so the fixture drops it
+    to emulate the partial-index reality.
+    """
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql("DROP INDEX IF EXISTS uq_organisations_slug")
+    now = datetime.now(UTC)
+    older = Organisation(name="Demo", slug=DEMO_ORG_SLUG, settings_json={})
+    newer = Organisation(name="Demo", slug=DEMO_ORG_SLUG, settings_json={})
+    older.created_at = now - timedelta(hours=2)
+    older.deleted_at = now - timedelta(hours=2)
+    newer.created_at = now - timedelta(hours=1)
+    newer.deleted_at = now - timedelta(hours=1)
+    session.add_all([older, newer])
+    await session.commit()
+
+    summary = await _run_seed(session, monkeypatch, _demo_settings())
+
+    assert summary == f"org={DEMO_ORG_SLUG} user={_DEMO_EMAIL}"
+    demo_orgs = list((await session.execute(select(Organisation).where(Organisation.slug == DEMO_ORG_SLUG))).scalars())
+    assert len(demo_orgs) == 2
+    live = [org for org in demo_orgs if org.deleted_at is None]
+    assert len(live) == 1
+    assert live[0].id == newer.id
+    membership = (await session.execute(select(OrgMembership))).scalar_one()
+    assert membership.organisation_id == newer.id
+
+
+@pytest.mark.parametrize(
+    ("entity", "count_model"),
+    [
+        pytest.param(Schema, Schema, id="schema"),
+        pytest.param(SchemaVersion, SchemaVersion, id="schema-version"),
+        pytest.param(Pipeline, Pipeline, id="pipeline"),
+        pytest.param(PipelineSnapshot, PipelineSnapshot, id="snapshot"),
+        pytest.param(Run, Run, id="run"),
+    ],
+)
+async def test_seed_sample_data_inserts_recover_after_conflict(
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    entity: type,
+    count_model: type,
+) -> None:
+    """Sample-data inserts adopt the concurrent winner and still complete.
+
+    Pre-seeds normally, then re-runs the seed with the entity's existence
+    check hidden once and its insert flushed into a simulated unique
+    violation — the concurrent-boot race. The savepoint must roll back only
+    the losing insert; the seed adopts the winner row and finishes with
+    unchanged entity counts (zero duplicates, zero failures).
+    """
+    await _run_seed(session, monkeypatch, _demo_settings())
+    counts_before = await _count(session, count_model)
+
+    hide = _HideCheckOnce(session, entity)
+    flaky = _FlakyFlush(session, entity)
+    hide.install()
+    flaky.install()
+    try:
+        summary = await _run_seed(session, monkeypatch, _demo_settings())
+    finally:
+        flaky.uninstall()
+        hide.uninstall()
+
+    assert summary == f"org={DEMO_ORG_SLUG} user={_DEMO_EMAIL}"
+    assert await _count(session, count_model) == counts_before
+
+
+async def test_seed_stray_membership_warning_ignores_soft_deleted_orgs(
+    session: AsyncSession, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Soft-deleted other-org memberships must not inflate other_org_count."""
+    other_account = Account(
+        email="other@example.com",
+        display_name="Other",
+        password_hash=hash_password("other-passphrase-123"),
+        auth_provider="local",
+        active=True,
+    )
+    doomed_org = Organisation(name="Doomed", slug="doomed", settings_json={})
+    session.add_all([other_account, doomed_org])
+    await session.flush()
+    session.add(
+        OrgMembership(
+            account_id=other_account.id,
+            organisation_id=doomed_org.id,
+            role="viewer",
+        )
+    )
+    await session.commit()
+
+    await _run_seed(session, monkeypatch, _demo_settings())
+    # The demo account picks up a stray membership, then that org is
+    # soft-deleted — a re-seed must not warn about the dead org.
+    stray_org_id = doomed_org.id
+    demo_account = (await session.execute(select(Account).where(Account.email == _DEMO_EMAIL))).scalar_one()
+    session.add(OrgMembership(account_id=demo_account.id, organisation_id=stray_org_id, role="viewer"))
+    await session.commit()
+    doomed_org.deleted_at = datetime.now(UTC)
+    await session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="modulo.db.seed_demo"):
+        await _run_seed(session, monkeypatch, _demo_settings())
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "demo_seed.account_has_memberships_outside_demo_org"
+    ]
+    assert not warnings

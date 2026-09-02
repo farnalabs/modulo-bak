@@ -11,8 +11,10 @@ the same plain 404 (the endpoint takes no client credentials, so login-identical
 viewer membership in the demo org (or with is_system_admin) is treated as
 feature-absent (plain 404 — a demo request can never mint a token for another
 org or an elevated role), the demo path NEVER touches the shared
-AuthRateLimiter (anonymous demo visitors cannot lock real users out of /login;
-the abuse cap is the per-IP RateLimitMiddleware rule), the auth.demo_login
+AuthRateLimiter at ANY layer — handler AND middleware (anonymous demo visitors
+cannot lock real users out of /login; the abuse cap is the per-IP
+RateLimitMiddleware rule with its process-local token-bucket floor), the
+auth.demo_login
 audit event is emitted, the per-IP rate-limit rule (10/hour) is registered, and
 the REAL _resolve_demo_org_membership (unmocked, against SQLite) only resolves
 a live demo-org viewer membership.
@@ -31,7 +33,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from modulo.api.dependencies import _get_engine, get_db_session
-from modulo.api.middleware.rate_limiter import RateLimitMiddleware
+from modulo.api.middleware.rate_limiter import AuthRateLimitMiddleware, RateLimitMiddleware
 from modulo.api.routes.auth import _resolve_demo_org_membership
 from modulo.api.routes.auth import router as auth_router
 from modulo.auth.passwords import hash_password
@@ -245,6 +247,8 @@ def test_demo_login_never_touches_shared_auth_rate_limiter(app: FastAPI, client:
     /login: no record_failure, no check_login, no record_success — the factory
     itself is never consulted, so no limiter state can move in either
     direction. The demo abuse cap is the per-IP RateLimitMiddleware rule.
+    Handler-level guarantee; the middleware layer is locked separately by
+    test_auth_middleware_demo_exempt_but_login_not.
     """
     _override_settings(app, demo_password="rotated-env-password")
     stale_account = _demo_account(password_hash=hash_password("old-stored-password"))
@@ -260,6 +264,48 @@ def test_demo_login_never_touches_shared_auth_rate_limiter(app: FastAPI, client:
     limiter.record_failure.assert_not_called()
     limiter.record_success.assert_not_called()
     limiter.check_login.assert_not_called()
+
+
+def test_auth_middleware_demo_exempt_but_login_not(mock_session: AsyncMock) -> None:
+    """Middleware-level: POST /api/v1/auth/demo never invokes the auth limiter.
+
+    Mounts AuthRateLimitMiddleware over the real auth router with a spied
+    limiter: a POST to /api/v1/auth/demo must NOT call the shared limiter's
+    check_login (the demo path is middleware-exempt — it can neither inherit
+    /login lockouts nor re-arm lockout keys via setex), while a POST to
+    /api/v1/auth/login still goes through it. Together with the handler-level
+    test above this locks the invariant at EVERY layer.
+    """
+    limiter = AsyncMock(spec=AuthRateLimiter)
+    limiter.check_login = AsyncMock(return_value=(True, 0))
+
+    auth_app = FastAPI()
+    auth_app.include_router(auth_router)
+    auth_app.add_middleware(
+        AuthRateLimitMiddleware,
+        settings=_settings(),
+        rate_limiter=limiter,
+    )
+    _override_settings(auth_app)
+
+    async def override_session() -> AsyncGenerator[AsyncMock, None]:
+        yield mock_session
+
+    auth_app.dependency_overrides[get_db_session] = override_session
+    auth_app.dependency_overrides[_get_engine] = lambda: MagicMock()
+
+    with (
+        TestClient(auth_app) as mw_client,
+        patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=None)),
+    ):
+        demo_resp = mw_client.post("/api/v1/auth/demo")
+        assert demo_resp.status_code == 404
+        # Assert BEFORE the /login request: check_login must still be untouched.
+        limiter.check_login.assert_not_awaited()
+
+        login_resp = mw_client.post("/api/v1/auth/login", json={"email": "x@example.com", "password": "pw"})
+        assert login_resp.status_code == 401
+        limiter.check_login.assert_awaited_once()
 
 
 def test_demo_login_account_without_demo_org_membership_answers_plain_404(app: FastAPI, client: TestClient) -> None:

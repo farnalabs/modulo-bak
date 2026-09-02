@@ -85,15 +85,39 @@ def _demo_graph_json(nodes: list[dict[str, object]]) -> dict[str, object]:
     return {"nodes": nodes, "edges": [{"id": "demo-edge-1", "source": "demo-intake", "target": "demo-report"}]}
 
 
+async def _select_demo_org(session: AsyncSession) -> Organisation | None:
+    """Deterministic single-row lookup for the demo org slug.
+
+    ``organisations.slug`` uniqueness is a PARTIAL index (``deleted_at IS
+    NULL``), so multiple soft-deleted 'demo' rows can coexist and a bare
+    ``scalar_one_or_none`` would raise ``MultipleResultsFound`` on every boot.
+    Mirrors the ``crud.organisation.get_organisation_by_slug`` defence:
+    order live rows first, then soft-deleted rows most-recent first, and take
+    one. (Organisation carries no ``updated_at``, so ``created_at`` is the
+    recency tiebreaker.)
+    """
+    result = await session.execute(
+        select(Organisation)
+        .where(Organisation.slug == DEMO_ORG_SLUG)
+        .order_by(Organisation.deleted_at.is_not(None), Organisation.created_at.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+def _undelete_demo_org(org: Organisation) -> Organisation:
+    """Revive a soft-deleted demo org (the seed owns the slug's live row)."""
+    if org.deleted_at is not None:
+        org.deleted_at = None
+        _log.info("demo_seed.org_undeleted", extra={"slug": DEMO_ORG_SLUG})
+    return org
+
+
 async def _get_or_create_demo_org(session: AsyncSession) -> Organisation:
     """Idempotently create the demo organisation (slug-unique, race-safe)."""
-    result = await session.execute(select(Organisation).where(Organisation.slug == DEMO_ORG_SLUG))
-    org = result.scalar_one_or_none()
+    org = await _select_demo_org(session)
     if org is not None:
-        if org.deleted_at is not None:
-            org.deleted_at = None
-            _log.info("demo_seed.org_undeleted", extra={"slug": DEMO_ORG_SLUG})
-        return org
+        return _undelete_demo_org(org)
     org = Organisation(name=DEMO_ORG_NAME, slug=DEMO_ORG_SLUG, settings_json={})
     try:
         # Savepoint so a concurrent boot that already committed the slug only
@@ -102,14 +126,15 @@ async def _get_or_create_demo_org(session: AsyncSession) -> Organisation:
             session.add(org)
             await session.flush()
     except IntegrityError:
-        result = await session.execute(select(Organisation).where(Organisation.slug == DEMO_ORG_SLUG))
-        org = result.scalar_one_or_none()
+        org = await _select_demo_org(session)
         if org is None:
             raise
         _log.info("demo_seed.org_recovered_after_conflict", extra={"slug": DEMO_ORG_SLUG})
     else:
         _log.info("demo_seed.org_created", extra={"slug": DEMO_ORG_SLUG})
-    return org
+    # The recovered row may be soft-deleted too — the undelete repair applies
+    # to every adoption path, not just the primary lookup.
+    return _undelete_demo_org(org)
 
 
 async def _seed_demo_account(session: AsyncSession, email: str, password: str) -> Account:
@@ -240,10 +265,10 @@ async def _seed_demo_membership(session: AsyncSession, account: Account, org: Or
 async def _seed_demo_schemas(session: AsyncSession, org: Organisation, account: Account) -> None:
     """Two published demo schemas (idempotent by (organisation, name)).
 
-    Multi-boot race note: unlike the org/account/membership inserts, these
-    sample entities use existence-check-then-insert — two boots racing on a
-    cold DB can raise a unique violation that fails ONE boot's seed loudly,
-    but it self-heals on the next boot's idempotent re-run.
+    Race-safe across multi-instance boots like the org/account/membership
+    inserts: each insert runs in a savepoint; a concurrent boot that already
+    committed the natural key only rolls back that savepoint, and the seed
+    adopts the winner row and continues.
     """
     specs = [
         {
@@ -277,9 +302,22 @@ async def _seed_demo_schemas(session: AsyncSession, org: Organisation, account: 
                 account_id=account.id,
                 description=spec["description"],
             )
-            session.add(schema)
-            await session.flush()
-            _log.info("demo_seed.schema_created", extra={"schema_name": spec["name"]})
+            try:
+                # Savepoint: a concurrent boot that committed the same
+                # (organisation, name) only rolls back this insert.
+                async with session.begin_nested():
+                    session.add(schema)
+                    await session.flush()
+            except IntegrityError:
+                result = await session.execute(
+                    select(Schema).where(Schema.organisation_id == org.id, Schema.name == spec["name"])
+                )
+                schema = result.scalar_one_or_none()
+                if schema is None:
+                    raise
+                _log.info("demo_seed.schema_recovered_after_conflict", extra={"schema_name": spec["name"]})
+            else:
+                _log.info("demo_seed.schema_created", extra={"schema_name": spec["name"]})
         version_result = await session.execute(
             select(SchemaVersion).where(
                 SchemaVersion.schema_id == schema.id,
@@ -289,26 +327,42 @@ async def _seed_demo_schemas(session: AsyncSession, org: Organisation, account: 
         )
         if version_result.scalar_one_or_none() is not None:
             continue
-        session.add(
-            SchemaVersion(
-                organisation_id=org.id,
-                schema_id=schema.id,
-                version="v1",
-                version_number=1,
-                definition_json=spec["definition"],
-                published=True,
-                account_id=account.id,
+        try:
+            # Savepoint: same multi-boot protection for the version row.
+            async with session.begin_nested():
+                session.add(
+                    SchemaVersion(
+                        organisation_id=org.id,
+                        schema_id=schema.id,
+                        version="v1",
+                        version_number=1,
+                        definition_json=spec["definition"],
+                        published=True,
+                        account_id=account.id,
+                    )
+                )
+                await session.flush()
+        except IntegrityError:
+            version_result = await session.execute(
+                select(SchemaVersion).where(
+                    SchemaVersion.schema_id == schema.id,
+                    SchemaVersion.version == "v1",
+                    SchemaVersion.organisation_id == org.id,
+                )
             )
-        )
-        _log.info("demo_seed.schema_version_created", extra={"schema_name": spec["name"], "version": "v1"})
+            if version_result.scalar_one_or_none() is None:
+                raise
+            _log.info("demo_seed.schema_version_recovered_after_conflict", extra={"schema_name": spec["name"]})
+        else:
+            _log.info("demo_seed.schema_version_created", extra={"schema_name": spec["name"], "version": "v1"})
 
 
 async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation, account: Account) -> None:
     """One demo pipeline (+ snapshot v1) and two terminal demo runs.
 
-    Multi-boot race note: existence-check-then-insert (see
-    _seed_demo_schemas) — a cold-DB race fails one boot loudly and self-heals
-    on the next boot's re-run.
+    Race-safe across multi-instance boots like the org/account/membership
+    inserts: each insert runs in a savepoint with IntegrityError recovery on
+    its natural key (see _seed_demo_schemas).
     """
     pipeline_result = await session.execute(
         select(Pipeline).where(Pipeline.organisation_id == org.id, Pipeline.name == "Demo Governance Pipeline")
@@ -325,9 +379,22 @@ async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation,
             graph_nodes_json=nodes,
             default_autonomy_level="manual_approval",
         )
-        session.add(pipeline)
-        await session.flush()
-        _log.info("demo_seed.pipeline_created", extra={"pipeline_id": str(pipeline.id)})
+        try:
+            # Savepoint: a concurrent boot that committed the same
+            # (organisation, name) only rolls back this insert.
+            async with session.begin_nested():
+                session.add(pipeline)
+                await session.flush()
+        except IntegrityError:
+            pipeline_result = await session.execute(
+                select(Pipeline).where(Pipeline.organisation_id == org.id, Pipeline.name == "Demo Governance Pipeline")
+            )
+            pipeline = pipeline_result.scalar_one_or_none()
+            if pipeline is None:
+                raise
+            _log.info("demo_seed.pipeline_recovered_after_conflict", extra={"org_id": str(org.id)})
+        else:
+            _log.info("demo_seed.pipeline_created", extra={"pipeline_id": str(pipeline.id)})
 
     snapshot_result = await session.execute(
         select(PipelineSnapshot).where(
@@ -348,9 +415,24 @@ async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation,
             prompt_pins_json=[],
             model_backend_pins_json=[],
         )
-        session.add(snapshot)
-        await session.flush()
-        _log.info("demo_seed.snapshot_created", extra={"snapshot_id": str(snapshot.id)})
+        try:
+            # Savepoint: same multi-boot protection for the snapshot row.
+            async with session.begin_nested():
+                session.add(snapshot)
+                await session.flush()
+        except IntegrityError:
+            snapshot_result = await session.execute(
+                select(PipelineSnapshot).where(
+                    PipelineSnapshot.pipeline_id == pipeline.id,
+                    PipelineSnapshot.snapshot_version == 1,
+                )
+            )
+            snapshot = snapshot_result.scalar_one_or_none()
+            if snapshot is None:
+                raise
+            _log.info("demo_seed.snapshot_recovered_after_conflict", extra={"pipeline_id": str(pipeline.id)})
+        else:
+            _log.info("demo_seed.snapshot_created", extra={"snapshot_id": str(snapshot.id)})
 
     # Deterministic, idempotent runs: fixed run_numbers with per-number
     # existence checks. The demo org is seed-owned (the viewer demo user cannot
@@ -385,8 +467,21 @@ async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation,
             error_code="DEMO_SAMPLE" if status == "failed" else None,
             outputs_json={"demo": "Sample demo output — synthetic, no agent execution."},
         )
-        session.add(run)
-        _log.info("demo_seed.run_created", extra={"run_number": run_number, "status": status})
+        try:
+            # Savepoint: same multi-boot protection for the run row
+            # ((organisation, run_number) unique key).
+            async with session.begin_nested():
+                session.add(run)
+                await session.flush()
+        except IntegrityError:
+            existing_result = await session.execute(
+                select(Run.id).where(Run.organisation_id == org.id, Run.run_number == run_number)
+            )
+            if existing_result.scalar_one_or_none() is None:
+                raise
+            _log.info("demo_seed.run_recovered_after_conflict", extra={"run_number": run_number})
+        else:
+            _log.info("demo_seed.run_created", extra={"run_number": run_number, "status": status})
 
 
 async def seed_demo(session: AsyncSession) -> str | None:
@@ -414,12 +509,17 @@ async def seed_demo(session: AsyncSession) -> str | None:
     # other orgs, the demo endpoint still only ever mints the demo-org viewer
     # session (see auth._resolve_demo_org_membership) — but flag the stray
     # memberships loudly so the operator can point the env at a fresh account.
+    # The join filters soft-deleted orgs (deleted_at IS NULL) so resurrected
+    # or expired memberships cannot inflate other_org_count.
     stray_org_ids = (
         (
             await session.execute(
-                select(OrgMembership.organisation_id).where(
+                select(OrgMembership.organisation_id)
+                .join(Organisation, Organisation.id == OrgMembership.organisation_id)
+                .where(
                     OrgMembership.account_id == account.id,
                     OrgMembership.organisation_id != org.id,
+                    Organisation.deleted_at.is_(None),
                 )
             )
         )
@@ -471,7 +571,10 @@ def main() -> None:
         print(f"[demo-seed] ok ({summary})", flush=True)  # noqa: T201
     except Exception as exc:
         _log.exception("demo_seed.failed")
-        print(f"[demo-seed] FAILED ({exc!r})", flush=True)  # noqa: T201
+        # Type + message only: SQLAlchemy reprs embed bind params, and this
+        # seed's binds include the demo account's password hash — never print
+        # it to stdout.
+        print(f"[demo-seed] FAILED ({type(exc).__name__}: {exc})", flush=True)  # noqa: T201
         sys.exit(1)
 
 

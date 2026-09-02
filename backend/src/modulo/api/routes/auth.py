@@ -443,6 +443,15 @@ async def login(
 # ---------------------------------------------------------------------------
 
 
+def _demo_not_found() -> HTTPException:
+    """The byte-identical plain 404 for EVERY demo failure (stealth contract).
+
+    Single-sourced so the "never reveal that a demo feature exists" shape —
+    plain 404, detail ``"Not Found"`` — cannot drift between failure paths.
+    """
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
 @router.post("/demo")
 @handle_db_errors("auth.demo_login")
 async def demo_login(
@@ -469,65 +478,64 @@ async def demo_login(
     elevated role. Credential mismatches answer the SAME plain 404 (not
     login's 401): the endpoint takes no client credentials, so a login-identical
     401 would serve no purpose and would leak that the feature exists. Rate
-    limiting: 10/hour per IP via RateLimitMiddleware.RULES only — the demo path
-    NEVER touches the shared AuthRateLimiter, so anonymous demo visitors cannot
-    lock real users out of /login.
+    limiting: the demo path NEVER touches the shared AuthRateLimiter at ANY
+    layer — handler AND middleware (AuthRateLimitMiddleware exempts
+    /api/v1/auth/demo) — so anonymous demo visitors cannot lock real users out
+    of /login; the demo abuse cap is the per-IP RateLimitMiddleware rule
+    (10/hour, with the process-local token-bucket floor when Redis is absent).
     """
     config = demo_login_config(settings)
     if config is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+        raise _demo_not_found()
     email, password = config
 
-    try:
-        async with session.begin():
-            # Stealth: the endpoint takes NO client credentials, so a credential
-            # mismatch (operator misconfiguration / tampering) answers the same
-            # plain 404 as every other failure — not /login's 401, which would
-            # reveal that a demo feature exists. The shared AuthRateLimiter is
-            # deliberately NOT consulted on this path (no record_failure, no
-            # check_login, no record_success): anonymous demo visitors must
-            # never be able to lock real users out of /login; the demo abuse
-            # cap is the per-IP RateLimitMiddleware rule (10/hour).
-            account = await get_account_by_email(session, email)
-            if account is None or not authenticate_db_user(password, account):
-                _log.warning(
-                    "auth.demo_login_credential_mismatch",
-                    extra={"account_id": str(account.id) if account is not None else None, "configured_user": email},
-                )
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-            # Defense-in-depth: never mint a token from generic login org
-            # resolution — only the demo org's viewer membership qualifies,
-            # and is_system_admin is re-checked here rather than trusted to
-            # the boot seed. Anything else is treated as feature-absent.
-            demo_context = None
-            if not account.is_system_admin:
-                demo_context = await _resolve_demo_org_membership(session, account.id)
-            if demo_context is None:
-                _log.warning(
-                    "auth.demo_login_membership_not_found",
-                    extra={"account_id": str(account.id)},
-                )
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-            org_id, org_role = demo_context
-            await update_last_login(session, account.id)
-    except asyncio.CancelledError:
-        raise
-    except HTTPException as exc:
-        raise exc
+    async with session.begin():
+        # Stealth: the endpoint takes NO client credentials, so a credential
+        # mismatch (operator misconfiguration / tampering) answers the same
+        # plain 404 as every other failure — not /login's 401, which would
+        # reveal that a demo feature exists. The shared AuthRateLimiter is
+        # deliberately NOT consulted on this path at ANY layer — the handler
+        # (no record_failure, no check_login, no record_success) AND the
+        # middleware (AuthRateLimitMiddleware._should_rate_limit exempts the
+        # demo path): anonymous demo visitors must never be able to lock real
+        # users out of /login; the demo abuse cap is the per-IP
+        # RateLimitMiddleware rule (10/hour).
+        account = await get_account_by_email(session, email)
+        if account is None or not authenticate_db_user(password, account):
+            _log.warning(
+                "auth.demo_login_credential_mismatch",
+                extra={"account_id": str(account.id) if account is not None else None, "configured_user": email},
+            )
+            raise _demo_not_found()
+        # Defense-in-depth: never mint a token from generic login org
+        # resolution — only the demo org's viewer membership qualifies,
+        # and is_system_admin is re-checked here rather than trusted to
+        # the boot seed. Anything else is treated as feature-absent.
+        demo_context = None
+        if not account.is_system_admin:
+            demo_context = await _resolve_demo_org_membership(session, account.id)
+        if demo_context is None:
+            _log.warning(
+                "auth.demo_login_membership_not_found",
+                extra={"account_id": str(account.id)},
+            )
+            raise _demo_not_found()
+        org_id, org_role = demo_context
+        await update_last_login(session, account.id)
 
     # Structured audit log for the demo-login event (login's logging pattern);
     # the token itself is minted only after the transaction committed.
     _log.info(
         "auth.demo_login",
-        extra={"account_id": str(account.id), "org_id": str(org_id) if org_id else None},
+        extra={"account_id": str(account.id), "org_id": str(org_id)},
     )
 
     access_token = create_access_token(
         account.email,
         settings.secret_key,
-        organisation_id=str(org_id) if org_id else "",
+        organisation_id=str(org_id),
         account_id=str(account.id),
-        org_role=org_role or "",
+        org_role=org_role,
         is_system_admin=account.is_system_admin,
         ttl_minutes=settings.modulo_demo_token_minutes,
     )
