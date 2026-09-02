@@ -34,6 +34,7 @@ from modulo.auth.jwt import (
 )
 from modulo.auth.passwords import authenticate_db_user
 from modulo.auth.ws_token import create_ws_token
+from modulo.core.demo import DEMO_ORG_ROLE, DEMO_ORG_SLUG, demo_login_config
 from modulo.core.rate_limiter import AuthRateLimiter
 from modulo.db.crud.account import get_account_by_email, get_account_by_id, update_last_login
 from modulo.db.crud.break_glass_deny import is_break_glass_denied
@@ -48,7 +49,6 @@ from modulo.db.models.account import Account
 from modulo.db.models.org_membership import OrgMembership
 from modulo.db.models.organisation import Organisation
 from modulo.db.models.token_family import TokenFamily
-from modulo.db.seed_demo import DEMO_ORG_ROLE, DEMO_ORG_SLUG, demo_login_config
 from modulo.settings import Settings, get_settings
 
 _MSG_INCORRECT_EMAIL_PASSWORD = "Incorrect email or password"  # nosec B105 — error message, not a real credential
@@ -284,6 +284,11 @@ async def _resolve_demo_org_membership(session: AsyncSession, account_id: uuid.U
     the demo organisation. Defense-in-depth against operator
     misconfiguration: if MODULO_DEMO_USER names a pre-existing privileged
     account, its other-org memberships are never eligible here.
+
+    Soft-deleted demo orgs are excluded (``deleted_at IS NULL``): a soft-delete
+    answers ``None`` — the endpoint's plain feature-absent 404 — until the seed
+    undeletes the org on its next boot, matching the seed's soft-delete
+    semantics.
     """
     result = await session.execute(
         select(OrgMembership.organisation_id, OrgMembership.role)
@@ -292,6 +297,7 @@ async def _resolve_demo_org_membership(session: AsyncSession, account_id: uuid.U
             OrgMembership.account_id == account_id,
             Organisation.slug == DEMO_ORG_SLUG,
             OrgMembership.role == DEMO_ORG_ROLE,
+            Organisation.deleted_at.is_(None),
         )
     )
     row = result.first()
@@ -451,33 +457,44 @@ async def demo_login(
     MODULO_DEMO_ENABLED is falsy or either credential is unset the endpoint
     answers a plain 404 so it never reveals that a demo feature exists.
 
-    The minted access token carries the SHORT demo TTL
-    (modulo_demo_token_minutes, ~2h) and NO refresh token is issued — the demo
-    session dies with the access token. The session is minted ONLY for a
-    viewer membership in the demo org: if the env user authenticates but has
-    no viewer membership in the demo org (operator misconfiguration — e.g.
-    MODULO_DEMO_USER naming a privileged account) the endpoint answers the
-    same plain 404, so a demo request can never mint a token for another org
-    or elevated role. Rate limiting: 10/hour per IP via
-    RateLimitMiddleware.RULES; auth lockout failures additionally feed the
-    shared AuthRateLimiter like a normal login.
+    The minted access token carries the SHORT demo TTL (modulo_demo_token_minutes,
+    default 2h, hard-capped at 4h) and NO refresh token is issued — the demo
+    session dies with the access token. Note the session persists until its TTL
+    expiry after the kill switch is flipped (no refresh token can extend it; the
+    4h cap bounds that residual window). The session is minted ONLY for a viewer
+    membership in the demo org: if the env user authenticates but has no viewer
+    membership in the demo org (operator misconfiguration — e.g.
+    MODULO_DEMO_USER naming a privileged account) the endpoint answers the same
+    plain 404, so a demo request can never mint a token for another org or
+    elevated role. Credential mismatches answer the SAME plain 404 (not
+    login's 401): the endpoint takes no client credentials, so a login-identical
+    401 would serve no purpose and would leak that the feature exists. Rate
+    limiting: 10/hour per IP via RateLimitMiddleware.RULES only — the demo path
+    NEVER touches the shared AuthRateLimiter, so anonymous demo visitors cannot
+    lock real users out of /login.
     """
     config = demo_login_config(settings)
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
     email, password = config
 
-    ip = _client_ip(request)
-    limiter = get_auth_rate_limiter(settings)
-
     try:
         async with session.begin():
-            # Env-vs-DB mismatch (operator misconfiguration / tampering) raises
-            # the standard 401 through _authenticate_credentials — identical
-            # denial semantics and limiter-failure recording as /login.
-            account = await _authenticate_credentials(session, email, password, limiter=limiter, ip=ip)
-            if limiter is not None:
-                await limiter.record_success(ip)
+            # Stealth: the endpoint takes NO client credentials, so a credential
+            # mismatch (operator misconfiguration / tampering) answers the same
+            # plain 404 as every other failure — not /login's 401, which would
+            # reveal that a demo feature exists. The shared AuthRateLimiter is
+            # deliberately NOT consulted on this path (no record_failure, no
+            # check_login, no record_success): anonymous demo visitors must
+            # never be able to lock real users out of /login; the demo abuse
+            # cap is the per-IP RateLimitMiddleware rule (10/hour).
+            account = await get_account_by_email(session, email)
+            if account is None or not authenticate_db_user(password, account):
+                _log.warning(
+                    "auth.demo_login_credential_mismatch",
+                    extra={"account_id": str(account.id) if account is not None else None, "configured_user": email},
+                )
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
             # Defense-in-depth: never mint a token from generic login org
             # resolution — only the demo org's viewer membership qualifies,
             # and is_system_admin is re-checked here rather than trusted to
@@ -486,6 +503,10 @@ async def demo_login(
             if not account.is_system_admin:
                 demo_context = await _resolve_demo_org_membership(session, account.id)
             if demo_context is None:
+                _log.warning(
+                    "auth.demo_login_membership_not_found",
+                    extra={"account_id": str(account.id)},
+                )
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
             org_id, org_role = demo_context
             await update_last_login(session, account.id)

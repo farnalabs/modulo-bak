@@ -2,7 +2,8 @@
 
 GATED: runs only when ``MODULO_DEMO_ENABLED`` is truthy AND both
 ``MODULO_DEMO_USER`` (email) and ``MODULO_DEMO_PASSWORD`` are non-empty
-(see ``modulo.settings``). Default off — the seed is a no-op otherwise, so the
+(see ``modulo.core.demo`` — the neutral gate both this seed and the auth
+route share). Default off — the seed is a no-op otherwise, so the
 default release path behaviour is unchanged.
 
 Creates (idempotently, NO Alembic migrations):
@@ -42,8 +43,9 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from modulo.core.demo import DEMO_ORG_ROLE, DEMO_ORG_SLUG, demo_login_config
 from modulo.db.models.account import Account
 from modulo.db.models.org_membership import OrgMembership
 from modulo.db.models.organisation import Organisation
@@ -52,30 +54,11 @@ from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import Run
 from modulo.db.models.schema import Schema, SchemaVersion
 from modulo.db.rls import set_rls_execution_context, set_rls_org
-from modulo.settings import Settings, get_settings
+from modulo.settings import get_settings
 
 _log = logging.getLogger(__name__)
 
-DEMO_ORG_SLUG = "demo"
 DEMO_ORG_NAME = "Demo"
-# Read-only: viewer is the bottom of the org-role hierarchy (ADR 017) and every
-# mutating route requires runner/operator/admin through require_permission.
-DEMO_ORG_ROLE = "viewer"
-
-
-def demo_login_config(settings: Settings) -> tuple[str, str] | None:
-    """Return ``(email, password)`` when the demo experience is fully configured.
-
-    ``None`` when the kill switch is off or either credential env var is empty —
-    both the demo endpoint and this seed treat that identically (feature absent).
-    """
-    if not settings.modulo_demo_enabled:
-        return None
-    email = settings.modulo_demo_user.strip()
-    password = settings.modulo_demo_password
-    if not email or not password:
-        return None
-    return (email, password)
 
 
 def _demo_pipeline_graph() -> list[dict[str, object]]:
@@ -130,7 +113,12 @@ async def _get_or_create_demo_org(session: AsyncSession) -> Organisation:
 
 
 async def _seed_demo_account(session: AsyncSession, email: str, password: str) -> Account:
-    """Idempotently create/update the demo user (password re-stamped from env)."""
+    """Idempotently create/update the demo user (password re-stamped from env).
+
+    The insert is race-safe across multi-instance boots: a concurrent boot that
+    already committed the email rolls back only this savepoint, then the seed
+    adopts the winner row and runs the same drift-repair path on it.
+    """
     from modulo.auth.passwords import hash_password, verify_password
 
     result = await session.execute(select(Account).where(Account.email == email))
@@ -143,18 +131,40 @@ async def _seed_demo_account(session: AsyncSession, email: str, password: str) -
             auth_provider="local",
             active=True,
             is_system_admin=False,
+            must_change_password=False,
         )
-        session.add(account)
-        await session.flush()
-        _log.info("demo_seed.account_created", extra={"email": email})
-        return account
+        try:
+            # Savepoint so a concurrent boot that already committed the email
+            # only rolls back this insert, not the surrounding seed transaction.
+            async with session.begin_nested():
+                session.add(account)
+                await session.flush()
+        except IntegrityError:
+            result = await session.execute(select(Account).where(Account.email == email))
+            account = result.scalar_one_or_none()
+            if account is None:
+                raise
+            _log.info("demo_seed.account_recovered_after_conflict", extra={"email": email})
+        else:
+            _log.info("demo_seed.account_created", extra={"email": email})
+            return account
 
     changed = False
     # Re-stamp the hash every run when the stored hash no longer verifies
     # against the env password, so rotating MODULO_DEMO_PASSWORD takes effect
     # on the next boot without manual DB surgery. bcrypt hashes are salted, so
     # the comparison must go through verify_password (never hash-to-hash).
-    if not account.password_hash or not verify_password(password, account.password_hash):
+    # Corrupt-hash safety: a malformed stored hash must not crash the boot
+    # seed — verify_password swallows bcrypt's ValueError, and the guard below
+    # catches anything unexpected (e.g. a non-string hash read shape) and
+    # re-stamps from env instead, matching the rotation intent.
+    try:
+        stored_hash = account.password_hash or ""
+        stored_hash_verifies = bool(stored_hash) and verify_password(password, stored_hash)
+    except Exception:
+        _log.warning("demo_seed.account_hash_corrupt", extra={"email": email})
+        stored_hash_verifies = False
+    if not stored_hash_verifies:
         account.password_hash = hash_password(password)
         changed = True
     if account.active is not True:
@@ -164,13 +174,24 @@ async def _seed_demo_account(session: AsyncSession, email: str, password: str) -
     if account.is_system_admin is True:
         account.is_system_admin = False
         changed = True
+    # A pre-existing account with must_change_password set would trap the demo
+    # viewer in ForceChangePasswordView, whose mutation is viewer-denied — the
+    # demo account must always be immediately usable.
+    if account.must_change_password is not False:
+        account.must_change_password = False
+        changed = True
     if changed:
         _log.info("demo_seed.account_updated", extra={"email": email})
     return account
 
 
 async def _seed_demo_membership(session: AsyncSession, account: Account, org: Organisation) -> None:
-    """Idempotent viewer-role membership; forces a drifted role back to viewer."""
+    """Idempotent viewer-role membership; forces a drifted role back to viewer.
+
+    The insert is race-safe across multi-instance boots (savepoint +
+    IntegrityError recovery on the (account, org) unique key), and the drift
+    warning reports the role captured BEFORE the overwrite.
+    """
     result = await session.execute(
         select(OrgMembership).where(
             OrgMembership.account_id == account.id,
@@ -179,24 +200,51 @@ async def _seed_demo_membership(session: AsyncSession, account: Account, org: Or
     )
     membership = result.scalar_one_or_none()
     if membership is None:
-        session.add(
-            OrgMembership(
-                account_id=account.id,
-                organisation_id=org.id,
-                role=DEMO_ORG_ROLE,
-            )
+        membership = OrgMembership(
+            account_id=account.id,
+            organisation_id=org.id,
+            role=DEMO_ORG_ROLE,
         )
-        _log.info("demo_seed.membership_created", extra={"email": account.email, "role": DEMO_ORG_ROLE})
-    elif membership.role != DEMO_ORG_ROLE:
+        try:
+            # Savepoint so a concurrent boot that already committed the
+            # (account, org) pair only rolls back this insert, not the
+            # surrounding seed transaction.
+            async with session.begin_nested():
+                session.add(membership)
+                await session.flush()
+        except IntegrityError:
+            result = await session.execute(
+                select(OrgMembership).where(
+                    OrgMembership.account_id == account.id,
+                    OrgMembership.organisation_id == org.id,
+                )
+            )
+            membership = result.scalar_one_or_none()
+            if membership is None:
+                raise
+            _log.info("demo_seed.membership_recovered_after_conflict", extra={"email": account.email})
+        else:
+            _log.info("demo_seed.membership_created", extra={"email": account.email, "role": DEMO_ORG_ROLE})
+            return
+    if membership.role != DEMO_ORG_ROLE:
+        # Capture BEFORE overwriting so the warning reports the actual
+        # previous role, not the role we just wrote.
+        previous_role = membership.role
         membership.role = DEMO_ORG_ROLE
         _log.warning(
             "demo_seed.membership_role_reset",
-            extra={"email": account.email, "previous_role": membership.role, "role": DEMO_ORG_ROLE},
+            extra={"email": account.email, "previous_role": previous_role, "role": DEMO_ORG_ROLE},
         )
 
 
 async def _seed_demo_schemas(session: AsyncSession, org: Organisation, account: Account) -> None:
-    """Two published demo schemas (idempotent by (organisation, name))."""
+    """Two published demo schemas (idempotent by (organisation, name)).
+
+    Multi-boot race note: unlike the org/account/membership inserts, these
+    sample entities use existence-check-then-insert — two boots racing on a
+    cold DB can raise a unique violation that fails ONE boot's seed loudly,
+    but it self-heals on the next boot's idempotent re-run.
+    """
     specs = [
         {
             "name": "Demo Intake",
@@ -256,7 +304,12 @@ async def _seed_demo_schemas(session: AsyncSession, org: Organisation, account: 
 
 
 async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation, account: Account) -> None:
-    """One demo pipeline (+ snapshot v1) and two terminal demo runs."""
+    """One demo pipeline (+ snapshot v1) and two terminal demo runs.
+
+    Multi-boot race note: existence-check-then-insert (see
+    _seed_demo_schemas) — a cold-DB race fails one boot loudly and self-heals
+    on the next boot's re-run.
+    """
     pipeline_result = await session.execute(
         select(Pipeline).where(Pipeline.organisation_id == org.id, Pipeline.name == "Demo Governance Pipeline")
     )
@@ -389,15 +442,21 @@ async def seed_demo(session: AsyncSession) -> str | None:
     return f"org={DEMO_ORG_SLUG} user={email}"
 
 
-async def seed_demo_runtime() -> str | None:
-    """Run ``seed_demo`` in its own transaction on the shared session factory.
+async def seed_demo_runtime(session_factory: async_sessionmaker[AsyncSession] | None = None) -> str | None:
+    """Run ``seed_demo`` in its own transaction on a session factory.
 
-    Used by the FastAPI boot lifespan (main.py) and the ``python -m modulo.db.seed_demo``
-    entry point below.
+    The single transaction wrapper for both callers: main.py's boot lifespan
+    passes its DI ``get_or_create_session_factory`` engine-backed factory (one
+    engine path per caller), while the ``python -m modulo.db.seed_demo``
+    entry point below falls back to the shared module-level
+    ``AsyncSessionLocal``.
     """
-    from modulo.db.session import AsyncSessionLocal
+    factory = session_factory
+    if factory is None:
+        from modulo.db.session import AsyncSessionLocal
 
-    async with AsyncSessionLocal() as session, session.begin():
+        factory = AsyncSessionLocal
+    async with factory() as session, session.begin():
         return await seed_demo(session)
 
 

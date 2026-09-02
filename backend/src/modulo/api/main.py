@@ -1100,16 +1100,17 @@ async def _seed_demo_orgs(settings: Settings) -> None:
 async def _seed_demo_login(settings: Settings) -> str | None:
     """Seed the demo org/user + sample data (FAR-535).
 
-    Idempotent and self-gating: ``seed_demo`` returns None (and writes nothing)
-    unless MODULO_DEMO_ENABLED + MODULO_DEMO_USER + MODULO_DEMO_PASSWORD are set.
+    Idempotent and self-gating: ``seed_demo_runtime`` returns None (and writes
+    nothing) unless MODULO_DEMO_ENABLED + MODULO_DEMO_USER + MODULO_DEMO_PASSWORD
+    are set. Delegates to the seed module's single transaction wrapper with the
+    DI engine-backed session factory — one wrapper, one engine path per caller.
     """
     from modulo.api.dependencies import get_or_create_engine, get_or_create_session_factory
-    from modulo.db.seed_demo import seed_demo
+    from modulo.db.seed_demo import seed_demo_runtime
 
     engine = get_or_create_engine(settings)
     factory = get_or_create_session_factory(engine)
-    async with factory() as session, session.begin():
-        return await seed_demo(session)
+    return await seed_demo_runtime(session_factory=factory)
 
 
 async def _seed_tier_catalog() -> None:

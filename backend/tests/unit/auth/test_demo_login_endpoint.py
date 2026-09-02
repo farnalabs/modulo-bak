@@ -4,29 +4,41 @@ Locks the POST /api/v1/auth/demo contract: the kill switch answers a plain 404
 when any of MODULO_DEMO_ENABLED / MODULO_DEMO_USER / MODULO_DEMO_PASSWORD is
 unset or empty, a successful call mints an access token carrying the SHORT
 demo TTL (modulo_demo_token_minutes, NOT modulo_access_token_minutes) with NO
-refresh token and viewer-role demo-org claims, misconfigured env credentials
-are denied byte-identically to /login, an authenticating account WITHOUT a
+refresh token and viewer-role demo-org claims, EVERY failure path — including
+a credential mismatch between the env config and the stored account — answers
+the same plain 404 (the endpoint takes no client credentials, so login-identical
+401s would leak that the feature exists), an authenticating account WITHOUT a
 viewer membership in the demo org (or with is_system_admin) is treated as
 feature-absent (plain 404 — a demo request can never mint a token for another
-org or an elevated role), the auth.demo_login audit event is emitted, and the
-per-IP rate-limit rule (10/hour) is registered.
+org or an elevated role), the demo path NEVER touches the shared
+AuthRateLimiter (anonymous demo visitors cannot lock real users out of /login;
+the abuse cap is the per-IP RateLimitMiddleware rule), the auth.demo_login
+audit event is emitted, the per-IP rate-limit rule (10/hour) is registered, and
+the REAL _resolve_demo_org_membership (unmocked, against SQLite) only resolves
+a live demo-org viewer membership.
 """
 
 import logging
 import uuid
 from collections.abc import AsyncGenerator, Generator
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from modulo.api.dependencies import _get_engine, get_db_session
 from modulo.api.middleware.rate_limiter import RateLimitMiddleware
+from modulo.api.routes.auth import _resolve_demo_org_membership
 from modulo.api.routes.auth import router as auth_router
 from modulo.auth.passwords import hash_password
+from modulo.core.rate_limiter import AuthRateLimiter
+from modulo.db.models.base import Base
+from modulo.db.models.org_membership import OrgMembership
+from modulo.db.models.organisation import Organisation
 from modulo.settings import Settings, get_settings
 
 _VALID_32 = "a" * 32
@@ -181,26 +193,73 @@ def test_demo_login_sets_session_cookie_with_demo_ttl(client: TestClient) -> Non
     assert "Max-Age=1800" in session_cookie
 
 
-def test_demo_login_unknown_env_user_denied_like_login(app: FastAPI, client: TestClient) -> None:
-    """Env user matching no real account yields the login-identical 401 shape."""
+def test_demo_login_unknown_env_user_answers_plain_404(app: FastAPI, client: TestClient) -> None:
+    """Env user matching no real account yields the same plain 404 as everything else.
+
+    The endpoint takes NO client credentials, so /login's 401 shape would serve
+    no purpose here and would reveal that a demo feature exists.
+    """
     _override_settings(app, demo_user="ghost@modulo.run")
-    with patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=None)):
+    with (
+        patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=None)),
+        patch("modulo.api.routes.auth.get_auth_rate_limiter", new=MagicMock(return_value=None)),
+    ):
         resp = client.post("/api/v1/auth/demo")
-    assert resp.status_code == 401
-    assert resp.json()["detail"] == "Incorrect email or password"
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Not Found"
+    assert "modulo_session" not in resp.cookies
 
 
-def test_demo_login_env_password_mismatch_denied_like_login(app: FastAPI, client: TestClient) -> None:
-    """A real demo account whose stored hash does not match the env password 401s."""
+def test_demo_login_env_password_mismatch_answers_plain_404(
+    app: FastAPI, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A real demo account whose stored hash does not match the env password 404s.
+
+    Stealth-consistent with every other demo failure (never a 401), and the
+    mismatch is audit-logged with account context (no secrets) so operators
+    can diagnose a bad MODULO_DEMO_PASSWORD.
+    """
     _override_settings(app, demo_password="rotated-env-password")
     stale_account = _demo_account(password_hash=hash_password("old-stored-password"))
     with (
         patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=stale_account)),
-        patch("modulo.api.routes.auth.get_auth_rate_limiter", return_value=None),
+        patch("modulo.api.routes.auth.get_auth_rate_limiter", new=MagicMock(return_value=None)),
+        caplog.at_level(logging.WARNING, logger="modulo.api.routes.auth"),
     ):
         resp = client.post("/api/v1/auth/demo")
-    assert resp.status_code == 401
-    assert resp.json()["detail"] == "Incorrect email or password"
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Not Found"
+    assert "modulo_session" not in resp.cookies
+    mismatch_records = [
+        record for record in caplog.records if record.getMessage() == "auth.demo_login_credential_mismatch"
+    ]
+    assert len(mismatch_records) == 1
+    assert mismatch_records[0].account_id == str(_DEMO_USER_ID)
+    assert mismatch_records[0].configured_user == _DEMO_EMAIL
+
+
+def test_demo_login_never_touches_shared_auth_rate_limiter(app: FastAPI, client: TestClient) -> None:
+    """The demo path must not interact with the shared AuthRateLimiter at all.
+
+    Anonymous demo visitors must never be able to lock real users out of
+    /login: no record_failure, no check_login, no record_success — the factory
+    itself is never consulted, so no limiter state can move in either
+    direction. The demo abuse cap is the per-IP RateLimitMiddleware rule.
+    """
+    _override_settings(app, demo_password="rotated-env-password")
+    stale_account = _demo_account(password_hash=hash_password("old-stored-password"))
+    limiter = AsyncMock(spec=AuthRateLimiter)
+    limiter_factory = MagicMock(return_value=limiter)
+    with (
+        patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=stale_account)),
+        patch("modulo.api.routes.auth.get_auth_rate_limiter", new=limiter_factory),
+    ):
+        resp = client.post("/api/v1/auth/demo")
+    assert resp.status_code == 404
+    limiter_factory.assert_not_called()
+    limiter.record_failure.assert_not_called()
+    limiter.record_success.assert_not_called()
+    limiter.check_login.assert_not_called()
 
 
 def test_demo_login_account_without_demo_org_membership_answers_plain_404(app: FastAPI, client: TestClient) -> None:
@@ -275,3 +334,74 @@ def test_demo_rate_limit_rule_registered() -> None:
     assert len(demo_rules) == 1
     assert demo_rules[0].max_requests == 10
     assert demo_rules[0].window_s == 3600
+
+
+# ---------------------------------------------------------------------------
+# REAL _resolve_demo_org_membership (unmocked, in-memory SQLite)
+# ---------------------------------------------------------------------------
+
+# Tables the resolver touches (incl. accounts for the FK surface). Scoped
+# create_all because unrelated models use Postgres-only column types SQLite
+# cannot render.
+_RESOLVER_TABLES = {"organisations", "accounts", "org_memberships"}
+
+
+@pytest.fixture
+async def resolver_session() -> AsyncGenerator[AsyncSession, None]:
+    eng = create_async_engine("sqlite+aiosqlite://", echo=False)
+    async with eng.begin() as conn:
+        wanted = [t for t in Base.metadata.sorted_tables if t.name in _RESOLVER_TABLES]
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=wanted))
+    maker = async_sessionmaker(eng, expire_on_commit=False)
+    async with maker() as session:
+        yield session
+    await eng.dispose()
+
+
+async def _add_membership(
+    session: AsyncSession,
+    *,
+    slug: str,
+    role: str,
+    deleted_at: datetime | None = None,
+) -> Organisation:
+    org = Organisation(name=slug.title(), slug=slug, settings_json={})
+    if deleted_at is not None:
+        org.deleted_at = deleted_at
+    session.add(org)
+    await session.flush()
+    session.add(OrgMembership(account_id=_DEMO_USER_ID, organisation_id=org.id, role=role))
+    await session.flush()
+    return org
+
+
+async def test_real_resolver_finds_viewer_membership_in_demo_org(resolver_session: AsyncSession) -> None:
+    """A live demo-org viewer membership resolves to (org_id, 'viewer')."""
+    org = await _add_membership(resolver_session, slug="demo", role="viewer")
+    await resolver_session.commit()
+    resolved = await _resolve_demo_org_membership(resolver_session, _DEMO_USER_ID)
+    assert resolved == (org.id, "viewer")
+
+
+async def test_real_resolver_ignores_other_org_membership(resolver_session: AsyncSession) -> None:
+    """A membership in another org only never resolves — no token for another org."""
+    await _add_membership(resolver_session, slug="other", role="viewer")
+    await resolver_session.commit()
+    resolved = await _resolve_demo_org_membership(resolver_session, _DEMO_USER_ID)
+    assert resolved is None
+
+
+async def test_real_resolver_ignores_non_viewer_role_in_demo_org(resolver_session: AsyncSession) -> None:
+    """A demo-org membership with a non-viewer role never resolves — no elevated role."""
+    await _add_membership(resolver_session, slug="demo", role="admin")
+    await resolver_session.commit()
+    resolved = await _resolve_demo_org_membership(resolver_session, _DEMO_USER_ID)
+    assert resolved is None
+
+
+async def test_real_resolver_ignores_soft_deleted_demo_org(resolver_session: AsyncSession) -> None:
+    """A soft-deleted demo org answers None until the seed undeletes it."""
+    await _add_membership(resolver_session, slug="demo", role="viewer", deleted_at=datetime.now(UTC))
+    await resolver_session.commit()
+    resolved = await _resolve_demo_org_membership(resolver_session, _DEMO_USER_ID)
+    assert resolved is None

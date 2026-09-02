@@ -50,10 +50,13 @@ class Settings(BaseSettings):
     modulo_demo_enabled: bool = Field(False)
     modulo_demo_user: str = Field("")
     modulo_demo_password: str = Field(default="", repr=False)
-    # Demo access-token TTL in minutes (~2 hours by default). The demo JWT is minted
-    # with this explicit expiry instead of modulo_access_token_minutes, so a demo
-    # session dies quickly and carries no refresh token to extend it.
-    modulo_demo_token_minutes: int = Field(120, ge=1, le=1440)
+    # Demo access-token TTL in minutes (2 hours by default, hard-capped at 4h).
+    # The demo JWT is minted with this explicit expiry instead of
+    # modulo_access_token_minutes, so a demo session dies quickly and carries no
+    # refresh token to extend it. Because no refresh token exists, a session
+    # minted before the kill switch is flipped still persists until its TTL
+    # expires — the 4h cap bounds that residual exposure window.
+    modulo_demo_token_minutes: int = Field(120, ge=1, le=240)
 
     modulo_public_url: str = Field("http://localhost:8000")
     modulo_license_key: str = Field("")
