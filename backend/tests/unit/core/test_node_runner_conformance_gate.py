@@ -125,15 +125,17 @@ async def test_gate_no_ctx_fast_path(monkeypatch: pytest.MonkeyPatch):
 
 
 async def test_gate_resume_approved_clears_marker_and_continues(monkeypatch: pytest.MonkeyPatch):
-    """Resume of THIS node's conformance block with an ``approved`` decision is
-    the documented human override: the marker is cleared and the node continues
-    WITHOUT re-running the live check."""
+    """Resume of THIS node's conformance block with an ``approved`` decision
+    (stamped for the block's gate) is the documented human override: the
+    markers are cleared and the node continues WITHOUT re-running the live
+    check."""
     _set_ctx(monkeypatch)
     check = _patch_check_node_start(monkeypatch, None)
     audit = _patch_audit(monkeypatch)
     interrupt = _patch_interrupt(monkeypatch)
     state = {
         "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
         "_hitl_decision": {"action": "approved", "gate_id": "guardrail_conformance_g_block"},
     }
 
@@ -141,8 +143,30 @@ async def test_gate_resume_approved_clears_marker_and_continues(monkeypatch: pyt
 
     assert blocked is False
     assert state["_conformance_blocked_node"] is None
+    assert state["_conformance_blocked_gate"] is None
     check.assert_not_awaited()
     audit.assert_not_awaited()
+    interrupt.assert_not_called()
+
+
+async def test_gate_resume_approved_stamped_with_node_id_clears_marker(monkeypatch: pytest.MonkeyPatch):
+    """FAR-541: a decision stamped with the blocked NODE id (not the guardrail
+    gate id) is equally valid — the block's consumer accepts either stamp."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": "approved", "gate_id": _NODE_ID},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is False
+    assert state["_conformance_blocked_node"] is None
+    check.assert_not_awaited()
     interrupt.assert_not_called()
 
 
@@ -158,7 +182,12 @@ async def test_gate_resume_rejected_fails_closed(monkeypatch: pytest.MonkeyPatch
     interrupt = _patch_interrupt(monkeypatch)
     state = {
         "_conformance_blocked_node": _NODE_ID,
-        "_hitl_decision": {"action": "rejected", "reason": "capability genuinely revoked"},
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {
+            "action": "rejected",
+            "gate_id": "guardrail_conformance_g_block",
+            "reason": "capability genuinely revoked",
+        },
     }
 
     with pytest.raises(gr.GuardrailBlockedError):
@@ -167,6 +196,51 @@ async def test_gate_resume_rejected_fails_closed(monkeypatch: pytest.MonkeyPatch
     check.assert_not_awaited()
     audit.assert_not_awaited()
     interrupt.assert_not_called()
+
+
+async def test_gate_resume_foreign_decision_marker_block_not_cleared(monkeypatch: pytest.MonkeyPatch):
+    """FAR-541 (THE C1 consumer regression): a decision stamped for a
+    DIFFERENT gate must never clear THIS node's conformance block — the block
+    stands and the node re-interrupts (stays awaiting_human) instead of
+    proceeding under a foreign override."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    audit = _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": "approved", "gate_id": "some_other_gate"},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is True
+    assert state["_conformance_blocked_node"] == _NODE_ID
+    check.assert_not_awaited()
+    audit.assert_not_awaited()
+    interrupt.assert_called_once()
+
+
+async def test_gate_resume_unstamped_decision_block_not_cleared(monkeypatch: pytest.MonkeyPatch):
+    """FAR-541: a decision without a stamp cannot be attributed to this block
+    — the block stands and the node re-interrupts."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": "approved"},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is True
+    assert state["_conformance_blocked_node"] == _NODE_ID
+    check.assert_not_awaited()
+    interrupt.assert_called_once()
 
 
 async def test_gate_resume_foreign_decision_runs_real_check(monkeypatch: pytest.MonkeyPatch):

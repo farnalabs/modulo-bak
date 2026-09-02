@@ -4093,13 +4093,93 @@ def _reconcile_job_type(status: str) -> str:
     """Re-dispatch job-type discriminator (F6a).
 
     awaiting_human/claimed -> ``resume_run`` (resumed ONLY from a committed
-    gate decision); pending/running -> ``execute_run``. Both resume cases are
-    guarded per-row: the run is re-dispatched as ``resume_run`` ONLY when a
-    gate decision is actually committed (see
+    gate decision scoped to the pending gate); pending/running ->
+    ``execute_run``. Both resume cases are guarded per-row: the run is
+    re-dispatched as ``resume_run`` ONLY when a gate decision is actually
+    committed for the gate the run is waiting at (see
     :func:`_awaiting_human_has_committed_decision`) — never with an empty
     decision.
     """
     return "resume_run" if status in ("awaiting_human", "claimed") else "execute_run"
+
+
+async def _latest_committed_decision_row(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> Any:
+    """``(decision, decision_payload, gate_id)`` of the run's latest committed
+    HITL decision row, or ``None``. Shared selection for the F6a guard and the
+    resume-data reconstruction so both always agree on WHICH decision is
+    resumed."""
+    result = await session.execute(
+        text(
+            "SELECT decision, decision_payload, gate_id FROM hitl_claims "
+            "WHERE organisation_id=:oid AND run_id=:rid AND decision IS NOT NULL "
+            "ORDER BY decision_at DESC NULLS LAST LIMIT 1"
+        ),
+        {"oid": str(org_id), "rid": str(run_id)},
+    )
+    return result.first()
+
+
+async def _pending_claimed_gate_id(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> str | None:
+    """The gate id of the run's CLAIMED-but-undecided claim row, if any.
+
+    The executor creates a claim row when a gate fires; a human claim on the
+    pending gate marks exactly which gate the run is waiting at (the live
+    FAR-541 incident: gate B claimed-undecided while gate A's decision was
+    replayed onto it). ``None`` when nothing is claimed-undecided.
+    """
+    result = await session.execute(
+        text(
+            "SELECT gate_id FROM hitl_claims "
+            "WHERE organisation_id=:oid AND run_id=:rid AND decision IS NULL "
+            "AND account_id IS NOT NULL "
+            "ORDER BY claimed_at DESC NULLS LAST LIMIT 1"
+        ),
+        {"oid": str(org_id), "rid": str(run_id)},
+    )
+    row = result.first()
+    return str(row[0]) if row is not None and row[0] is not None else None
+
+
+async def _has_any_undecided_claim_row(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    run_id: uuid.UUID,
+) -> bool:
+    """True when the run has any undecided claim row (claimed or unclaimed)."""
+    result = await session.execute(
+        text("SELECT 1 FROM hitl_claims WHERE organisation_id=:oid AND run_id=:rid AND decision IS NULL LIMIT 1"),
+        {"oid": str(org_id), "rid": str(run_id)},
+    )
+    return result.first() is not None
+
+
+def _decision_gate_identity(latest: Any) -> str | None:
+    """The gate a committed decision row resolves.
+
+    FAR-541 stamps every decision payload with its ``gate_id``; a stamped
+    payload carries the identity. A legacy/payload-less row (or a pre-stamping
+    payload) predates stamping — the identity then comes from the decision
+    ROW's own ``gate_id`` (``hitl_claims.gate_id``), which is authoritative
+    because the decision was committed on that row's gate.
+    """
+    payload, row_gate_id = latest[1], latest[2]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            payload = None
+    stamped = payload.get("gate_id") if isinstance(payload, dict) else None
+    if stamped is not None:
+        return str(stamped)
+    return str(row_gate_id) if row_gate_id else None
 
 
 async def _awaiting_human_has_committed_decision(
@@ -4107,21 +4187,40 @@ async def _awaiting_human_has_committed_decision(
     org_id: uuid.UUID,
     run_id: uuid.UUID,
 ) -> bool:
-    """True when the run has a committed HITL gate decision.
+    """True when the run's PENDING gate has a committed HITL decision for it.
 
     F6a auto-approve guard: an ``awaiting_human``/``claimed`` run may only be
     re-dispatched as ``resume_run`` when a human actually committed a gate
-    decision (``hitl_claims.decision IS NOT NULL``). ``executor.resume`` injects the
-    resume payload as ``_hitl_decision``; the HITL gate node treats any
-    non-None decision as a human verdict (an empty ``{}`` resumes as
-    ``approved``). Re-dispatching a genuinely-waiting run — no human action, no
-    committed decision, whose completed job hash expired and heartbeat froze —
-    with EMPTY resume_data would therefore auto-approve its gates. The claimed
-    exemption is REMOVED (FAR-541): a claim alone is NOT resume-safe — a
-    claimed-but-undecided run was observed live re-dispatching with an empty
-    decision and auto-approving its gate. A claimed run with a COMMITTED
-    decision still resumes (mid-resume crash recovery: decision committed +
-    resume job lost).
+    decision (``hitl_claims.decision IS NOT NULL``). Re-dispatching a
+    genuinely-waiting run — no human action, no committed decision, whose
+    completed job hash expired and heartbeat froze — with EMPTY resume_data
+    would auto-approve its gates (pre-FAR-541 the gate node treated any
+    non-None decision — even an empty ``{}`` — as ``approved``; the gate now
+    fails closed on unrecognized actions). The claimed exemption is REMOVED
+    (FAR-541): a claim alone is NOT resume-safe — a claimed-but-undecided run
+    was observed live re-dispatching with an empty decision and auto-approving
+    its gate.
+
+    FAR-541 iteration 2 — gate SCOPING: decisions are per-RUN but consumers
+    are per-gate (``_hitl_decision`` is never cleared from state), so a
+    resume is valid ONLY when the committed decision resolves the gate the
+    run is currently waiting at:
+
+    * A CLAIMED-but-undecided claim row marks the pending gate. The guard
+      passes ONLY when the latest committed decision is for THAT gate — its
+      stamped ``gate_id`` or, for legacy rows, the decision row's own
+      ``gate_id`` (the human decided exactly the claimed gate and the resume
+      job was lost).
+    * An UNCLAIMED undecided row (an awaiting_human run nobody claimed)
+      cannot be verified as the decided gate -> conservative SKIP (never
+      re-dispatch): the reconcile replays nothing onto a gate no human has
+      engaged with.
+    * NO undecided rows at all + a STAMPED decision: the run is parked at the
+      decided gate's interrupt with its resume job lost — mid-resume crash
+      recovery, and the MCP flow's resume path (``review_hitl`` never
+      dispatches a resume itself). The consumer's own stamp check is the
+      second line of defense. An UNSTAMPED (legacy) decision in this state
+      cannot be verified -> SKIP.
 
     Stricter than the old ``decision IS NOT NULL`` guard (B1-reconcile): a
     decision is only ``committed`` when the decision is present AND — for
@@ -4139,35 +4238,43 @@ async def _awaiting_human_has_committed_decision(
     auto-approving the gate (a manual-output decision would pass
     ``{"action": "approved"}`` to the manual node as its output). A payload-less
     row (legacy/pre-migration) is treated as a plain approval/rejection that
-    needs no payload to resume faithfully.
+    needs no payload to resume faithfully — its identity comes from the row.
     """
-    result = await session.execute(
-        text(
-            "SELECT decision, decision_payload FROM hitl_claims "
-            "WHERE organisation_id=:oid AND run_id=:rid AND decision IS NOT NULL "
-            "ORDER BY decision_at DESC NULLS LAST LIMIT 1"
-        ),
-        {"oid": str(org_id), "rid": str(run_id)},
-    )
-    row = result.first()
-    if row is None or row[0] is None:
+    latest = await _latest_committed_decision_row(session, org_id, run_id)
+    if latest is None or latest[0] is None:
         return False
-    payload = row[1]
+    payload = latest[1]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            payload = None
     if isinstance(payload, dict):
         action = payload.get("action")
-        if action == "manual_output":
+        if action == "manual_output" and "output" not in payload:
             # A manual-output decision MUST carry its output — otherwise the
             # manual node resumes with ``{"action": "approved"}`` as its output.
-            return "output" in payload
-        if action == "approved_with_modification":
+            return False
+        if action == "approved_with_modification" and "modified_output" not in payload:
             # An approve-with-modification MUST carry the modified output —
             # otherwise the gate resumes as a plain approval, dropping the
             # human's modification.
-            return "modified_output" in payload
-    # A payload-less row (legacy/pre-migration) degrades to
-    # ``{"action": <decision>}`` — a plain approval/rejection/deliver_manual
-    # needs no payload to be faithfully resumed.
-    return True
+            return False
+    # Gate scoping (FAR-541): the decision must resolve the gate the run is
+    # waiting at. See the docstring for the three-state matrix.
+    claimed_pending_gate = await _pending_claimed_gate_id(session, org_id, run_id)
+    if claimed_pending_gate is not None:
+        return _decision_gate_identity(latest) == claimed_pending_gate
+    if await _has_any_undecided_claim_row(session, org_id, run_id):
+        # Unclaimed awaiting_human: the pending gate is undecided and no human
+        # has engaged with it — the committed decision is necessarily for an
+        # earlier gate. Conservative SKIP (never re-dispatch).
+        return False
+    # No undecided rows: the run is parked at the last decided gate's
+    # interrupt (resume job lost / MCP decision). Resume ONLY when the
+    # decision carries a stamp — a legacy unstamped decision cannot be
+    # verified against the pending gate.
+    return isinstance(payload, dict) and payload.get("gate_id") is not None
 
 
 async def _committed_decision_resume_data(
@@ -4183,29 +4290,30 @@ async def _committed_decision_resume_data(
     committed. NEVER returns ``{}`` for a committed decision — a recovered
     rejection must resume as rejected, and an approve-with-modification must
     carry its modification.
+
+    FAR-541: the reconstructed payload ALWAYS carries the decision row's own
+    ``gate_id`` (added when the payload does not already carry the stamp) so
+    the consumer's gate-identity check passes for legacy rows reconstructed
+    for the gate they were committed on.
     """
-    result = await session.execute(
-        text(
-            "SELECT decision, decision_payload FROM hitl_claims "
-            "WHERE organisation_id=:oid AND run_id=:rid AND decision IS NOT NULL "
-            "ORDER BY decision_at DESC NULLS LAST LIMIT 1"
-        ),
-        {"oid": str(org_id), "rid": str(run_id)},
-    )
-    row = result.first()
-    if row is None or row[0] is None:
+    latest = await _latest_committed_decision_row(session, org_id, run_id)
+    if latest is None or latest[0] is None:
         return None
-    decision, payload = row[0], row[1]
+    decision, payload = latest[0], latest[1]
     if isinstance(payload, str):
         try:
             payload = json.loads(payload)
         except (ValueError, TypeError):
             payload = None
     if isinstance(payload, dict):
-        return dict(payload)
-    if payload is None and decision:
-        return {"action": decision}
-    return None
+        reconstructed: dict[str, Any] = dict(payload)
+    elif payload is None and decision:
+        reconstructed = {"action": decision}
+    else:
+        return None
+    if reconstructed.get("gate_id") is None and latest[2]:
+        reconstructed["gate_id"] = str(latest[2])
+    return reconstructed
 
 
 def _saq_run_claim_cap() -> int:
@@ -4444,15 +4552,19 @@ async def dispatcher_reconcile() -> dict[str, Any]:
         payload-carrying actions) its ``decision_payload`` is present — checked
         per-row via :func:`_awaiting_human_has_committed_decision`. A
         genuinely-waiting run (no decision committed) whose job hash expired +
-        heartbeat froze must NOT be resumed: ``executor.resume`` injects the
-        (empty) payload as ``_hitl_decision``, which the HITL gate node treats
-        as an approval — auto-approving the gate. The claimed exemption is
-        REMOVED (FAR-541): a claim alone is not resume-safe — a
+        heartbeat froze must NOT be resumed: pre-FAR-541 ``executor.resume``
+        injected the (empty) payload as ``_hitl_decision``, which the HITL
+        gate node treated as an approval — auto-approving the gate (the gate
+        now fails closed on unrecognized actions, FAR-541). The claimed
+        exemption is REMOVED (FAR-541): a claim alone is not resume-safe — a
         claimed-but-undecided run never re-dispatches (it stays claimed until
-        the human decides or the claim expires). Resume ``resume_data`` is
-        reconstructed from the persisted ``hitl_claims.decision_payload``
-        (B1-reconcile) — a recovered rejection resumes as rejected, never as an
-        empty ``{}``.
+        the human decides or the claim expires). FAR-541 iteration 2 adds
+        gate SCOPING: the committed decision must resolve the gate the run is
+        waiting at (claimed-undecided row identity match; conservative SKIP
+        otherwise — see :func:`_awaiting_human_has_committed_decision`).
+        Resume ``resume_data`` is reconstructed from the persisted
+        ``hitl_claims.decision_payload`` (B1-reconcile) — a recovered
+        rejection resumes as rejected, never as an empty ``{}``.
 
     Per-org DB-only terminalizers (before the row select):
       * B4 age-bound: any ``running`` + ``dispatcher='saq'`` row whose
@@ -4879,14 +4991,16 @@ async def _resolve_hitl_resume_or_skip(
 
     Returns ``(skip, resume_data)``: ``skip`` is True when a genuinely-waiting
     awaiting_human/claimed run must NOT be resumed (no committed gate decision
-    — a resumed empty decision would auto-approve the gate); otherwise
-    ``resume_data`` is reconstructed from the committed HITL decision (never
-    ``{}``). The claimed exemption is REMOVED (FAR-541): a claimed row resumes
-    only when a decision is committed — mid-resume crash recovery (decision
-    committed + resume job lost) still resumes, with ``resume_data``
-    reconstructed from ``hitl_claims.decision_payload`` — while a
-    claimed-but-undecided run never re-dispatches (it stays claimed until the
-    human decides or the claim expires). Extracted unchanged from
+    scoped to the pending gate — a resumed empty decision would auto-approve
+    the gate, and a decision for an EARLIER gate would resolve the pending one
+    with zero human action on it); otherwise ``resume_data`` is reconstructed
+    from the committed HITL decision (never ``{}``). The claimed exemption is
+    REMOVED (FAR-541): a claimed row resumes only when the committed decision
+    matches the claimed-undecided gate — mid-resume crash recovery (decision
+    committed for the pending gate + resume job lost) still resumes, with
+    ``resume_data`` reconstructed from ``hitl_claims.decision_payload`` —
+    while a claimed-but-undecided run never re-dispatches (it stays claimed
+    until the human decides or the claim expires). Extracted unchanged from
     ``_reconcile_one_row``.
     """
     if row.status not in ("awaiting_human", "claimed"):

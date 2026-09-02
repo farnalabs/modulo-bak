@@ -3410,6 +3410,12 @@ async def _dispatch_hitl_action(
 
     Raises the domain exceptions (GateNotFoundError, NotTeamMemberError, etc.)
     which the caller maps to error responses.
+
+    FAR-541: every decision payload is STAMPED with the ``gate_id`` it resolves.
+    The decision commits on the gate's claim row (created by the executor when
+    the gate fired); the MCP flow never dispatches a resume itself — the
+    dispatcher reconcile is the resume path, and it scopes its reconstruction
+    by this stamp.
     """
     if action == "claim":
         gate = await mgr.claim(s, run_id=rid, gate_id=gate_id, org_id=org_id, claimant_id=key_id)
@@ -3419,7 +3425,14 @@ async def _dispatch_hitl_action(
             "expires_at": gate.expires_at.isoformat() if gate.expires_at else None,
         }
     if action == "approve":
-        await mgr.approve(s, run_id=rid, gate_id=gate_id, org_id=org_id, claim_token=claim_token or "")
+        await mgr.approve(
+            s,
+            run_id=rid,
+            gate_id=gate_id,
+            org_id=org_id,
+            claim_token=claim_token or "",
+            decision_payload={"action": "approved", "gate_id": gate_id},
+        )
         return {"status": "approved", "gate_id": gate_id}
     if action == "deliver_manual":
         await mgr.deliver_manual(
@@ -3430,8 +3443,12 @@ async def _dispatch_hitl_action(
             claim_token=claim_token or "",
             output=output or {},
             actor_id=key_id,
+            decision_payload={"action": "deliver_manual", "gate_id": gate_id, "output": output or {}},
         )
         return {"status": "delivered_manual", "gate_id": gate_id}
+    reject_payload: dict[str, Any] = {"action": "rejected", "gate_id": gate_id}
+    if reason is not None:
+        reject_payload["reason"] = reason
     await mgr.reject(
         s,
         run_id=rid,
@@ -3440,6 +3457,7 @@ async def _dispatch_hitl_action(
         claim_token=claim_token or "",
         actor_id=key_id,
         reason=reason,
+        decision_payload=reject_payload,
     )
     return {"status": "rejected", "gate_id": gate_id}
 

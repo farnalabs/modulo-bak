@@ -1599,6 +1599,39 @@ def test_recover_node_refuses_guardrail_blocked_run(client: TestClient) -> None:
     assert "guardrail-override" in resp.json()["detail"].lower()
 
 
+def test_recover_node_refuses_gate_node_prefix_with_422(client: TestClient) -> None:
+    """FAR-541: the recover-node resume dispatches {"action": "skip"/"replay"}
+    — that is NOT a gate decision, and the gate consumer now fails closed on
+    unstamped decisions (the resume would bounce the run back to
+    awaiting_human). A HITL gate target (``hitl_gate_<source>_<target>``) is
+    refused up front with an explicit 422."""
+    with patch("modulo.api.routes.runs.set_rls_org"):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/hitl_gate_source_target/recover",
+            json={"input_data": {"answer": 42}},
+        )
+
+    assert resp.status_code == 422
+    assert "HITL approve/reject endpoints" in resp.json()["detail"]
+
+
+def test_recover_node_refuses_pending_gate_target_with_422(client: TestClient, mock_session: AsyncMock) -> None:
+    """FAR-541: when the run is interrupted AT the target node (an undecided
+    claim row exists for it), recovery is refused with an explicit 422 — use
+    the HITL decision endpoints instead."""
+    gate_result = MagicMock()
+    gate_result.scalar_one_or_none.return_value = "pending-node-1"
+    mock_session.execute = AsyncMock(return_value=gate_result)
+    with patch("modulo.api.routes.runs.set_rls_org"):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/pending-node-1/recover",
+            json={},
+        )
+
+    assert resp.status_code == 422
+    assert "HITL approve/reject endpoints" in resp.json()["detail"]
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/runs/{run_id}/guardrail-override — FAR-208 remediation
 # ---------------------------------------------------------------------------

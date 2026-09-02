@@ -712,6 +712,11 @@ class TestReviewHitl(_AuthContext):
 
         assert result == {"status": "approved", "gate_id": "gate-1"}
         manager.approve.assert_awaited_once()
+        # FAR-541: the persisted decision payload is stamped with the gate id.
+        assert manager.approve.await_args.kwargs["decision_payload"] == {
+            "action": "approved",
+            "gate_id": "gate-1",
+        }
 
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server.HITLManager")
@@ -736,6 +741,11 @@ class TestReviewHitl(_AuthContext):
 
         assert result == {"status": "rejected", "gate_id": "gate-1"}
         manager.reject.assert_awaited_once()
+        # FAR-541: the persisted decision payload is stamped with the gate id.
+        assert manager.reject.await_args.kwargs["decision_payload"] == {
+            "action": "rejected",
+            "gate_id": "gate-1",
+        }
 
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server.HITLManager")
@@ -766,6 +776,12 @@ class TestReviewHitl(_AuthContext):
 
         assert result == {"status": "delivered_manual", "gate_id": "gate-1"}
         manager.deliver_manual.assert_awaited_once()
+        # FAR-541: the persisted decision payload is stamped with the gate id.
+        assert manager.deliver_manual.await_args.kwargs["decision_payload"] == {
+            "action": "deliver_manual",
+            "gate_id": "gate-1",
+            "output": {"result": "ok"},
+        }
 
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server.HITLManager")

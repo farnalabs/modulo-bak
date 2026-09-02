@@ -330,7 +330,10 @@ async def test_hitl_resume_roundtrip_approve_with_modification(
     account_id = await _seed_account(db_engine, org_id, "hitl-approve@test.local")
     pipe = await _seed_pipeline(db_engine, org_id, "PipeHitlApprove", account_id)
     backend_id = uuid.uuid4()
+    # FAR-541: the gate id is deterministic (hitl_gate_<source>_<target>); the
+    # decision payload must carry the SAME stamp the per-gate consumer checks.
     gate_config: dict[str, Any] = {
+        "gate_id": "hitl_gate_a_b",
         "human_only": True,
         "overdue_threshold_minutes": 60,
         "required_team_id": None,
@@ -351,6 +354,7 @@ async def test_hitl_resume_roundtrip_approve_with_modification(
     gate_id = await _read_gate_id(db_engine, org_id, run_id)
     payload = {
         "action": "approved_with_modification",
+        "gate_id": gate_id,
         "modified_output": {"answer": "human-edited"},
     }
     await _commit_decision(db_engine, org_id, run_id, gate_id, decision="approved", decision_payload=payload)
@@ -395,7 +399,10 @@ async def test_hitl_resume_roundtrip_committed_rejection_resumes_as_rejected(
     account_id = await _seed_account(db_engine, org_id, "hitl-reject@test.local")
     pipe = await _seed_pipeline(db_engine, org_id, "PipeHitlReject", account_id)
     backend_id = uuid.uuid4()
+    # FAR-541: the gate id is deterministic (hitl_gate_<source>_<target>); the
+    # decision payload must carry the SAME stamp the per-gate consumer checks.
     gate_config: dict[str, Any] = {
+        "gate_id": "hitl_gate_a_b",
         "human_only": True,
         "overdue_threshold_minutes": 60,
         "required_team_id": None,
@@ -411,7 +418,7 @@ async def test_hitl_resume_roundtrip_committed_rejection_resumes_as_rejected(
     await _interrupt_run(db_engine, migrated_db_url, org_id, run_id, backend_id, fixtures)
 
     gate_id = await _read_gate_id(db_engine, org_id, run_id)
-    payload = {"action": "rejected", "reason": "wrong answer"}
+    payload = {"action": "rejected", "gate_id": gate_id, "reason": "wrong answer"}
     await _commit_decision(db_engine, org_id, run_id, gate_id, decision="rejected", decision_payload=payload)
 
     from sqlalchemy.ext.asyncio import async_sessionmaker

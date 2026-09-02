@@ -2365,13 +2365,17 @@ async def _run_conformance_gate(
     Behaviour:
       - On resume of THIS node's conformance block (``state`` carries the
         ``_conformance_blocked_node`` marker set before the interrupt) the
-        human decision is routed: ``approved`` (or ``deliver_manual``) is the
-        documented human override -> the marker is cleared and the node
+        human decision is routed — and only when the decision is STAMPED for
+        this block (FAR-541: its ``gate_id`` matches the blocked node id or
+        the block's guardrail gate id; ``_hitl_decision`` alone is NEVER
+        trusted to skip the check): ``approved`` (or ``deliver_manual``) is
+        the documented human override -> the markers are cleared and the node
         continues; ``rejected`` -> the node is DENIED and the run FAILS CLOSED
         (raises ``GuardrailBlockedError`` -> terminal ``eval_failed``), never a
-        fail-open continuation. ``_hitl_decision`` alone is NEVER trusted to
-        skip the check: it persists in state for the whole run after ANY HITL
-        resume, so a foreign decision must not disable this safety gate.
+        fail-open continuation. A foreign/mismatched decision leaves the block
+        standing and re-interrupts. ``_hitl_decision`` persists in state for
+        the whole run after ANY HITL resume, so a foreign decision must not
+        disable this safety gate.
       - No bound guardrail with a conformance claim -> fast path (no DB).
       - ``absent``/``unknown`` on a ``block``-action guardrail -> raise a HITL
         interrupt (the run transitions to ``awaiting_human`` with a
@@ -2434,15 +2438,46 @@ async def _run_conformance_gate(
 def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
     """Route a human's decision after a conformance block (True: fail closed).
 
-    On ``rejected`` the run FAILS CLOSED: the capability the block protected is
-    still unavailable, so the node must NOT execute. ``GuardrailBlockedError`` is
-    mapped by the executor to terminal ``eval_failed``/``eval_blocked`` (never a
-    resume). ``approved``/``deliver_manual`` is the documented human override:
-    the marker is cleared (so a later foreign resume replay of this node re-runs
+    FAR-541: ``_hitl_decision`` alone is NEVER trusted — the decision must be
+    STAMPED for THIS block (its ``gate_id`` matches the blocked node id or the
+    block's own guardrail gate id, stamped in state as
+    ``_conformance_blocked_gate``). ``_hitl_decision`` persists in state for
+    the whole run after ANY HITL resume, so a decision made at an earlier gate
+    must not clear (or reject on) this safety gate: a mismatched or missing
+    stamp leaves the block standing and re-interrupts — the run keeps waiting
+    for a decision that resolves THIS block (``conformance.foreign_decision_ignored``
+    warning; gate ids only, never payload content).
+
+    On a STAMPED ``rejected`` the run FAILS CLOSED: the capability the block
+    protected is still unavailable, so the node must NOT execute.
+    ``GuardrailBlockedError`` is mapped by the executor to terminal
+    ``eval_failed``/``eval_blocked`` (never a resume). A STAMPED
+    ``approved``/``deliver_manual`` is the documented human override: the
+    markers are cleared (so a later foreign resume replay of this node re-runs
     the real check) and normal execution continues.
     """
     decision = state.get("_hitl_decision")
     action = decision.get("action") if isinstance(decision, dict) else None
+    stamped_gate = decision.get("gate_id") if isinstance(decision, dict) else None
+    blocked_gate = str(state.get("_conformance_blocked_gate") or "")
+    accepted_stamps = {node_id, blocked_gate} - {""}
+    if stamped_gate is None or str(stamped_gate) not in accepted_stamps:
+        _log.warning(
+            "conformance.foreign_decision_ignored",
+            extra={"node_id": node_id, "decision_gate_id": stamped_gate},
+        )
+        # Fail closed: the block STANDS — re-interrupt so the run keeps waiting
+        # for a decision stamped for THIS block (a foreign decision never
+        # clears a guardrail block).
+        interrupt(
+            {
+                "gate_id": blocked_gate or node_id,
+                "node_id": node_id,
+                "conformance_blocked": True,
+                "reason": "awaiting a human decision for this conformance block",
+            }
+        )
+        return True
     if action == "rejected":
         from modulo.core.guardrails import GuardrailBlockedError
 
@@ -2451,6 +2486,7 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
             "capability conformance gate was rejected by the human reviewer; the run fails closed",
         )
     state["_conformance_blocked_node"] = None
+    state["_conformance_blocked_gate"] = None
     return False
 
 
@@ -2474,9 +2510,14 @@ async def _handle_conformance_block(
     # Stamp the per-node marker so the resume path can tell THIS node's
     # conformance block apart from any other gate's resume decision
     # (``_hitl_decision`` persists in state for the rest of the run).
+    # FAR-541: the block's own gate id is stamped alongside so the resume
+    # path can verify the decision was made for THIS block (the HITL API
+    # stamps the decision with the claim row's gate id — the guardrail gate
+    # id the interrupt was created with).
     # Mutations before ``interrupt()`` are persisted by the checkpointer
     # (same pattern as ``_hitl_gate`` / ``_manual_node``).
     state["_conformance_blocked_node"] = node_id
+    state["_conformance_blocked_gate"] = str(result.gate_id)
     interrupt(
         {
             "gate_id": result.gate_id,
@@ -3096,20 +3137,38 @@ async def _hitl_gate_resume_result(
     gate, or ``(False, None)`` on first invocation so the caller proceeds to
     the condition/eval/autonomy checks.
 
-    Only recognized actions resume: ``approved`` (the approve-with-modification
-    API submits ``approved`` plus a ``modified_output`` member, so it is
-    covered by ``approved``), ``rejected``, and ``deliver_manual``. Anything
-    else — a missing action, an empty ``{}``, an unknown action value, a
-    non-dict decision — FAILS CLOSED: ``(False, None)``. The gate falls
-    through to the condition/eval/autonomy path and, with human_only, still
-    re-interrupts; the malformed decision is ignored, never approving.
-    Belt-and-braces against empty-decision resumes (FAR-541): the
-    dispatcher-reconcile F6a guard is the first line of defense, this is the
-    second.
+    Two fail-closed checks apply (FAR-541), and BOTH must pass:
+
+    1. Gate identity: the decision must be STAMPED with THIS gate's id
+       (``decision["gate_id"] == gate_id``). Decisions are per-RUN but
+       consumers are per-gate, and ``_hitl_decision`` persists in state for
+       the whole run (it is never cleared after consumption), so a decision
+       made at an earlier gate would otherwise resolve this one with zero
+       human action. A mismatched or missing stamp is ignored with a
+       ``hitl_gate.foreign_decision_ignored`` warning (the gate id and the
+       decision's stamped gate id only — never payload content) and the gate
+       falls through to re-interrupt under human_only.
+    2. Action vocabulary: only recognized actions resume — ``approved`` (the
+       approve-with-modification API submits ``approved`` plus a
+       ``modified_output`` member, so it is covered by ``approved``),
+       ``rejected``, and ``deliver_manual``. Anything else — a missing action,
+       an empty ``{}``, an unknown action value — FAILS CLOSED. (A non-dict
+       decision fails the identity check first: it carries no stamp.)
+
+    Belt-and-braces against stale/foreign/empty-decision resumes (FAR-541):
+    the dispatcher-reconcile F6a gate-scoping guard is the first line of
+    defense, this is the second.
     """
     if decision is None:
         return (False, None)
     action = decision.get("action") if isinstance(decision, dict) else None
+    stamped_gate = decision.get("gate_id") if isinstance(decision, dict) else None
+    if stamped_gate != gate_id:
+        _log.warning(
+            "hitl_gate.foreign_decision_ignored",
+            extra={"gate_id": gate_id, "decision_gate_id": stamped_gate},
+        )
+        return (False, None)
     if action == "deliver_manual":
         return _hitl_gate_deliver_manual_result(gate_id, decision)
     if action not in ("approved", "rejected"):
@@ -3424,8 +3483,14 @@ def make_manual_node_fn(
 
     async def _manual_node(state: dict[str, Any]) -> dict[str, Any]:
         # Check if this is a resume with human output.
+        # FAR-541: the decision must be STAMPED with THIS node's id —
+        # ``_hitl_decision`` persists in state for the whole run, so a decision
+        # made at an earlier gate must never complete this node (historically
+        # with ``manual_output=None``). A mismatched/missing stamp fails
+        # closed: the node re-interrupts and keeps waiting for its own input.
         decision = state.get("_hitl_decision")
-        if decision is not None and isinstance(decision, dict):
+        stamped_gate = decision.get("gate_id") if isinstance(decision, dict) else None
+        if isinstance(decision, dict) and stamped_gate == node_id:
             resume_data = decision.get("output")
             manual_output: dict[str, Any] | None = resume_data if isinstance(resume_data, dict) else None
             if output_schema_json and manual_output is not None:
@@ -3449,6 +3514,11 @@ def make_manual_node_fn(
                 ],
                 "manual_output": manual_output,
             }
+        if decision is not None:
+            _log.warning(
+                "manual_node.foreign_decision_ignored",
+                extra={"node_id": node_id, "decision_gate_id": stamped_gate},
+            )
 
         # First invocation —  record pending artifact and interrupt.
         artifacts: list[dict[str, Any]] = list(state.get("artifacts") or [])

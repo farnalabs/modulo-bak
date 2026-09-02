@@ -77,6 +77,7 @@ from modulo.db.crud.run import (
 )
 from modulo.db.models.account import Account
 from modulo.db.models.agent import Agent
+from modulo.db.models.hitl_claim import HitlClaim
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import TERMINAL_STATUSES, Run
@@ -2000,10 +2001,39 @@ async def recover_run_node(
             detail="Only operators and admins can recover nodes",
         )
 
+    # FAR-541: the recover-node resume dispatches {"action": "skip"/"replay"} —
+    # that is NOT a gate decision, and the gate consumer now fails closed on
+    # unstamped/foreign decisions (the resume would bounce the run straight
+    # back to awaiting_human). Reject gate targets up front with an explicit
+    # pointer to the HITL decision endpoints.
+    if node_id.startswith("hitl_gate_"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Node is a HITL gate; use the HITL approve/reject endpoints for gate nodes.",
+        )
+
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
+            # FAR-541: a pending (undecided) claim row for the target node
+            # means the run is interrupted AT that gate — recovery is not the
+            # right tool there either.
+            pending_gate = (
+                await session.execute(
+                    select(HitlClaim.gate_id).where(
+                        HitlClaim.run_id == run_id,
+                        HitlClaim.organisation_id == principal.organisation_id,
+                        HitlClaim.gate_id == node_id,
+                        HitlClaim.decision.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if pending_gate is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail="Node is a pending HITL gate; use the HITL approve/reject endpoints for gate nodes.",
+                )
             try:
                 run = await recover_node(
                     session,
