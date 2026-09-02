@@ -107,7 +107,7 @@ Fresh entries for these features are added to the graph below as behaviour track
 - **feat-mcp** - Model Context Protocol tool configuration - routes: `/settings/mcp`
 - **feat-guardrails** - Guardrail policies - routes: `/settings/guardrails`
 - **feat-connectors** - External tool connectors - routes: `/admin/connectors`
-- **feat-environments** - Environment profiles and run environments - routes: `/admin/environments`, `/admin/sandbox-concurrency`, `/environment-profiles`, `/environment-profiles/new`, `/environment-profiles/:id/edit`
+- **feat-environments** - Environment profiles - routes: `/admin/sandbox-concurrency`, `/environment-profiles`, `/environment-profiles/new`, `/environment-profiles/:id/edit`
 - **feat-triggers** - Manual, webhook, and scheduled triggers - routes: `/settings/triggers`
 
 ### Admin
@@ -120,7 +120,7 @@ Fresh entries for these features are added to the graph below as behaviour track
 
 ### System
 - **feat-license** - Feature licensing and plan tiers - routes: `/settings/license`
-- **feat-runtime** - Runtime configuration, rate limits, retention, and sandbox concurrency - routes: `/settings/runtime-config`, `/settings/rate-limits`, `/admin/housekeeping`, `/admin/environments`, `/admin/run-retention`, `/admin/sandbox-concurrency`
+- **feat-runtime** - Runtime configuration, rate limits, retention, and sandbox concurrency - routes: `/settings/runtime-config`, `/settings/rate-limits`, `/admin/housekeeping`, `/admin/run-retention`, `/admin/sandbox-concurrency`
 - **feat-system-config** - System-level configuration administration - routes: `/admin/system/config`
 - **feat-system-orgs** - System-level organization administration - routes: `/admin/system/orgs`
 - **feat-product-analytics** - Product usage and adoption analytics for system administrators - routes: `/admin/product-analytics`
@@ -139,7 +139,7 @@ Behaviour-tracker entries in this directory. Infra-only surfaces (no UI route in
 > [Known graph gaps](#known-graph-gaps). Keeping a single list stops the two copies
 > drifting apart (they did: the older inline copy still named features whose trackers
 > had already landed in the index below).
-> 
+>
 > **Closed this walk:** `feat-environments` gained its behaviour-tracker entry
 > (`environments/environments.md`) — see the graph index above.
 
