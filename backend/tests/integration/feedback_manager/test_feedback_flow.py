@@ -272,7 +272,7 @@ async def _create_seed_run(
         {
             "id": str(pipeline_id),
             "org_id": str(org_id),
-            "name": "Feedback Test Pipeline",
+            "name": f"Feedback Test Pipeline {pipeline_id.hex[:8]}",
             "uid": str(user_id),
         },
     )

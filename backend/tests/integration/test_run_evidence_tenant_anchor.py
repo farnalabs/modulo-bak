@@ -93,6 +93,22 @@ async def evidence_tenant(db_engine: AsyncEngine, test_user: uuid.UUID) -> _Evid
             ),
             {"id": str(tenant.snapshot_id), "pid": str(tenant.pipeline_id), "oid": str(tenant.org_id)},
         )
+        # Migration 0166 promoted run_evidence.node_id to a Uuid FK on nodes.id;
+        # write_evidence_row swallows the resulting IntegrityError, so the
+        # referenced node must actually exist for the evidence row to persist.
+        await conn.execute(
+            text(
+                "INSERT INTO nodes (id, organisation_id, pipeline_id, name, account_id, timeout_seconds) "
+                "VALUES (:nid, :oid, :pid, 'evidence-node', :uid, 300) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {
+                "nid": str(_NODE_A),
+                "oid": str(tenant.org_id),
+                "pid": str(tenant.pipeline_id),
+                "uid": str(test_user),
+            },
+        )
     return tenant
 
 

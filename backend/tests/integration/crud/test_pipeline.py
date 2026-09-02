@@ -6,6 +6,7 @@ RLS is set to test_org; all inserts are rolled back after each test.
 import uuid
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.db.crud.pipeline import (
@@ -21,6 +22,38 @@ from modulo.db.crud.pipeline import (
 from modulo.db.rls import set_rls_org, set_rls_user_context
 
 pytestmark = pytest.mark.integration
+
+
+async def _seed_nodes(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+    user_id: uuid.UUID,
+    node_ids: list[uuid.UUID],
+) -> None:
+    """Materialise graph node rows so pipeline_edges FK constraints resolve.
+
+    Migration 0162 added pipeline_edges_(source|target)_node_id_fkey on the
+    (deprecated) ``nodes`` table, but ``replace_pipeline_graph`` only persists
+    ``graph_nodes_json`` — it never inserts the referenced node rows. Seed them so
+    saving an edge satisfies the FK in tests.
+    """
+    for nid in node_ids:
+        await session.execute(
+            text(
+                "INSERT INTO nodes (id, organisation_id, pipeline_id, name, account_id, timeout_seconds) "
+                "VALUES (:id, :oid, :pid, :name, :aid, 300) "
+                "ON CONFLICT (id) DO NOTHING"
+            ),
+            {
+                "id": str(nid),
+                "oid": str(org_id),
+                "pid": str(pipeline_id),
+                "name": f"node-{nid.hex[:8]}",
+                "aid": str(user_id),
+            },
+        )
+    await session.flush()
 
 
 async def test_create_pipeline(rls_session: AsyncSession, test_org: uuid.UUID, test_user: uuid.UUID) -> None:
@@ -115,6 +148,7 @@ async def test_replace_pipeline_graph_persists_nodes_and_first_class_edges(
         },
     ]
     edge_id = uuid.uuid4()
+    await _seed_nodes(rls_session, test_org, pipeline.id, test_user, [first_node, second_node])
     saved = await replace_pipeline_graph(
         rls_session,
         pipeline_id=pipeline.id,
@@ -155,6 +189,7 @@ async def test_replace_pipeline_graph_multi_edge_round_trip(
         account_id=test_user,
     )
     node_ids = [str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())]
+    node_uuids = [uuid.UUID(n) for n in node_ids]
     nodes = [
         {
             "id": node_ids[0],
@@ -192,6 +227,7 @@ async def test_replace_pipeline_graph_multi_edge_round_trip(
             "hitl_gate_config": None,
         },
     ]
+    await _seed_nodes(rls_session, test_org, pipeline.id, test_user, node_uuids)
     saved = await replace_pipeline_graph(
         rls_session,
         pipeline_id=pipeline.id,
@@ -230,6 +266,7 @@ async def test_clone_pipeline_returns_new_id_and_name_prefix(
         {"id": str(second_node), "agent_id": str(uuid.uuid4()), "position": {"x": 200, "y": 0}},
     ]
     edge_id = uuid.uuid4()
+    await _seed_nodes(rls_session, test_org, source.id, test_user, [first_node, second_node])
     await replace_pipeline_graph(
         rls_session,
         pipeline_id=source.id,
@@ -366,6 +403,8 @@ async def test_replace_pipeline_graph_removes_stale_edges(
         account_id=test_user,
     )
     node_id = uuid.uuid4()
+    target_node_id = uuid.uuid4()
+    await _seed_nodes(rls_session, test_org, pipeline.id, test_user, [node_id, target_node_id])
     await replace_pipeline_graph(
         rls_session,
         pipeline_id=pipeline.id,
@@ -375,7 +414,7 @@ async def test_replace_pipeline_graph_removes_stale_edges(
             {
                 "id": uuid.uuid4(),
                 "source_node_id": node_id,
-                "target_node_id": uuid.uuid4(),
+                "target_node_id": target_node_id,
                 "edge_type": "normal",
                 "hitl_gate_config": None,
             },

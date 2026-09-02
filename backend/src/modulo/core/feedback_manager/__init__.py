@@ -692,7 +692,7 @@ class FeedbackManager:
         feedback_correction: dict[str, Any] = {
             "rejection_reason": record.rejection_reason,
             "rejected_output": record.rejected_output,
-            "producing_node_id": record.producing_node_id,
+            "producing_node_id": str(record.producing_node_id),
             "is_correction_run": True,
         }
         if run_context_overrides:
