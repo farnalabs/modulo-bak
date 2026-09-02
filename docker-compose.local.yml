@@ -1,6 +1,6 @@
 services:
   db-local:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: modulo
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
@@ -17,7 +17,7 @@ services:
       retries: 10
 
   redis-local:
-    image: redis:8-alpine
+    image: redis:7-alpine
     ports:
       - "6380:6379"
 

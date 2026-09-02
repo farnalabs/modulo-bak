@@ -9,7 +9,6 @@ on:
 env:
   SECRET_KEY: ${{ secrets.SECRET_KEY }}
   FERNET_KEY: ${{ secrets.FERNET_KEY }}
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   # Fast jobs run on ALL events (PR + push + manual)
@@ -28,12 +27,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - run: uv sync --frozen
       - run: uv run --no-build --no-sync ruff check .
       - name: Ruff format check
@@ -110,12 +103,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - run: uv sync --frozen
       - name: Run unit tests with coverage
         shell: bash
@@ -155,7 +142,7 @@ jobs:
             tests/bdd/steps/test_eval_block_steps.py tests/bdd/steps/test_hitl.py \
             tests/bdd/steps/test_eval_scorer_gates.py \
             -q --tb=short --timeout=120 -p no:warnings
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: coverage-report
@@ -181,12 +168,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - run: uv sync --frozen
       - name: Detect changed integration test files
         id: changed
@@ -293,9 +274,9 @@ jobs:
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 11.25.0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v6
         with:
-          node-version: "24"
+          node-version: "22"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile --ignore-scripts
@@ -341,17 +322,11 @@ jobs:
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
           version: 11.25.0
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v6
         with:
-          node-version: "24"
+          node-version: "22"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - name: Install backend deps
         working-directory: backend
         run: uv sync --frozen
@@ -420,12 +395,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - name: Verify single migration head
         working-directory: backend
         shell: bash
@@ -518,12 +487,6 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
-
       - run: uv sync --frozen
       - name: Break-glass boot allow-list + connectivity smoke
         env:

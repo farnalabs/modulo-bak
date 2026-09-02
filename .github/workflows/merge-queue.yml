@@ -37,7 +37,6 @@ concurrency:
 env:
   SECRET_KEY: ${{ secrets.SECRET_KEY }}
   FERNET_KEY: ${{ secrets.FERNET_KEY }}
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
   freeze-gate:
@@ -220,9 +219,9 @@ jobs:
         with:
           version: 11.25.0
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v6
         with:
-          node-version: "24"
+          node-version: "22"
           cache: pnpm
           cache-dependency-path: frontend/pnpm-lock.yaml
 
@@ -613,12 +612,6 @@ jobs:
         shell: bash
         run: |
           echo "" > /tmp/failure_description.txt
-
-      - name: Authenticate git for uv GitHub dependency fetches
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
       - name: Install backend deps
         if: steps.merge.outputs.merged_count != '0'
