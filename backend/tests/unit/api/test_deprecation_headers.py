@@ -1,9 +1,16 @@
 """Unit tests for DeprecationHeaderMiddleware."""
 
+from datetime import date, timedelta
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from modulo.api.middleware.deprecation_headers import DeprecationHeaderMiddleware
+
+
+def _future_sunset() -> str:
+    """Return an ISO date comfortably in the future so deprecation headers are exercised (200 path)."""
+    return (date.today() + timedelta(days=30)).isoformat()
 
 
 def _make_app() -> FastAPI:
@@ -49,12 +56,13 @@ class TestDeprecationHeaderMiddleware:
 
     def test_deprecated_route_gets_sunset_header_when_set(self):
         """Sunset header should be added when sunset date is provided."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2026-09-01")
+        sunset = _future_sunset()
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=sunset)
         app = _make_app()
         with TestClient(app) as client:
             resp = client.get("/api/v1/old-endpoint")
         assert resp.status_code == 200
-        assert resp.headers.get("Sunset") == "2026-09-01"
+        assert resp.headers.get("Sunset") == sunset
 
     def test_deprecated_route_gets_link_header_when_migration_url_set(self):
         """Link header should be added when migration_url is provided."""
@@ -67,9 +75,10 @@ class TestDeprecationHeaderMiddleware:
 
     def test_deprecated_route_gets_all_headers_when_fully_configured(self):
         """All three headers should appear when sunset and migration_url are set."""
+        sunset = _future_sunset()
         DeprecationHeaderMiddleware.deprecate(
             "/api/v1/old-endpoint",
-            sunset="2026-09-01",
+            sunset=sunset,
             migration_url="/docs/migrations/v2",
         )
         app = _make_app()
@@ -77,7 +86,7 @@ class TestDeprecationHeaderMiddleware:
             resp = client.get("/api/v1/old-endpoint")
         assert resp.status_code == 200
         assert resp.headers.get("Deprecation") == "true"
-        assert resp.headers.get("Sunset") == "2026-09-01"
+        assert resp.headers.get("Sunset") == sunset
         assert resp.headers.get("Link") == '/docs/migrations/v2; rel="deprecation"'
 
     def test_path_prefix_matches_subpaths(self):
