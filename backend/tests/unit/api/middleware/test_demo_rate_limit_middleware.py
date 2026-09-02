@@ -1,15 +1,23 @@
 """Process-local demo rate-limit floor tests (FAR-535 qa-iterate iteration 2).
 
-When RateLimitMiddleware's registry degrades to ``_NoopRateLimiter`` (Redis
-unconfigured/unreachable, or sqlite mode) every route is normally fail-open —
-existing behaviour. The demo auto-login endpoint is the exception: it mints a
-real session with zero user input, so its 10/hour per-IP cap must survive the
-fallback via a bounded in-process TokenBucket. Locks here:
+When RateLimitMiddleware's registry cannot enforce, every route is normally
+fail-open — existing behaviour. The demo auto-login endpoint is the exception:
+it mints a real session with zero user input, so its 10/hour per-IP cap must
+survive BOTH degraded registry states via a bounded in-process TokenBucket:
+
+  * Redis unconfigured (sqlite mode / empty redis_url) — the registry is
+    ``_NoopRateLimiter``, which allows everything;
+  * Redis configured but failing at request time — the registry check raises.
+
+Locks here:
 
   * with a noop registry, the 11th rapid demo request from one IP is 429'd
     (with Retry-After) while the first 10 pass;
-  * a different IP's bucket is untouched (per-IP isolation);
-  * OTHER ruled routes keep their fail-open noop behaviour (no floor).
+  * with a RAISING registry (configured-but-failing Redis), the 11th demo
+    request still 429s via the floor — a failing registry does NOT bypass
+    the bucket, and its verdict is honoured;
+  * OTHER ruled routes keep their fail-open behaviour in both states;
+  * a different IP's bucket is untouched (per-IP isolation).
 
 Uses direct ``dispatch`` calls with mock requests — no HTTP stack — mirroring
 the middleware-internals test style in tests/unit/rate_limiter/.
@@ -138,6 +146,91 @@ def test_demo_floor_uses_bounded_token_bucket_shape() -> None:
     """The floor bucket dict starts empty before any demo request."""
     bucket = _demo_floor_buckets.get("ip:203.0.113.9:/api/v1/auth/demo")
     assert bucket is None
+
+
+# ---------------------------------------------------------------------------
+# Configured-but-failing Redis (verification round): the registry is a real
+# limiter whose check RAISES at request time (Redis.from_url is lazy, so the
+# constructor succeeds). The demo floor must engage here too — the middleware
+# would otherwise fail open and the demo cap would be inert in exactly the
+# degraded state it claims to survive.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingRegistry:
+    """Registry stand-in whose check always raises (Redis configured, dead)."""
+
+    async def check(self, key: str, max_requests: int, window_s: int = 60) -> bool:
+        raise RuntimeError("redis down")
+
+
+def _middleware_with_raising_registry() -> RateLimitMiddleware:
+    app = FastAPI()
+
+    @app.post(DEMO_RULE_PREFIX)
+    async def demo() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.post("/api/v1/runs")
+    async def runs() -> dict[str, bool]:
+        return {"ok": True}
+
+    return RateLimitMiddleware(app=app, settings=_settings(), registry=_RaisingRegistry())  # type: ignore[arg-type]
+
+
+async def test_demo_floor_engages_when_registry_check_raises() -> None:
+    """11 demo requests with a RAISING registry: the 11th still 429s via the floor.
+
+    A failing registry must NOT bypass the process-local bucket — the floor's
+    verdict (429 with Retry-After on exhaustion) is honoured instead of the
+    blanket fail-open other routes get.
+    """
+    mw = _middleware_with_raising_registry()
+    call_next = _call_next()
+
+    responses = [await mw.dispatch(_demo_request("203.0.113.9"), call_next) for _ in range(11)]
+
+    first_ten = [resp.status_code for resp in responses[:10]]
+    assert all(status == 200 for status in first_ten)
+    assert responses[10].status_code == 429
+    assert "Retry-After" in responses[10].headers
+    assert call_next.await_count == 10
+    bucket = _demo_floor_buckets.get("ip:203.0.113.9:/api/v1/auth/demo")
+    assert isinstance(bucket, TokenBucket)
+
+
+async def test_other_routes_fail_open_when_registry_check_raises() -> None:
+    """Non-demo ruled routes keep the blanket fail-open on a RAISING registry."""
+    mw = _middleware_with_raising_registry()
+    req = MagicMock()
+    req.method = "POST"
+    req.url.path = "/api/v1/runs"
+    req.scope = {}
+    req.headers.get = MagicMock(side_effect=lambda name, default="": default)
+    req.client = MagicMock(host="203.0.113.9")
+    call_next = _call_next()
+
+    for _ in range(15):
+        resp = await mw.dispatch(req, call_next)
+        assert resp.status_code == 200
+
+    assert not _demo_floor_buckets
+
+
+async def test_raising_registry_does_not_bypass_floor_for_demo_rule() -> None:
+    """A floor-exhausted demo IP keeps getting 429 even while the registry raises."""
+    mw = _middleware_with_raising_registry()
+    call_next = _call_next()
+
+    for _ in range(10):
+        resp = await mw.dispatch(_demo_request("203.0.113.9"), call_next)
+        assert resp.status_code == 200
+    assert (await mw.dispatch(_demo_request("203.0.113.9"), call_next)).status_code == 429
+
+    later_resp = await mw.dispatch(_demo_request("203.0.113.9"), call_next)
+
+    assert later_resp.status_code == 429
+    assert call_next.await_count == 10
 
 
 async def test_demo_floor_bucket_shape_after_first_request() -> None:

@@ -12,8 +12,10 @@ second (non-demo) organisation present, the seed_demo_runtime wrapper
 running the seed in its own transaction on a caller-provided session factory,
 deterministic recovery when multiple soft-deleted 'demo'-slug orgs coexist
 (Postgres partial-index reality — no MultipleResultsFound, undelete applied to
-the chosen row), and savepoint IntegrityError recovery for every sample-data
-insert (concurrent-style duplicate ⇒ adopt the winner, seed still completes).
+the chosen row), savepoint IntegrityError recovery for every sample-data
+insert (concurrent-style duplicate ⇒ adopt the winner, seed still completes),
+and failure-log sanitization: seed failures never surface SQLAlchemy bind
+parameters (which embed the demo account's bcrypt password hash).
 """
 
 import logging
@@ -591,3 +593,85 @@ async def test_seed_stray_membership_warning_ignores_soft_deleted_orgs(
         if record.getMessage() == "demo_seed.account_has_memberships_outside_demo_org"
     ]
     assert not warnings
+
+
+# ---------------------------------------------------------------------------
+# Failure-log sanitization (verification round): SQLAlchemy DBAPIError /
+# StatementError str() and repr() embed the failed statement's bind parameters
+# as "[parameters: (...)]" — for the demo account INSERT those include the
+# bcrypt password_hash. Every seed-failure log/print surface must carry the
+# sanitized text only.
+# ---------------------------------------------------------------------------
+
+_HASH_MARKER = "<bcrypt-hash>"
+
+
+def _leaking_integrity_error() -> IntegrityError:
+    """An IntegrityError whose str()/repr() embed a [parameters: (...)] section.
+
+    Mirrors the real failure shape: SQLAlchemy renders the failed statement's
+    bind params, and the demo account INSERT binds the bcrypt password hash.
+    """
+    return IntegrityError(
+        "INSERT INTO accounts (email, password_hash) VALUES ($1, $2)",
+        (_DEMO_EMAIL, _HASH_MARKER),
+        Exception("duplicate key value violates unique constraint"),
+    )
+
+
+def test_safe_exc_text_strips_bind_parameters() -> None:
+    """The sanitizer keeps type + message but removes the [parameters:] section."""
+    exc = _leaking_integrity_error()
+    raw = str(exc)
+    # Discriminating pre-check: the fixture genuinely leaks, so the stripped
+    # assertions below cannot pass vacuously.
+    assert _HASH_MARKER in raw
+    assert "[parameters:" in raw
+
+    text = seed_demo_module._safe_exc_text(exc)
+
+    assert _HASH_MARKER not in text
+    assert "[parameters:" not in text
+    assert text.startswith("IntegrityError:")
+
+
+def test_safe_exc_text_handles_plain_exceptions() -> None:
+    """A non-SQLAlchemy failure passes through with type + message intact."""
+    text = seed_demo_module._safe_exc_text(ValueError("boom"))
+
+    assert text == "ValueError: boom"
+
+
+def test_seed_failure_log_and_print_never_leak_bind_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A seed failure surfaces sanitized text only — no hash, no [parameters:.
+
+    Exercises the standalone entry (main): both the structured log record and
+    the stdout FAILED line must carry the sanitized text; the raw exception
+    (whose str embeds the hash) must never appear on any surface. Deliberately
+    sync: main() drives the seed via asyncio.run(), which cannot run inside
+    this suite's event loop.
+    """
+    settings = _demo_settings()
+    monkeypatch.setattr(seed_demo_module, "get_settings", lambda: settings)
+
+    async def _failing_runtime() -> None:
+        raise _leaking_integrity_error()
+
+    monkeypatch.setattr(seed_demo_module, "seed_demo_runtime", _failing_runtime)
+
+    with caplog.at_level(logging.ERROR, logger="modulo.db.seed_demo"), pytest.raises(SystemExit) as excinfo:
+        seed_demo_module.main()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    log_text = "\n".join(f"{record.getMessage()} {getattr(record, 'error', '')}" for record in caplog.records)
+    combined = captured.out + captured.err + log_text
+    assert _HASH_MARKER not in combined
+    assert "[parameters:" not in combined
+    # Still diagnosable: exception type + message survive the sanitization.
+    assert "IntegrityError" in combined
+    assert "demo_seed.failed" in log_text

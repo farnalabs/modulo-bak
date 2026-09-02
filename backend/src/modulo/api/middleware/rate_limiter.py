@@ -24,11 +24,15 @@ from modulo.settings import Settings, get_settings
 
 RATELIMIT_BYPASS_HEADER = "MODULO_RATELIMIT_BYPASS_TOKEN"
 
-# FAR-535: process-local floor for the demo auto-login path. When the shared
-# registry degrades to _NoopRateLimiter (Redis unconfigured/unreachable, or
-# sqlite mode) the Redis-backed demo rule would silently stop enforcing, yet
-# the demo endpoint mints real sessions with zero user input — its 10/hour cap
-# must survive the fallback. Other routes stay fail-open (existing behaviour).
+# FAR-535: process-local floor for the demo auto-login path. The demo
+# endpoint mints real sessions with zero user input, so its 10/hour cap must
+# survive EVERY degraded registry state:
+#   * Redis configured and healthy — the shared registry enforces the rule.
+#   * Redis unconfigured (or sqlite mode) — the registry is _NoopRateLimiter,
+#     which allows everything; the floor enforces 10/hour per-process.
+#   * Redis configured but failing at request time — the registry check
+#     raises and the middleware would normally fail open; for the demo rule
+#     the floor engages instead. Other routes keep failing open.
 DEMO_RULE_PREFIX = "/api/v1/auth/demo"
 _DEMO_FLOOR_RATE_PER_HOUR = 10
 _DEMO_FLOOR_BURST = 10
@@ -124,7 +128,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """Rate limits per-route based on pre-defined rules.
 
     Uses Redis sliding window (ZADD + ZREMRANGEBYSCORE) when Redis is
-    configured; falls back to in-memory token bucket otherwise.
+    configured and reachable. In the two degraded states — Redis unconfigured
+    (the registry is _NoopRateLimiter) and Redis configured but failing at
+    request time (the registry check raises) — requests normally fail open,
+    except the demo auto-login rule, which falls back to the process-local
+    token-bucket floor (see ``_consume_demo_floor``).
 
     Accepts optional ``settings`` and ``registry`` constructor params.
     When provided, these are used instead of calling ``get_settings()``
@@ -134,9 +142,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     RULES: ClassVar[list[RateLimitRule]] = [
         # FAR-535: demo auto-login — 10/hour per IP. Strict: the endpoint mints
         # a real session with zero user input, so it must be expensive to abuse.
-        # Enforced by the Redis registry when available AND by the process-local
-        # token-bucket floor (see _consume_demo_floor) when it degrades to a
-        # _NoopRateLimiter. Declared FIRST: _rule_for returns the first matching
+        # Enforced by the Redis registry when it can enforce (healthy Redis),
+        # and by the process-local token-bucket floor (see _consume_demo_floor)
+        # whenever the registry cannot — noop registry (Redis unconfigured /
+        # sqlite mode) or a runtime check failure (Redis configured but
+        # failing). Declared FIRST: _rule_for returns the first matching
         # prefix and no other rule overlaps /api/v1/auth/demo, but leading
         # specificity keeps future prefix additions from silently overriding
         # this limit.
@@ -183,6 +193,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             client_key = self._client_key(request)
             rule = self._rule_for(request)
 
+            registry_failed = False
             try:
                 allowed = await self._registry.check(
                     client_key,
@@ -192,15 +203,23 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             except asyncio.CancelledError:
                 raise
             except Exception:
+                registry_failed = True
                 _log.warning(
                     "ratelimit.check_failed",
                     extra={"client_key": client_key},
                     exc_info=True,
                 )
                 allowed = True
-            if allowed and isinstance(self._registry, _NoopRateLimiter) and rule.path_prefix == DEMO_RULE_PREFIX:
-                # FAR-535 Redis-unavailable floor: the noop registry allows
-                # everything, but the demo cap must still bite per-process.
+            if rule.path_prefix == DEMO_RULE_PREFIX and (
+                registry_failed or isinstance(self._registry, _NoopRateLimiter)
+            ):
+                # FAR-535 demo floor: engaged whenever the shared registry
+                # cannot enforce the demo cap — either it degrades to the noop
+                # limiter (Redis unconfigured / sqlite mode) or its runtime
+                # check raises (Redis configured but failing). The bucket's
+                # verdict is honoured (429 with Retry-After on exhaustion);
+                # a failing registry must NOT bypass the cap. Other routes
+                # keep the existing fail-open behaviour (allowed stays True).
                 allowed = await _consume_demo_floor(client_key)
             if not allowed:
                 _log.warning("ratelimit.exceeded", extra={"client_key": client_key})

@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 import sys
 from datetime import UTC, datetime, timedelta
 
@@ -59,6 +60,36 @@ from modulo.settings import get_settings
 _log = logging.getLogger(__name__)
 
 DEMO_ORG_NAME = "Demo"
+
+# SQLAlchemy DBAPIError/StatementError str() and repr() embed the failed
+# statement's bind parameters as a "[parameters: (...)]" section. The demo
+# account INSERT binds include the demo user's bcrypt password_hash, so every
+# seed-failure log/print goes through _safe_exc_text — never the raw
+# exception text or repr.
+_PARAMETERS_SECTION_RE = re.compile(r"\[parameters:\s*.*?\]", re.DOTALL)
+
+
+def _safe_exc_text(exc: BaseException) -> str:
+    """Type + message for a seed-failure log, with bind parameters stripped.
+
+    SQLAlchemy's DBAPIError/StatementError string and repr forms embed
+    ``[parameters: (...)]``; for the demo account INSERT those bind params
+    contain the demo account's bcrypt password_hash. The section is removed
+    entirely (not masked) so neither the hash nor a "[parameters:" marker
+    survives in any log/stdout surface.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    return _PARAMETERS_SECTION_RE.sub("", text)
+
+
+class DemoSeedError(Exception):
+    """Raised by main.py's demo-seed wrapper when the demo seed fails.
+
+    The message is always ``_safe_exc_text`` output: ``_boot_seed`` prints
+    ``repr(exc)`` to stdout and logs the traceback, and SQLAlchemy exception
+    reprs embed bind parameters (this seed's include the demo password hash),
+    so the original exception is deliberately NOT chained here.
+    """
 
 
 def _demo_pipeline_graph() -> list[dict[str, object]]:
@@ -568,14 +599,16 @@ def main() -> None:
         return
     try:
         summary = asyncio.run(seed_demo_runtime())
-        print(f"[demo-seed] ok ({summary})", flush=True)  # noqa: T201
     except Exception as exc:
-        _log.exception("demo_seed.failed")
-        # Type + message only: SQLAlchemy reprs embed bind params, and this
-        # seed's binds include the demo account's password hash — never print
-        # it to stdout.
-        print(f"[demo-seed] FAILED ({type(exc).__name__}: {exc})", flush=True)  # noqa: T201
+        detail = _safe_exc_text(exc)
+        # Sanitized type + message only — NO exc_info. SQLAlchemy reprs embed
+        # bind params (this seed's include the demo password hash), and
+        # traceback rendering re-embeds them via str(exc), so the raw
+        # exception/traceback must never reach stdout or the logs.
+        _log.error("demo_seed.failed", extra={"error": detail})
+        print(f"[demo-seed] FAILED ({detail})", flush=True)  # noqa: T201
         sys.exit(1)
+    print(f"[demo-seed] ok ({summary})", flush=True)  # noqa: T201
 
 
 if __name__ == "__main__":
