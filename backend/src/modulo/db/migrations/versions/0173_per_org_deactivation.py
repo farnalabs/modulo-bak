@@ -1,7 +1,7 @@
 """Per-org user deactivation: the membership tombstone, not accounts.active.
 
-Revision ID: 0172_per_org_deactivation
-Revises: 0171_runs_list_performance_indexes
+Revision ID: 0173_per_org_deactivation
+Revises: 0172_seed_orphan_organisation
 Create Date: 2026-09-02
 
 Why per-org (gh-1794 / FAR-533)
@@ -41,8 +41,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision: str = "0172_per_org_deactivation"
-down_revision: str | None = "0171_runs_list_performance_indexes"
+revision: str = "0173_per_org_deactivation"
+down_revision: str | None = "0172_seed_orphan_organisation"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 

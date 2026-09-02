@@ -49,7 +49,7 @@ Rejected as unnecessary complexity — the `active` boolean already separates "c
 
 The deactivation described above was account-global: `accounts.active = false`
 locked the user out of EVERY org they belong to, while the caller was only ever
-authorised by a SINGLE shared org. Migration `0172_per_org_deactivation`
+authorised by a SINGLE shared org. Migration `0173_per_org_deactivation`
 redefined the caller-bound SECURITY DEFINER so the org-admin deactivation path
 tombstones the caller's-org membership (`org_memberships.deactivated_at`) and
 leaves `accounts.active` untouched — a user shared with orgs B/C keeps their
