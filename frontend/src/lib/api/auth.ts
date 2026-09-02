@@ -2,6 +2,9 @@ import { getAutoLoginConfig } from '../../config/runtime'
 
 const TOKEN_KEY = 'modulo_access_token'
 const REFRESH_TOKEN_KEY = 'modulo_refresh_token'
+// FAR-535: persisted marker that the current session came from the /demo
+// auto-login. Read by the demo-mode banner; cleared with the session.
+const DEMO_SESSION_KEY = 'modulo_demo_session'
 
 // S8475: only store well-formed, opaque token strings in browser storage.
 // Rejects anything containing control/whitespace chars or exceeding a sane
@@ -28,6 +31,28 @@ function storeToken(key: string, token: string): void {
 
 let _authListeners: Array<(token: string | null) => void> = []
 let _refreshingPromise: Promise<boolean> | null = null
+// True when the most recently cleared session was a demo session and no new
+// login has happened since. Consumed by shouldReRunAutoLogin (client.ts) so an
+// expired demo session never triggers the silent auto-login recovery — a demo
+// session must die with its short-lived token, not escalate into the
+// instance's auto-login account.
+let _lastClearedWasDemo = false
+
+export function isDemoSession(): boolean {
+  return localStorage.getItem(DEMO_SESSION_KEY) === '1'
+}
+
+export function setDemoSession(active: boolean): void {
+  if (active) {
+    localStorage.setItem(DEMO_SESSION_KEY, '1')
+  } else {
+    localStorage.removeItem(DEMO_SESSION_KEY)
+  }
+}
+
+export function wasDemoSessionCleared(): boolean {
+  return _lastClearedWasDemo
+}
 
 function notifyListeners(): void {
   const token = localStorage.getItem(TOKEN_KEY)
@@ -47,12 +72,19 @@ export function onAuthChange(fn: (token: string | null) => void): () => void {
 
 export function setAccessToken(token: string): void {
   storeToken(TOKEN_KEY, token)
+  // A fresh login supersedes the demo-end signal — recovery gating applies
+  // only until the next successful authentication of any kind.
+  _lastClearedWasDemo = false
   notifyListeners()
 }
 
 export function clearAccessToken(): void {
+  // Capture BEFORE clearing: the auto-login recovery gate (client.ts) must
+  // know the session being torn down was a demo session.
+  _lastClearedWasDemo = isDemoSession()
   localStorage.removeItem(TOKEN_KEY)
   clearRefreshToken()
+  setDemoSession(false)
   notifyListeners()
 }
 

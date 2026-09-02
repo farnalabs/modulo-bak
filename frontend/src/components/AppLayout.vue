@@ -18,6 +18,7 @@
     >
       <div class="relative z-10 space-y-2">
         <DbCapacityBanner v-if="isAdminUser" />
+        <DemoBanner />
         <OnboardingBanner />
         <div class="px-6">
           <ProductAnalyticsConsentPrompt />
@@ -59,6 +60,7 @@ import { abortUiCommands } from "../composables/useUiCommandExecutor";
 import { applyPrimeVueTokenBridge } from "../lib/primevue-theme";
 import OnboardingBanner from "./onboarding/OnboardingBanner.vue";
 import DbCapacityBanner from "./DbCapacityBanner.vue";
+import DemoBanner from "./DemoBanner.vue";
 import CommandPalette from "./CommandPalette.vue";
 import SpotlightOverlay from "./onboarding/SpotlightOverlay.vue";
 import ProductAnalyticsConsentPrompt from "./product-analytics/ProductAnalyticsConsentPrompt.vue";

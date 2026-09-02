@@ -102,6 +102,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """
 
     RULES: ClassVar[list[RateLimitRule]] = [
+        # FAR-535: demo auto-login — 10/hour per IP. Strict: the endpoint mints
+        # a real session with zero user input, so it must be expensive to abuse.
+        # Declared FIRST: _rule_for returns the first matching prefix and no
+        # other rule overlaps /api/v1/auth/demo, but leading specificity keeps
+        # future prefix additions from silently overriding this limit.
+        RateLimitRule(path_prefix="/api/v1/auth/demo", max_requests=10, window_s=3600),
         # PRD §7.18: POST /api/v1/runs — 60/min
         RateLimitRule(path_prefix="/api/v1/runs", max_requests=60, window_s=60),
         # PRD §7.18: webhook POST — 100/min

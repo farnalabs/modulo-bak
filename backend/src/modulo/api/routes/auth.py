@@ -47,6 +47,7 @@ from modulo.db.crud.token_family import (
 from modulo.db.models.account import Account
 from modulo.db.models.org_membership import OrgMembership
 from modulo.db.models.token_family import TokenFamily
+from modulo.db.seed_demo import demo_login_config
 from modulo.settings import Settings, get_settings
 
 _MSG_INCORRECT_EMAIL_PASSWORD = "Incorrect email or password"  # nosec B105 — error message, not a real credential
@@ -74,6 +75,11 @@ class LoginResponse(BaseModel):
 
 class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=1)
+
+
+class DemoLoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 
 class RefreshResponse(BaseModel):
@@ -399,6 +405,77 @@ async def login(
         ) from None
 
     return _mint_login_response(ctx, settings)
+
+
+# ---------------------------------------------------------------------------
+# Demo auto-login (FAR-535)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/demo")
+@handle_db_errors("auth.demo_login")
+async def demo_login(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    session: AsyncSession = Depends(get_db_session),
+) -> JSONResponse:
+    """Auto-login the env-configured read-only demo user (FAR-535).
+
+    The browser sends NO credentials — the server reads the demo email/password
+    from settings (MODULO_DEMO_USER / MODULO_DEMO_PASSWORD). Kill switch: when
+    MODULO_DEMO_ENABLED is falsy or either credential is unset the endpoint
+    answers a plain 404 so it never reveals that a demo feature exists.
+
+    The minted access token carries the SHORT demo TTL
+    (modulo_demo_token_minutes, ~2h) and NO refresh token is issued — the demo
+    session dies with the access token. Rate limiting: 10/hour per IP via
+    RateLimitMiddleware.RULES; auth lockout failures additionally feed the
+    shared AuthRateLimiter like a normal login.
+    """
+    config = demo_login_config(settings)
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+    email, password = config
+
+    ip = _client_ip(request)
+    limiter = get_auth_rate_limiter(settings)
+
+    try:
+        async with session.begin():
+            # Env-vs-DB mismatch (operator misconfiguration / tampering) raises
+            # the standard 401 through _authenticate_credentials — identical
+            # denial semantics and limiter-failure recording as /login.
+            account = await _authenticate_credentials(session, email, password, limiter=limiter, ip=ip)
+            if limiter is not None:
+                await limiter.record_success(ip)
+            await update_last_login(session, account.id)
+            memberships = await list_memberships_for_account(session, account.id)
+            org_id, org_role = _resolve_login_org_context(memberships, account)
+    except asyncio.CancelledError:
+        raise
+    except HTTPException as exc:
+        raise exc
+
+    # Structured audit log for the demo-login event (login's logging pattern);
+    # the token itself is minted only after the transaction committed.
+    _log.info(
+        "auth.demo_login",
+        extra={"account_id": str(account.id), "org_id": str(org_id) if org_id else None},
+    )
+
+    access_token = create_access_token(
+        account.email,
+        settings.secret_key,
+        organisation_id=str(org_id) if org_id else "",
+        account_id=str(account.id),
+        org_role=org_role or "",
+        is_system_admin=account.is_system_admin,
+        ttl_minutes=settings.modulo_demo_token_minutes,
+    )
+    content = DemoLoginResponse(access_token=access_token).model_dump()
+    response = JSONResponse(content=content)
+    _set_auth_cookies(response, access_token, settings, max_age_seconds=settings.modulo_demo_token_minutes * 60)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -883,29 +960,37 @@ async def csrf_token(
         ) from None
 
 
-def _set_auth_cookies(response: Response, access_token: str, settings: Settings) -> None:
+def _set_auth_cookies(
+    response: Response, access_token: str, settings: Settings, *, max_age_seconds: int | None = None
+) -> None:
+    """Set the session + CSRF cookies for a freshly minted access token.
+
+    ``max_age_seconds`` overrides the default settings-derived TTL — the demo
+    login uses it so the cookie lifetime matches the shorter demo token expiry.
+    """
     secure = not settings.debug
+    resolved_max_age = max_age_seconds if max_age_seconds is not None else settings.modulo_access_token_minutes * 60
     response.set_cookie(
         key="modulo_session",
         value=access_token,
         httponly=True,
         samesite="strict",
         secure=secure,
-        max_age=settings.modulo_access_token_minutes * 60,
+        max_age=resolved_max_age,
         path="/",
     )
     csrf_token_value = secrets.token_hex(32)
-    _set_csrf_cookie(response, csrf_token_value, settings)
+    _set_csrf_cookie(response, csrf_token_value, settings, max_age_seconds=max_age_seconds)
 
 
-def _set_csrf_cookie(response: Response, token: str, settings: Settings) -> None:
+def _set_csrf_cookie(response: Response, token: str, settings: Settings, *, max_age_seconds: int | None = None) -> None:
     response.set_cookie(
         key="XSRF-TOKEN",
         value=token,
         httponly=False,  # NOSONAR S3330 — JS-readable CSRF token; SameSite=strict + secure mitigate.
         samesite="strict",
         secure=not settings.debug,
-        max_age=settings.modulo_access_token_minutes * 60,
+        max_age=max_age_seconds if max_age_seconds is not None else settings.modulo_access_token_minutes * 60,
         path="/",
     )
 

@@ -954,6 +954,11 @@ async def _run_boot_guards_and_seeds(settings: Settings) -> None:
     if settings.modulo_seed_demo_orgs:
         await _boot_seed("demo_orgs", _seed_demo_orgs(settings))
 
+    # Demo auto-login experience (FAR-535). Fires only when MODULO_DEMO_ENABLED
+    # is truthy AND MODULO_DEMO_USER/MODULO_DEMO_PASSWORD are set — otherwise the
+    # seed is a no-op and the default release path behaviour is unchanged.
+    await _boot_seed("demo_user", _seed_demo_login(settings))
+
     # Initialise the LangGraph checkpointer schema (langgraph.* tables).
     try:
         await _init_checkpointer(
@@ -1090,6 +1095,21 @@ async def _seed_demo_orgs(settings: Settings) -> None:
     engine = get_or_create_engine(settings)
     factory = get_or_create_session_factory(engine)
     await seed_demo_orgs(factory)
+
+
+async def _seed_demo_login(settings: Settings) -> str | None:
+    """Seed the demo org/user + sample data (FAR-535).
+
+    Idempotent and self-gating: ``seed_demo`` returns None (and writes nothing)
+    unless MODULO_DEMO_ENABLED + MODULO_DEMO_USER + MODULO_DEMO_PASSWORD are set.
+    """
+    from modulo.api.dependencies import get_or_create_engine, get_or_create_session_factory
+    from modulo.db.seed_demo import seed_demo
+
+    engine = get_or_create_engine(settings)
+    factory = get_or_create_session_factory(engine)
+    async with factory() as session, session.begin():
+        return await seed_demo(session)
 
 
 async def _seed_tier_catalog() -> None:
