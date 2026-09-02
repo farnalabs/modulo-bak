@@ -1012,7 +1012,7 @@ class FeedbackManager:
                 payload_json={
                     "correction_id": ctx.correction.id,
                     "guardrail_id": ctx.correction.guardrail_id,
-                    "node_id": record.producing_node_id,
+                    "node_id": str(record.producing_node_id),
                     "attempt": attempt,
                 },
             )
