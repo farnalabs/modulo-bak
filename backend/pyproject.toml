@@ -532,10 +532,12 @@ dev = [
     # Pinned to the pytest-9.1 fix for the _register_fixture(nodeid=...) deprecation
     # (pytest-dev/pytest-bdd#823): no PyPI release carries it yet (8.1.0 is latest).
     # Replace with a >=8.1.1 PyPI pin once the fix is released.
-    # Pin to the contributor's fork branch (Sanjays2402/pytest-bdd@fix-register-fixture-node-deprecation):
-    # the fix commit 60f6625b lives there on a real branch, whereas on pytest-dev/pytest-bdd it is an
-    # orphaned SHA that uv cannot reliably fetch (git reports "could not read Username" in CI).
-    "pytest-bdd @ git+https://github.com/Sanjays2402/pytest-bdd@60f6625b71b5552af02a4830e3d520f5ab6838e4",
+    # Pin to the contributor's fork BRANCH (Sanjays2402/pytest-bdd@fix-register-fixture-node-deprecation):
+    # the fix commit 60f6625b lives there on a real, advertised branch ref. Pinning to the branch ref
+    # (not the raw SHA) makes uv's git fetch reliable in CI — fetching an unadvertised SHA from GitHub
+    # is flaky and intermittently fails with "could not read Username". The branch currently resolves
+    # to 60f6625b; replace with a >=8.1.1 PyPI pin once the fix is released.
+    "pytest-bdd @ git+https://github.com/Sanjays2402/pytest-bdd@fix-register-fixture-node-deprecation",
     "pytest-cov>=7.1.0",
     "pytest-playwright>=0.8.0",
     "pytest-timeout>=2.4.0",
