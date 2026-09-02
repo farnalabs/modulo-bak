@@ -424,7 +424,7 @@ def test_apply_imported_retry_policy_core_fault_emits_legacy_warning() -> None:
     pipeline_info = {"retry_policy": {"on": ["bogus"], "max_retries": 2}}
     warnings: list[str] = []
     _apply_imported_retry_policy(pipeline, pipeline_info, warnings)
-    assert pipeline.retry_policy == {}
+    assert not pipeline.retry_policy
     assert warnings == ["Imported pipeline 'retry_policy' was malformed; dropped to the no-policy default ({})."]
 
 
@@ -447,7 +447,7 @@ def test_apply_imported_retry_policy_absent_policy_no_warning() -> None:
     pipeline = MagicMock()
     warnings: list[str] = []
     _apply_imported_retry_policy(pipeline, {}, warnings)
-    assert pipeline.retry_policy == {}
+    assert not pipeline.retry_policy
     assert warnings == []
 
 

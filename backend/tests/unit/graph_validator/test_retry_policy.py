@@ -132,12 +132,12 @@ def test_schedule_absent_or_empty_passes() -> None:
         {"on": ["failure"], "max_retries": 1, "backoff_schedule": None},
         {"on": ["failure"], "max_retries": 1, "backoff_schedule": {}},
     ):
-        assert _schedule_errors(policy) == []
+        assert not _schedule_errors(policy)
 
 
 def test_schedule_non_dict_policy_passes() -> None:
     # A non-dict policy is the core validator's fault, not the schedule's.
-    assert _schedule_errors("stall") == []
+    assert not _schedule_errors("stall")
 
 
 def test_schedule_non_dict_schedule_is_malformed() -> None:
@@ -154,9 +154,9 @@ def test_schedule_bounds_edges() -> None:
 
     # Accepted
     for delay in (1, 300, 300.0, 1.0):
-        assert _schedule_errors({"backoff_schedule": {"delay_seconds": delay}}) == [], delay
+        assert not _schedule_errors({"backoff_schedule": {"delay_seconds": delay}}), delay
     for mult in (1, 1.0, 2, 2.0, 10, 10.0):
-        assert _schedule_errors({"backoff_schedule": {"delay_seconds": 45, "multiplier": mult}}) == [], mult
+        assert not _schedule_errors({"backoff_schedule": {"delay_seconds": 45, "multiplier": mult}}), mult
     # Rejected: bools, non-integral, out of bounds, NaN/Infinity
     for bad in (0, 301, -1, 0.9, 300.5, 1.5, True, False, float("nan"), float("inf"), "45", None):
         assert _schedule_errors({"backoff_schedule": {"delay_seconds": bad}}), bad
@@ -185,7 +185,7 @@ def test_schedule_unknown_inner_key_rejected() -> None:
 
 
 def test_schedule_valid_schedule_emits_nothing() -> None:
-    assert _schedule_errors({"backoff_schedule": {"delay_seconds": 30, "multiplier": 1.5}}) == []
+    assert not _schedule_errors({"backoff_schedule": {"delay_seconds": 30, "multiplier": 1.5}})
 
 
 def test_schedule_malformed_does_not_affect_core_check() -> None:

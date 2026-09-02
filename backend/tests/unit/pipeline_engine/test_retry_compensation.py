@@ -443,7 +443,8 @@ def test_resolve_backoff_schedule_legacy_backoff_coexistence() -> None:
     is node-default-inherited), and the node-inheritance path still reads it."""
     policy = {"on": ["failure"], "max_retries": 2, "backoff": 1.5}
     present, _delay, _mult, reason = rc.resolve_backoff_schedule(policy)
-    assert present is False and reason is None
+    assert present is False
+    assert reason is None
     node_policy = rc._policy_from_pipeline_default(policy)
     assert node_policy.backoff_seconds == 1.5  # node inheritance path UNCHANGED
 
@@ -496,7 +497,8 @@ def test_resolve_backoff_schedule_accepted_resolves_cross_check() -> None:
             GraphValidator.check_retry_policy_schedule(policy, result)
             assert result.is_valid, (delay, mult)
             present, _delay, _mult, reason = rc.resolve_backoff_schedule(policy)
-            assert present is True and reason is None, (delay, mult)
+            assert present is True, (delay, mult)
+            assert reason is None, (delay, mult)
 
 
 def test_sanitize_retry_policy_snippet_bounded_and_redacted() -> None:
@@ -581,7 +583,8 @@ def test_write_sites_produce_identical_canonical_stored_output() -> None:
             {"on": ["failure"], "max_retries": 2, "backoff_schedule": dict(schedule)}
         )
         assert fault is None, schedule
-        assert api_out is not None and import_out is not None, schedule
+        assert api_out is not None, schedule
+        assert import_out is not None, schedule
         assert api_out["backoff_schedule"] == import_out["backoff_schedule"], schedule
     # Spot-check the canonical spellings survive both sites identically.
     api_out = _validate_retry_policy(

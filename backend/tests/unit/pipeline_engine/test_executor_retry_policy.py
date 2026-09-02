@@ -1191,8 +1191,10 @@ def test_retry_backoff_defaults_single_sourced_from_retry_compensation():
 
     from modulo.core.pipeline_engine import retry_compensation as rc
 
-    assert executor_module._RETRY_BACKOFF_BASE_SECONDS == rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS == 45.0
-    assert executor_module._RETRY_BACKOFF_DEFAULT_MULTIPLIER == rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER == 2.0
+    assert executor_module._RETRY_BACKOFF_BASE_SECONDS == rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS
+    assert rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS == 45.0
+    assert executor_module._RETRY_BACKOFF_DEFAULT_MULTIPLIER == rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER
+    assert rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER == 2.0
     # The live parameter defaults reference the rc constants directly.
     sig = inspect.signature(executor_module._retry_backoff_seconds)
     assert sig.parameters["base"].default == rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS

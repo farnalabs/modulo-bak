@@ -121,6 +121,16 @@ _BUDGET_MSG = "retry_policy 'max_retries' must be an integer between 0 and 5"
         ({"on": ["stall"], "max_retries": True}, _BUDGET_MSG),
         ({"on": ["stall"], "max_retries": 6}, _BUDGET_MSG),
     ],
+    ids=[
+        "payload_not_object_scalar",
+        "payload_not_object_list",
+        "on_not_a_list_string",
+        "on_not_a_list_with_int",
+        "on_contains_bogus_value",
+        "max_retries_not_int_string",
+        "max_retries_not_int_bool",
+        "max_retries_out_of_range",
+    ],
 )
 def test_validate_retry_policy_message_parity(payload: object, expected_message: str) -> None:
     """Each failure class raises the EXACT message the pre-refactor inline
