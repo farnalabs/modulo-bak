@@ -1,6 +1,6 @@
 services:
   db-test:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     environment:
       POSTGRES_USER: modulo_test
       POSTGRES_PASSWORD: modulo_test
