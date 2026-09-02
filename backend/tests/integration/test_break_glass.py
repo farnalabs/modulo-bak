@@ -1,7 +1,7 @@
 """Integration tests for break-glass deliverable (A) — last-admin prevention.
 
 Exercises the caller-bound ``deactivate_break_glass`` SECURITY DEFINER
-(reconciliation chain 0108_schema_org_identity, redefined per-org by 0172)
+(reconciliation chain 0108_schema_org_identity, redefined per-org by 0173)
 against a real Postgres: M2010/M2020/M2040 pgcodes, force gating on the
 operator role (real login vs SET ROLE), scoped-vs-global deactivation (the
 non-operator branch is per-org since FAR-533/gh-1794 — the membership

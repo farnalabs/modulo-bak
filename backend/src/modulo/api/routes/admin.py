@@ -1435,7 +1435,7 @@ async def admin_reactivate_user(
             # FAR-533 (gh-1794): reactivation is PER-ORG — clear the
             # deactivated_at tombstone on the CALLER'S-ORG membership only and
             # never touch accounts.active. A globally-flipped account (operator
-            # break-glass, or legacy pre-0172 deactivation) stays inactive
+            # break-glass, or legacy pre-0173 deactivation) stays inactive
             # until an operator restores it; clearing this tombstone alone
             # restores exactly this org.
             from sqlalchemy import update as sa_update

@@ -116,7 +116,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Reconciliation-chain convention (0108+): downgrades are no-ops. The
-    # pre-0172 function body is recoverable by re-applying the 0108 statement;
+    # pre-0173 function body is recoverable by re-applying the 0108 statement;
     # re-defining it here would resurrect the global accounts.active flip the
     # fix exists to remove.
     pass
