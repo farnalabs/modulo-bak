@@ -264,6 +264,9 @@ async def _create_seed_run(
     thread_id = str(uuid.uuid4())
     pipeline_id = uuid.uuid4()
     snapshot_id = uuid.uuid4()
+    # Unique per seed: uq_pipelines_org_name — test_link_correction_run seeds
+    # TWICE in the same org/session, so a fixed name collides on the second.
+    pipeline_name = f"feedback-test-pipeline-{uuid.uuid4().hex[:10]}"
     await session.execute(
         text(
             "INSERT INTO pipelines (id, organisation_id, name, account_id, run_context_defaults, graph_nodes_json) "
@@ -272,7 +275,7 @@ async def _create_seed_run(
         {
             "id": str(pipeline_id),
             "org_id": str(org_id),
-            "name": "Feedback Test Pipeline",
+            "name": pipeline_name,
             "uid": str(user_id),
         },
     )
