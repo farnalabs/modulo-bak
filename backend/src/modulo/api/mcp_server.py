@@ -3415,7 +3415,8 @@ async def _dispatch_hitl_action(
     The decision commits on the gate's claim row (created by the executor when
     the gate fired); the MCP flow never dispatches a resume itself — the
     dispatcher reconcile is the resume path, and it scopes its reconstruction
-    by this stamp.
+    by this stamp. HITLManager._decide would stamp the persisted payload
+    anyway; these explicit stamps document the writer contract per call.
     """
     if action == "claim":
         gate = await mgr.claim(s, run_id=rid, gate_id=gate_id, org_id=org_id, claimant_id=key_id)
@@ -3425,6 +3426,7 @@ async def _dispatch_hitl_action(
             "expires_at": gate.expires_at.isoformat() if gate.expires_at else None,
         }
     if action == "approve":
+        # _decide would stamp anyway (FAR-541); kept for writer-contract clarity.
         await mgr.approve(
             s,
             run_id=rid,
@@ -3435,6 +3437,7 @@ async def _dispatch_hitl_action(
         )
         return {"status": "approved", "gate_id": gate_id}
     if action == "deliver_manual":
+        # _decide would stamp anyway (FAR-541); kept for writer-contract clarity.
         await mgr.deliver_manual(
             s,
             run_id=rid,
@@ -3446,6 +3449,7 @@ async def _dispatch_hitl_action(
             decision_payload={"action": "deliver_manual", "gate_id": gate_id, "output": output or {}},
         )
         return {"status": "delivered_manual", "gate_id": gate_id}
+    # _decide would stamp anyway (FAR-541); kept for writer-contract clarity.
     reject_payload: dict[str, Any] = {"action": "rejected", "gate_id": gate_id}
     if reason is not None:
         reject_payload["reason"] = reason

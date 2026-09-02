@@ -257,7 +257,9 @@ async def approve_gate(
     # FAR-541: every resume decision is STAMPED with the gate it resolves so a
     # per-gate consumer (``_hitl_gate_resume_result``) can reject a foreign
     # decision left in state by an earlier gate (decisions are per-RUN but
-    # consumers are per-gate; ``_hitl_decision`` is never cleared).
+    # consumers are per-gate; ``_hitl_decision`` is never cleared). HITLManager._decide
+    # would stamp the persisted payload anyway; this explicit stamp feeds the
+    # DIRECT executor.resume injection below, which bypasses _decide.
     resume_data: dict[str, Any] = {"action": "approved", "gate_id": gate_id}
     if req.notes:
         resume_data["notes"] = req.notes
@@ -353,6 +355,10 @@ async def approve_gate_with_modification(
     """
     mgr = HITLManager()
     # FAR-541: the payload is stamped with the gate it resolves (see approve_gate).
+    # The real writer contract: action "approved" + "modified_output" (there is
+    # no "approved_with_modification" action). _decide would stamp the persisted
+    # payload anyway; this explicit stamp feeds the DIRECT executor.resume
+    # injection below, which bypasses _decide.
     resume_data: dict[str, Any] = {
         "action": "approved",
         "gate_id": gate_id,
@@ -546,6 +552,8 @@ async def deliver_manual_output(
         )
 
     # FAR-541: the payload is stamped with the gate it resolves (see approve_gate).
+    # _decide would stamp the persisted payload anyway; this explicit stamp
+    # feeds the DIRECT executor.resume injection below, which bypasses _decide.
     resume_data: dict[str, Any] = {"action": "deliver_manual", "gate_id": gate_id, "output": req.output}
     mgr = HITLManager()
     try:
@@ -634,6 +642,8 @@ async def submit_manual_output(
     """Submit output for a manual-input node and resume the run."""
     # FAR-541: stamped with the NODE id being delivered to — the manual node's
     # consumer (``_manual_node``) resumes only on a decision stamped for it.
+    # _decide would stamp the persisted payload anyway; this explicit stamp
+    # feeds the DIRECT executor.resume injection below, which bypasses _decide.
     resume_data: dict[str, Any] = {"action": "manual_output", "gate_id": gate_id, "output": req.output}
     mgr = HITLManager()
     try:

@@ -1585,12 +1585,16 @@ class TestAwaitingHumanHasCommittedDecision:
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
 
     @pytest.mark.asyncio
-    async def test_approved_with_modification_with_output_is_committed(self) -> None:
+    async def test_approve_with_modification_writer_payload_is_committed(self) -> None:
+        """The approve-with-modification API (routes/hitl.py) submits
+        ``approved`` plus a ``modified_output`` member (FAR-541 iteration 3:
+        the retired ``approved_with_modification`` action was never produced by
+        any writer and its special-case branch is pruned)."""
         session = self._mock_session(
             [
                 (
                     "approved",
-                    {"action": "approved_with_modification", "gate_id": "gate-b", "modified_output": {"v": 1}},
+                    {"action": "approved", "gate_id": "gate-b", "modified_output": {"v": 1}},
                     "gate-b",
                 ),
                 ("gate-b",),
@@ -1599,14 +1603,64 @@ class TestAwaitingHumanHasCommittedDecision:
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
 
     @pytest.mark.asyncio
-    async def test_approved_with_modification_without_output_is_not_committed(self) -> None:
-        """An approve-with-modification decision without its modified output is
-        NOT committed — a payload-less recovery would drop the human's
-        modification and resume as a plain approval."""
+    async def test_retired_approved_with_modification_action_is_not_gate_consumable(self) -> None:
+        """FAR-541 iteration 3 (FIX 1 + 6a): the retired
+        ``approved_with_modification`` action has no writer and no special case
+        anymore — it is simply not a gate-consumable action, so in the
+        no-undecided-rows crash-recovery branch it SKIPs (never re-dispatched
+        into the gate's fail-closed action check, which would bounce-loop)."""
         session = self._mock_session(
-            [("approved", {"action": "approved_with_modification", "gate_id": "gate-b"}, "gate-b")]
+            [
+                (
+                    "approved",
+                    {"action": "approved_with_modification", "gate_id": "gate-b", "modified_output": {"v": 1}},
+                    "gate-b",
+                ),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
+            ]
         )
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
+
+    @pytest.mark.asyncio
+    async def test_manual_output_no_undecided_rows_skipped(self) -> None:
+        """FAR-541 iteration 3 (FIX 6a): a ``manual_output`` decision is not a
+        gate verdict — in the no-undecided-rows branch it must SKIP, else
+        resuming it would bounce off the gate consumer's fail-closed action
+        check and re-dispatch-loop."""
+        session = self._mock_session(
+            [
+                ("approved", {"action": "manual_output", "gate_id": "gate-b", "output": {"a": 1}}, "gate-b"),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
+            ]
+        )
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
+
+    @pytest.mark.asyncio
+    async def test_corrupted_nondict_payload_is_skipped(self) -> None:
+        """FAR-541 iteration 3 (FIX 6b): the guard and the resume-data
+        reconstruction agree — a corrupted non-dict payload reconstructs to
+        None, so the guard SKIPs instead of re-dispatching a resume with
+        resume_data=None (an empty decision)."""
+        session = self._mock_session(
+            [
+                ("approved", ["not", "a", "dict"], "gate-b"),
+                ("gate-b",),
+            ]
+        )
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
+
+    @pytest.mark.asyncio
+    async def test_latest_decision_query_orders_deterministically(self) -> None:
+        """FAR-541 iteration 3 (FIX 6c): the shared latest-decision query is
+        fully deterministic — decision_at DESC NULLS LAST, then claimed_at DESC
+        NULLS LAST, then id DESC — so the guard and the reconstruction (separate
+        calls) can never disagree on WHICH decision wins on a timestamp tie."""
+        session = self._mock_session([None])
+        await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING)
+        sql = str(session.execute.await_args_list[0].args[0])
+        assert "ORDER BY decision_at DESC NULLS LAST, claimed_at DESC NULLS LAST, id DESC LIMIT 1" in sql
 
     @pytest.mark.asyncio
     async def test_deliver_manual_with_payload_is_committed(self) -> None:

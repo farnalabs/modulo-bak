@@ -352,8 +352,12 @@ async def test_hitl_resume_roundtrip_approve_with_modification(
     assert status == "awaiting_human"
 
     gate_id = await _read_gate_id(db_engine, org_id, run_id)
+    # FAR-541 (iteration 3): the real writer contract — approve-with-modification
+    # (routes/hitl.py) submits action "approved" plus a "modified_output" member;
+    # the retired "approved_with_modification" action was never produced by any
+    # writer and the gate consumer fails closed on it.
     payload = {
-        "action": "approved_with_modification",
+        "action": "approved",
         "gate_id": gate_id,
         "modified_output": {"answer": "human-edited"},
     }

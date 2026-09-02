@@ -113,6 +113,17 @@ Features:
 - `manual` node type – same as HITL but human provides full output
 - `hitl` node type (FAR-402 P1) – a draggable human-in-the-loop gate; compiles to the same synthetic-gate path as a legacy edge-level HITL gate. `manual` remains the non-gating human-output step.
 
+**Decision-payload contract (normative, FAR-541):** every resume decision is a dict `{"action": <verdict>, "gate_id": <the identity it resolves>}` plus any per-action members (`output`, `modified_output`, `reason`, `notes`). `HITLManager._decide` is the single stamp authority: it stamps a payload that lacks `gate_id` with the claim row's gate id and refuses (422) a payload stamped for a *different* gate; call-site stamps (API routes, MCP) remain because they feed the direct `executor.resume` injection that bypasses `_decide`. A decision is honoured ONLY by the gate/node its stamp names — every consumer verifies the stamp against its own identity and fails closed on a missing/foreign stamp (re-interrupt, never resume):
+
+| Writer | Stamp (`gate_id`) | Consumer | Recognized actions |
+|---|---|---|---|
+| `POST /runs/{id}/hitl/{gate}/approve`, `/approve-with-modification`, `/reject`, `/deliver-manual`; MCP `review_hitl` | the gate id from the URL | `_hitl_gate_resume_result` | `approved` (incl. `modified_output`), `rejected`, `deliver_manual` |
+| `POST /runs/{id}/manual/{node}/submit` | the manual node's id | `_manual_node` | `manual_output` (+ `output`) |
+| `POST /runs/{id}/nodes/{node}/recover` (operator break-glass) | the run's pending claim row's gate id (node id for manual nodes; the guardrail gate id for conformance blocks); unstamped when no undecided row exists | `_manual_node` / `_handle_conformance_resume` | `skip`, `replay` |
+| Conformance override via HITL API | the blocked node id or the block's guardrail gate id | `_handle_conformance_resume` | `approved`, `deliver_manual` (override); `rejected` fails closed |
+
+Interrupt payloads carry the same identity: the gate node interrupts with its `gate_id`, a manual node with `gate_id: <node_id>`, a conformance block with the block's guardrail gate id — the executor keys the pending `hitl_claims` row on that `gate_id` verbatim. The dispatcher reconcile resumes an `awaiting_human`/`claimed` run ONLY per this scoping matrix: claimed + same-gate committed decision → resume with the reconstructed stamped payload; claimed-undecided or identity-mismatched → skip; unclaimed undecided row → conservative skip; stamped gate-consumable decision + no undecided rows → crash-recovery resume (legacy pre-stamping rows are stranded by design — at most the 2026-09-02 incident cohort; ops remedy is a manual DB stamp or ticket, no backfill migration). Recover-node refuses HITL gate targets (422) — gate decisions must go through approve/reject.
+
 ### Connector Hub (`modulo/connectors/`)
 
 Abstraction over external tool integrations. ConnectorType defines an abstract capability category (e.g. `git-host`, `shell`). ConnectorInstance is a configured, authenticated binding. ConnectorHub decrypts credentials once at run-start into a run-scoped context object – credentials never enter LangGraph state, checkpoints, OTel spans, or logs.

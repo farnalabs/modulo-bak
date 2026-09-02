@@ -198,6 +198,65 @@ async def test_gate_resume_rejected_fails_closed(monkeypatch: pytest.MonkeyPatch
     interrupt.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# Operator break-glass via recover-node (FAR-541 iteration 3, FIX 3 + FIX 4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("action", ["skip", "replay"])
+async def test_gate_resume_operator_break_glass_clears_marker(monkeypatch: pytest.MonkeyPatch, action: str):
+    """FAR-541 FIX 3: recover-node skip/replay is the documented operator
+    break-glass for a conformance block — the recover route stamps the recovery
+    payload with the pending claim row's gate id (the block's own guardrail
+    gate id) and the consumer honours it: the markers are cleared so the node
+    re-runs."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    audit = _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": action, "gate_id": "guardrail_conformance_g_block"},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is False
+    assert state["_conformance_blocked_node"] is None
+    assert state["_conformance_blocked_gate"] is None
+    check.assert_not_awaited()
+    audit.assert_not_awaited()
+    interrupt.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["manual_output", "weird", None])
+async def test_gate_resume_unknown_override_action_fails_closed(monkeypatch: pytest.MonkeyPatch, action: str | None):
+    """FAR-541 FIX 4: the override is restricted to the recognized allowlist
+    (``approved``/``deliver_manual``/``skip``/``replay``) — any other stamped
+    action (a ``manual_output`` decision meant for a manual node, garbage, or a
+    missing action) does NOT clear the block: warn + re-interrupt (the block
+    stands)."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    audit = _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": action, "gate_id": "guardrail_conformance_g_block", "output": {"a": 1}},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is True
+    assert state["_conformance_blocked_node"] == _NODE_ID
+    assert state["_conformance_blocked_gate"] == "guardrail_conformance_g_block"
+    check.assert_not_awaited()
+    audit.assert_not_awaited()
+    interrupt.assert_called_once()
+
+
 async def test_gate_resume_foreign_decision_marker_block_not_cleared(monkeypatch: pytest.MonkeyPatch):
     """FAR-541 (THE C1 consumer regression): a decision stamped for a
     DIFFERENT gate must never clear THIS node's conformance block — the block

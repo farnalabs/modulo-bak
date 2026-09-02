@@ -2451,10 +2451,20 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
     On a STAMPED ``rejected`` the run FAILS CLOSED: the capability the block
     protected is still unavailable, so the node must NOT execute.
     ``GuardrailBlockedError`` is mapped by the executor to terminal
-    ``eval_failed``/``eval_blocked`` (never a resume). A STAMPED
-    ``approved``/``deliver_manual`` is the documented human override: the
-    markers are cleared (so a later foreign resume replay of this node re-runs
-    the real check) and normal execution continues.
+    ``eval_failed``/``eval_blocked`` (never a resume).
+
+    The override action is restricted to a recognized allowlist (FAR-541
+    iteration 3, fail-closed on garbage):
+
+    * ``approved`` / ``deliver_manual`` — the documented human override (the
+      HITL API writers); the markers are cleared (so a later foreign resume
+      replay of this node re-runs the real check) and normal execution
+      continues.
+    * ``skip`` / ``replay`` — the operator break-glass stamped by the
+      recover-node route (routes/runs.py): the pre-FAR-541 semantics kept — a
+      stamped skip/replay clears the block so the node re-runs.
+    * Anything else (a missing action, ``manual_output``, garbage) does NOT
+      clear the block — warn + re-interrupt (``conformance.unknown_override_ignored``).
     """
     decision = state.get("_hitl_decision")
     action = decision.get("action") if isinstance(decision, dict) else None
@@ -2485,6 +2495,23 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
             f"conformance_gate_{node_id}",
             "capability conformance gate was rejected by the human reviewer; the run fails closed",
         )
+    if action not in ("approved", "deliver_manual", "skip", "replay"):
+        # FAR-541 iteration 3: only recognized override actions clear the
+        # block. Anything else (including a ``manual_output`` decision meant
+        # for a manual node, or garbage) fails closed — warn + re-interrupt.
+        _log.warning(
+            "conformance.unknown_override_ignored",
+            extra={"node_id": node_id, "decision_gate_id": stamped_gate, "action": action},
+        )
+        interrupt(
+            {
+                "gate_id": blocked_gate or node_id,
+                "node_id": node_id,
+                "conformance_blocked": True,
+                "reason": "awaiting a recognized override decision for this conformance block",
+            }
+        )
+        return True
     state["_conformance_blocked_node"] = None
     state["_conformance_blocked_gate"] = None
     return False
@@ -3536,6 +3563,13 @@ def make_manual_node_fn(
         decision = interrupt(
             {
                 "manual": True,
+                # FAR-541 (iteration 3): the interrupt payload carries its own
+                # identity stamp. ``_handle_graph_interrupt`` keys the pending
+                # claim row on ``gate_id`` VERBATIM — without this member the
+                # manual node's claim row was keyed "" (invisible to the
+                # recover-node 422 guard, unclaimable through the HITL API).
+                # The stamp equals the node id, matching the consumer's check.
+                "gate_id": node_id,
                 "node_id": node_id,
                 "prompt": manual_prompt,
                 "output_schema_id": node_def.get("output_schema_id"),

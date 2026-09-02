@@ -4111,12 +4111,16 @@ async def _latest_committed_decision_row(
     """``(decision, decision_payload, gate_id)`` of the run's latest committed
     HITL decision row, or ``None``. Shared selection for the F6a guard and the
     resume-data reconstruction so both always agree on WHICH decision is
-    resumed."""
+    resumed. The ORDER BY is fully deterministic (FAR-541 iteration 3): the
+    tiebreak on ``claimed_at`` then ``id`` makes the picked row stable when two
+    decisions share a ``decision_at`` timestamp, so the guard and the
+    reconstruction (separate calls) can never disagree on WHICH decision wins.
+    """
     result = await session.execute(
         text(
             "SELECT decision, decision_payload, gate_id FROM hitl_claims "
             "WHERE organisation_id=:oid AND run_id=:rid AND decision IS NOT NULL "
-            "ORDER BY decision_at DESC NULLS LAST LIMIT 1"
+            "ORDER BY decision_at DESC NULLS LAST, claimed_at DESC NULLS LAST, id DESC LIMIT 1"
         ),
         {"oid": str(org_id), "rid": str(run_id)},
     )
@@ -4223,22 +4227,28 @@ async def _awaiting_human_has_committed_decision(
       cannot be verified -> SKIP.
 
     Stricter than the old ``decision IS NOT NULL`` guard (B1-reconcile): a
-    decision is only ``committed`` when the decision is present AND — for
-    payload-carrying actions (``approved_with_modification``/``manual_output``)
-    — the persisted ``decision_payload`` is present and actually carries the
-    required data. A payload-carrying decision without its payload cannot be
-    faithfully resumed. ``decision_payload`` is read via raw SQL (the jsonb
-    column ships in a parallel migration).
+    decision is only ``committed`` when the decision is present AND faithful:
+
+    * a ``manual_output`` payload must still carry its ``output`` — a
+      payload-less recovery would degrade to ``{"action": "approved"}`` and
+      pass that dict to the manual node as its output;
+    * a corrupted NON-DICT payload cannot be reconstructed (the resume-data
+      helper returns None for it), so the guard skips — guard and
+      reconstruction always agree (FAR-541 iteration 3);
+    * in the no-undecided-rows crash-recovery branch the payload must be
+      stamped AND carry a gate-consumable action
+      (``approved``/``rejected``/``deliver_manual``) — a ``manual_output`` (or
+      unknown/retired action) decision committed at a gate is not a verdict
+      the gate consumer accepts, so resuming it would bounce the run straight
+      back to awaiting_human and re-dispatch-loop (FAR-541 iteration 3).
 
     The payload-requirement is keyed off the persisted ``decision_payload``'s
     ``action`` member, NOT the ``decision`` column — the column only ever holds
     ``approved``/``rejected``/``deliver_manual``, so a column-keyed check would
     be dead code and could never protect a manual-output decision whose payload
-    was lost: a payload-less recovery degrades to ``{"action": "approved"}``,
-    auto-approving the gate (a manual-output decision would pass
-    ``{"action": "approved"}`` to the manual node as its output). A payload-less
-    row (legacy/pre-migration) is treated as a plain approval/rejection that
-    needs no payload to resume faithfully — its identity comes from the row.
+    was lost. A payload-less row (legacy/pre-migration) is treated as a plain
+    approval/rejection that needs no payload to resume faithfully — its
+    identity comes from the row.
     """
     latest = await _latest_committed_decision_row(session, org_id, run_id)
     if latest is None or latest[0] is None:
@@ -4249,16 +4259,17 @@ async def _awaiting_human_has_committed_decision(
             payload = json.loads(payload)
         except (ValueError, TypeError):
             payload = None
+    if payload is not None and not isinstance(payload, dict):
+        # FAR-541 iteration 3: the guard and ``_committed_decision_resume_data``
+        # must agree — reconstruction returns None for a non-dict payload, so
+        # resuming here would dispatch resume_run with resume_data=None (an
+        # empty decision). SKIP.
+        return False
     if isinstance(payload, dict):
         action = payload.get("action")
         if action == "manual_output" and "output" not in payload:
             # A manual-output decision MUST carry its output — otherwise the
             # manual node resumes with ``{"action": "approved"}`` as its output.
-            return False
-        if action == "approved_with_modification" and "modified_output" not in payload:
-            # An approve-with-modification MUST carry the modified output —
-            # otherwise the gate resumes as a plain approval, dropping the
-            # human's modification.
             return False
     # Gate scoping (FAR-541): the decision must resolve the gate the run is
     # waiting at. See the docstring for the three-state matrix.
@@ -4272,9 +4283,23 @@ async def _awaiting_human_has_committed_decision(
         return False
     # No undecided rows: the run is parked at the last decided gate's
     # interrupt (resume job lost / MCP decision). Resume ONLY when the
-    # decision carries a stamp — a legacy unstamped decision cannot be
-    # verified against the pending gate.
-    return isinstance(payload, dict) and payload.get("gate_id") is not None
+    # decision carries a stamp AND a gate-consumable action — a
+    # ``manual_output`` decision (or any unknown/retired action) is not a
+    # verdict the gate consumer accepts, so resuming it would bounce the run
+    # straight back to awaiting_human and re-dispatch-loop.
+    #
+    # FAR-541 iteration 3 (FIX 8, accepted residue): legacy pre-stamping
+    # decided rows are STRANDED by this skip — the reconcile skips (unstamped),
+    # recover-node 422s (gate target), and re-decide 409s (row already
+    # decided). The cohort is bounded: at most the 2026-09-02 incident run(s)
+    # (HITL gates first fired that day), so NO backfill migration is shipped.
+    # Ops remedy: stamp the row's ``decision_payload`` manually in the DB (or
+    # raise a ticket for the run's owner) to unblock it.
+    return (
+        isinstance(payload, dict)
+        and payload.get("gate_id") is not None
+        and payload.get("action") in ("approved", "rejected", "deliver_manual")
+    )
 
 
 async def _committed_decision_resume_data(
@@ -4287,9 +4312,11 @@ async def _committed_decision_resume_data(
     Returns the persisted ``hitl_claims.decision_payload`` (jsonb) verbatim when
     present, else ``{"action": <decision>}`` for a payload-less committed
     decision (legacy rows / pre-migration DBs). ``None`` when no decision is
-    committed. NEVER returns ``{}`` for a committed decision — a recovered
-    rejection must resume as rejected, and an approve-with-modification must
-    carry its modification.
+    committed or the persisted payload is a corrupted non-dict. NEVER returns
+    ``{}`` for a committed decision — a recovered rejection must resume as
+    rejected, and an approve-with-modification decision (the API submits
+    ``approved`` plus a ``modified_output`` member) must carry the human's
+    modification.
 
     FAR-541: the reconstructed payload ALWAYS carries the decision row's own
     ``gate_id`` (added when the payload does not already carry the stamp) so

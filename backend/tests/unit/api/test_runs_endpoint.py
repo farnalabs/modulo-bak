@@ -145,6 +145,10 @@ def _make_mock_session() -> AsyncMock:
     exec_result = MagicMock()
     exec_result.scalar_one_or_none.return_value = None
     exec_result.scalars.return_value.first.return_value = None
+    # FAR-541 (iteration 3): the recover-node route reads the run's undecided
+    # claim rows via scalars().all() — default to no rows so the recovery
+    # dispatches unstamped (failed-run recovery).
+    exec_result.scalars.return_value.all.return_value = []
     exec_result.all.return_value = []
     session.execute = AsyncMock(return_value=exec_result)
     return session
@@ -1616,20 +1620,118 @@ def test_recover_node_refuses_gate_node_prefix_with_422(client: TestClient) -> N
 
 
 def test_recover_node_refuses_pending_gate_target_with_422(client: TestClient, mock_session: AsyncMock) -> None:
-    """FAR-541: when the run is interrupted AT the target node (an undecided
-    claim row exists for it), recovery is refused with an explicit 422 — use
-    the HITL decision endpoints instead."""
+    """FAR-541 (iteration 3, FIX 3): when the run is parked at an undecided
+    claim row keyed ``hitl_gate_*`` (a real HITL gate — regardless of which
+    node the operator targeted), recovery is refused with an explicit 422 —
+    gate decisions must go through the HITL approve/reject endpoints."""
     gate_result = MagicMock()
-    gate_result.scalar_one_or_none.return_value = "pending-node-1"
+    gate_result.scalars.return_value.all.return_value = ["hitl_gate_a_b"]
     mock_session.execute = AsyncMock(return_value=gate_result)
     with patch("modulo.api.routes.runs.set_rls_org"):
         resp = client.post(
-            f"/api/v1/runs/{_RUN_ID}/nodes/pending-node-1/recover",
+            f"/api/v1/runs/{_RUN_ID}/nodes/node-b/recover",
             json={},
         )
 
     assert resp.status_code == 422
     assert "HITL approve/reject endpoints" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Recover-node stamping (FAR-541 iteration 3, FIX 3)
+# ---------------------------------------------------------------------------
+
+
+def test_recover_node_stamps_manual_target_from_undecided_row(client: TestClient, mock_session: AsyncMock) -> None:
+    """FAR-541 (iteration 3, FIX 3): when the run is parked at an undecided
+    manual-node claim row (keyed by the NODE id — the interrupt payload stamps
+    ``gate_id: node_id``), the recovery payload is STAMPED with that row's gate
+    id so the manual node's consumer (stamp == node id) accepts the resume."""
+    run = _make_run(status="awaiting_human")
+    undecided = MagicMock()
+    undecided.scalars.return_value.all.return_value = ["manual-node-1"]
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ) as mock_dispatch,
+    ):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/manual-node-1/recover",
+            json={"input_data": {"answer": 42}},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "replay"
+    assert mock_dispatch.await_args.kwargs["resume_data"] == {
+        "action": "replay",
+        "gate_id": "manual-node-1",
+        "output": {"answer": 42},
+    }
+
+
+def test_recover_node_stamps_conformance_target_from_undecided_row(client: TestClient, mock_session: AsyncMock) -> None:
+    """FAR-541 (iteration 3, FIX 3): conformance-blocked runs (the claim row is
+    keyed by the block's guardrail gate id, not the node id) recover through
+    the same break-glass — the payload is stamped with the guardrail gate id,
+    which the conformance consumer honours for skip/replay."""
+    run = _make_run(status="awaiting_human")
+    undecided = MagicMock()
+    undecided.scalars.return_value.all.return_value = ["guardrail_conformance_g1"]
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ) as mock_dispatch,
+    ):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/some-blocked-node/recover",
+            json={},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "skip"
+    assert mock_dispatch.await_args.kwargs["resume_data"] == {
+        "action": "skip",
+        "gate_id": "guardrail_conformance_g1",
+        "output": None,
+    }
+
+
+def test_recover_node_without_undecided_row_dispatches_unstamped(client: TestClient, mock_session: AsyncMock) -> None:
+    """FAR-541 (iteration 3, FIX 3): with NO undecided claim row (failed-run
+    recovery) the payload is dispatched UNSTAMPED exactly as before — the
+    failed node has no stamp-verifying consumer."""
+    run = _make_run(status="failed")
+    undecided = MagicMock()
+    undecided.scalars.return_value.all.return_value = []
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ) as mock_dispatch,
+    ):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/manual-node-1/recover",
+            json={"input_data": {"answer": 42}},
+        )
+
+    assert resp.status_code == 200
+    dispatched = mock_dispatch.await_args.kwargs["resume_data"]
+    assert dispatched == {"action": "replay", "output": {"answer": 42}}
+    assert "gate_id" not in dispatched
 
 
 # ---------------------------------------------------------------------------

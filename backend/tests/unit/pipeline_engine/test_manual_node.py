@@ -177,6 +177,11 @@ async def test_manual_node_first_call_raises_interrupt():
     assert isinstance(value, dict)
     assert value["manual"] is True
     assert value["node_id"] == "manual-unit-1"
+    # FAR-541 (iteration 3): the interrupt payload stamps its own identity —
+    # ``_handle_graph_interrupt`` keys the pending claim row on ``gate_id``
+    # verbatim, so the manual node's row is keyed by the NODE id (previously ""
+    # — invisible to the recover-node guard and the HITL decision API).
+    assert value["gate_id"] == "manual-unit-1"
 
 
 async def test_manual_node_awaiting_human_sets_artifact():
@@ -376,3 +381,49 @@ async def test_manual_node_unstamped_decision_stays_interrupted():
                 "_hitl_decision": {"action": "manual_output", "output": {"answer": 42}},
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Recover-node roundtrip (FAR-541 iteration 3, FIX 3)
+# ---------------------------------------------------------------------------
+
+
+async def test_manual_node_completes_from_recover_node_replay_payload():
+    """FAR-541 FIX 3 roundtrip (replay): recover-node stamps the recovery
+    payload with the run's pending claim row's gate_id — for a manual node that
+    row is keyed by the NODE id (FIX 2 stamp) — and the consumer accepts
+    exactly that payload, completing with the recovery output."""
+    node_def = {"id": "manual-unit-14", "node_type": "manual"}
+    node_fn = make_manual_node_fn(node_def)
+
+    # The exact payload the recover-node route dispatches when the run's
+    # undecided claim row is keyed by this node's id (routes/runs.py):
+    # {"action": "replay", "gate_id": <row.gate_id>, "output": <input_data>}.
+    result = await node_fn(
+        {
+            "artifacts": [],
+            "_hitl_decision": {"action": "replay", "gate_id": "manual-unit-14", "output": {"answer": 42}},
+        }
+    )
+
+    assert result["manual_output"] == {"answer": 42}
+    assert result["artifacts"][0]["status"] == "completed"
+    assert result["artifacts"][0]["human_output"] == {"answer": 42}
+
+
+async def test_manual_node_completes_from_recover_node_skip_payload():
+    """FAR-541 FIX 3 roundtrip (skip): a recover-node skip (no input_data)
+    stamps the same identity — the node completes with no output."""
+    node_def = {"id": "manual-unit-15", "node_type": "manual"}
+    node_fn = make_manual_node_fn(node_def)
+
+    result = await node_fn(
+        {
+            "artifacts": [],
+            "_hitl_decision": {"action": "skip", "gate_id": "manual-unit-15", "output": None},
+        }
+    )
+
+    assert result.get("manual_output") is None
+    assert result["artifacts"][0]["status"] == "completed"
+    assert result["artifacts"][0]["human_output"] is None

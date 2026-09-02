@@ -1993,6 +1993,12 @@ async def recover_run_node(
       * **Skip** — omit ``input_data`` (or set ``null``); the node is marked
         completed with no output and the run resumes.
 
+    FAR-541: HITL gate targets are refused (422) — gate decisions must go
+    through the approve/reject endpoints. When the run is parked at an
+    undecided claim row, the recovery payload is stamped with that row's gate
+    id so the per-consumer stamp checks accept it (manual nodes: the node id;
+    conformance blocks: the guardrail gate id — the operator break-glass).
+
     Requires operator or admin role.
     """
     if principal.org_role not in ("admin", "operator"):
@@ -2012,28 +2018,45 @@ async def recover_run_node(
             detail="Node is a HITL gate; use the HITL approve/reject endpoints for gate nodes.",
         )
 
+    # FAR-541 (iteration 3, FIX 3): the recovery payload is stamped with the
+    # run's pending claim row's gate id (resolved below) so the per-consumer
+    # stamp checks accept it. Set inside the transaction; left None when the
+    # run has NO undecided claim row (failed-run recovery — dispatch unstamped
+    # exactly as before).
+    stamp_gate_id: str | None = None
+
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             await set_rls_user_context(session, principal.account_id, principal.org_role)
-            # FAR-541: a pending (undecided) claim row for the target node
-            # means the run is interrupted AT that gate — recovery is not the
-            # right tool there either.
-            pending_gate = (
-                await session.execute(
-                    select(HitlClaim.gate_id).where(
-                        HitlClaim.run_id == run_id,
-                        HitlClaim.organisation_id == principal.organisation_id,
-                        HitlClaim.gate_id == node_id,
-                        HitlClaim.decision.is_(None),
+            # FAR-541 (iteration 3, FIX 3): the run's UNDECIDED claim row(s)
+            # mark where the run is interrupted — regardless of the target
+            # node's name. A row keyed ``hitl_gate_*`` is a real HITL gate
+            # whose decision must go through approve/reject -> explicit 422.
+            # Manual-node rows (keyed by the node id — the interrupt payload
+            # stamps ``gate_id: node_id``) and conformance-block rows (keyed
+            # by the guardrail gate id) are stamped into the recovery payload,
+            # which the manual-node and conformance consumers accept. A legacy
+            # ""-keyed row (pre-stamping interrupt) never wins the stamp.
+            undecided_gate_ids: list[str] = list(
+                (
+                    await session.execute(
+                        select(HitlClaim.gate_id).where(
+                            HitlClaim.run_id == run_id,
+                            HitlClaim.organisation_id == principal.organisation_id,
+                            HitlClaim.decision.is_(None),
+                        )
                     )
                 )
-            ).scalar_one_or_none()
-            if pending_gate is not None:
+                .scalars()
+                .all()
+            )
+            if any(gate.startswith("hitl_gate_") for gate in undecided_gate_ids):
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Node is a pending HITL gate; use the HITL approve/reject endpoints for gate nodes.",
                 )
+            stamp_gate_id = next((gate for gate in undecided_gate_ids if gate), None)
             try:
                 run = await recover_node(
                     session,
@@ -2087,6 +2110,13 @@ async def recover_run_node(
     # to SAQ (the recover-node path); a resume failure surfaces here as 500
     # rather than fire-and-forget 200.
     resume_data: dict[str, Any] = {"action": action, "output": req.input_data}
+    if stamp_gate_id is not None:
+        # FAR-541 (iteration 3, FIX 3): stamped with the pending claim row's
+        # gate id — the manual-node consumer (stamp == node id), the
+        # conformance consumer (stamp == the block's guardrail gate id), and
+        # the gate consumer (stamp == its own gate id) all verify this stamp;
+        # a run parked at a real HITL gate was already 422'd above.
+        resume_data["gate_id"] = stamp_gate_id
 
     try:
         outcome, _job_id = await dispatch_run(
