@@ -6,7 +6,7 @@ import {
   attemptTokenRefresh,
   clearAccessToken,
   redirectToLogin,
-  wasDemoSessionCleared,
+  wasDemoSessionEnded,
 } from './auth'
 
 export {
@@ -38,10 +38,13 @@ export function getInitialAuthState(hasToken: boolean): boolean {
 // endpoint would be hammered in a loop.
 // FAR-535: a cleared DEMO session is additionally never recovered — the demo
 // session must die with its short-lived token instead of escalating into the
-// instance's silent auto-login account (the demo-end flag resets on any new
-// login, see lib/api/auth.ts).
+// instance's silent auto-login account. qa iter 2: the gate reads the PERSISTED
+// demo-ended tombstone (lib/api/auth.ts), not an in-memory flag — the tombstone
+// is written before the marker is removed in clearAccessToken (same in-session
+// semantics) but is shared across tabs, so a second tab's stale state can no
+// longer permit the escalation. It resets on any new successful auth.
 export function shouldReRunAutoLogin(wasAuthenticated: boolean, hasToken: boolean, hasAutoLogin: boolean): boolean {
-  if (wasDemoSessionCleared()) return false
+  if (wasDemoSessionEnded()) return false
   return wasAuthenticated && !hasToken && hasAutoLogin
 }
 

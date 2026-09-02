@@ -115,6 +115,7 @@ function mockLoginFetch(deferredLogin: ReturnType<typeof deferred<{ ok: boolean;
     return Promise.resolve({ ok: true, json: async () => ({}) })
   })
   vi.stubGlobal('fetch', fetchMock)
+  return fetchMock
 }
 
 describe('App auto-login recovery', () => {
@@ -255,6 +256,26 @@ describe('App demo reload guard (FAR-535)', () => {
 
     // Auto-login ran (the login POST is in flight) and no /demo hand-off was requested.
     expect(mockRouter.push).not.toHaveBeenCalledWith('/demo')
+    deferredLogin.resolve({ ok: true, json: async () => ({ access_token: 'fresh-token', refresh_token: 'fresh-refresh', user: { id: '1', email: 'demo@modulo', name: 'Demo' } }) })
+    await flushPromises()
+    expect(mockRouter.push).toHaveBeenCalledWith('/')
+  })
+
+  it('takes the normal (auto-)login flow — never /demo — after an explicit demo logout (qa iter 2)', async () => {
+    // AppLayout.logout clears with { demoEnded: false }: after the reload
+    // neither the demo marker nor the demo-ended tombstone exists, so App must
+    // behave exactly as for a fresh visitor. With auto-login configured that
+    // means the credential POST fires and lands on '/'; with no auto-login it
+    // would be the plain /login view. It must NEVER push back to /demo — that
+    // would re-mint a demo session the visitor explicitly walked away from.
+    const deferredLogin = deferred<{ ok: boolean; json: () => Promise<Record<string, unknown>> }>()
+    const fetchMock = mockLoginFetch(deferredLogin)
+
+    shallowMount(App)
+    await flushPromises()
+
+    expect(mockRouter.push).not.toHaveBeenCalledWith('/demo')
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/auth/login', expect.anything())
     deferredLogin.resolve({ ok: true, json: async () => ({ access_token: 'fresh-token', refresh_token: 'fresh-refresh', user: { id: '1', email: 'demo@modulo', name: 'Demo' } }) })
     await flushPromises()
     expect(mockRouter.push).toHaveBeenCalledWith('/')

@@ -6,11 +6,14 @@ const REFRESH_TOKEN_KEY = 'modulo_refresh_token'
 // auto-login. Read by the demo-mode banner; cleared with the session.
 const DEMO_SESSION_KEY = 'modulo_demo_session'
 // FAR-535 (qa iter 1): persisted tombstone written when a demo session is torn
-// down. clearAccessToken removes the token AND the demo marker together, so
-// after a demo-token expiry + reload neither exists and first-mount auto-login
-// would silently log the former demo visitor in as the instance's auto-login
-// account. The tombstone outlives that clear (and any reload) and is consumed
-// by App.vue's mount-time check; it is cleared by any NEW successful auth.
+// down by expiry. clearAccessToken removes the token AND the demo marker
+// together, so after a demo-token expiry + reload neither exists and
+// first-mount auto-login would silently log the former demo visitor in as the
+// instance's auto-login account. The tombstone outlives that clear (and any
+// reload) and is consumed by App.vue's mount-time check; it is cleared by any
+// NEW successful auth. qa iter 2: an EXPLICIT user logout (AppLayout.logout)
+// suppresses the tombstone so the visitor can actually leave the demo — only
+// an involuntary end (token expiry, forced clear) re-mints into /demo.
 const DEMO_ENDED_KEY = 'modulo_demo_ended'
 
 // S8475: only store well-formed, opaque token strings in browser storage.
@@ -38,12 +41,6 @@ function storeToken(key: string, token: string): void {
 
 let _authListeners: Array<(token: string | null) => void> = []
 let _refreshingPromise: Promise<boolean> | null = null
-// True when the most recently cleared session was a demo session and no new
-// login has happened since. Consumed by shouldReRunAutoLogin (client.ts) so an
-// expired demo session never triggers the silent auto-login recovery — a demo
-// session must die with its short-lived token, not escalate into the
-// instance's auto-login account.
-let _lastClearedWasDemo = false
 
 export function isDemoSession(): boolean {
   return localStorage.getItem(DEMO_SESSION_KEY) === '1'
@@ -57,8 +54,11 @@ export function setDemoSession(active: boolean): void {
   }
 }
 
-// Persisted signal that a demo session has ended and no new authentication has
-// succeeded since. Unlike the in-memory flag below, this survives page reloads.
+// Persisted signal that a demo session has ended involuntarily (expiry, forced
+// clear) and no new authentication has succeeded since. Survives page reloads
+// and is shared across tabs — unlike the in-memory flag it replaces (removed in
+// qa iter 2), whose per-tab staleness could permit the auto-login escalation
+// the tombstone exists to block.
 export function wasDemoSessionEnded(): boolean {
   return localStorage.getItem(DEMO_ENDED_KEY) !== null
 }
@@ -67,10 +67,6 @@ function markDemoSessionEnded(): void {
   if (localStorage.getItem(DEMO_ENDED_KEY) === null) {
     localStorage.setItem(DEMO_ENDED_KEY, String(Date.now()))
   }
-}
-
-export function wasDemoSessionCleared(): boolean {
-  return _lastClearedWasDemo
 }
 
 function notifyListeners(): void {
@@ -102,15 +98,24 @@ export function setAccessToken(token: string): void {
   // says so".
   setDemoSession(false)
   localStorage.removeItem(DEMO_ENDED_KEY)
-  _lastClearedWasDemo = false
   notifyListeners()
 }
 
-export function clearAccessToken(): void {
-  // Capture BEFORE clearing: the auto-login recovery gate (client.ts) must
-  // know the session being torn down was a demo session.
-  _lastClearedWasDemo = isDemoSession()
-  if (_lastClearedWasDemo) {
+export interface ClearAccessTokenOptions {
+  /**
+   * Whether clearing this session counts as the demo session having ended
+   * involuntarily (token expiry, forced clear) and should therefore persist
+   * the demo-ended tombstone. Defaults to true. Pass false for an EXPLICIT
+   * user logout (AppLayout.logout): the visitor chose to leave, so after the
+   * reload they must land on the normal login flow, not be re-minted into
+   * /demo (which would burn the mint budget against their will).
+   */
+  demoEnded?: boolean
+}
+
+export function clearAccessToken(options?: ClearAccessTokenOptions): void {
+  const demoEnded = options?.demoEnded ?? true
+  if (demoEnded && isDemoSession()) {
     // Persist the demo-ended signal BEFORE removing the marker, so it outlives
     // the token clear and any reload (App.vue's mount-time check consumes it).
     markDemoSessionEnded()

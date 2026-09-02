@@ -1,4 +1,4 @@
-import { clearAccessToken, isValidToken, setAccessToken, setDemoSession } from './auth'
+import { clearAccessToken, getAccessToken, isValidToken, setAccessToken, setDemoSession } from './auth'
 import { setMustChangePassword } from '../mustChangePassword'
 
 // The hand-off fetch runs pre-mount (router guard) and main.ts awaits
@@ -51,4 +51,21 @@ export async function runDemoHandOff(): Promise<boolean> {
   } finally {
     clearTimeout(timeoutId)
   }
+}
+
+export type DemoEntryRoute = 'dashboard' | 'login'
+
+// qa iter 2: the single /demo decision point, shared by the router guard and
+// DemoView's defensive fallback so the two paths cannot drift. A browser that
+// already holds a LIVE session (demo or real) keeps it and goes to the
+// dashboard — a mere visit to /demo never tears a session down or re-mints a
+// token (Back/Forward must not burn the mint budget). A tokenless browser runs
+// the one-shot hand-off exactly once, landing on the dashboard on success or
+// plain login on failure — never an error that reveals demo internals.
+export async function resolveDemoEntry(): Promise<DemoEntryRoute> {
+  if (getAccessToken()) {
+    return 'dashboard'
+  }
+  const ok = await runDemoHandOff()
+  return ok ? 'dashboard' : 'login'
 }

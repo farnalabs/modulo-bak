@@ -126,7 +126,13 @@ function openCommandPalette() {
 }
 
 function logout() {
-  clearAccessToken();
+  // qa iter 2: an explicit user logout must NOT persist the demo-ended
+  // tombstone — a demo visitor clicking Sign out chose to leave, so after the
+  // reload they land on the normal login flow (App.vue sees no token, no demo
+  // marker, no tombstone) instead of being re-minted into /demo against their
+  // will. Involuntary clears (token expiry, 401 recovery) keep the default
+  // tombstone so auto-login cannot escalate a dead demo session.
+  clearAccessToken({ demoEnded: false });
   window.location.reload();
 }
 

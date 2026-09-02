@@ -7,7 +7,7 @@ import { usePlanStore } from '../stores/planStore'
 import manifest from '@/manifest.yaml'
 import LoginView from '../views/LoginView.vue'
 import AuthCallbackView from '../views/AuthCallbackView.vue'
-import { runDemoHandOff } from '../lib/api/demo'
+import { resolveDemoEntry } from '../lib/api/demo'
 
 declare module 'vue-router' {
   interface RouteMeta {
@@ -587,12 +587,10 @@ router.beforeEach(async (to) => {
     // recovery listener, and re-minted a token (burning the 10/hour budget).
     // With a token present (demo flag set or a real session) the visitor goes
     // straight to the dashboard; only a tokenless browser runs the hand-off.
+    // qa iter 2: the rule lives in resolveDemoEntry (lib/api/demo.ts) so the
+    // guard and DemoView's fallback cannot drift.
     if (to.name === 'demo') {
-      if (getAccessToken()) {
-        return { name: 'dashboard' }
-      }
-      const ok = await runDemoHandOff()
-      return ok ? { name: 'dashboard' } : { name: 'login' }
+      return { name: await resolveDemoEntry() }
     }
 
     const routeName = to.name
