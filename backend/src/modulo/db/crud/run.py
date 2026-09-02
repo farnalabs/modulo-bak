@@ -1343,14 +1343,16 @@ async def get_run(session: AsyncSession, run_id: uuid.UUID, *, organisation_id: 
 #
 # Deliberately NOT deferred:
 # * ``input_payload`` — masked into every REST list item (runs.py _build_list_item).
-# * ``cost_breakdown`` — read by the MCP ``modulo://pipelines/{id}/runs`` resource
-#   (mcp_server._format_run_line) on DETACHED instances outside the session, so a
-#   deferred access there would raise instead of lazy-loading.
+# ``cost_breakdown`` IS deferred: its only list-path reader was the MCP
+# ``modulo://pipelines/{id}/runs`` resource (mcp_server._format_run_line), which
+# now captures the value IN-SESSION (a plain dict keyed by run id) instead of
+# reading it on detached instances outside the session.
 # Every consumer of ``list_runs`` (REST runs route, MCP list_runs tool, MCP
 # pipeline-runs resource, viewmodel RunSummary) was audited against this tuple —
 # test_runs_list_query_deferral.py pins it.
 _RUNS_LIST_DEFERRED_COLUMNS: tuple[str, ...] = (
     "node_token_usage",
+    "cost_breakdown",
     "outputs_json",
     "node_telemetry_json",
     "raw_output_markers",

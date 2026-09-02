@@ -2,6 +2,7 @@
 
 import uuid
 from decimal import Decimal
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from modulo.api.mcp_server import resource_pipeline_runs
@@ -25,6 +26,7 @@ def _make_mock_run(
     trigger_type: str = "manual",
     total_tokens: int | None = 1500,
     total_cost_usd: float | None = 0.075,
+    cost_breakdown: list[dict[str, Any]] | None = None,
 ) -> MagicMock:
     r = MagicMock()
     r.id = run_id or uuid.uuid4()
@@ -34,7 +36,41 @@ def _make_mock_run(
     r.created_at.isoformat.return_value = "2026-06-20T14:30:00+00:00"
     r.total_tokens = total_tokens
     r.total_cost_usd = total_cost_usd
+    r.cost_breakdown = cost_breakdown
     return r
+
+
+class _DetachedDeferredRun:
+    """Run stand-in that mimics a detached deferred-column ORM instance.
+
+    The runs-list query defers ``cost_breakdown`` (crud/run.py
+    ``_RUNS_LIST_DEFERRED_COLUMNS``), so a read on the detached instance after
+    the session closes would raise instead of lazy-loading. This stand-in
+    reproduces that contract: reading ``cost_breakdown`` is only allowed while
+    ``session_state["open"]`` is True.
+    """
+
+    def __init__(self, session_state: dict[str, bool]) -> None:
+        self.id = uuid.uuid4()
+        self.status = "complete"
+        self.trigger_type = "manual"
+        self.created_at = MagicMock()
+        self.created_at.isoformat.return_value = "2026-06-20T14:30:00+00:00"
+        self.total_tokens = 1500
+        self.total_cost_usd = 0.075
+        self._session_state = session_state
+        self._breakdown: list[dict[str, Any]] = [
+            {"component": "llm", "display_name": "LLM tokens", "amount_usd": 0.075, "source": "ledger"}
+        ]
+
+    @property
+    def cost_breakdown(self) -> list[dict[str, Any]]:
+        if not self._session_state["open"]:
+            raise AssertionError(
+                "cost_breakdown read outside the session — the MCP pipeline-runs "
+                "resource must capture the deferred value in-session"
+            )
+        return self._breakdown
 
 
 def _make_mock_session() -> AsyncMock:
@@ -196,6 +232,65 @@ class TestResourcePipelineRunsSuccess:
         assert "child_cost=$0.000000" in result
         assert "aggregate_cost=$0.075000" in result
         mock_get_child_run_rollup.assert_awaited_once()
+
+    @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
+    @patch("modulo.api.mcp_server.get_pipeline")
+    @patch("modulo.db.crud.run.list_runs")
+    @patch("modulo.db.crud.run.get_child_run_rollup")
+    @patch("modulo.api.mcp_server._session")
+    async def test_run_with_cost_breakdown_renders_breakdown(
+        self,
+        mock_session: AsyncMock,
+        mock_get_child_run_rollup: AsyncMock,
+        mock_list_runs: AsyncMock,
+        mock_get_pipeline: AsyncMock,
+        mock_validate_auth: AsyncMock,
+    ) -> None:
+        session = _make_mock_session()
+        mock_session.return_value.__aenter__.return_value = session
+
+        mock_get_pipeline.return_value = _make_mock_pipeline()
+
+        breakdown = [{"component": "llm", "display_name": "LLM tokens", "amount_usd": 0.075, "source": "ledger"}]
+        run1 = _make_mock_run(run_id=uuid.uuid4(), total_cost_usd=0.075, cost_breakdown=breakdown)
+        mock_list_runs.return_value = _make_page_result(items=[run1], total=1)
+        mock_get_child_run_rollup.return_value = {}
+
+        result = await resource_pipeline_runs(pipeline_id=str(_PIPELINE_ID))
+
+        # The resource output still carries per-component cost data.
+        assert "breakdown={" in result
+        assert "- LLM tokens (llm): $0.075 ledger" in result
+
+    @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
+    @patch("modulo.api.mcp_server.get_pipeline")
+    @patch("modulo.db.crud.run.list_runs")
+    @patch("modulo.db.crud.run.get_child_run_rollup")
+    @patch("modulo.api.mcp_server._session")
+    async def test_cost_breakdown_captured_in_session_not_detached(
+        self,
+        mock_session: AsyncMock,
+        mock_get_child_run_rollup: AsyncMock,
+        mock_list_runs: AsyncMock,
+        mock_get_pipeline: AsyncMock,
+        mock_validate_auth: AsyncMock,
+    ) -> None:
+        state = {"open": False}
+        mock_session.return_value.__aenter__.side_effect = lambda: state.update(open=True)
+        mock_session.return_value.__aexit__.side_effect = lambda *a: state.update(open=False)
+
+        mock_get_pipeline.return_value = _make_mock_pipeline()
+
+        run1 = _DetachedDeferredRun(state)
+        mock_list_runs.return_value = _make_page_result(items=[run1], total=1)
+        mock_get_child_run_rollup.return_value = {}
+
+        result = await resource_pipeline_runs(pipeline_id=str(_PIPELINE_ID))
+
+        # Rendering after the session closed still shows the breakdown captured
+        # in-session; a detached read of the deferred column would have raised.
+        assert "breakdown={" in result
+        assert "- LLM tokens (llm): $0.075 ledger" in result
 
     @patch("modulo.api.mcp_server.validate_current_auth", return_value=True)
     @patch("modulo.api.mcp_server.get_pipeline")
