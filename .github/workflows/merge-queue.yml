@@ -1003,14 +1003,14 @@ jobs:
                 # interpolation), so title characters can't break the payload.
                 COMMENT_BODY=$(printf 'PR #%s merged (partial slice): "%s". Ticket left open - close it manually when the sweep completes.' "$NUM" "$TITLE")
                 COMMENT_PAYLOAD=$(jq -n \
-                  --arg q 'mutation($id: String!, $body: String!) { issueComment(input: { issueId: $id, body: $body }) { success comment { id } } }' \
+                  --arg q 'mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }' \
                   --arg id "$ISSUE_ID" --arg body "$COMMENT_BODY" \
-                  '{query: $q, variables: { id: $id, body: $body } }' \
+                  '{query: $q, variables: { input: { issueId: $id, body: $body } } }' \
                   2>/dev/null || echo "")
                 COMMENT_OK=$(curl -sS --max-time 30 -X POST https://api.linear.app/graphql \
                   -H "Authorization: $LINEAR_API_KEY" -H "Content-Type: application/json" \
                   -d "$COMMENT_PAYLOAD" \
-                  | jq -r '.data.issueComment.success' 2>/dev/null || echo "")
+                  | jq -r '.data.commentCreate.success' 2>/dev/null || echo "")
                 if [ "$COMMENT_OK" = "true" ]; then
                   echo "  $TICKET <- partial-slice comment posted (ticket left open)"
                 else
