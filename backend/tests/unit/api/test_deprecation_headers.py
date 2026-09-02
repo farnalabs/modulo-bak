@@ -1,15 +1,17 @@
 """Unit tests for DeprecationHeaderMiddleware."""
 
-from datetime import date, timedelta
+import datetime
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from modulo.api.middleware.deprecation_headers import DeprecationHeaderMiddleware
 
-# A sunset date safely in the future, so the "sunset header is set" assertions
-# keep exercising the not-yet-expired path regardless of when the suite runs.
-FUTURE_SUNSET = (date.today() + timedelta(days=30)).isoformat()
+# A sunset date safely in the future relative to the test run. Hardcoding a
+# fixed date (e.g. "2026-09-01") made these tests brittle: once the date
+# passed, the middleware correctly returned 410 Gone and the 200 assertions
+# broke for a reason unrelated to the code under test.
+FUTURE_SUNSET = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
 
 
 def _make_app() -> FastAPI:
@@ -106,7 +108,7 @@ class TestDeprecationHeaderMiddleware:
 
     def test_clear_resets_registry(self):
         """Calling clear() should remove all registered deprecation rules."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2026-09-01")
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=FUTURE_SUNSET)
         DeprecationHeaderMiddleware.clear()
         app = _make_app()
         with TestClient(app) as client:
