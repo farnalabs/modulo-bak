@@ -1163,7 +1163,9 @@ export interface paths {
          *     auth error. Plan/feature resolution is anonymous (via
          *     ``_anonymous_plan_context``); when the SSO feature is not enabled /
          *     unlicensed the endpoint answers a normal 200 with an EMPTY provider list
-         *     (no 401/402) so the login page simply renders no SSO options.
+         *     (no 401/402) so the login page simply renders no SSO options. The
+         *     anonymous path resolves system-level licenses only — org-level licenses
+         *     are unreachable pre-auth.
          *
          *     OIDC providers are merged from the sso_providers DB table (preferred) and
          *     the env-var fallback, deduplicated by provider_id. The DB read goes through
@@ -7734,7 +7736,10 @@ export interface paths {
          *     * Rate-limited to 1 request per 60 seconds per IP.
          *     * Daily cap of 100 events per IP.
          *     * Max request body size 10,000 bytes.
-         *     * Events are stored as orphaned records (no organisation scoping).
+         *     * Events are stored in a dedicated orphan-org partition: the ingest
+         *       transaction is RLS-pinned to a nil-UUID organisation row (seeded by
+         *       migration 0171) that tenant sessions can never see (org-only RLS
+         *       policies), so unattributed frontend errors never leak across tenancy.
          *     * A future cleanup job will prune events older than 48 hours (TTL).
          */
         post: operations["ingest_errors_public_api_v1_errors_ingest_public_post"];
@@ -12996,7 +13001,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5, backoff: seconds?, backoff_schedule?: {delay_seconds: 1-300, multiplier?: 1.0-10.0}}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing. 'backoff' is the legacy NODE-level inherited retry delay (node retries inherit this value; default 0). 'backoff_schedule' paces ONLY the run-level re-dispatch: the in-job sleep is min(delay_seconds * multiplier^(attempt-1), 300) plus up to +25% jitter (cap and jitter are code-held, not configurable); multiplier defaults to 2.0 (1.0 = fixed delay). The effective re-dispatch gap is the sleep plus settings.saq_retry_delay plus queue wait.
              */
             retry_policy?: {
                 [key: string]: unknown;
@@ -13149,6 +13154,14 @@ export interface components {
             mode: "llm" | "script";
             /** Agent Command */
             agent_command?: string | null;
+            /** Agent Commands */
+            agent_commands?: string[] | null;
+            /**
+             * Commands Concatenation String
+             * @description Joiner inserted between agent_commands entries when the pipeline runs.
+             * @default &&
+             */
+            commands_concatenation_string: string;
             /** Agent Prompt */
             agent_prompt?: string | null;
             /** Script Command */
@@ -13465,7 +13478,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5, backoff: seconds?, backoff_schedule?: {delay_seconds: 1-300, multiplier?: 1.0-10.0}}. Set to {} to clear. 'backoff' = node-level inherited retry delay; 'backoff_schedule' = run-level re-dispatch pacing only (min(delay_seconds * multiplier^(attempt-1), 300) + up to 25% jitter; multiplier default 2.0). Effective gap = sleep + settings.saq_retry_delay + queue wait.
              */
             retry_policy?: {
                 [key: string]: unknown;
@@ -25711,6 +25724,8 @@ export interface operations {
                 search?: string | null;
                 page?: number;
                 page_size?: number;
+                /** @description Cursor from previous response */
+                cursor?: string | null;
                 variant_group_id?: string | null;
                 batch_id?: string | null;
                 _fresh?: boolean;

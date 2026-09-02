@@ -708,9 +708,15 @@ def test_single_migration_head() -> None:
     # 0171_runs_list_performance_indexes (Runs-page timeout fix) chains off 0170.
     chaining_off_0170 = [p for p in revisions if parents[p] == "0170_add_residual_foreign_keys"]
     assert [_basename(p) for p in chaining_off_0170] == ["0171_runs_list_performance_indexes.py"]
-    # Nothing chains off 0171 -> it is the single head.
+    # 0172_seed_orphan_organisation (FAR-523 orphan-org seed) chains off 0171.
     chaining_off_0171 = [p for p in revisions if parents[p] == "0171_runs_list_performance_indexes"]
-    assert chaining_off_0171 == []
+    assert [_basename(p) for p in chaining_off_0171] == ["0172_seed_orphan_organisation.py"]
+    # 0173_per_org_deactivation (FAR-533 per-org deactivation) chains off 0172_seed_orphan_organisation.
+    chaining_off_0172 = [p for p in revisions if parents[p] == "0172_seed_orphan_organisation"]
+    assert [_basename(p) for p in chaining_off_0172] == ["0173_per_org_deactivation.py"]
+    # Nothing chains off 0173 -> it is the single head.
+    chaining_off_0173 = [p for p in revisions if parents[p] == "0173_per_org_deactivation"]
+    assert chaining_off_0173 == []
 
 
 async def test_load_eval_subscriber_events_normalises_json() -> None:

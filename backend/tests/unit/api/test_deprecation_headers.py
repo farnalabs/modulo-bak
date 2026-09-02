@@ -7,9 +7,13 @@ from fastapi.testclient import TestClient
 
 from modulo.api.middleware.deprecation_headers import DeprecationHeaderMiddleware
 
-# A sunset date safely in the future, so the "sunset header is set" assertions
-# keep exercising the not-yet-expired path regardless of when the suite runs.
-FUTURE_SUNSET = (date.today() + timedelta(days=30)).isoformat()
+FUTURE_SUNSET = "2099-12-31"
+PAST_SUNSET = "2020-01-01"
+
+
+def _future_sunset() -> str:
+    """Return an ISO date comfortably in the future so deprecation headers are exercised (200 path)."""
+    return (date.today() + timedelta(days=30)).isoformat()
 
 
 def _make_app() -> FastAPI:
@@ -55,12 +59,13 @@ class TestDeprecationHeaderMiddleware:
 
     def test_deprecated_route_gets_sunset_header_when_set(self):
         """Sunset header should be added when sunset date is provided."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=FUTURE_SUNSET)
+        sunset = _future_sunset()
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=sunset)
         app = _make_app()
         with TestClient(app) as client:
             resp = client.get("/api/v1/old-endpoint")
         assert resp.status_code == 200
-        assert resp.headers.get("Sunset") == FUTURE_SUNSET
+        assert resp.headers.get("Sunset") == sunset
 
     def test_deprecated_route_gets_link_header_when_migration_url_set(self):
         """Link header should be added when migration_url is provided."""
@@ -73,9 +78,10 @@ class TestDeprecationHeaderMiddleware:
 
     def test_deprecated_route_gets_all_headers_when_fully_configured(self):
         """All three headers should appear when sunset and migration_url are set."""
+        sunset = _future_sunset()
         DeprecationHeaderMiddleware.deprecate(
             "/api/v1/old-endpoint",
-            sunset=FUTURE_SUNSET,
+            sunset=sunset,
             migration_url="/docs/migrations/v2",
         )
         app = _make_app()
@@ -83,7 +89,7 @@ class TestDeprecationHeaderMiddleware:
             resp = client.get("/api/v1/old-endpoint")
         assert resp.status_code == 200
         assert resp.headers.get("Deprecation") == "true"
-        assert resp.headers.get("Sunset") == FUTURE_SUNSET
+        assert resp.headers.get("Sunset") == sunset
         assert resp.headers.get("Link") == '/docs/migrations/v2; rel="deprecation"'
 
     def test_path_prefix_matches_subpaths(self):
@@ -106,7 +112,7 @@ class TestDeprecationHeaderMiddleware:
 
     def test_clear_resets_registry(self):
         """Calling clear() should remove all registered deprecation rules."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2026-09-01")
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=FUTURE_SUNSET)
         DeprecationHeaderMiddleware.clear()
         app = _make_app()
         with TestClient(app) as client:
@@ -125,7 +131,7 @@ class TestDeprecationHeaderMiddleware:
 
     def test_410_gone_when_sunset_past(self):
         """A deprecated route whose sunset date has passed returns 410 Gone."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2020-01-01")
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=PAST_SUNSET)
         app = _make_app()
         with TestClient(app) as client:
             resp = client.get("/api/v1/old-endpoint")
@@ -136,13 +142,13 @@ class TestDeprecationHeaderMiddleware:
 
     def test_200_with_headers_when_sunset_future(self):
         """A deprecated route with a future sunset date returns 200 with headers."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2099-12-31")
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=FUTURE_SUNSET)
         app = _make_app()
         with TestClient(app) as client:
             resp = client.get("/api/v1/old-endpoint")
         assert resp.status_code == 200
         assert resp.headers.get("Deprecation") == "true"
-        assert resp.headers.get("Sunset") == "2099-12-31"
+        assert resp.headers.get("Sunset") == FUTURE_SUNSET
 
     def test_410_includes_deprecation_header(self):
         """410 Gone response still includes Deprecation: true header."""
@@ -156,7 +162,7 @@ class TestDeprecationHeaderMiddleware:
 
     def test_non_matching_path_no_410(self):
         """Unrelated paths should not trigger 410 even if a deprecation exists."""
-        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset="2020-01-01")
+        DeprecationHeaderMiddleware.deprecate("/api/v1/old-endpoint", sunset=PAST_SUNSET)
         app = _make_app()
         with TestClient(app) as client:
             resp = client.get("/api/v2/new-endpoint")
