@@ -312,6 +312,7 @@ describe('AdminConnectorsView', () => {
     expect(wrapper.text()).not.toContain('Please fix')
   })
 
+
   it('preserves a stored non-lowercase on_unknown value on edit-save (no silent downgrade)', async () => {
     // A stored 'FAIL_CLOSED' must match case-insensitively and be normalised on
     // prefill: pre-fix it fell through to the fail_open default and the next
@@ -343,6 +344,53 @@ describe('AdminConnectorsView', () => {
 
     expect(mockPatch).toHaveBeenCalledTimes(1)
     expect(patchBody()?.config_json.on_unknown).toBe('fail_closed')
+  })
+
+  it('preserves unknown config_json keys on a REST config-only edit round-trip (FAR-466 / FAR-504)', async () => {
+    // A REST connector whose stored config carries GENUINELY UNKNOWN keys (not
+    // surfaced as first-class form controls). The edit form must snapshot them
+    // back into the JSON editor (prefillRestConfig -> advanced_json) and re-merge
+    // them into the PATCH body's config_json (buildRestConfig), so an
+    // edit-save never silently drops config (no data loss on edit).
+    mockGet.mockResolvedValue({
+      data: {
+        items: [
+          restConnectorItem('rest-1', 'REST Connector', {
+            base_url: 'https://api.example.com',
+            method: 'GET',
+            timeout_seconds: 30,
+            verify_tls: true,
+            on_unknown: 'fail_open',
+            auth_mode: 'bearer',
+            records_path: '',
+            custom_unknown: { nested: true },
+            custom_str: 'keep-me',
+          }),
+        ],
+      },
+      error: undefined,
+    })
+    const wrapper = mountView()
+    await nextTick()
+    await nextTick()
+
+    await openEdit(wrapper, 'rest-1')
+    // Unknown keys are snapshotted into the advanced JSON editor on prefill...
+    const advancedJson = wrapper.find('[data-testid="rest-connector-advanced-json"]')
+    expect((advancedJson.element as HTMLTextAreaElement).value).toContain('custom_unknown')
+
+    // ...and a config-only save re-merges them into the PATCH config_json.
+    await wrapper.find('form').trigger('submit')
+    await nextTick()
+
+    expect(mockPatch).toHaveBeenCalledTimes(1)
+    const body = patchBody()
+    // Unknown / legacy keys preserved through the round-trip.
+    expect(body?.config_json.custom_unknown).toEqual({ nested: true })
+    expect(body?.config_json.custom_str).toBe('keep-me')
+    // First-class control keys also survive.
+    expect(body?.config_json.base_url).toBe('https://api.example.com')
+    expect(body?.config_json.method).toBe('GET')
   })
 
   it('preserves a stored non-number timeout_seconds instead of silently resetting it to 30', async () => {
