@@ -4683,18 +4683,6 @@ dependencies = [
     { name = "pytest" },
     { name = "typing-extensions" },
 ]
-sdist = { hash = "sha256:f19c50954be58251ed4f7fffb4c1cbc6c55e63a388024cc76c8d641fbb68aa6c" }
-
-[package.metadata]
-requires-dist = [
-    { name = "gherkin-official", specifier = ">=29.0.0,!=31.0.0,!=32.0.0" },
-    { name = "mako" },
-    { name = "packaging" },
-    { name = "parse" },
-    { name = "parse-type" },
-    { name = "pytest", specifier = ">=7.0.0" },
-    { name = "typing-extensions" },
-]
 
 [[package]]
 name = "pytest-cov"
