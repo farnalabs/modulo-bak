@@ -185,19 +185,24 @@ _ERROR_CODE_HARNESS_IDEMPOTENCY_GATE = "harness.idempotency_gate"
 # Backoff schedule for a retry_policy re-dispatch (FAR-136). A policy-triggered
 # retry must NOT re-fire back-to-back — the run is re-dispatched only after a
 # jittered, capped exponential delay. ``base`` is the first-attempt wait; the
-# delay doubles per attempt and is capped at ``cap``. Jitter spreads re-dispatch
+# delay grows per attempt and is capped at ``cap``. Jitter spreads re-dispatch
 # across the fleet (a herd of failing pipelines must not all re-fire together).
-_RETRY_BACKOFF_BASE_SECONDS = 45.0
+# FAR-525 qa gate: the DEFAULT base/multiplier are SINGLE-SOURCED to
+# retry_compensation.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS/_MULTIPLIER (the
+# resolver's absent-path defaults) — the executor-local aliases below exist
+# only as named references and must never drift from the rc constants (pinned
+# by test_retry_backoff_defaults_single_sourced_from_retry_compensation).
+_RETRY_BACKOFF_BASE_SECONDS = float(rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS)
 _RETRY_BACKOFF_CAP_SECONDS = 300.0
 # Jitter range as a fraction of the current schedule value; uniform in
 # [0, fraction * delay] so the schedule keeps its exponential shape while
 # still decorrelating concurrent retries. Capped against ``_RETRY_BACKOFF_CAP_SECONDS``.
 _RETRY_BACKOFF_JITTER_FRACTION = 0.25
-# FAR-525: the growth factor of the in-job sleep schedule. 2.0 matches the
-# pre-FAR-525 hardcoded doubling (present-with-defaults == absent) and the
-# sibling backoff layers; a run-level ``backoff_schedule`` may override it in
-# [1.0, 10.0] (fixed delay at 1.0).
-_RETRY_BACKOFF_DEFAULT_MULTIPLIER = 2.0
+# FAR-525: the growth factor of the in-job sleep schedule — single-sourced to
+# the resolver's default (2.0 matches the pre-FAR-525 hardcoded doubling so
+# "present with defaults" == "absent"); a run-level ``backoff_schedule`` may
+# override it in [1.0, 10.0] (fixed delay at 1.0).
+_RETRY_BACKOFF_DEFAULT_MULTIPLIER = float(rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER)
 
 
 def _sanitize_detail(detail: Any, limit: int = 5000) -> str:
@@ -229,10 +234,10 @@ def _traceback_detail(exc: BaseException, limit: int = 2000) -> str:
 def _retry_backoff_seconds(
     attempt_n: int,
     *,
-    base: float = _RETRY_BACKOFF_BASE_SECONDS,
+    base: float = rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS,
     cap: float = _RETRY_BACKOFF_CAP_SECONDS,
     jitter_fraction: float = _RETRY_BACKOFF_JITTER_FRACTION,
-    multiplier: float = _RETRY_BACKOFF_DEFAULT_MULTIPLIER,
+    multiplier: float = rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER,
 ) -> float:
     """Jittered, capped exponential backoff delay for a retry_policy retry.
 
@@ -241,8 +246,11 @@ def _retry_backoff_seconds(
     ``min(base * multiplier ** (attempt_n - 1), cap)`` and a uniform jitter term in
     ``[0, jitter_fraction * delay]`` is added (clamped so the total never
     exceeds ``cap``). A 0/negative ``attempt_n`` is clamped to 1.
-    ``multiplier`` (FAR-525) defaults to 2.0 so "present with defaults" is
-    behaviourally identical to "absent" — the pre-FAR-525 exponential schedule.
+    ``base``/``multiplier`` (FAR-525) default to the SINGLE-SOURCED
+    ``retry_compensation.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS`` /
+    ``RETRY_SCHEDULE_DEFAULT_MULTIPLIER`` (45.0 / 2.0) so "present with
+    defaults" is behaviourally identical to "absent" — the pre-FAR-525
+    exponential schedule.
 
     The schedule is bounded by the retry budget at the decision site: the
     executor only re-dispatches while ``node_attempt_count <= max_retries``,

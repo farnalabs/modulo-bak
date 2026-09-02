@@ -47,6 +47,7 @@ __all__ = [
     "NodeRetryPolicy",
     "RetryConfigError",
     "build_run_ref",
+    "canonicalise_backoff_schedule",
     "detect_compensation_cycle",
     "edge_has_compensation",
     "edge_retry_and_compensation_conflict",
@@ -254,14 +255,19 @@ def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | Non
 
     Returns ``(schedule_present, delay_seconds, multiplier, fail_open_reason)``:
       - absent (``backoff_schedule`` is ``None``/``{}``/missing, or the policy
-        is not a dict): ``(False, 45.0, 2.0, None)`` — the caller uses the
-        executor's own hardcoded defaults via ``_retry_backoff_seconds``.
-      - valid: ``(True, delay_seconds, multiplier, None)`` with types
-        canonicalised (integral floats -> int, ints -> float) so a re-resolve
-        is deterministic and the topology hash stays stable.
-      - invalid: ``(True, 45.0, 2.0, reason)`` — present but unusable, so the
-        caller logs the structured fail-open warning and re-dispatch falls
-        back to the hardcoded default schedule.
+        is not a dict): ``(False, RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS,
+        RETRY_SCHEDULE_DEFAULT_MULTIPLIER, None)`` — the LIVE defaults are
+        THIS module's ``RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS`` /
+        ``RETRY_SCHEDULE_DEFAULT_MULTIPLIER`` (the executor's
+        ``_retry_backoff_seconds`` parameter defaults are single-sourced to
+        the same constants; the topology hash is unaffected either way — it
+        folds the STORED policy dict, never the resolver's return values).
+      - valid: ``(True, delay_seconds, multiplier, None)`` — ``delay_seconds``
+        is an integer-valued float and ``multiplier`` a float, so a re-resolve
+        of the same stored dict is deterministic.
+      - invalid: ``(True, default, default, reason)`` — present but unusable,
+        so the caller logs the structured fail-open warning and re-dispatch
+        falls back to the default schedule.
     """
     base = float(RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS)
     default_multiplier = RETRY_SCHEDULE_DEFAULT_MULTIPLIER
@@ -280,29 +286,93 @@ def resolve_backoff_schedule(policy: Any) -> tuple[bool, float, float, str | Non
     if unknown:
         return _fail_open(f"backoff_schedule contains unknown keys {sorted(str(k) for k in unknown)}")
 
+    def _safe_float(value: float) -> float | None:
+        # A JSON int literal with more digits than float can represent (e.g.
+        # 10**400) parses to an arbitrary-precision int whose float()
+        # conversion raises OverflowError — contain it in the fail-open.
+        try:
+            return float(value)
+        except OverflowError:
+            return None
+
     delay_raw = schedule.get("delay_seconds")
     if isinstance(delay_raw, bool) or not isinstance(delay_raw, (int, float)):
         return _fail_open("backoff_schedule 'delay_seconds' must be a number of seconds")
-    delay = float(delay_raw)
+    delay_f = _safe_float(delay_raw)
+    if delay_f is None:
+        return _fail_open("'delay_seconds' is out of representable range")
     # NaN/Infinity fail the range comparison (not <= bound / not < bound), so
     # they land in the same fail-open bucket as any other out-of-bounds value.
-    if not RETRY_SCHEDULE_MIN_DELAY_SECONDS <= delay <= RETRY_SCHEDULE_MAX_DELAY_SECONDS:
+    if not RETRY_SCHEDULE_MIN_DELAY_SECONDS <= delay_f <= RETRY_SCHEDULE_MAX_DELAY_SECONDS:
         return _fail_open(
             f"backoff_schedule 'delay_seconds' out of bounds "
             f"[{RETRY_SCHEDULE_MIN_DELAY_SECONDS}, {RETRY_SCHEDULE_MAX_DELAY_SECONDS}]"
         )
-    delay_seconds: int = int(delay)  # integral by the range+type contract
+    # Aligned with the write-site validator (FAR-525 qa gate): a non-integral
+    # in-range delay (e.g. 2.5) is rejected there, so the resolver must not
+    # silently truncate it — fail open to the default schedule instead.
+    if delay_f != int(delay_f):
+        return _fail_open("'delay_seconds' must be an integer")
 
     mult_raw = schedule.get("multiplier", default_multiplier)
     if isinstance(mult_raw, bool) or not isinstance(mult_raw, (int, float)):
         return _fail_open("backoff_schedule 'multiplier' must be a number")
-    multiplier = float(mult_raw)
+    multiplier = _safe_float(mult_raw)
+    if multiplier is None:
+        return _fail_open("'multiplier' is out of representable range")
     if not RETRY_SCHEDULE_MIN_MULTIPLIER <= multiplier <= RETRY_SCHEDULE_MAX_MULTIPLIER:
         return _fail_open(
             f"backoff_schedule 'multiplier' out of bounds "
             f"[{RETRY_SCHEDULE_MIN_MULTIPLIER}, {RETRY_SCHEDULE_MAX_MULTIPLIER}]"
         )
-    return (True, float(delay_seconds), multiplier, None)
+    return (True, float(int(delay_f)), multiplier, None)
+
+
+def canonicalise_backoff_schedule(schedule: Any) -> dict[str, Any] | None:
+    """Canonicalise a ``backoff_schedule`` dict for type-stable storage (FAR-525).
+
+    The SINGLE implementation of the write-site canonicalisation invariant
+    (``delay_seconds`` integral float -> ``int``, ``multiplier`` ``int`` ->
+    ``float``) — shared by the API write path and the import sanitiser so the
+    retry-aware topology hash cannot flip on a float/int spelling of the same
+    schedule.
+
+    Returns ``None`` for absent/empty/non-dict input (nothing to canonicalise)
+    and a NEW dict (the input is never mutated) otherwise. Raises
+    ``ValueError`` with the standard validator message shape when a value
+    cannot be represented as float at all (e.g. a JSON int literal with more
+    digits than float can represent, ``10**400``) — the shape/bounds faults
+    themselves stay owned by ``GraphValidator.check_retry_policy_schedule``;
+    this helper only guards its own conversion.
+    """
+    if not isinstance(schedule, dict) or not schedule:
+        return None
+    canonical = dict(schedule)
+    delay = canonical.get("delay_seconds")
+    if isinstance(delay, (int, float)) and not isinstance(delay, bool):
+        # Attempt the float conversion for ANY numeric (ints included) so a
+        # huge un-representable int (e.g. 10**400) raises the standard
+        # ValueError instead of leaking an OverflowError; only FLOAT values
+        # are rebuilt (ints pass through value-exact).
+        try:
+            delay_f = float(delay)
+        except OverflowError as exc:
+            raise ValueError(
+                "retry_policy 'backoff_schedule' 'delay_seconds' must be an integer between "
+                f"{RETRY_SCHEDULE_MIN_DELAY_SECONDS} and {RETRY_SCHEDULE_MAX_DELAY_SECONDS}"
+            ) from exc
+        if not isinstance(delay, int) and delay_f.is_integer():
+            canonical["delay_seconds"] = int(delay_f)
+    mult = canonical.get("multiplier")
+    if isinstance(mult, int) and not isinstance(mult, bool):
+        try:
+            canonical["multiplier"] = float(mult)
+        except OverflowError as exc:
+            raise ValueError(
+                "retry_policy 'backoff_schedule' 'multiplier' must be a number between "
+                f"{RETRY_SCHEDULE_MIN_MULTIPLIER} and {RETRY_SCHEDULE_MAX_MULTIPLIER}"
+            ) from exc
+    return canonical
 
 
 _TOKENISH_KEY_RE = re.compile(r"token|secret|password|credential|api[-_]?key|authorization", re.IGNORECASE)

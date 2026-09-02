@@ -383,12 +383,22 @@ def test_resolve_backoff_schedule_fail_open_matrix() -> None:
         {"delay_seconds": 1000},
         {"delay_seconds": 0.5},
         {"delay_seconds": 301},
+        # Non-integral IN-RANGE delays are rejected by the write-site
+        # validator, so the resolver must fail open — never silently truncate.
+        {"delay_seconds": 2.5},
+        {"delay_seconds": 45.5},
         {"delay_seconds": True},
         {"delay_seconds": "45"},
         {"delay_seconds": None},
+        # Huge JSON int literals parse to arbitrary-precision Python ints
+        # whose float() conversion raises OverflowError — must fail open,
+        # never raise.
+        {"delay_seconds": 10**309},
+        {"delay_seconds": 10**400},
         {"multiplier": 2.0},  # missing delay_seconds
         {"delay_seconds": 45, "multiplier": 0.5},
         {"delay_seconds": 45, "multiplier": 100},
+        {"delay_seconds": 45, "multiplier": 10**400},
         {"delay_seconds": 45, "multiplier": True},
         {"delay_seconds": 45, "multiplier": "2"},
         {"delay_seconds": 45, "nope": 1},  # unknown inner key
@@ -401,6 +411,25 @@ def test_resolve_backoff_schedule_fail_open_matrix() -> None:
         assert delay == 45.0, schedule
         assert mult == 2.0, schedule
         assert reason, schedule
+
+
+def test_resolve_backoff_schedule_huge_int_delay_fail_open_reason() -> None:
+    """FAR-525 qa gate: a huge-int delay_seconds (>308 digits) fails open with
+    an out-of-representable-range reason instead of raising OverflowError."""
+    for huge in (10**309, 10**400, -(10**309)):
+        _present, _delay, _mult, reason = rc.resolve_backoff_schedule({"backoff_schedule": {"delay_seconds": huge}})
+        assert reason is not None
+        assert "representable range" in reason
+
+
+def test_resolve_backoff_schedule_non_integral_in_range_delay_fail_open_reason() -> None:
+    """FAR-525 qa gate: a non-integral IN-RANGE delay fails open with the
+    integrality reason (aligned with the write-site validator) — never a
+    silent float->int truncation."""
+    for delay in (2.5, 45.5):
+        _present, _delay, _mult, reason = rc.resolve_backoff_schedule({"backoff_schedule": {"delay_seconds": delay}})
+        assert reason is not None
+        assert "must be an integer" in reason
 
 
 def test_resolve_backoff_schedule_fail_open_non_dict_schedule() -> None:
@@ -421,7 +450,10 @@ def test_resolve_backoff_schedule_legacy_backoff_coexistence() -> None:
 
 def test_resolve_backoff_schedule_accepted_resolves_cross_check() -> None:
     """Property: every schedule the WRITE-SITE validator accepts, the resolver
-    resolves without fail-open (and vice versa for well-typed in-bounds rows)."""
+    resolves without fail-open (and vice versa for well-typed in-bounds rows).
+    INTEGRAL delay values only (2, 45, 300): the validator rejects
+    non-integral in-range delays, and the resolver now fail-opens on them —
+    the accepted surface is integral-valued."""
     from modulo.core.graph_validator import GraphValidator
     from modulo.core.graph_validator._types import ValidationResult
 
@@ -461,3 +493,66 @@ def test_resolve_backoff_schedule_default_schedule_value_matches_executor_defaul
         assert executor_module._retry_backoff_seconds(attempt, base=delay, multiplier=mult) == min(
             45.0 * 2.0 ** (attempt - 1), 300.0
         )
+
+
+# ---------------------------------------------------------------------------
+# FAR-525 qa gate — canonicalise_backoff_schedule (the SINGLE write-site helper)
+# ---------------------------------------------------------------------------
+
+
+def test_canonicalise_backoff_schedule_absent_variants() -> None:
+    assert rc.canonicalise_backoff_schedule(None) is None
+    assert rc.canonicalise_backoff_schedule({}) is None
+    assert rc.canonicalise_backoff_schedule("nope") is None
+
+
+def test_canonicalise_backoff_schedule_round_trip() -> None:
+    """Integral float delay -> int; int multiplier -> float; other keys and
+    non-integral values pass through untouched; input never mutated."""
+    schedule = {"delay_seconds": 300.0, "multiplier": 2, "extra": "kept"}
+    canonical = rc.canonicalise_backoff_schedule(schedule)
+    assert canonical == {"delay_seconds": 300, "multiplier": 2.0, "extra": "kept"}
+    assert isinstance(canonical["delay_seconds"], int)
+    assert isinstance(canonical["multiplier"], float)
+    assert schedule == {"delay_seconds": 300.0, "multiplier": 2, "extra": "kept"}
+    # Non-integral delay untouched; int delay untouched (already canonical).
+    assert rc.canonicalise_backoff_schedule({"delay_seconds": 1.5}) == {"delay_seconds": 1.5}
+    assert rc.canonicalise_backoff_schedule({"delay_seconds": 45}) == {"delay_seconds": 45}
+    assert rc.canonicalise_backoff_schedule({"delay_seconds": 45, "multiplier": 2.0}) == {
+        "delay_seconds": 45,
+        "multiplier": 2.0,
+    }
+
+
+def test_canonicalise_backoff_schedule_huge_int_raises_standard_message() -> None:
+    """Defense: a huge int that cannot be float-converted raises ValueError
+    with the standard validator message shape — never OverflowError."""
+    with pytest.raises(ValueError, match="must be an integer between"):
+        rc.canonicalise_backoff_schedule({"delay_seconds": 10**400})
+
+
+def test_write_sites_produce_identical_canonical_stored_output() -> None:
+    """FAR-525 qa gate: BOTH write sites (API _validate_retry_policy and the
+    import sanitiser) produce IDENTICAL stored output for the same inputs —
+    the canonicalisation invariant has ONE implementation."""
+    from modulo.api.routes.pipelines import _validate_retry_policy
+    from modulo.core.workflow_import_export import _sanitize_retry_policy
+
+    for schedule in (
+        {"delay_seconds": 300.0, "multiplier": 2},
+        {"delay_seconds": 300, "multiplier": 2.0},
+        {"delay_seconds": 45.0},
+        {"delay_seconds": 1, "multiplier": 10},
+    ):
+        api_out = _validate_retry_policy({"on": ["failure"], "max_retries": 2, "backoff_schedule": dict(schedule)})
+        import_out, fault = _sanitize_retry_policy(
+            {"on": ["failure"], "max_retries": 2, "backoff_schedule": dict(schedule)}
+        )
+        assert fault is None, schedule
+        assert api_out is not None and import_out is not None, schedule
+        assert api_out["backoff_schedule"] == import_out["backoff_schedule"], schedule
+    # Spot-check the canonical spellings survive both sites identically.
+    api_out = _validate_retry_policy(
+        {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 300.0, "multiplier": 2}}
+    )
+    assert api_out["backoff_schedule"] == {"delay_seconds": 300, "multiplier": 2.0}

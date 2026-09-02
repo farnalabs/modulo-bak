@@ -369,6 +369,7 @@ def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | Non
     if value is None:
         return value
     from modulo.core.graph_validator._types import ValidationResult
+    from modulo.core.pipeline_engine import retry_compensation
 
     result = ValidationResult()
     GraphValidator.check_retry_policy(value, result)
@@ -387,22 +388,13 @@ def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | Non
             extra={"keys": sorted(unknown_top)},
         )
 
-    # Canonicalize type-stable storage: integral-float delay_seconds -> int,
-    # int multiplier -> float (validator and resolver coerce IDENTICALLY).
-    schedule = value.get("backoff_schedule")
-    if isinstance(schedule, dict) and schedule:
-        delay = schedule.get("delay_seconds")
-        if (
-            isinstance(delay, (int, float))
-            and not isinstance(delay, bool)
-            and float(delay).is_integer()
-            and not isinstance(delay, int)
-        ):
-            schedule = {**schedule, "delay_seconds": int(delay)}
-        mult = schedule.get("multiplier")
-        if isinstance(mult, int) and not isinstance(mult, bool):
-            schedule = {**schedule, "multiplier": float(mult)}
-        value = {**value, "backoff_schedule": schedule}
+    # Canonicalize type-stable storage via the SINGLE shared helper
+    # (retry_compensation.canonicalise_backoff_schedule): integral-float
+    # delay_seconds -> int, int multiplier -> float (validator and resolver
+    # coerce IDENTICALLY — one implementation, shared with the import sanitiser).
+    canonical_schedule = retry_compensation.canonicalise_backoff_schedule(value.get("backoff_schedule"))
+    if canonical_schedule is not None:
+        value = {**value, "backoff_schedule": canonical_schedule}
     return value
 
 

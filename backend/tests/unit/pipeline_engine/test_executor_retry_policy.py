@@ -1182,6 +1182,23 @@ def test_retry_backoff_cap_constants_pinned():
     assert rc_mod.RETRY_SCHEDULE_MAX_MULTIPLIER == 10.0
 
 
+def test_retry_backoff_defaults_single_sourced_from_retry_compensation():
+    """FAR-525 qa gate: the executor's default base/multiplier are
+    SINGLE-SOURCED to retry_compensation.RETRY_SCHEDULE_DEFAULT_* — the same
+    constants the runtime resolver uses on the absent path. Raising one layer
+    without the other must be impossible without this pin failing."""
+    import inspect
+
+    from modulo.core.pipeline_engine import retry_compensation as rc
+
+    assert executor_module._RETRY_BACKOFF_BASE_SECONDS == rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS == 45.0
+    assert executor_module._RETRY_BACKOFF_DEFAULT_MULTIPLIER == rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER == 2.0
+    # The live parameter defaults reference the rc constants directly.
+    sig = inspect.signature(executor_module._retry_backoff_seconds)
+    assert sig.parameters["base"].default == rc.RETRY_SCHEDULE_DEFAULT_DELAY_SECONDS
+    assert sig.parameters["multiplier"].default == rc.RETRY_SCHEDULE_DEFAULT_MULTIPLIER
+
+
 async def test_execute_retry_policy_schedule_fixed_delay_wiring():
     """Wiring: the awaited sleep arg == the resolved schedule delay == the log
     field (ONE jitter draw â€” no re-resolution between log and sleep)."""

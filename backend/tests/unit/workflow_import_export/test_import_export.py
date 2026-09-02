@@ -324,6 +324,27 @@ def test_sanitize_retry_policy_whole_drops_mixed_error() -> None:
     assert fault == "core"
 
 
+def test_sanitize_retry_policy_unexpected_schedule_exception_degrades_to_schedule_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FAR-525 qa gate defense-in-depth: the schedule validator raising an
+    UNEXPECTED exception must degrade to the schedule-fault class (nested
+    drop, core kept) — a malformed bundled schedule must never break the
+    import. The CORE check keeps its semantics (only unexpected-exception
+    containment is broadened here)."""
+    from modulo.core.graph_validator import GraphValidator
+
+    policy = {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": 45}}
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("simulated validator defect")
+
+    monkeypatch.setattr(GraphValidator, "check_retry_policy_schedule", _boom)
+    sanitized, fault = _sanitize_retry_policy(policy)
+    assert sanitized == {"on": ["failure"], "max_retries": 2}
+    assert fault == "schedule"
+
+
 def test_sanitize_retry_policy_canonicalization_only_delta_does_not_fault() -> None:
     """A canonicalisation-only delta (300.0 -> 300, int multiplier -> float)
     is NOT a fault: the policy is kept and no warning-worthy fault class is

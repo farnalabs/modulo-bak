@@ -871,6 +871,8 @@ def _sanitize_retry_policy(imported: Any) -> tuple[dict[str, Any], str | None]:
     fault is the fatal one, and keeping ``on``/``max_retries`` beside a
     schedule we had to drop anyway buys nothing.
     """
+    from modulo.core.pipeline_engine import retry_compensation
+
     if imported is None:
         return {}, None
     if not isinstance(imported, dict):
@@ -880,19 +882,24 @@ def _sanitize_retry_policy(imported: Any) -> tuple[dict[str, Any], str | None]:
     if not core_check.is_valid:
         return {}, "core"
     schedule_check = ValidationResult()
-    GraphValidator.check_retry_policy_schedule(imported, schedule_check)
+    try:
+        GraphValidator.check_retry_policy_schedule(imported, schedule_check)
+        schedule_valid = schedule_check.is_valid
+    except Exception:
+        # Defense-in-depth (FAR-525 qa gate): the schedule validator must never
+        # break the import with an unexpected exception — ANY escape degrades
+        # to the schedule-fault class (nested drop + schedule warning). The
+        # CORE check above keeps its exact semantics (a core fault whole-drops,
+        # unchanged) — only unexpected-exception containment is broadened.
+        schedule_valid = False
     policy = dict(imported)
-    if schedule_check.is_valid:
-        # Canonicalise type-stable storage (integral float -> int, int -> float).
-        schedule = policy.get("backoff_schedule")
-        if isinstance(schedule, dict) and schedule:
-            delay = schedule.get("delay_seconds")
-            if isinstance(delay, (int, float)) and not isinstance(delay, bool) and float(delay).is_integer():
-                schedule = {**schedule, "delay_seconds": int(delay)}
-            mult = schedule.get("multiplier")
-            if isinstance(mult, int) and not isinstance(mult, bool):
-                schedule = {**schedule, "multiplier": float(mult)}
-            policy["backoff_schedule"] = schedule
+    if schedule_valid:
+        # Canonicalise type-stable storage via the SINGLE shared helper
+        # (retry_compensation.canonicalise_backoff_schedule): integral float
+        # -> int, int -> float — identical to the API write site.
+        canonical_schedule = retry_compensation.canonicalise_backoff_schedule(policy.get("backoff_schedule"))
+        if canonical_schedule is not None:
+            policy["backoff_schedule"] = canonical_schedule
         return policy, None
     policy.pop("backoff_schedule", None)
     return policy, "schedule"

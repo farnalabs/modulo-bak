@@ -164,6 +164,20 @@ def test_schedule_bounds_edges() -> None:
         assert _schedule_errors({"backoff_schedule": {"delay_seconds": 45, "multiplier": bad}}), bad
 
 
+def test_schedule_huge_int_delay_is_malformed_not_a_crash() -> None:
+    """FAR-525 qa gate: a JSON int literal with >308 digits (10**309 / 10**400)
+    parses to an arbitrary-precision Python int whose float() conversion raises
+    OverflowError. The validator must contain that and emit the STANDARD
+    RETRY_POLICY_SCHEDULE_MALFORMED issue (a 422 at the write sites, a warning
+    at run start) — never raise."""
+    for huge in (10**309, 10**400, -(10**400)):
+        errors = _schedule_errors({"backoff_schedule": {"delay_seconds": huge}})
+        assert len(errors) == 1, huge
+    for huge in (10**309, 10**400):
+        errors = _schedule_errors({"backoff_schedule": {"delay_seconds": 45, "multiplier": huge}})
+        assert len(errors) == 1, huge
+
+
 def test_schedule_unknown_inner_key_rejected() -> None:
     errors = _schedule_errors({"backoff_schedule": {"delay_seconds": 45, "backof": 2}})
     assert len(errors) == 1

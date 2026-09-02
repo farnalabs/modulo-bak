@@ -355,6 +355,23 @@ def test_create_pipeline_rejects_out_of_bounds_delay_seconds(client: TestClient)
     assert "delay_seconds" in resp.json()["detail"]
 
 
+def test_create_pipeline_rejects_huge_int_delay_seconds_with_422(client: TestClient) -> None:
+    """FAR-525 qa gate: a JSON int literal with >308 digits (e.g. 10**400)
+    parses to an arbitrary-precision Python int whose float() conversion
+    raises OverflowError. The validator contains it, so the API answers a
+    VALIDATION 422 (the standard malformed-schedule message) — never a 500."""
+    for huge in (10**309, 10**400):
+        resp = client.post(
+            "/api/v1/pipelines",
+            json={
+                "name": "Pipeline",
+                "retry_policy": {"on": ["failure"], "max_retries": 2, "backoff_schedule": {"delay_seconds": huge}},
+            },
+        )
+        assert resp.status_code == 422, huge
+        assert "delay_seconds" in resp.json()["detail"], huge
+
+
 def test_create_pipeline_rejects_schedule_missing_delay_seconds(client: TestClient) -> None:
     resp = client.post(
         "/api/v1/pipelines",

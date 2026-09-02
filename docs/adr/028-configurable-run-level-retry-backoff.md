@@ -35,8 +35,17 @@ RUN-LEVEL `retry_policy` only:
   A non-empty object missing `delay_seconds` is malformed.
 - **Effective in-job sleep** = `min(delay_seconds × multiplier^(attempt-1), 300)`
   plus the hardcoded +25% proportional jitter, total clamped to 300. The 300s
-  cap is a CODE-HELD constant (`retry_compensation.RETRY_SCHEDULE_MAX_DELAY_SECONDS`),
-  not user-configurable; the jitter stays hardcoded.
+  cap is a CODE-HELD pair of constants, not user-configurable, with DISTINCT
+  roles (FAR-525 qa gate attribution): `retry_compensation.RETRY_SCHEDULE_MAX_DELAY_SECONDS`
+  is the INPUT-VALIDATION bound for `delay_seconds` (what the write-site
+  validator and the runtime resolver accept), while the executor's
+  `_RETRY_BACKOFF_CAP_SECONDS` (the `cap` default of `_retry_backoff_seconds`)
+  is the actual SLEEP clamp applied to the computed delay. Both are 300 today;
+  raising one without the other silently diverges accepted input from
+  effective behaviour (an accepted 600s input would still sleep at the old
+  clamp, or an accepted-at-300 input would clamp a lower bound — either way
+  the operator-facing contract and the runtime disagree). The jitter stays
+  hardcoded.
 - **`multiplier` defaults to 2.0** — "present with defaults" is behaviourally
   identical to "absent" (`{delay_seconds: 45}` ≡ today's behaviour). This
   matches the sibling backoff layers (node retries, edge retries) and lets a

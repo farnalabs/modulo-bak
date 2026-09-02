@@ -2776,6 +2776,18 @@ class GraphValidator:
                 f"retry_policy 'backoff_schedule' contains unknown keys {sorted(str(k) for k in unknown)}; "
                 f"allowed keys are {sorted(rc.RETRY_SCHEDULE_ALLOWED_KEYS)}",
             )
+
+        # A JSON integer literal with more digits than float can represent
+        # (e.g. 10**400) parses to an arbitrary-precision Python int whose
+        # float() conversion raises OverflowError BEFORE the range comparison
+        # — contain it so a huge int lands in the same malformed bucket as any
+        # other bound fault (never a 500 / hard abort).
+        def _as_float(value: Any) -> float | None:
+            try:
+                return float(value)
+            except OverflowError:
+                return None
+
         delay = schedule.get("delay_seconds")
         if delay is None:
             result.error(
@@ -2783,26 +2795,21 @@ class GraphValidator:
                 "retry_policy 'backoff_schedule' must include 'delay_seconds' "
                 f"(integer seconds, {rc.RETRY_SCHEDULE_MIN_DELAY_SECONDS}-{rc.RETRY_SCHEDULE_MAX_DELAY_SECONDS})",
             )
-        elif (
-            isinstance(delay, bool)
-            or not isinstance(delay, (int, float))
-            or not (
-                rc.RETRY_SCHEDULE_MIN_DELAY_SECONDS <= float(delay) <= rc.RETRY_SCHEDULE_MAX_DELAY_SECONDS
-                and float(delay) == int(float(delay))
-            )
-        ):
-            result.error(
-                "RETRY_POLICY_SCHEDULE_MALFORMED",
-                "retry_policy 'backoff_schedule' 'delay_seconds' must be an integer between "
-                f"{rc.RETRY_SCHEDULE_MIN_DELAY_SECONDS} and {rc.RETRY_SCHEDULE_MAX_DELAY_SECONDS}",
-            )
+        else:
+            delay_f = None if isinstance(delay, bool) or not isinstance(delay, (int, float)) else _as_float(delay)
+            if delay_f is None or not (
+                rc.RETRY_SCHEDULE_MIN_DELAY_SECONDS <= delay_f <= rc.RETRY_SCHEDULE_MAX_DELAY_SECONDS
+                and delay_f == int(delay_f)
+            ):
+                result.error(
+                    "RETRY_POLICY_SCHEDULE_MALFORMED",
+                    "retry_policy 'backoff_schedule' 'delay_seconds' must be an integer between "
+                    f"{rc.RETRY_SCHEDULE_MIN_DELAY_SECONDS} and {rc.RETRY_SCHEDULE_MAX_DELAY_SECONDS}",
+                )
         if "multiplier" in schedule:
             mult = schedule["multiplier"]
-            if (
-                isinstance(mult, bool)
-                or not isinstance(mult, (int, float))
-                or not rc.RETRY_SCHEDULE_MIN_MULTIPLIER <= float(mult) <= rc.RETRY_SCHEDULE_MAX_MULTIPLIER
-            ):
+            mult_f = None if isinstance(mult, bool) or not isinstance(mult, (int, float)) else _as_float(mult)
+            if mult_f is None or not rc.RETRY_SCHEDULE_MIN_MULTIPLIER <= mult_f <= rc.RETRY_SCHEDULE_MAX_MULTIPLIER:
                 result.error(
                     "RETRY_POLICY_SCHEDULE_MALFORMED",
                     "retry_policy 'backoff_schedule' 'multiplier' must be a number between "
