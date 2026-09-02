@@ -11,6 +11,14 @@ env:
   DATABASE_URL: "postgresql+asyncpg://modulo:${{ secrets.POSTGRES_PASSWORD || 'modulo' }}@localhost:5432/modulo"
   SECRET_KEY: ${{ secrets.SECRET_KEY }}
   FERNET_KEY: ${{ secrets.FERNET_KEY }}
+  # Authenticate GitHub git fetches (uv pulls pytest-bdd from a fork by commit SHA,
+  # which GitHub intermittently rejects for anonymous access with "could not read
+  # Username"). Route github.com git/https through GITHUB_TOKEN so the fetch is
+  # authenticated and reliable in CI.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GIT_CONFIG_COUNT: "1"
+  GIT_CONFIG_KEY_0: "url.https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/.insteadOf"
+  GIT_CONFIG_VALUE_0: "https://github.com/"
   REDIS_URL: "redis://localhost:6379/0"
   MODULO_PUBLIC_URL: "http://localhost:8000"
   MODULO_USERS: "admin:admin"
