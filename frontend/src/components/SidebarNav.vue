@@ -99,6 +99,7 @@ import SidebarGroup from "./SidebarGroup.vue";
 
 import { getVisibleNavGroups } from "../config/navigation";
 import type { NavGroup } from "../config/navigation";
+import { isDemoSession } from "../lib/api/auth";
 import { useSidebar } from "../composables/useSidebar";
 import { usePlanStore } from "../stores/planStore";
 
@@ -165,6 +166,8 @@ const visibleSidebarGroups = computed(() =>
     devMode: planStore.devMode,
     tierInfoLoaded: tierInfoLoaded.value,
     isAtMinimumTier: (tier: string) => planStore.isAtMinimumTier(tier),
+    // FAR-535: computed once per getVisibleNavGroups call, not per item.
+    isDemoSession: isDemoSession(),
   }),
 );
 </script>

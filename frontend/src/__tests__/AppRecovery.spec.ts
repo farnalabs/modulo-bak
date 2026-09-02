@@ -39,9 +39,10 @@ const clientState = vi.hoisted(() => {
   }
 })
 
-// FAR-535: mirrors the persisted demo-session flag so the App.vue mount can be
-// driven into the "demo marker set, no stored token" reload state.
-const demoState = vi.hoisted(() => ({ isDemo: false }))
+// FAR-535: mirrors the persisted demo-session flag and the demo-ended
+// tombstone so the App.vue mount can be driven into the "prior demo session,
+// no stored token" reload states.
+const demoState = vi.hoisted(() => ({ isDemo: false, demoEnded: false }))
 
 vi.mock('vue-router', () => ({
   useRoute: () => routeRef,
@@ -65,6 +66,7 @@ vi.mock('@/lib/api/client', () => ({
       wasAuthenticated && !hasToken && hasAutoLogin,
   ),
   isDemoSession: vi.fn(() => demoState.isDemo),
+  wasDemoSessionEnded: vi.fn(() => demoState.demoEnded),
 }))
 
 vi.mock('@/lib/error-tracking', () => ({
@@ -97,6 +99,7 @@ beforeEach(() => {
   clientState.setToken(null)
   clientState.setHandler(null)
   demoState.isDemo = false
+  demoState.demoEnded = false
   mockRouter.push.mockClear()
 })
 
@@ -192,10 +195,13 @@ describe('App auto-login recovery', () => {
   })
 })
 
-// FAR-535: on reload with a persisted demo marker but no stored token (the
+// FAR-535: on reload with a prior demo session but no stored token (the
 // short-lived demo session has ended), App must NOT silently auto-login as the
 // instance's auto-login account — it hands back to the /demo route, whose guard
 // re-issues a fresh demo session (or lands on /login when demo is disabled).
+// qa iter 1: the signal is the persisted demo-ended tombstone (which survives
+// clearAccessToken + reload); the live demo-marker check stays as a second
+// signal for the mid-session path.
 describe('App demo reload guard (FAR-535)', () => {
   it('redirects to /demo and never calls auto-login when the demo flag is set without a token', async () => {
     demoState.isDemo = true
@@ -217,7 +223,30 @@ describe('App demo reload guard (FAR-535)', () => {
     expect(wrapper.findComponent({ name: 'AppLayout' }).exists()).toBe(false)
   })
 
-  it('keeps first-mount auto-login unchanged when the demo flag is not set', async () => {
+  it('redirects to /demo and never calls auto-login when the demo-ended tombstone is present without a token', async () => {
+    // qa iter 1: the tombstone is the signal that actually fires on the real
+    // expiry path — clearAccessToken removes token AND demo marker together,
+    // so after a reload only the tombstone remembers the demo session.
+    demoState.demoEnded = true
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: async () => ({}) }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const wrapper = shallowMount(App)
+    await flushPromises()
+
+    expect(mockRouter.push).toHaveBeenCalledWith('/demo')
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      '/api/v1/auth/login',
+      expect.anything(),
+    )
+    expect(wrapper.findComponent({ name: 'LoginView' }).exists()).toBe(true)
+    expect(wrapper.findComponent({ name: 'AppLayout' }).exists()).toBe(false)
+  })
+
+  it('keeps first-mount auto-login unchanged when no demo signal is present', async () => {
+    // A real login (or any successful auth) clears the tombstone and the demo
+    // marker (see lib/api/auth.ts), so a genuine fresh visitor auto-logs-in
+    // exactly as before.
     const deferredLogin = deferred<{ ok: boolean; json: () => Promise<Record<string, unknown>> }>()
     mockLoginFetch(deferredLogin)
 

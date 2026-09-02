@@ -5,6 +5,13 @@ const REFRESH_TOKEN_KEY = 'modulo_refresh_token'
 // FAR-535: persisted marker that the current session came from the /demo
 // auto-login. Read by the demo-mode banner; cleared with the session.
 const DEMO_SESSION_KEY = 'modulo_demo_session'
+// FAR-535 (qa iter 1): persisted tombstone written when a demo session is torn
+// down. clearAccessToken removes the token AND the demo marker together, so
+// after a demo-token expiry + reload neither exists and first-mount auto-login
+// would silently log the former demo visitor in as the instance's auto-login
+// account. The tombstone outlives that clear (and any reload) and is consumed
+// by App.vue's mount-time check; it is cleared by any NEW successful auth.
+const DEMO_ENDED_KEY = 'modulo_demo_ended'
 
 // S8475: only store well-formed, opaque token strings in browser storage.
 // Rejects anything containing control/whitespace chars or exceeding a sane
@@ -12,7 +19,7 @@ const DEMO_SESSION_KEY = 'modulo_demo_session'
 const TOKEN_PATTERN = /^[A-Za-z0-9._\-]+$/
 const MAX_TOKEN_LENGTH = 8192
 
-function isValidToken(value: unknown): value is string {
+export function isValidToken(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length > 0 &&
@@ -50,6 +57,18 @@ export function setDemoSession(active: boolean): void {
   }
 }
 
+// Persisted signal that a demo session has ended and no new authentication has
+// succeeded since. Unlike the in-memory flag below, this survives page reloads.
+export function wasDemoSessionEnded(): boolean {
+  return localStorage.getItem(DEMO_ENDED_KEY) !== null
+}
+
+function markDemoSessionEnded(): void {
+  if (localStorage.getItem(DEMO_ENDED_KEY) === null) {
+    localStorage.setItem(DEMO_ENDED_KEY, String(Date.now()))
+  }
+}
+
 export function wasDemoSessionCleared(): boolean {
   return _lastClearedWasDemo
 }
@@ -72,8 +91,17 @@ export function onAuthChange(fn: (token: string | null) => void): () => void {
 
 export function setAccessToken(token: string): void {
   storeToken(TOKEN_KEY, token)
-  // A fresh login supersedes the demo-end signal — recovery gating applies
-  // only until the next successful authentication of any kind.
+  // Any new successful authentication (real login, SSO callback, token refresh,
+  // or a fresh demo hand-off) supersedes all prior demo state: the demo marker
+  // must never survive into a real session (a two-tab race would otherwise
+  // leave a real token flagged as demo — demo banner on a real session,
+  // private_preview nav hidden, auto-login recovery wrongly suppressed), and
+  // the demo-end tombstone only gates auto-login until the next successful
+  // auth of any kind. The demo hand-off sets the marker AFTER this call, so
+  // the default is "a new token is not a demo session unless the hand-off
+  // says so".
+  setDemoSession(false)
+  localStorage.removeItem(DEMO_ENDED_KEY)
   _lastClearedWasDemo = false
   notifyListeners()
 }
@@ -82,6 +110,11 @@ export function clearAccessToken(): void {
   // Capture BEFORE clearing: the auto-login recovery gate (client.ts) must
   // know the session being torn down was a demo session.
   _lastClearedWasDemo = isDemoSession()
+  if (_lastClearedWasDemo) {
+    // Persist the demo-ended signal BEFORE removing the marker, so it outlives
+    // the token clear and any reload (App.vue's mount-time check consumes it).
+    markDemoSessionEnded()
+  }
   localStorage.removeItem(TOKEN_KEY)
   clearRefreshToken()
   setDemoSession(false)

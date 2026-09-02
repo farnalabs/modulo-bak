@@ -18,6 +18,7 @@ export {
   getAuthHeaders,
   isDemoSession,
   setDemoSession,
+  wasDemoSessionEnded,
 } from './auth'
 
 // Decides the app's initial auth state at startup (used by App.vue). An

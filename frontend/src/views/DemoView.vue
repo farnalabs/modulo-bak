@@ -10,17 +10,24 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { getAccessToken } from '../lib/api/client'
 import { runDemoHandOff } from '../lib/api/demo'
 
 const router = useRouter()
 
 // Defensive fallback: the /demo route guard performs the hand-off pre-mount and
 // redirects away before this component ever renders. If this view is ever
-// reached anyway (guard bypassed), run the same hand-off here so the visitor is
-// never stranded — dashboard on success, plain login on failure (no error may
-// reveal demo internals).
+// reached anyway (guard bypassed), apply the SAME rule as the guard so the two
+// paths cannot drift: a live session (demo or real) is never torn down — go to
+// the dashboard; only a tokenless browser runs the hand-off, once. Redirect
+// targets use the same route names as the guard (dashboard on success, plain
+// login on failure — no error may reveal demo internals).
 onMounted(async () => {
+  if (getAccessToken()) {
+    router.replace({ name: 'dashboard' })
+    return
+  }
   const ok = await runDemoHandOff()
-  router.replace(ok ? '/' : '/login')
+  router.replace(ok ? { name: 'dashboard' } : { name: 'login' })
 })
 </script>

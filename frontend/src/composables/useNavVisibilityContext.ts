@@ -1,6 +1,6 @@
 import { computed } from 'vue'
 import { usePlanStore } from '../stores/planStore'
-import { getAccessToken } from '../lib/api/client'
+import { getAccessToken, isDemoSession } from '../lib/api/client'
 import { decodeJwtPayload } from '../lib/jwt'
 import type { NavVisibilityContext } from '../config/navigation'
 
@@ -24,5 +24,7 @@ export function useNavVisibilityContext() {
     devMode: planStore.devMode,
     tierInfoLoaded: !!planStore.tierRanks && Object.keys(planStore.tierRanks).length > 0,
     isAtMinimumTier: (tier: string) => planStore.isAtMinimumTier(tier),
+    // FAR-535: read once per context evaluation, not per nav item.
+    isDemoSession: isDemoSession(),
   }))
 }

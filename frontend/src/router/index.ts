@@ -581,7 +581,16 @@ router.beforeEach(async (to) => {
     // BEFORE App mounts, so an anonymous visitor hitting /demo lands straight
     // on the dashboard with the demo session already stored (App.vue's
     // unauthenticated LoginView branch never has a chance to flash).
+    // qa iter 1: a LIVE session must never be torn down by merely visiting
+    // /demo — previously every navigation re-ran the hand-off, so
+    // Back/Forward to /demo logged a real user out, raced the auto-login
+    // recovery listener, and re-minted a token (burning the 10/hour budget).
+    // With a token present (demo flag set or a real session) the visitor goes
+    // straight to the dashboard; only a tokenless browser runs the hand-off.
     if (to.name === 'demo') {
+      if (getAccessToken()) {
+        return { name: 'dashboard' }
+      }
       const ok = await runDemoHandOff()
       return ok ? { name: 'dashboard' } : { name: 'login' }
     }
