@@ -33,8 +33,9 @@ primary_region = 'lhr'
   # (deploy/fly/), NOT the Docker build context. The build context stays the
   # repo root (CI runs `fly deploy --config deploy/fly/fly.staging.toml` from
   # the repo root), so the Dockerfile's `COPY backend/`, `COPY frontend/` etc.
-  # still work. We therefore go up one level to reach the real file.
-  dockerfile = "../backend/Dockerfile.fly"
+  # still work. This file lives in deploy/fly/, so to reach the repo-root
+  # backend/Dockerfile.fly we go up TWO levels (../../).
+  dockerfile = "../../backend/Dockerfile.fly"
 
 [processes]
   app = ""
