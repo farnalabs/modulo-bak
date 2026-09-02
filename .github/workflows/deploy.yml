@@ -131,7 +131,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -156,7 +156,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -183,7 +183,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -214,7 +214,7 @@ jobs:
     runs-on: ubicloud-standard-2
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -279,7 +279,7 @@ jobs:
     timeout-minutes: 20
     steps:
       # Full history required: semgrep diffs against --baseline-commit HEAD^.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
@@ -415,7 +415,7 @@ jobs:
     needs: [pre-deploy-gate]
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -1075,7 +1075,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
@@ -1134,7 +1134,7 @@ jobs:
     if: always() && (needs.staging-e2e.result == 'success' || github.event.inputs.skip_staging_e2e == 'true')
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 1
@@ -1759,7 +1759,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
