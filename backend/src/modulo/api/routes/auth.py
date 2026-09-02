@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from jwt import InvalidTokenError as JWTError
 from pydantic import BaseModel, Field
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -46,8 +46,9 @@ from modulo.db.crud.token_family import (
 )
 from modulo.db.models.account import Account
 from modulo.db.models.org_membership import OrgMembership
+from modulo.db.models.organisation import Organisation
 from modulo.db.models.token_family import TokenFamily
-from modulo.db.seed_demo import demo_login_config
+from modulo.db.seed_demo import DEMO_ORG_ROLE, DEMO_ORG_SLUG, demo_login_config
 from modulo.settings import Settings, get_settings
 
 _MSG_INCORRECT_EMAIL_PASSWORD = "Incorrect email or password"  # nosec B105 — error message, not a real credential
@@ -275,6 +276,30 @@ def _resolve_login_org_context(
     return None, None
 
 
+async def _resolve_demo_org_membership(session: AsyncSession, account_id: uuid.UUID) -> tuple[uuid.UUID, str] | None:
+    """Demo-org viewer membership for the account, or ``None`` when absent.
+
+    Resolves through the demo org SLUG + the viewer role (not just "any
+    membership") so the demo endpoint can only ever mint a session scoped to
+    the demo organisation. Defense-in-depth against operator
+    misconfiguration: if MODULO_DEMO_USER names a pre-existing privileged
+    account, its other-org memberships are never eligible here.
+    """
+    result = await session.execute(
+        select(OrgMembership.organisation_id, OrgMembership.role)
+        .join(Organisation, Organisation.id == OrgMembership.organisation_id)
+        .where(
+            OrgMembership.account_id == account_id,
+            Organisation.slug == DEMO_ORG_SLUG,
+            OrgMembership.role == DEMO_ORG_ROLE,
+        )
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return (row.organisation_id, row.role)
+
+
 async def _run_login_transaction(
     session: AsyncSession,
     email: str,
@@ -428,7 +453,12 @@ async def demo_login(
 
     The minted access token carries the SHORT demo TTL
     (modulo_demo_token_minutes, ~2h) and NO refresh token is issued — the demo
-    session dies with the access token. Rate limiting: 10/hour per IP via
+    session dies with the access token. The session is minted ONLY for a
+    viewer membership in the demo org: if the env user authenticates but has
+    no viewer membership in the demo org (operator misconfiguration — e.g.
+    MODULO_DEMO_USER naming a privileged account) the endpoint answers the
+    same plain 404, so a demo request can never mint a token for another org
+    or elevated role. Rate limiting: 10/hour per IP via
     RateLimitMiddleware.RULES; auth lockout failures additionally feed the
     shared AuthRateLimiter like a normal login.
     """
@@ -448,9 +478,17 @@ async def demo_login(
             account = await _authenticate_credentials(session, email, password, limiter=limiter, ip=ip)
             if limiter is not None:
                 await limiter.record_success(ip)
+            # Defense-in-depth: never mint a token from generic login org
+            # resolution — only the demo org's viewer membership qualifies,
+            # and is_system_admin is re-checked here rather than trusted to
+            # the boot seed. Anything else is treated as feature-absent.
+            demo_context = None
+            if not account.is_system_admin:
+                demo_context = await _resolve_demo_org_membership(session, account.id)
+            if demo_context is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+            org_id, org_role = demo_context
             await update_last_login(session, account.id)
-            memberships = await list_memberships_for_account(session, account.id)
-            org_id, org_role = _resolve_login_org_context(memberships, account)
     except asyncio.CancelledError:
         raise
     except HTTPException as exc:

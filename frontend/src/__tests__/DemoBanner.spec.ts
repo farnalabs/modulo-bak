@@ -27,8 +27,8 @@ describe('DemoBanner', () => {
   it('renders the banner strings from the en-US locale keys', () => {
     setDemoSession(true)
     const wrapper = mount(DemoBanner)
-    const locale = enUS.components.DemoBanner as { title: string; subtitle: string }
-    expect(wrapper.text()).toContain(locale.title)
-    expect(wrapper.text()).toContain(locale.subtitle)
+    const components = enUS.components as { DemoBanner: { title: string; subtitle: string } }
+    expect(wrapper.text()).toContain(components.DemoBanner.title)
+    expect(wrapper.text()).toContain(components.DemoBanner.subtitle)
   })
 })

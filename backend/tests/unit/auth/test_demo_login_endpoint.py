@@ -5,8 +5,11 @@ when any of MODULO_DEMO_ENABLED / MODULO_DEMO_USER / MODULO_DEMO_PASSWORD is
 unset or empty, a successful call mints an access token carrying the SHORT
 demo TTL (modulo_demo_token_minutes, NOT modulo_access_token_minutes) with NO
 refresh token and viewer-role demo-org claims, misconfigured env credentials
-are denied byte-identically to /login, the auth.demo_login audit event is
-emitted, and the per-IP rate-limit rule (10/hour) is registered.
+are denied byte-identically to /login, an authenticating account WITHOUT a
+viewer membership in the demo org (or with is_system_admin) is treated as
+feature-absent (plain 404 — a demo request can never mint a token for another
+org or an elevated role), the auth.demo_login audit event is emitted, and the
+per-IP rate-limit rule (10/hour) is registered.
 """
 
 import logging
@@ -67,13 +70,6 @@ def _demo_account(password_hash: str | None = None) -> MagicMock:
     account.must_change_password = False
     account.password_hash = password_hash if password_hash is not None else hash_password(_DEMO_PASSWORD)
     return account
-
-
-def _viewer_membership() -> MagicMock:
-    membership = MagicMock()
-    membership.organisation_id = _DEMO_ORG_ID
-    membership.role = "viewer"
-    return membership
 
 
 @pytest.fixture(autouse=True)
@@ -146,8 +142,8 @@ def test_demo_login_success_mints_short_lived_demo_token(client: TestClient) -> 
         patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=account)),
         patch("modulo.api.routes.auth.update_last_login", new=AsyncMock()),
         patch(
-            "modulo.api.routes.auth.list_memberships_for_account",
-            new=AsyncMock(return_value=[_viewer_membership()]),
+            "modulo.api.routes.auth._resolve_demo_org_membership",
+            new=AsyncMock(return_value=(_DEMO_ORG_ID, "viewer")),
         ),
     ):
         resp = client.post("/api/v1/auth/demo")
@@ -172,8 +168,8 @@ def test_demo_login_sets_session_cookie_with_demo_ttl(client: TestClient) -> Non
         patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=account)),
         patch("modulo.api.routes.auth.update_last_login", new=AsyncMock()),
         patch(
-            "modulo.api.routes.auth.list_memberships_for_account",
-            new=AsyncMock(return_value=[_viewer_membership()]),
+            "modulo.api.routes.auth._resolve_demo_org_membership",
+            new=AsyncMock(return_value=(_DEMO_ORG_ID, "viewer")),
         ),
     ):
         resp = client.post("/api/v1/auth/demo")
@@ -207,14 +203,61 @@ def test_demo_login_env_password_mismatch_denied_like_login(app: FastAPI, client
     assert resp.json()["detail"] == "Incorrect email or password"
 
 
+def test_demo_login_account_without_demo_org_membership_answers_plain_404(app: FastAPI, client: TestClient) -> None:
+    """An authenticating account with NO viewer demo-org membership 404s.
+
+    Defense against MODULO_DEMO_USER misconfiguration naming a pre-existing
+    privileged account: its other-org memberships must never be mintable into
+    a demo token — the endpoint resolves the session ONLY through the demo
+    org slug + viewer role and treats everything else as feature-absent.
+    """
+    _override_settings(app, demo_user="existing-admin@example.com")
+    existing_account = _demo_account()
+    existing_account.email = "existing-admin@example.com"
+    with (
+        patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=existing_account)),
+        patch("modulo.api.routes.auth.update_last_login", new=AsyncMock()),
+        patch(
+            "modulo.api.routes.auth._resolve_demo_org_membership",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        resp = client.post("/api/v1/auth/demo")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Not Found"
+    assert "modulo_session" not in resp.cookies
+
+
+def test_demo_login_system_admin_account_answers_plain_404(app: FastAPI, client: TestClient) -> None:
+    """is_system_admin=True on the authenticating account 404s without minting.
+
+    Re-checked in the endpoint (not just the boot seed): an elevated account
+    must never receive a demo session, and the membership resolver is not even
+    consulted.
+    """
+    elevated_account = _demo_account()
+    elevated_account.is_system_admin = True
+    resolver = AsyncMock(return_value=(_DEMO_ORG_ID, "viewer"))
+    with (
+        patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=elevated_account)),
+        patch("modulo.api.routes.auth.update_last_login", new=AsyncMock()),
+        patch("modulo.api.routes.auth._resolve_demo_org_membership", new=resolver),
+    ):
+        resp = client.post("/api/v1/auth/demo")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Not Found"
+    resolver.assert_not_called()
+    assert "modulo_session" not in resp.cookies
+
+
 def test_demo_login_success_logs_audit_event(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
     account = _demo_account()
     with (
         patch("modulo.api.routes.auth.get_account_by_email", new=AsyncMock(return_value=account)),
         patch("modulo.api.routes.auth.update_last_login", new=AsyncMock()),
         patch(
-            "modulo.api.routes.auth.list_memberships_for_account",
-            new=AsyncMock(return_value=[_viewer_membership()]),
+            "modulo.api.routes.auth._resolve_demo_org_membership",
+            new=AsyncMock(return_value=(_DEMO_ORG_ID, "viewer")),
         ),
         caplog.at_level(logging.INFO, logger="modulo.api.routes.auth"),
     ):

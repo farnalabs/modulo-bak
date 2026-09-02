@@ -302,37 +302,38 @@ async def _seed_demo_pipeline_and_runs(session: AsyncSession, org: Organisation,
     # Deterministic, idempotent runs: fixed run_numbers with per-number
     # existence checks. The demo org is seed-owned (the viewer demo user cannot
     # trigger runs), so a missing number can only mean a partial/absent seed.
-    run_specs = [
-        {"run_number": 1, "status": "complete", "total_tokens": 1840, "total_cost_usd": 0.0042},
-        {"run_number": 2, "status": "failed", "total_tokens": 210, "total_cost_usd": 0.0005},
+    # (run_number, status, total_tokens, total_cost_usd)
+    run_specs: list[tuple[int, str, int, float]] = [
+        (1, "complete", 1840, 0.0042),
+        (2, "failed", 210, 0.0005),
     ]
-    for spec in run_specs:
+    for run_number, status, total_tokens, total_cost_usd in run_specs:
         existing_result = await session.execute(
-            select(Run.id).where(Run.organisation_id == org.id, Run.run_number == spec["run_number"])
+            select(Run.id).where(Run.organisation_id == org.id, Run.run_number == run_number)
         )
         if existing_result.scalar_one_or_none() is not None:
             continue
-        thread_id = f"demo-seed-{org.id}-{spec['run_number']}"
+        thread_id = f"demo-seed-{org.id}-{run_number}"
         run = Run(
             organisation_id=org.id,
             pipeline_id=pipeline.id,
             snapshot_id=snapshot.id,
             account_id=account.id,
             trigger_type="manual",
-            status=spec["status"],
-            run_number=spec["run_number"],
+            status=status,
+            run_number=run_number,
             input_hash=hashlib.sha256(thread_id.encode()).hexdigest(),
             langgraph_thread_id=thread_id,
-            started_at=datetime.now(UTC) - timedelta(hours=2 * spec["run_number"]),
-            completed_at=datetime.now(UTC) - timedelta(hours=2 * spec["run_number"] - 1),
-            total_tokens=spec["total_tokens"],
-            total_cost_usd=spec["total_cost_usd"],
-            error_detail="Demo sample failure — no real work was performed." if spec["status"] == "failed" else None,
-            error_code="DEMO_SAMPLE" if spec["status"] == "failed" else None,
+            started_at=datetime.now(UTC) - timedelta(hours=2 * run_number),
+            completed_at=datetime.now(UTC) - timedelta(hours=2 * run_number - 1),
+            total_tokens=total_tokens,
+            total_cost_usd=total_cost_usd,
+            error_detail="Demo sample failure — no real work was performed." if status == "failed" else None,
+            error_code="DEMO_SAMPLE" if status == "failed" else None,
             outputs_json={"demo": "Sample demo output — synthetic, no agent execution."},
         )
         session.add(run)
-        _log.info("demo_seed.run_created", extra={"run_number": spec["run_number"], "status": spec["status"]})
+        _log.info("demo_seed.run_created", extra={"run_number": run_number, "status": status})
 
 
 async def seed_demo(session: AsyncSession) -> str | None:
@@ -354,6 +355,29 @@ async def seed_demo(session: AsyncSession) -> str | None:
     org = await _get_or_create_demo_org(session)
     account = await _seed_demo_account(session, email, password)
     await _seed_demo_membership(session, account, org)
+
+    # Operator-misconfiguration observability: MODULO_DEMO_USER should name a
+    # dedicated account. If it named an existing account with memberships in
+    # other orgs, the demo endpoint still only ever mints the demo-org viewer
+    # session (see auth._resolve_demo_org_membership) — but flag the stray
+    # memberships loudly so the operator can point the env at a fresh account.
+    stray_org_ids = (
+        (
+            await session.execute(
+                select(OrgMembership.organisation_id).where(
+                    OrgMembership.account_id == account.id,
+                    OrgMembership.organisation_id != org.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if stray_org_ids:
+        _log.warning(
+            "demo_seed.account_has_memberships_outside_demo_org",
+            extra={"email": email, "other_org_count": len(stray_org_ids)},
+        )
 
     # Org-scoped entity writes run under the documented execution context so
     # Postgres RLS admits them (mirrors seed_cost_components_for_org).
