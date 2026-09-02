@@ -77,7 +77,6 @@ vi.mock('../composables/useDataFetch', async () => {
 })
 
 import PipelineEditorView from '../views/PipelineEditorView.vue'
-import { api } from '../lib/api/client'
 
 const router = createRouter({
   history: createWebHistory(),
