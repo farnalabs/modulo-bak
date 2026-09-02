@@ -1,5 +1,8 @@
 name: "Deploy: Staging + Prod"
 
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 on:
   push:
     branches: [main]
@@ -125,6 +128,12 @@ jobs:
           python-version: "3.12"
           enable-cache: true
 
+      - name: Authenticate git for uv GitHub dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
+
       - name: Backend lint
         working-directory: backend
         run: |
@@ -149,6 +158,12 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+
+      - name: Authenticate git for uv GitHub dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
       - name: Sync deps
         working-directory: backend
@@ -207,6 +222,12 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+
+      - name: Authenticate git for uv GitHub dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
       - name: Sync deps
         working-directory: backend
@@ -272,6 +293,12 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
+
+      - name: Authenticate git for uv GitHub dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
       - name: Sync deps
         run: uv sync --project backend --frozen

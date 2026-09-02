@@ -13,6 +13,7 @@ env:
   FERNET_KEY: ${{ secrets.FERNET_KEY }}
   REDIS_URL: "redis://localhost:6379/0"
   MODULO_PUBLIC_URL: "http://localhost:8000"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   MODULO_USERS: "admin:admin"
   CORS_ORIGINS: "http://localhost:4173"
   MODULO_PLUGIN_DISCOVERY: "false"
@@ -87,6 +88,12 @@ jobs:
           echo "Redis did not become ready in time"
           docker logs modulo-bdd-redis
           exit 1
+
+      - name: Authenticate git for uv GitHub dependency fetches
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global credential.https://github.com.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_TOKEN"; }; f'
 
       - name: Install backend deps
         working-directory: backend
