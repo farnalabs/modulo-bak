@@ -31,12 +31,18 @@ async def _seed_nodes(
     user_id: uuid.UUID,
     node_ids: list[uuid.UUID],
 ) -> None:
-    """Materialise graph node rows so pipeline_edges FK constraints resolve.
+    """Materialise graph node rows for the pipeline_edges node references.
 
-    Migration 0162 added pipeline_edges_(source|target)_node_id_fkey on the
-    (deprecated) ``nodes`` table, but ``replace_pipeline_graph`` only persists
-    ``graph_nodes_json`` — it never inserts the referenced node rows. Seed them so
-    saving an edge satisfies the FK in tests.
+    ``pipeline_edges_(source|target)_node_id_fkey`` was added by the ORIGINAL
+    ``0164_add_missing_foreign_keys`` and has since been dropped from it
+    (edit-in-place, 0164-round-2): ``nodes`` is the DEPRECATED composite-template
+    table, and graph node IDs live only in ``pipelines.graph_nodes_json`` — they
+    never materialise into ``nodes``, so the constraint was unsatisfiable. No FK
+    on ``*_node_id`` exists in the chain today, so this seeding is not currently
+    load-bearing; it is kept because ``replace_pipeline_graph`` persists only
+    ``graph_nodes_json``, and writing the referenced rows keeps these tests
+    referentially honest — the precondition 0166/0170 name for ever re-adding a
+    real FK.
     """
     for nid in node_ids:
         await session.execute(
