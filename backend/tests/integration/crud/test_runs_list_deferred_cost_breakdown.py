@@ -159,4 +159,10 @@ async def test_get_run_cost_breakdowns_empty_ids_makes_no_query(db_engine: Async
     """The empty-page short-circuit returns {} without touching the database."""
     factory = async_sessionmaker(db_engine, expire_on_commit=False)
     async with factory() as session:
-        assert await get_run_cost_breakdowns(session, []) == {}
+        breakdowns = await get_run_cost_breakdowns(session, [])
+
+    # An empty mapping, asserted via falsiness (tests/architecture
+    # test_no_empty_container_literal_equality forbids ``== {}``); the isinstance
+    # check keeps the return contract pinned to a dict.
+    assert isinstance(breakdowns, dict)
+    assert not breakdowns
