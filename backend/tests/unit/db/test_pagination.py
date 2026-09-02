@@ -45,7 +45,7 @@ async def test_paginate_accepts_valid_datetime_cursor() -> None:
 
     page = await paginator.paginate(session, select(Pipeline), cursor=cursor, model=Pipeline)
 
-    assert page.items == []
+    assert not page.items
     assert session.execute.await_count == 1
 
 
@@ -64,5 +64,5 @@ async def test_paginate_string_cursor_is_not_validated_as_datetime() -> None:
         sort_dir="asc",
     )
 
-    assert page.items == []
+    assert not page.items
     assert session.execute.await_count == 1
