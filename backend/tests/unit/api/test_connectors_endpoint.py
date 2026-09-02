@@ -1422,9 +1422,9 @@ def test_rest_validate_credentials_parity_with_connector() -> None:
         RestConnector.validate_credentials(creds)  # must not raise
         RestConnector._normalise_auth(creds)  # must not raise (parity)
     for creds in invalid:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="REST "):
             RestConnector.validate_credentials(creds)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="REST "):
             RestConnector._normalise_auth(creds)
 
 
