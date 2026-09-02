@@ -3095,12 +3095,29 @@ async def _hitl_gate_resume_result(
     Returns ``(True, gate_result)`` when the human's decision resolves the
     gate, or ``(False, None)`` on first invocation so the caller proceeds to
     the condition/eval/autonomy checks.
+
+    Only recognized actions resume: ``approved`` (the approve-with-modification
+    API submits ``approved`` plus a ``modified_output`` member, so it is
+    covered by ``approved``), ``rejected``, and ``deliver_manual``. Anything
+    else — a missing action, an empty ``{}``, an unknown action value, a
+    non-dict decision — FAILS CLOSED: ``(False, None)``. The gate falls
+    through to the condition/eval/autonomy path and, with human_only, still
+    re-interrupts; the malformed decision is ignored, never approving.
+    Belt-and-braces against empty-decision resumes (FAR-541): the
+    dispatcher-reconcile F6a guard is the first line of defense, this is the
+    second.
     """
     if decision is None:
         return (False, None)
     action = decision.get("action") if isinstance(decision, dict) else None
     if action == "deliver_manual":
         return _hitl_gate_deliver_manual_result(gate_id, decision)
+    if action not in ("approved", "rejected"):
+        _log.warning(
+            "hitl_gate.malformed_decision_ignored",
+            extra={"gate_id": gate_id, "decision_type": type(decision).__name__, "action": action},
+        )
+        return (False, None)
     is_rejected = action == "rejected"
     await _dispatch_reject_correction_best_effort(state, decision, gate_id, hitl_gate_config, session_factory, org_id)
     return (True, _hitl_gate_approve_reject_result(gate_id, decision, is_rejected))

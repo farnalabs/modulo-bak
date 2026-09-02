@@ -333,16 +333,37 @@ class TestReconcilePredicateMatrix:
 
     @pytest.mark.asyncio
     async def test_claimed_stale_no_job_redispatched_as_resume_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """F6a gated recovery: a claimed run with a stale heartbeat and NO SAQ
-        job in Redis IS re-dispatched as resume_run (a claim was already made —
-        the guard does not apply)."""
+        """F6a gated recovery WITH a committed decision: a claimed run with a
+        stale heartbeat, NO SAQ job in Redis, and a committed HITL decision IS
+        re-dispatched as resume_run (mid-resume crash recovery — decision
+        committed + resume job lost; resume_data is reconstructed from the
+        decision payload). FAR-541 removed the claimed exemption, so the
+        decision guard now applies to claimed rows too."""
         summary, reenqueue, _, _, awaiting_guard, _ = await _run_reconcile(
-            monkeypatch, [_run_row(RUN_AWAITING, "claimed", stale=True)]
+            monkeypatch, [_run_row(RUN_AWAITING, "claimed", stale=True)], awaiting_committed=True
         )
         assert summary["repaired"] == 1
         reenqueue.assert_awaited_once()
         assert reenqueue.await_args.args[3] == "resume_run"
-        awaiting_guard.assert_not_awaited()
+        awaiting_guard.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_does_not_autoapprove_claimed_undecided_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FAR-541 regression (observed live on app.modulo.run 2026-09-02
+        11:36-11:38 UTC): a human claimed a fired HITL gate at 11:36:21 without
+        deciding; the next reconcile tick re-dispatched the run as resume_run
+        with an EMPTY decision; executor.resume injected {} as _hitl_decision;
+        the gate node treated the empty dict as an approval and the run posted
+        a formal GitHub approval. Now: a claimed row with NO committed decision
+        (stale heartbeat, no Redis job) is SKIPPED — no resume_run enqueue."""
+        summary, reenqueue, ingest, _, awaiting_guard, _ = await _run_reconcile(
+            monkeypatch, [_run_row(RUN_AWAITING, "claimed", stale=True)], awaiting_committed=False
+        )
+        assert summary["repaired"] == 0
+        assert summary["skipped"] == 1
+        reenqueue.assert_not_awaited()
+        ingest.assert_not_awaited()
+        awaiting_guard.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_capacity_deferred_redispatched_in_saq_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -520,6 +541,96 @@ class TestReconcilePredicateMatrix:
         assert summary["nodeless_failed"] == 0
         assert summary["skipped"] == 1
         reenqueue.assert_not_awaited()
+
+
+class TestHitlResumeOrSkipPredicateMatrix:
+    """Direct predicate matrix for ``_resolve_hitl_resume_or_skip`` (FAR-541).
+
+    The claimed exemption is REMOVED: a claimed row behaves exactly like an
+    awaiting_human row — it resumes only from a committed gate decision
+    (mid-resume crash recovery preserved), and a claimed-but-undecided run is
+    skipped rather than re-dispatched with an empty decision.
+    """
+
+    def _row(self, status: str) -> SimpleNamespace:
+        return SimpleNamespace(id=RUN_AWAITING, status=status)
+
+    async def _resolve(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        status: str,
+        *,
+        committed: bool,
+        resume_data: dict[str, Any] | None = None,
+    ) -> tuple[bool, dict[str, Any] | None, dict[str, Any], AsyncMock, AsyncMock]:
+        row = self._row(status)
+        summary: dict[str, Any] = {"skipped": 0}
+        guard = AsyncMock(return_value=committed)
+        resume = AsyncMock(return_value=resume_data)
+        monkeypatch.setattr(ch, "_awaiting_human_has_committed_decision", guard)
+        monkeypatch.setattr(ch, "_committed_decision_resume_data", resume)
+        skip, data = await ch._resolve_hitl_resume_or_skip(MagicMock(), ORG, row, summary)
+        return skip, data, summary, guard, resume
+
+    @pytest.mark.asyncio
+    async def test_claimed_with_committed_decision_resumes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Crash recovery preserved: claimed + committed decision -> resume with
+        resume_data reconstructed from the committed decision payload."""
+        payload = {"action": "rejected", "reason": "needs work"}
+        skip, data, summary, guard, resume = await self._resolve(
+            monkeypatch, "claimed", committed=True, resume_data=payload
+        )
+        assert skip is False
+        assert data == payload
+        assert summary["skipped"] == 0
+        guard.assert_awaited_once()
+        resume.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_claimed_without_committed_decision_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """THE FIX (FAR-541): claimed + NO committed decision -> (True, None);
+        the run is never re-dispatched with an empty decision."""
+        skip, data, summary, guard, resume = await self._resolve(monkeypatch, "claimed", committed=False)
+        assert skip is True
+        assert data is None
+        assert summary["skipped"] == 1
+        guard.assert_awaited_once()
+        resume.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_awaiting_human_with_committed_decision_resumes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unchanged: awaiting_human + committed decision -> resume."""
+        payload = {"action": "approved", "notes": "looks good"}
+        skip, data, summary, guard, resume = await self._resolve(
+            monkeypatch, "awaiting_human", committed=True, resume_data=payload
+        )
+        assert skip is False
+        assert data == payload
+        assert summary["skipped"] == 0
+        guard.assert_awaited_once()
+        resume.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_awaiting_human_without_committed_decision_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Unchanged: awaiting_human + no committed decision -> (True, None)."""
+        skip, data, summary, guard, resume = await self._resolve(monkeypatch, "awaiting_human", committed=False)
+        assert skip is True
+        assert data is None
+        assert summary["skipped"] == 1
+        guard.assert_awaited_once()
+        resume.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_other_status_passes_through_unguarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-HITL status (pending/running) is not touched by the guard."""
+        summary: dict[str, Any] = {"skipped": 0}
+        guard = AsyncMock()
+        monkeypatch.setattr(ch, "_awaiting_human_has_committed_decision", guard)
+        skip, data = await ch._resolve_hitl_resume_or_skip(MagicMock(), ORG, self._row("running"), summary)
+        assert skip is False
+        assert data is None
+        assert summary["skipped"] == 0
+        guard.assert_not_awaited()
 
 
 class TestNodelessRedispatchBudget:
