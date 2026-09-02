@@ -309,7 +309,13 @@ const purgeResult = ref<PurgeResponse | null>(null)
 const showPurgeConfirm = ref(false)
 
 const pipelineOptions = computed(() => pipelines.value.map(p => ({ value: p.id, label: p.name })))
-const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({ value: s, label: t(STATUS_LABEL_KEY[s] ?? `views.AdminRunRetentionView.status_${s}`) })))
+// Statuses added to RUN_STATUS without a STATUS_LABEL_KEY entry fall back to a
+// humanised form of the raw value ("router_no_match" -> "router no match") so a
+// new status can never render a raw i18n key in the dropdown.
+const statusOptions = computed(() => AVAILABLE_STATUSES.map(s => ({
+  value: s,
+  label: STATUS_LABEL_KEY[s] ? t(STATUS_LABEL_KEY[s]) : s.replace(/_/g, ' '),
+})))
 
 const terminalCandidates = computed(() => candidates.value.filter(c => isTerminalStatus(c.status.toLowerCase())))
 
