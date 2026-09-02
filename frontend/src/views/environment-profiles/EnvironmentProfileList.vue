@@ -66,6 +66,7 @@
                 <span
                   class="h-1.5 w-1.5 rounded-full"
                   :class="profile.status === 'active' ? 'bg-success' : 'bg-muted-foreground'"
+                  aria-hidden="true"
                 />
                 <span class="capitalize">{{ profile.status === 'active' ? $t('common.active') : $t('common.deleted') }}</span>
               </span>
@@ -123,6 +124,7 @@
                 >
                   <span
                     class="inline-block h-2 w-2 rounded-full shrink-0"
+                    aria-hidden="true"
                     :class="{
                       'bg-yellow-400': event.event === 'provisioning' || event.event === 'destroying',
                       'bg-success': event.event === 'provisioned' || event.event === 'destroyed' || event.event === 'command_complete',
@@ -168,8 +170,9 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useEnvironmentProfilesStore } from '../../stores/environmentProfiles'
 import type { EnvironmentProfileSummary } from '../../stores/environmentProfiles'
-import { getAccessToken } from '../../lib/api/client'
+import { getAuthHeaders } from '../../lib/api/client'
 import { formatApiError } from '../../lib/api/formatError'
+import { parseSSEStream } from '../../lib/sse'
 import LoadingSpinner from '../../components/shared/LoadingSpinner.vue'
 import ErrorAlert from '../../components/shared/ErrorAlert.vue'
 import FeatureGate from '../../components/FeatureGate.vue'
@@ -204,9 +207,7 @@ async function testConnection(profile: EnvironmentProfileSummary) {
   try {
     const response = await fetch(`/api/v1/environment-profiles/${profile.id}/test`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${getAccessToken() ?? ''}`,
-      },
+      headers: getAuthHeaders(),
     })
     if (!response.ok) {
       testResult.events.push({ event: 'failed', detail: `HTTP ${response.status}`, timestamp: new Date().toISOString() })
@@ -219,23 +220,13 @@ async function testConnection(profile: EnvironmentProfileSummary) {
       return
     }
 
-    const decoder = new TextDecoder()
-    let buffer = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n\n')
-      buffer = lines.pop() ?? ''
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const parsed = JSON.parse(line.slice(6)) as TestEvent
-            testResult.events.push(parsed)
-          } catch {
-            testResult.events.push({ event: 'info', detail: line.slice(6), timestamp: new Date().toISOString() })
-          }
-        }
+    for await (const message of parseSSEStream(reader)) {
+      if (!message.data) continue
+      try {
+        const parsed = JSON.parse(message.data) as TestEvent
+        testResult.events.push(parsed)
+      } catch {
+        testResult.events.push({ event: 'info', detail: message.data, timestamp: new Date().toISOString() })
       }
     }
   } catch (e: unknown) {
