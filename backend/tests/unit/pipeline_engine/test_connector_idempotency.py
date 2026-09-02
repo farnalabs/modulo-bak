@@ -1258,7 +1258,7 @@ class TestConnectorIntentMarkerGateStates:
         assert envelope["idempotency_gate"] == "connector_write_fail_closed"
         assert envelope["delivery_done"] is False
 
-    async def test_no_delivery_marker_replaces_intent_for_gate(self) -> None:
+    def test_no_delivery_marker_is_not_ambiguous_for_gate(self) -> None:
         """Only the newest state counts: when the slot holds the resolved
         no-delivery marker, the same key is NOT ambiguous even though a prior
         intent existed (the intent was REPLACED in place)."""
@@ -1395,7 +1395,7 @@ class TestRaisedConnectorErrorAmbiguous:
                 intent_active=False,
                 exception=RuntimeError("boom"),
             )
-        assert fake_run.raw_output_markers == {}
+        assert not fake_run.raw_output_markers
 
 
 class TestSameKeyDeliveryEvidencePreserved:
@@ -1673,7 +1673,7 @@ class TestGateEligibilityPairing:
             )
             assert gate is None, "killswitch off: the gate proceeds (disabled, cannot suppress)"
             assert _connector_intent_marker_enabled("fail_closed") is False
-        assert fresh_run.raw_output_markers == {}, "gate disabled ⇒ no intent marker"
+        assert not fresh_run.raw_output_markers, "gate disabled ⇒ no intent marker"
 
 
 class TestPersistRaiseBoundary:
@@ -1703,7 +1703,7 @@ class TestPersistRaiseBoundary:
             filters={},
             data={"obj": self._RaisingStr()},
         )
-        assert fake_run.raw_output_markers == {}, "hash/persist failure degrades to no marker; node proceeds"
+        assert not fake_run.raw_output_markers, "hash/persist failure degrades to no marker; node proceeds"
 
     async def test_no_delivery_persist_never_raises_on_hostile_payload(self) -> None:
         fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
@@ -1721,7 +1721,7 @@ class TestPersistRaiseBoundary:
             data={"obj": self._RaisingStr()},
             reason="connector_reported_failure",
         )
-        assert fake_run.raw_output_markers == {}, "original error/result preserved — persist never masks it"
+        assert not fake_run.raw_output_markers, "original error/result preserved — persist never masks it"
 
     async def test_delivered_stamp_never_raises_on_hostile_payload(self) -> None:
         fake_run = _FakeConnectorRun(markers={}, idempotency_key=_PERSISTED_KEY)
@@ -1739,7 +1739,7 @@ class TestPersistRaiseBoundary:
             data={"obj": self._RaisingStr()},
             result={"ok": True},
         )
-        assert fake_run.raw_output_markers == {}, "a hostile payload must not fail the node after a delivered write"
+        assert not fake_run.raw_output_markers, "a hostile payload must not fail the node after a delivered write"
 
 
 class TestEnvelopeHonesty:

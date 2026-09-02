@@ -2170,8 +2170,9 @@ async def _connector_write_gate(
 
     A first-time write (no marker), a changed-payload/target re-run (a
     DIFFERENT derived key), and a DEFINITE-failure re-run (the intent marker
-    was resolved to ``no_delivery_confirmed: True`` — the connector raised or
-    its result reported failure) are NEVER suppressed — the definite failure
+    was resolved to ``no_delivery_confirmed: True`` — the connector's result
+    reported failure; a connector that RAISED is ambiguous instead and its
+    intent marker stays in-flight) are NEVER suppressed — the definite failure
     re-fires under BOTH modes (FAR-458: never suppress a definite failure).
     ``on_unknown="off"`` bypasses the gate entirely — the write always fires,
     never deduped.

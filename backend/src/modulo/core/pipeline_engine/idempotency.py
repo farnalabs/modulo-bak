@@ -236,9 +236,12 @@ def read_before_write_ambiguous(
     failure — a crash/timeout between the two leaves it in-flight, which is
     exactly the ambiguity fail_closed guards against).
 
-    ``no_delivery_confirmed: True`` marks a DEFINITE no-delivery (the connector
-    raised, or its result reported failure): the write did NOT reach upstream,
-    so the later attempt's gate must treat it as NOT ambiguous and re-fire under
+    ``no_delivery_confirmed: True`` marks a DEFINITE no-delivery (the
+    connector's result explicitly reported failure — post-FAR-531, a connector
+    that RAISED is AMBIGUOUS, not definite: the write may have landed despite
+    the error, so its intent marker stays in-flight and no-delivery is never
+    persisted for it): the write did NOT reach upstream, so the later attempt's
+    gate must treat it as NOT ambiguous and re-fire under
     BOTH modes (FAR-458: never suppress a definite failure — suppression would
     strand the operator's recover-by-re-run).
 
