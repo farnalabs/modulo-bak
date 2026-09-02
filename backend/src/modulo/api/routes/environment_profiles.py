@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from modulo.api.constants import MSG_FEATURE_NOT_AVAILABLE, MSG_INTERNAL_SERVER_ERROR, MSG_UNEXPECTED_ERROR
+from modulo.api.constants import MSG_FEATURE_NOT_AVAILABLE, MSG_UNEXPECTED_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature, require_permission
 from modulo.auth.jwt import TenantPrincipal
@@ -495,43 +495,17 @@ async def _sandbox_test_stream(profile: EnvironmentProfile) -> AsyncIterator[str
 
 
 @router.post("/{profile_id}/test")
+@handle_db_errors(_CODE_ENVIRONMENT_PROFILES_TEST_PROFILE)
 async def test_profile(
     profile_id: uuid.UUID,
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal = require_permission("environment_profile.test"),
 ) -> StreamingResponse:
     """Provision a sandbox from the profile, run echo, destroy it — stream events."""
-    try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            await set_rls_user_context(session, principal.account_id, principal.org_role)
-            profile = await _get_profile_or_404(session, profile_id)
-    except IntegrityError as exc:
-        _log.exception(_CODE_ENVIRONMENT_PROFILES_TEST_PROFILE)
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An environment profile with this name already exists.",
-        ) from exc
-    except ProgrammingError:
-        _log.exception(_CODE_ENVIRONMENT_PROFILES_TEST_PROFILE)
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail=MSG_FEATURE_NOT_AVAILABLE,
-        ) from None
-    except SQLAlchemyError:
-        _log.exception(_CODE_ENVIRONMENT_PROFILES_TEST_PROFILE)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=_MSG_DATABASE_ERROR_OCCURRED_PLEASE,
-        ) from None
-    except HTTPException:
-        raise
-    except Exception:
-        _log.exception("Unexpected error in test_profile")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=MSG_INTERNAL_SERVER_ERROR,
-        ) from None
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        await set_rls_user_context(session, principal.account_id, principal.org_role)
+        profile = await _get_profile_or_404(session, profile_id)
     return StreamingResponse(
         _sandbox_test_stream(profile),
         media_type="text/event-stream",
