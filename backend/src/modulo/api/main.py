@@ -22,6 +22,7 @@ from modulo.api.dependencies import (
 )
 from modulo.api.exception_handlers import (
     http_exception_handler,
+    storage_exhausted_exception_handler,
     unhandled_exception_handler,
     validation_exception_handler,
 )
@@ -36,6 +37,7 @@ from modulo.api.middleware.request_timeout import RequestTimeoutMiddleware
 from modulo.api.middleware.security_headers import SecurityHeadersMiddleware
 from modulo.api.middleware.sensitive_mask import router as sensitive_router
 from modulo.api.routes.admin import router as admin_router
+from modulo.api.routes.admin_capacity import router as admin_capacity_router
 from modulo.api.routes.admin_dev_mode import router as admin_dev_mode_router
 from modulo.api.routes.admin_email import router as admin_email_router
 from modulo.api.routes.admin_feature_flags import router as admin_feature_flags_router
@@ -125,6 +127,7 @@ from modulo.core.graceful_shutdown import ShutdownManager, ShutdownMiddleware
 from modulo.core.hitl_manager.expiry_job import ClaimExpiryJob
 from modulo.core.logging_config import configure_logging
 from modulo.core.seed_data.catalog import FLAGS, TIERS
+from modulo.db.capacity import StorageExhaustedError
 from modulo.db.session import engine as db_engine
 from modulo.otel_bridge import setup_otel, shutdown_otel
 from modulo.settings import Settings, get_settings
@@ -642,6 +645,15 @@ async def _seed_sso_providers(settings: Settings) -> None:
         if existing.scalar_one_or_none() is not None:
             return
 
+        from modulo.db.models.organisation import Organisation
+
+        org = (
+            await session.execute(select(Organisation).order_by(Organisation.created_at).limit(1))
+        ).scalar_one_or_none()
+        if org is None:
+            logger.warning("startup.sso_provider_seed_no_organisation")
+            return
+
         try:
             entries = json.loads(settings.modulo_oidc_providers)
         except (json.JSONDecodeError, TypeError):
@@ -660,6 +672,7 @@ async def _seed_sso_providers(settings: Settings) -> None:
             provider = SsoProvider(
                 provider_type="oidc",
                 name=entry.get("provider_id", entry.get("name", "Imported OIDC Provider")),
+                provider_id=entry["provider_id"],
                 client_id=entry["client_id"],
                 client_secret=encrypt_stored_secret(entry["client_secret"], settings.fernet_key),
                 discovery_url=entry["discovery_url"],
@@ -667,6 +680,7 @@ async def _seed_sso_providers(settings: Settings) -> None:
                 enabled=True,
                 auto_provision=True,
                 default_role=settings.modulo_sso_default_role,
+                organisation_id=org.id,
             )
             session.add(provider)
             logger.info(
@@ -810,7 +824,7 @@ async def _run_retention_loop(interval_seconds: int = 3600) -> None:
 
 
 @asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Configure structured JSON logging first so all startup logs are structured.
     configure_logging()
 
@@ -935,6 +949,12 @@ async def _run_boot_guards_and_seeds(settings: Settings) -> None:
     # Seed the default cost components for every org (idempotent; system-
     # context org enumeration, per-org set_rls_org on the inserts).
     await _boot_seed("cost_components", _seed_cost_components(settings))
+
+    # Gated demo-org seed framework (FAR-450). Disabled unless
+    # MODULO_SEED_DEMO_ORGS is set; DEMO_ORGS is empty by default so nothing
+    # seeds until follow-up tickets populate it. Non-fatal like the rest.
+    if settings.modulo_seed_demo_orgs:
+        await _boot_seed("demo_orgs", _seed_demo_orgs(settings))
 
     # Initialise the LangGraph checkpointer schema (langgraph.* tables).
     try:
@@ -1070,6 +1090,15 @@ async def _seed_cost_components(settings: Settings) -> None:
     await seed_cost_components(factory)
 
 
+async def _seed_demo_orgs(settings: Settings) -> None:
+    from modulo.api.dependencies import get_or_create_engine, get_or_create_session_factory
+    from modulo.core.seed_data.demo_data import seed_demo_orgs
+
+    engine = get_or_create_engine(settings)
+    factory = get_or_create_session_factory(engine)
+    await seed_demo_orgs(factory)
+
+
 async def _seed_tier_catalog() -> None:
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1148,6 +1177,7 @@ app.include_router(admin_system_config_router)
 app.include_router(admin_tiers_router)
 app.include_router(admin_triggers_router)
 app.include_router(admin_housekeeping_router)
+app.include_router(admin_capacity_router)
 app.include_router(auth_router)
 app.include_router(sso_router)
 app.include_router(analytics_router)
@@ -1232,4 +1262,5 @@ app.mount("/mcp", build_mcp_asgi_app())
 
 app.add_exception_handler(StarletteHTTPException, http_exception_handler)  # type: ignore[arg-type]
 app.add_exception_handler(RequestValidationError, validation_exception_handler)  # type: ignore[arg-type]
+app.add_exception_handler(StorageExhaustedError, storage_exhausted_exception_handler)  # type: ignore[arg-type]
 app.add_exception_handler(Exception, unhandled_exception_handler)

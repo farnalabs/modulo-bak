@@ -3,12 +3,18 @@
 import copy
 import uuid
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from modulo.core.exceptions import SnapshotLockNotAvailableError
 from modulo.core.guardrails import fingerprint_guardrail_pins
-from modulo.db.crud.pipeline_snapshot import create_snapshot_from_live_graph
+from modulo.db.crud.pipeline_snapshot import (
+    SNAPSHOT_LOCK_ATTEMPTS,
+    SNAPSHOT_LOCK_RETRY_SLEEP_SECONDS,
+    create_snapshot_from_live_graph,
+)
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 
 
@@ -61,6 +67,7 @@ async def test_live_graph_becomes_executable_snapshot_with_dependency_pins() -> 
     edge.target_node_id = target_id
     edge.edge_type = "normal"
     edge.hitl_gate_config = None
+    edge.condition_expression = None
 
     agent = MagicMock()
     agent.id = agent_id
@@ -147,6 +154,7 @@ async def test_live_graph_becomes_executable_snapshot_with_dependency_pins() -> 
             "target": str(target_id),
             "type": "normal",
             "hitl_gate_config": None,
+            "condition_expression": None,
         }
     ]
     assert snapshot.connector_bindings_json[0]["instance_name"] == "Workspace"
@@ -189,3 +197,137 @@ async def test_live_graph_becomes_executable_snapshot_with_dependency_pins() -> 
     assert "credentials" not in repr(snapshot.model_backend_pins_json)
     session.add.assert_called_once_with(snapshot)
     session.flush.assert_awaited_once()
+
+
+async def test_snapshot_carries_condition_expression_for_conditional_edge() -> None:
+    """A conditional edge must keep its JMESPath ``condition_expression`` when
+    the live graph is frozen into a run snapshot (FAR-455). Regression guard:
+    without it a conditional-edge pipeline fails every run with
+    GraphValidationError CONDITION_MISSING_EXPRESSION even though the live edge
+    row holds the expression.
+    """
+    org_id = uuid.uuid4()
+    pipeline_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+    expr = "result.answer != 'UNKNOWN'"
+
+    pipeline = MagicMock()
+    pipeline.id = pipeline_id
+    pipeline.organisation_id = org_id
+    pipeline.graph_nodes_json = [
+        {"id": str(source_id), "agent_id": None, "connector_binding": None},
+        {"id": str(target_id), "agent_id": None, "connector_binding": None},
+    ]
+    pipeline.run_context_defaults = {"branch": "main"}
+
+    edge = MagicMock()
+    edge.id = uuid.uuid4()
+    edge.source_node_id = source_id
+    edge.target_node_id = target_id
+    edge.edge_type = "conditional"
+    edge.hitl_gate_config = None
+    edge.condition_expression = expr
+
+    session = AsyncMock(spec=AsyncSession)
+    lock_result = MagicMock()
+    lock_result.scalar_one.return_value = True
+    unlock_result = MagicMock()
+    session.execute.side_effect = [
+        lock_result,
+        _scalar_result(pipeline),  # _load_pipeline_and_edges -> Pipeline
+        _scalars_result([edge]),  # _load_pipeline_and_edges -> PipelineEdge
+        _scalar_result(1),  # snapshot_version max
+        _scalars_result([]),  # guardrail rows (none bound)
+        unlock_result,
+    ]
+
+    snapshot = await create_snapshot_from_live_graph(session, pipeline_id=pipeline_id)
+
+    assert isinstance(snapshot, PipelineSnapshot)
+    assert snapshot.graph_json["edges"] == [
+        {
+            "id": str(edge.id),
+            "source": str(source_id),
+            "target": str(target_id),
+            "type": "conditional",
+            "hitl_gate_config": None,
+            "condition_expression": expr,
+        }
+    ]
+    session.add.assert_called_once_with(snapshot)
+    session.flush.assert_awaited_once()
+
+
+def _lock_attempt_result(acquired: bool) -> MagicMock:
+    result = MagicMock()
+    result.scalar_one.return_value = acquired
+    return result
+
+
+async def test_snapshot_lock_retry_succeeds_when_lock_frees_within_budget() -> None:
+    """FAR-527: two near-simultaneous run-starts contend on the per-pipeline
+    snapshot advisory lock. The bounded-wait loop must retry the (non-blocking)
+    pg_try_advisory_lock attempt and succeed once the lock frees — a single
+    failed attempt used to raise outright and silently drop the trigger."""
+
+    pipeline_id = uuid.uuid4()
+    source_id = uuid.uuid4()
+    target_id = uuid.uuid4()
+
+    pipeline = MagicMock()
+    pipeline.id = pipeline_id
+    pipeline.organisation_id = uuid.uuid4()
+    pipeline.graph_nodes_json = [
+        {"id": str(source_id), "agent_id": None, "connector_binding": None},
+        {"id": str(target_id), "agent_id": None, "connector_binding": None},
+    ]
+    pipeline.run_context_defaults = {"branch": "main"}
+
+    edge = MagicMock()
+    edge.id = uuid.uuid4()
+    edge.source_node_id = source_id
+    edge.target_node_id = target_id
+    edge.edge_type = "normal"
+    edge.hitl_gate_config = None
+    edge.condition_expression = None
+
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.side_effect = [
+        _lock_attempt_result(False),  # attempt 1: contended
+        _lock_attempt_result(True),  # attempt 2: lock freed
+        _scalar_result(pipeline),  # _load_pipeline_and_edges -> Pipeline
+        _scalars_result([edge]),  # _load_pipeline_and_edges -> PipelineEdge
+        _scalar_result(1),  # snapshot_version max
+        _scalars_result([]),  # guardrail rows (none bound)
+        MagicMock(),  # unlock
+    ]
+
+    with patch("modulo.db.crud.pipeline_snapshot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        snapshot = await create_snapshot_from_live_graph(session, pipeline_id=pipeline_id)
+
+    assert isinstance(snapshot, PipelineSnapshot)
+    assert snapshot.pipeline_id == pipeline_id
+    mock_sleep.assert_awaited_once_with(SNAPSHOT_LOCK_RETRY_SLEEP_SECONDS)
+    # Lock held across the copy, released exactly once in the finally path.
+    assert session.execute.await_count == 7
+
+
+async def test_snapshot_lock_raises_after_exhausting_retry_budget() -> None:
+    """FAR-527: when the lock stays unavailable for the whole budget the
+    function must still raise SnapshotLockNotAvailableError — after exactly
+    SNAPSHOT_LOCK_ATTEMPTS lock queries (never an unlock of a lock it does
+    not hold) and SNAPSHOT_LOCK_ATTEMPTS - 1 sleeps."""
+
+    pipeline_id = uuid.uuid4()
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.return_value = _lock_attempt_result(False)
+
+    with (
+        patch("modulo.db.crud.pipeline_snapshot.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        pytest.raises(SnapshotLockNotAvailableError, match=f"after {SNAPSHOT_LOCK_ATTEMPTS} attempts"),
+    ):
+        await create_snapshot_from_live_graph(session, pipeline_id=pipeline_id)
+
+    assert session.execute.await_count == SNAPSHOT_LOCK_ATTEMPTS
+    assert mock_sleep.await_count == SNAPSHOT_LOCK_ATTEMPTS - 1

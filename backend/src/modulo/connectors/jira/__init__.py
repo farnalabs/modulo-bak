@@ -9,10 +9,17 @@ from typing import Any
 import httpx
 
 from modulo.connectors._retry_headers import (
+    BASE_DELAY,
+    MAX_DELAY,
+    MAX_RETRIES,
+    RETRYABLE_STATUSES,
+    backoff_delay,
     extract_rate_limit_metadata,
     format_rate_limit_detail,
     parse_rate_limit_reset,
     parse_retry_after,
+    should_retry_network,
+    should_retry_status,
 )
 from modulo.connectors._safe_int import safe_int as _safe_int
 from modulo.connectors.base import (
@@ -22,12 +29,16 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
+from modulo.core.ssrf import pinned_async_client_sync
 
-_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
-_MAX_RETRIES = 3
-_BASE_DELAY = 1.0
-_MAX_DELAY = 30.0
+# Retry/backoff configuration (canonical values live in _retry_headers)
+_RETRYABLE_STATUSES = RETRYABLE_STATUSES
+_MAX_RETRIES = MAX_RETRIES
+_BASE_DELAY = BASE_DELAY
+_MAX_DELAY = MAX_DELAY
 
 # Jira Cloud reports quota state via X-RateLimit-* headers on every response
 _RATE_LIMIT_HEADERS = (
@@ -182,6 +193,7 @@ class JiraConnector(ConnectorBase):
             raise ValueError(
                 "Jira credentials must contain either 'token' (PAT/OAuth) or 'email' + 'api_token' (Basic auth)",
             )
+        self._redactor = CredentialRedactor.from_creds(creds)
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -196,7 +208,12 @@ class JiraConnector(ConnectorBase):
         return headers
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-512): validate + resolve the base_url's host and
+        # pin the validated IP onto the transport so the connection never
+        # re-resolves at connect time (closes DNS-rebind). ``trust_env=False``
+        # stops a proxy from re-resolving the destination and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=self._base_url,
             headers=self._headers(),
             auth=self._auth,
@@ -218,14 +235,14 @@ class JiraConnector(ConnectorBase):
                     r = await client.request(method, path, **kwargs)
                     if r.status_code == 304:
                         raise ValueError("Jira API returned 304 Not Modified — resource unchanged")
-                    if r.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                    if should_retry_status(r.status_code, attempt):
                         await asyncio.sleep(self._sleep_delay(r, attempt))
                         continue
                     r.raise_for_status()
                     return r
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
-                if exc.response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+                if should_retry_status(exc.response.status_code, attempt):
                     await asyncio.sleep(self._sleep_delay(exc.response, attempt))
                     continue
                 detail = exc.response.text[:200]
@@ -233,17 +250,17 @@ class JiraConnector(ConnectorBase):
                     quota = _rate_limit_detail(exc.response)
                     if quota:
                         detail = f"{detail} (quota: {quota})"
-                raise ValueError(f"Jira API HTTP {exc.response.status_code}: {detail}") from exc
+                raise ValueError(self._redactor.redact(f"Jira API HTTP {exc.response.status_code}: {detail}")) from exc
             except httpx.TimeoutException as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_jitter(min(_BASE_DELAY * (1 << attempt), _MAX_DELAY)))
+                if should_retry_network(attempt):
+                    await asyncio.sleep(_jitter(backoff_delay(attempt)))
                     continue
                 raise ValueError("Jira API timeout") from exc
             except httpx.ConnectError as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_jitter(min(_BASE_DELAY * (1 << attempt), _MAX_DELAY)))
+                if should_retry_network(attempt):
+                    await asyncio.sleep(_jitter(backoff_delay(attempt)))
                     continue
                 raise ValueError("Jira API connection error") from exc
         raise ValueError("Jira API request failed after retries") from last_exc
@@ -268,8 +285,9 @@ class JiraConnector(ConnectorBase):
         try:
             return response.json()
         except json.JSONDecodeError as exc:
-            raise ValueError(f"Jira API invalid response: {response.text[:200]}") from exc
+            raise ValueError(self._redactor.redact(f"Jira API invalid response: {response.text[:200]}")) from exc
 
+    @redacting
     async def health_check(self) -> HealthResult:
         """Verify connectivity by fetching the current user's profile."""
         try:
@@ -278,12 +296,13 @@ class JiraConnector(ConnectorBase):
             display_name = user_info.get("displayName", "")
             return HealthResult(ok=True, detail=display_name)
         except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(self._redactor.redact_exc(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(self._redactor.redact_exc(exc))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         match q.resource:
             case "issue":
@@ -303,13 +322,13 @@ class JiraConnector(ConnectorBase):
                 if q.cursor:
                     params["startAt"] = int(q.cursor)
                 r = await self._call_api("POST", "/search", json=params)
-                body: dict[str, Any] = await self._parse_json(r)
-                issues = body.get("issues", [])
+                payload: dict[str, Any] = await self._parse_json(r)
+                issues = payload.get("issues", [])
                 if not isinstance(issues, list):
                     issues = []
-                total = _safe_int(body.get("total"), len(issues))
-                start_at = _safe_int(body.get("startAt"), 0)
-                max_results = _safe_int(body.get("maxResults"), max_results)
+                total = _safe_int(payload.get("total"), len(issues))
+                start_at = _safe_int(payload.get("startAt"), 0)
+                max_results = _safe_int(payload.get("maxResults"), max_results)
                 next_cursor: str | None = None
                 if start_at + max_results < total:
                     next_cursor = str(start_at + max_results)
@@ -496,6 +515,7 @@ class JiraConnector(ConnectorBase):
             case _:
                 raise ValueError(f"Unsupported Jira resource: {q.resource!r}")
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         match payload.resource:
             case "issue":

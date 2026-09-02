@@ -264,8 +264,8 @@ class ScimListResponse(BaseModel):
 
 @router.get("/ServiceProviderConfig", dependencies=[Depends(require_scim_feature)])
 async def get_service_provider_config(
-    settings: Settings = Depends(get_settings),
-    principal: ScimPrincipal = Depends(get_scim_principal),
+    _settings: Settings = Depends(get_settings),
+    _principal: ScimPrincipal = Depends(get_scim_principal),
 ) -> dict[str, object]:
     return {
         "schemas": ["urn:ietf:params:scim:schemas:core:2.0:ServiceProviderConfig"],
@@ -667,7 +667,7 @@ async def delete_user(
     user_id: uuid.UUID,
     principal: ScimPrincipal = Depends(get_scim_principal),
     session: AsyncSession = Depends(get_db_session),
-    settings: Settings = Depends(get_settings),
+    _settings: Settings = Depends(get_settings),
 ) -> None:
     try:
         async with session.begin():
@@ -1052,12 +1052,14 @@ async def _replace_group_members(session: AsyncSession, group: Any, members_valu
     for em in existing:
         await scim_remove_group_member(session, group.id, em.account_id)
     for uid in _iter_member_uuids(members_value):
-        await scim_add_group_member(
-            session,
-            org_id=org_id,
-            team_id=group.id,
-            user_id=uid,
-        )
+        user = await scim_get_user(session, org_id, uid)
+        if user is not None:
+            await scim_add_group_member(
+                session,
+                org_id=org_id,
+                team_id=group.id,
+                user_id=uid,
+            )
 
 
 async def _apply_replace_group_op(session: AsyncSession, group: Any, op: Any, org_id: uuid.UUID) -> None:
@@ -1085,12 +1087,14 @@ def _iter_member_uuids(values: Any) -> list[uuid.UUID]:
 async def _apply_add_group_op(session: AsyncSession, group: Any, op: Any, org_id: uuid.UUID) -> None:
     if op.path == "members" or op.path is None:
         for uid in _iter_member_uuids(op.value):
-            await scim_add_group_member(
-                session,
-                org_id=org_id,
-                team_id=group.id,
-                user_id=uid,
-            )
+            user = await scim_get_user(session, org_id, uid)
+            if user is not None:
+                await scim_add_group_member(
+                    session,
+                    org_id=org_id,
+                    team_id=group.id,
+                    user_id=uid,
+                )
 
 
 async def _remove_member_by_path(session: AsyncSession, group: Any, path: str) -> None:
@@ -1204,7 +1208,7 @@ async def delete_group(
     group_id: uuid.UUID,
     principal: ScimPrincipal = Depends(get_scim_principal),
     session: AsyncSession = Depends(get_db_session),
-    settings: Settings = Depends(get_settings),
+    _settings: Settings = Depends(get_settings),
 ) -> None:
     try:
         async with session.begin():

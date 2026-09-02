@@ -112,7 +112,7 @@ async def test_rls_policies_exist_on_all_org_scoped_tables(
     Expected tables are derived from information_schema (tables with an
     organisation_id column) so this test stays accurate as new tables are added.
     The five team-scoped tables (0124) intentionally carry ``rls_team_isolation``
-    (which includes the org check) instead of the org-only policy ÔÇö they are
+    (which includes the org check) instead of the org-only policy — they are
     asserted by ``test_team_scoped_tables_have_no_org_only_policy``.
     """
     team_scoped = {
@@ -144,12 +144,12 @@ async def test_rls_policies_exist_on_all_org_scoped_tables(
             ).fetchall()
         }
 
-    # organisations table has no organisation_id column ÔÇö correctly excluded.
+    # organisations table has no organisation_id column — correctly excluded.
     # The five team-scoped tables carry rls_team_isolation (org check included),
-    # never the org-only policy ÔÇö excluded here, asserted by the sibling test.
+    # never the org-only policy — excluded here, asserted by the sibling test.
     # The LangGraph checkpoint tables are runtime-managed by
-    # ``ModuloPostgresSaver.setup()`` (no migration, no RLS policy ÔÇö the saver
-    # app-scopes its own queries by organisation_id) ÔÇö excluded here too.
+    # ``ModuloPostgresSaver.setup()`` (no migration, no RLS policy — the saver
+    # app-scopes its own queries by organisation_id) — excluded here too.
     expected = (
         org_scoped
         - {"organisations"}
@@ -348,18 +348,150 @@ async def test_rls_team_isolation_policies_exist(db_engine: AsyncEngine) -> None
     assert not missing, f"Tables missing rls_team_isolation policy: {sorted(missing)}"
 
 
+# ---------------------------------------------------------------------------
+# Fail-closed RLS regression guard for migrations 0155 / 0156
+# ---------------------------------------------------------------------------
+
+
+async def test_strict_rls_tables_fail_closed_with_empty_org_context(
+    db_engine: AsyncEngine,
+    non_superuser_role: str,
+) -> None:
+    """parameter_schemas / parameter_sets / oauth_authorization_codes /
+    oauth_token_families must return 0 rows under an empty org context.
+
+    Regression guard for migrations 0155/0156: these tables were tightened
+    from a fail-open rls_org_isolation (strict OR null-context) to a null-safe
+    strict scope that fails CLOSED. As a non-superuser (so RLS applies) with an
+    EMPTY ``app.organisation_id``, a SELECT must return 0 rows for each table —
+    proving the fail-open branch is gone. The positive control (correct org
+    context returns the seeded rows) proves the policy filters by org rather
+    than denying access entirely.
+    """
+    org_id = uuid.uuid4()
+    account_id = uuid.uuid4()
+    schema_id = uuid.uuid4()
+
+    # Seed as superuser (bypasses RLS). Use unique emails/names to satisfy
+    # constraints and avoid colliding with other tests' rows.
+    slug = f"rls-strict-{org_id.hex[:8]}"
+    try:
+        async with db_engine.connect() as conn, conn.begin():
+            await conn.execute(
+                text(
+                    "INSERT INTO organisations (id, name, slug, settings_json) VALUES (:id, :name, :slug, '{}'::json)",
+                ),
+                {"id": str(org_id), "name": "RLS-Strict-Org", "slug": slug},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO accounts (id, email, display_name, auth_provider, active, password_hash) "
+                    "VALUES (:id, :email, :name, 'local', true, 'hash')",
+                ),
+                {
+                    "id": str(account_id),
+                    "email": f"{slug}@example.com",
+                    "name": "rls-strict",
+                },
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO parameter_schemas (id, organisation_id, name, account_id, parameters) "
+                    "VALUES (:id, :oid, 'schema1', :aid, '[]'::json)",
+                ),
+                {"id": str(schema_id), "oid": str(org_id), "aid": str(account_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO parameter_sets "
+                    "(id, parameter_schema_id, version, schema_version, name, account_id, values) "
+                    "VALUES (:id, :sid, 1, 1, 'set1', :aid, '{}'::json)",
+                ),
+                {"id": str(uuid.uuid4()), "sid": str(schema_id), "aid": str(account_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO oauth_authorization_codes "
+                    "(code, client_id, organisation_id, account_id, scopes, redirect_uri, expires_at) "
+                    "VALUES (:code, 'client1', :oid, :aid, 'read', 'https://x/cb', now() + interval '1 hour')",
+                ),
+                {"code": f"code-{org_id.hex[:8]}", "oid": str(org_id), "aid": str(account_id)},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO oauth_token_families (family_id, client_id, organisation_id) "
+                    "VALUES (:fid, 'client1', :oid)",
+                ),
+                {"fid": str(uuid.uuid4()), "oid": str(org_id)},
+            )
+
+        tables = [
+            "parameter_schemas",
+            "parameter_sets",
+            "oauth_authorization_codes",
+            "oauth_token_families",
+        ]
+        # Hardcoded query per table so the statement text is a literal (not an
+        # f-string) — the table names are fixed, not interpolated user input.
+        count_queries = {
+            "parameter_schemas": "SELECT count(*) FROM parameter_schemas",
+            "parameter_sets": "SELECT count(*) FROM parameter_sets",
+            "oauth_authorization_codes": "SELECT count(*) FROM oauth_authorization_codes",
+            "oauth_token_families": "SELECT count(*) FROM oauth_token_families",
+        }
+
+        # Fail-closed: an empty org context must leak no rows.
+        async with db_engine.connect() as conn, conn.begin():
+            await conn.execute(text(f'SET LOCAL ROLE "{non_superuser_role}"'))
+            await conn.execute(
+                text("SELECT set_config('app.organisation_id', '', true)"),
+            )
+            for table in tables:
+                count = (await conn.execute(text(count_queries[table]))).scalar()
+                assert count == 0, f"{table}: empty org context leaked {count} rows — fail-open RLS reintroduced"
+
+        # Positive control: the correct org context must return the seeded rows,
+        # proving RLS filters by org rather than denying everything.
+        async with db_engine.connect() as conn, conn.begin():
+            await conn.execute(text(f'SET LOCAL ROLE "{non_superuser_role}"'))
+            await conn.execute(
+                text("SELECT set_config('app.organisation_id', :oid, true)"),
+                {"oid": str(org_id)},
+            )
+            for table in tables:
+                count = (await conn.execute(text(count_queries[table]))).scalar()
+                assert count >= 1, (
+                    f"{table}: org context returned {count} rows — "
+                    "rls_org_isolation policy missing or denying all access"
+                )
+    finally:
+        # Clean up seeded rows (superuser bypasses RLS) in FK-dependency order.
+        async with db_engine.connect() as conn, conn.begin():
+            params = {"oid": str(org_id), "aid": str(account_id)}
+            for stmt in (
+                "DELETE FROM oauth_authorization_codes WHERE organisation_id = :oid",
+                "DELETE FROM oauth_token_families WHERE organisation_id = :oid",
+                "DELETE FROM parameter_sets WHERE organisation_id = :oid",
+                "DELETE FROM parameter_schemas WHERE organisation_id = :oid",
+                "DELETE FROM accounts WHERE id = :aid",
+                "DELETE FROM organisations WHERE id = :oid",
+            ):
+                await conn.execute(text(stmt), params)
+
+
 async def test_team_scoped_tables_have_no_org_only_policy(db_engine: AsyncEngine) -> None:
     """The OR'd org-only RLS policy was dropped on team-scoped tables (0124).
 
     Regression guard for the cross-team leak: a team-scoped table must carry
     ONLY the team-visibility policy (which includes the org check), never the
-    org-only policy that ORs in every org row. lifecycle_maps is org-only by
-    design and must keep its org policy.
+    org-only policy that ORs in every org row. Conversely, the org-only tables
+    (``lifecycle_maps`` and its ``lifecycle_map_stages`` projection) must keep
+    their org policy and must NOT gain a team/account policy.
 
     The ``rls_team_isolation`` policy body (``pg_policies.qual``) must ALSO
     contain the execution-context escape hatch (``app.execution_context``) so
     background machinery (which sets org scope only) can read team-private rows
-    ÔÇö and it must keep the org check (``app.organisation_id``) so the escape
+    — and it must keep the org check (``app.organisation_id``) so the escape
     hatch can never leak rows across organisations.
 
     This pins the FINAL policy state on a real Postgres (migrations applied),
@@ -374,7 +506,17 @@ async def test_team_scoped_tables_have_no_org_only_policy(db_engine: AsyncEngine
         "environment_profiles",
         "library_primitives",
     }
-    org_only_tables = {"lifecycle_maps"}
+    # Org-only by design: these tables carry ONLY rls_org_isolation and must
+    # NOT gain a team/account policy. ``lifecycle_maps`` enforces its
+    # visibility/owner_team_id rules at the app layer, and
+    # ``lifecycle_map_stages`` is a derived read projection of
+    # ``lifecycle_maps.content_json`` whose ``account_id`` records which
+    # account last saved the map -- it is provenance, NOT an authorisation
+    # boundary. Gating reads on ``account_id`` would hide an org-visible map's
+    # stages from every other member of the organisation, and adding a policy
+    # that ORs with rls_org_isolation would be dead weight (Postgres ORs
+    # permissive policies). See the PR #2125 discussion.
+    org_only_tables = {"lifecycle_maps", "lifecycle_map_stages"}
 
     async with db_engine.connect() as conn:
         rows = (await conn.execute(text("SELECT tablename, policyname, qual FROM pg_policies"))).fetchall()
@@ -393,12 +535,17 @@ async def test_team_scoped_tables_have_no_org_only_policy(db_engine: AsyncEngine
         assert body, f"{table} team policy has no USING body (qual)"
         assert "app.organisation_id" in body, f"{table} team policy lost the org check (cross-org leak)"
         assert "app.execution_context" in body, (
-            f"{table} team policy missing the execution-context escape hatch ÔÇö "
+            f"{table} team policy missing the execution-context escape hatch — "
             "background machinery (org scope only) cannot read team-private rows"
         )
 
     for table in org_only_tables:
         assert "rls_org_isolation" in policies.get(table, set()), f"{table} missing org policy"
+        assert "rls_team_isolation" not in policies.get(table, set()), (
+            f"{table} is org-only by design but gained a team/account policy. Because PostgreSQL ORs "
+            "permissive policies, such a policy is either dead weight (if rls_org_isolation is kept) or "
+            "a read regression (if it is dropped, since org colleagues would lose access)."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -448,7 +595,7 @@ async def _set_rls(session: AsyncSession, org_id: uuid.UUID) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Migration 0060 ÔÇö rls_team_isolation policy correctness after column rename
+# Migration 0060 — rls_team_isolation policy correctness after column rename
 # ---------------------------------------------------------------------------
 
 
@@ -457,7 +604,7 @@ async def test_team_memberships_isolated_by_org_rls(
 ) -> None:
     """Team membership rows are correctly isolated by org-scoped RLS.
 
-    After the usersÔåÆaccounts+org_memberships reconciliation (0108_schema_org_identity),
+    After the users→accounts+org_memberships reconciliation (0108_schema_org_identity),
     the rls_org_isolation policy on team_memberships (org-scoped via OrgScoped)
     must use ``organisation_id`` to prevent cross-org membership leaks.
     This test creates accounts in different teams within the same org and
@@ -472,7 +619,7 @@ async def test_team_memberships_isolated_by_org_rls(
     account_b = await _create_account(db_engine, "member-b@rls-membership.com")
 
     # The check_team_privilege_cap trigger requires every account to hold an
-    # org_membership row in the org before it can be added to a team ÔÇö without
+    # org_membership row in the org before it can be added to a team — without
     # it the org role resolves to NULL and the trigger raises
     # "Team role ... exceeds org role <NULL>".
     async with db_engine.connect() as conn, conn.begin():
@@ -552,7 +699,7 @@ async def test_team_memberships_isolated_by_org_rls(
 
 
 # ---------------------------------------------------------------------------
-# ORM tenant filter tests (SQLite ÔÇö RLS is Postgres-only)
+# ORM tenant filter tests (SQLite — RLS is Postgres-only)
 # ---------------------------------------------------------------------------
 
 

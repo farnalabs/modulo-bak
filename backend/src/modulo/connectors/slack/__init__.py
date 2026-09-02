@@ -7,7 +7,12 @@ from typing import Any, cast
 
 import httpx
 
-from modulo.connectors._retry_headers import parse_retry_after as _parse_retry_after
+from modulo.connectors._retry_headers import (
+    RETRYABLE_STATUSES,
+)
+from modulo.connectors._retry_headers import (
+    parse_retry_after as _parse_retry_after,
+)
 from modulo.connectors._safe_cursor import safe_cursor as _safe_cursor
 from modulo.connectors._safe_int import safe_int as _safe_int
 from modulo.connectors._safe_page import safe_records as _safe_records
@@ -18,11 +23,14 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
+from modulo.core.ssrf import pinned_async_client_sync
 
 _SLACK_API = "https://slack.com/api"
 
-_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_RETRYABLE_STATUSES = RETRYABLE_STATUSES
 _MAX_RETRIES = 3
 _BASE_DELAY = 1.0
 _MAX_DELAY = 30.0
@@ -64,9 +72,24 @@ def _check_slack_ok(body: Any, context: str) -> None:
         raise SlackAPIError(f"Slack API error in {context}: {body.get('error', 'unknown')}")
 
 
+async def _should_backoff(response: httpx.Response, attempt: int) -> bool:
+    if response.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
+        await asyncio.sleep(_compute_retry_delay(attempt, response))
+        return True
+    return False
+
+
+async def _backoff_or_raise(message: str, attempt: int, exc: Exception) -> None:
+    if attempt < _MAX_RETRIES:
+        await asyncio.sleep(_compute_retry_delay(attempt))
+        return
+    raise SlackNetworkError(message) from exc
+
+
 class SlackConnector(ConnectorBase):
     def __init__(self, bot_token: str) -> None:
         self._bot_token = bot_token
+        self._redactor = CredentialRedactor([bot_token])
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -76,31 +99,36 @@ class SlackConnector(ConnectorBase):
         return {"Authorization": f"Bearer {self._bot_token}"}
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=_SLACK_API, headers=self._headers(), timeout=30)
+        # PINNED TRANSPORT (FAR-512): validate + resolve the Slack API host and
+        # pin the validated IP onto the transport so the connection never
+        # re-resolves at connect time (closes DNS-rebind). ``trust_env=False``
+        # stops a proxy from re-resolving the destination and defeating the pin.
+        return pinned_async_client_sync(
+            _SLACK_API,
+            base_url=_SLACK_API,
+            headers=self._headers(),
+            timeout=30,
+        )
+
+    async def _send_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        async with self._client() as client:
+            return await client.request(method, path, **kwargs)
 
     async def _call_api(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                async with self._client() as client:
-                    r = await client.request(method, path, **kwargs)
-                    if r.status_code in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
-                        await asyncio.sleep(_compute_retry_delay(attempt, r))
-                        continue
-                    r.raise_for_status()
-                    return r
+                response = await self._send_request(method, path, **kwargs)
+                if await _should_backoff(response, attempt):
+                    continue
+                response.raise_for_status()
+                return response
             except httpx.TimeoutException as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_compute_retry_delay(attempt))
-                    continue
-                raise SlackNetworkError("Slack API timeout") from exc
+                await _backoff_or_raise("Slack API timeout", attempt, exc)
             except httpx.ConnectError as exc:
                 last_exc = exc
-                if attempt < _MAX_RETRIES:
-                    await asyncio.sleep(_compute_retry_delay(attempt))
-                    continue
-                raise SlackNetworkError("Slack API connection error") from exc
+                await _backoff_or_raise("Slack API connection error", attempt, exc)
             except httpx.HTTPStatusError as exc:
                 last_exc = exc
                 raise self._error_for_status(exc) from exc
@@ -139,30 +167,37 @@ class SlackConnector(ConnectorBase):
         _check_slack_ok(body, "conversations.list")
         return bool(body.get("channels"))
 
+    @redacting
     async def health_check(self) -> HealthResult:
         try:
             r = await self._call_api("GET", "/api.test", timeout=10)
             body = await self._parse_json(r)
             if not body.get("ok"):
-                return HealthResult(ok=False, detail=body.get("error", "unknown"))
+                return HealthResult(ok=False, detail=self._redactor.redact(body.get("error", "unknown")))
             try:
                 await self.verify_scopes()
             except SlackNetworkError as exc:
-                return HealthResult(ok=False, detail=f"Token validation failed due to network error: {exc}")
+                return HealthResult(
+                    ok=False, detail=self._redactor.redact(f"Token validation failed due to network error: {exc}")
+                )
             except SlackError as exc:
-                return HealthResult(ok=False, detail=f"Token is invalid or revoked: {exc}")
+                return HealthResult(ok=False, detail=self._redactor.redact(f"Token is invalid or revoked: {exc}"))
             try:
                 in_channel = await self._is_bot_in_channel()
             except SlackNetworkError as exc:
-                return HealthResult(ok=False, detail=f"Channel membership check failed due to network error: {exc}")
+                return HealthResult(
+                    ok=False,
+                    detail=self._redactor.redact(f"Channel membership check failed due to network error: {exc}"),
+                )
             except SlackError as exc:
-                return HealthResult(ok=False, detail=f"Channel membership check failed: {exc}")
+                return HealthResult(ok=False, detail=self._redactor.redact(f"Channel membership check failed: {exc}"))
             if not in_channel:
                 return HealthResult(ok=False, detail="Bot is not in any channel")
             return HealthResult(ok=True)
         except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(self._redactor.redact_exc(exc))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         match q.resource:
             case "channels":
@@ -190,6 +225,7 @@ class SlackConnector(ConnectorBase):
             case _:
                 raise ValueError(f"Unsupported Slack resource: {q.resource!r}")
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         match payload.resource:
             case "message":

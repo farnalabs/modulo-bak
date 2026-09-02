@@ -3,7 +3,7 @@
     <div class="page-wide">
       <header class="flex items-center justify-between">
         <PageHeader title="Plugins" :subtitle="$t('views.AdminPluginsView.manage_installed_modulo_plugins_and_extensions')" />
-        <Button class="border-primary/30 hover:border-primary/60" data-testid="admin-plugins-refresh" @click="loadPlugins">
+        <Button type="button" class="border-primary/30 hover:border-primary/60" data-testid="admin-plugins-refresh" @click="loadPlugins">
           Refresh
         </Button>
       </header>
@@ -40,6 +40,7 @@
                   <td class="table-cell">
                     <div>
                       <button
+                        type="button"
                         class="font-medium text-left hover:text-primary transition-colors"
                         @click="toggleExpand(plugin.PLUGIN_ID)"
                       >
@@ -74,11 +75,12 @@
                   </td>
                   <td class="table-cell-numeric">
                     <div class="flex items-center justify-end gap-1">
-                      <label for="adminpluginsview-field-1"
+                      <label :for="`adminpluginsview-toggle-${plugin.PLUGIN_ID}`"
                         class="relative inline-flex cursor-pointer items-center"
                         :title="activeStates[plugin.PLUGIN_ID] !== false ? 'Disable plugin' : 'Enable plugin'"
+                        :aria-label="activeStates[plugin.PLUGIN_ID] !== false ? 'Disable plugin' : 'Enable plugin'"
                       >
-                        <input id="adminpluginsview-field-1"
+                        <input :id="`adminpluginsview-toggle-${plugin.PLUGIN_ID}`"
                           type="checkbox"
                           class="sr-only peer"
                           :checked="activeStates[plugin.PLUGIN_ID] !== false"
@@ -89,6 +91,7 @@
                         />
                       </label>
                       <button
+                        type="button"
                         class="rounded p-1 text-muted-foreground hover:bg-accent"
                         data-testid="admin-plugins-expand"
                         :aria-label="$t('views.AdminPluginsView.expand_plugin_details')"
@@ -212,7 +215,7 @@ function toggleExpand(id: string) {
 }
 
 async function togglePlugin(id: string) {
-  const newState = activeStates[id] !== false ? false : true
+  const newState = activeStates[id] === false
   activeStates[id] = newState
   try {
     const { error: err } = await (api as any).PUT(`/api/v1/plugins/${id}/toggle`, {

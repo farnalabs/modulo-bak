@@ -140,6 +140,10 @@ class TestCredentialsMaskedInApiResponse:
         mock_connector.tier = "community"
         mock_connector.created_at = datetime(2025, 1, 1, tzinfo=UTC)
         mock_connector.updated_at = datetime(2025, 1, 1, tzinfo=UTC)
+        # Nullable degraded markers: a bare MagicMock would auto-create these as
+        # non-serialisable mocks, so mirror a healthy ORM row explicitly.
+        mock_connector.degraded_at = None
+        mock_connector.last_skip_error = None
         return mock_connector
 
     def test_api_key_is_masked(self, client: TestClient) -> None:
@@ -196,6 +200,17 @@ class TestSensitiveKeyDetection:
             "webhook_secret",
             "passwd",
         ],
+        ids=[
+            "api_key",
+            "token",
+            "secret",
+            "password",
+            "credential",
+            "API_KEY",
+            "client_secret",
+            "webhook_secret",
+            "passwd",
+        ],
     )
     def test_true_for_sensitive_patterns(self, key: str) -> None:
         assert is_sensitive_key(key) is True
@@ -216,6 +231,7 @@ class TestNonSensitiveKeyDetection:
             "model",
             "provider",
         ],
+        ids=["description", "name", "url", "host", "port", "timeout", "model", "provider"],
     )
     def test_false_for_innocuous_keys(self, key: str) -> None:
         assert is_sensitive_key(key) is False

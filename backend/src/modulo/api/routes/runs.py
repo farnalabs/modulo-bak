@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -28,7 +29,10 @@ from modulo.api.dependencies import (
     require_permission,
     require_permission_any_credential,
 )
-from modulo.api.middleware.sensitive_mask import is_sensitive_key, mask_sensitive_value
+from modulo.api.middleware.sensitive_mask import (
+    is_sensitive_key,
+    mask_sensitive_value,
+)
 from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
 from modulo.core.dispatch import dispatch_run
@@ -51,7 +55,9 @@ from modulo.core.pipeline_engine.recovery import (
     recover_node,
 )
 from modulo.core.rate_limiter import TokenBucketRegistry
+from modulo.core.secret_patterns import mask_secret_values_in_text
 from modulo.core.trigger_engine import TriggerEngine
+from modulo.db.capacity import StorageExhaustedError
 from modulo.db.crud.node_observation import observe_node
 from modulo.db.crud.observability import get_otel_config
 from modulo.db.crud.pipeline import get_pipeline
@@ -378,6 +384,11 @@ def _build_list_item(run: Run, ctx: _ListPageContext) -> dict[str, Any]:
         "concurrency_limit": ctx.concurrency_limit,
         "waiting": _is_capacity_waiting(run.status, ctx.active_count, ctx.concurrency_limit),
     }
+    # FAR-490: snapshot_id must be a UUID/str or None; a MagicMock (e.g. in
+    # test fakes) or any other non-UUID value must surface as None, never a 500.
+    # Mirror the FAR-228/FAR-213 defensive coercion above.
+    _raw_list_snapshot_id = getattr(run, "snapshot_id", None)
+    _list_snapshot_id = str(_raw_list_snapshot_id) if isinstance(_raw_list_snapshot_id, (uuid.UUID, str)) else None
     return {
         "run_id": str(run.id),
         "pipeline_id": str(run.pipeline_id),
@@ -385,6 +396,9 @@ def _build_list_item(run: Run, ctx: _ListPageContext) -> dict[str, Any]:
         "status": run.status,
         "trigger_type": run.trigger_type,
         "run_number": run.run_number,
+        # FAR-490: snapshot the run executes (None only for legacy/pre-FK rows)
+        # so run→snapshot verification is one GET, not pagination archaeology.
+        "snapshot_id": _list_snapshot_id,
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
@@ -580,6 +594,12 @@ class RunResponse(BaseModel):
     run_number: int | None = None
     pipeline_name: str | None = None
     langgraph_thread_id: str
+    # FAR-490: the immutable snapshot this run executes. Every run-start path
+    # creates a fresh snapshot from the committed live graph, so the snapshot
+    # (fetchable via GET /pipelines/{id}/snapshots/{snapshot_id}) is the
+    # authoritative record of what the run ACTUALLY executed — expose the link
+    # so staleness investigations never have to diff the live graph instead.
+    snapshot_id: uuid.UUID | None = None
     error_detail: str | None = None
     error_code: str | None = None
     total_cost_usd: Decimal | None = None
@@ -739,6 +759,12 @@ def _build_run_response(
     # FAR-213: same defensive coercion for the blocked_partial_summary column.
     blocked_partial_summary = run.blocked_partial_summary if isinstance(run.blocked_partial_summary, dict) else None
 
+    # FAR-490: defensive coercion — snapshot_id must be a UUID/str or None; a
+    # MagicMock (e.g. in test fakes) or any other non-UUID value must never 500
+    # the run detail endpoint.
+    _raw_snapshot_id = getattr(run, "snapshot_id", None)
+    snapshot_id = _raw_snapshot_id if isinstance(_raw_snapshot_id, (uuid.UUID, str)) else None
+
     return RunResponse(
         run_id=run.id,
         status=run.status,
@@ -746,6 +772,7 @@ def _build_run_response(
         run_number=run.run_number,
         pipeline_name=pipeline_name,
         langgraph_thread_id=run.langgraph_thread_id,
+        snapshot_id=snapshot_id,
         error_detail=error_detail,
         error_code=error_code,
         total_cost_usd=run.total_cost_usd,
@@ -820,7 +847,7 @@ async def _require_valid_entry_agent(session: AsyncSession, entry_node: dict[str
 async def _validate_run_input_basics(
     session: AsyncSession,
     graph_json: dict[str, Any],
-    snapshot: PipelineSnapshot,
+    _snapshot: PipelineSnapshot,
     input_payload: dict[str, Any],
 ) -> None:
     """Basic pre-run input health checks (not full schema validation).
@@ -927,7 +954,7 @@ async def _create_manual_run(
 async def trigger_run(
     req: TriggerRunRequest,
     session: AsyncSession = Depends(get_db_session),
-    engine: AsyncEngine = Depends(_get_engine),
+    _engine: AsyncEngine = Depends(_get_engine),
     principal: TenantPrincipal = require_permission_any_credential("run.trigger"),
 ) -> RunResponse:
     """Manually trigger a pipeline run.
@@ -986,6 +1013,8 @@ async def trigger_run(
             detail=f"Cannot create run: organisation {exc.org_id} not found",
         ) from None
 
+    except StorageExhaustedError:
+        raise
     except HTTPException:
         raise
     except Exception:
@@ -1387,7 +1416,7 @@ async def get_run_io_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
             snapshot = await _load_snapshot_for_run(session, run)
     except IntegrityError:
         _log.exception("runs.get_run_io_endpoint")
@@ -1440,7 +1469,7 @@ async def export_run_fixture(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
             if run is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_RUN_NOT_FOUND)
             snapshot = await _load_snapshot_for_run(session, run)
@@ -1630,12 +1659,21 @@ async def get_run_workspace_events(
 def _mask_output_value(value: Any, *, _depth: int = 0) -> Any:
     """Recursively mask sensitive string fields in *value*.
 
-    Traverses dicts, lists, and simple values.  String values whose keys
-    match :func:`is_sensitive_key` are replaced with the standard mask.
+    Two complementary strategies are applied:
+
+    1. **Key-name masking** (existing): string values whose key matches
+       :func:`is_sensitive_key` are replaced wholesale with the standard mask.
+    2. **Value-pattern masking** (FAR-392): every string value is also scanned
+       for gitleaks-style secret VALUES (API keys, tokens, private keys,
+       connection strings, JWTs, ...) regardless of the key it sits under, so
+       secrets in free text or under arbitrary keys are masked too.
+
     Nones and non-string atomic values pass through unchanged.
     """
     if _depth > 20:
         return value
+    if isinstance(value, str):
+        return mask_secret_values_in_text(value)
     if isinstance(value, dict):
         return {
             k: (
@@ -1679,7 +1717,7 @@ async def get_run_node_output(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
     except IntegrityError:
         _log.exception("runs.get_run_node_output")
         raise HTTPException(
@@ -1826,7 +1864,7 @@ async def observe_run_node(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
     except IntegrityError:
         _log.exception(_CODE_RUNS_OBSERVE_RUN_NODE)
         raise HTTPException(
@@ -2211,7 +2249,6 @@ def _mask_prompt_text(text: str) -> str:
     password, key, credential) with bullet characters. Also redacts
     Authorization/Bearer headers and JWT-like tokens regardless of key name.
     """
-    import re
 
     masked = text
     for pattern, replacement in _SENSITIVE_MASK_PATTERNS:
@@ -2246,7 +2283,7 @@ def _decrypt_checkpoint(raw_checkpoint: Any, fernet_key: str | None) -> Any:
                     decrypted = f.decrypt(parsed["data"].encode())
                     return json.loads(decrypted.decode())
                 return parsed
-        except (json.JSONDecodeError, Exception) as exc:
+        except Exception as exc:
             _log.warning("checkpoint.decrypt_skip", extra={"error": str(exc)[:200]})
     elif isinstance(raw_checkpoint, dict) and raw_checkpoint.get("__encrypted__") and fernet_key:
         try:
@@ -2459,7 +2496,7 @@ async def reveal_node_prompt(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run = await get_run(session, run_id)
+            run = await get_run(session, run_id, organisation_id=principal.organisation_id)
 
             if run is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_RUN_NOT_FOUND)
@@ -2571,8 +2608,8 @@ async def diff_node_output(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            run_a = await get_run(session, req.run_id_a)
-            run_b = await get_run(session, req.run_id_b)
+            run_a = await get_run(session, req.run_id_a, organisation_id=principal.organisation_id)
+            run_b = await get_run(session, req.run_id_b, organisation_id=principal.organisation_id)
     except IntegrityError:
         _log.exception("runs.diff_node_output")
         raise HTTPException(

@@ -1,5 +1,6 @@
 """Create immutable execution snapshots from the editable pipeline graph."""
 
+import asyncio
 import copy
 import hashlib
 import uuid
@@ -36,6 +37,15 @@ def _pipeline_lock_keys(pipeline_id: uuid.UUID) -> tuple[int, int]:
     return (key1, key2)
 
 
+# FAR-527: bounded-wait acquisition of the snapshot advisory lock. Snapshot
+# creation is a fast graph copy, so contention between two near-simultaneous
+# run-starts resolves in milliseconds — a short retry loop nearly always
+# succeeds where a single pg_try_advisory_lock attempt raised and the caller
+# silently dropped the trigger. Module-level so tests can patch them.
+SNAPSHOT_LOCK_ATTEMPTS = 5
+SNAPSHOT_LOCK_RETRY_SLEEP_SECONDS = 0.25
+
+
 async def _load_pipeline_and_edges(
     session: AsyncSession, pipeline_id: uuid.UUID
 ) -> tuple[Pipeline | None, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -57,6 +67,7 @@ async def _load_pipeline_and_edges(
             "target": str(edge.target_node_id),
             "type": edge.edge_type,
             "hitl_gate_config": copy.deepcopy(edge.hitl_gate_config),
+            "condition_expression": edge.condition_expression,
         }
         for edge in edges
     ]
@@ -347,6 +358,10 @@ async def create_snapshot_from_live_graph(
     *,
     pipeline_id: uuid.UUID,
     account_id: uuid.UUID | None = None,
+    version_kind: str = "run",
+    created_kind: str = "run",
+    draft: bool = False,
+    channel: str = "none",
 ) -> PipelineSnapshot | None:
     """Lock and copy the authoritative live graph into an immutable snapshot.
 
@@ -354,15 +369,32 @@ async def create_snapshot_from_live_graph(
     context set. Uses a Postgres advisory lock (session-scoped) to serialise
     snapshot creation for a given pipeline, avoiding transaction-scoped FOR
     UPDATE so the caller's transaction is not blocked during graph loading.
+
+    FAR-402 P6: the run-start callers (webhook/replay/trigger/manual/slack)
+    keep the defaults and produce a ``version_kind='run'`` snapshot; live-edit
+    saves go through ``create_snapshot_edit`` which passes ``version_kind='edit'``
+    so the live-edit chain stays distinguishable from run-frozen snapshots.
+
+    FAR-527: lock acquisition retries up to ``SNAPSHOT_LOCK_ATTEMPTS`` times,
+    sleeping ``SNAPSHOT_LOCK_RETRY_SLEEP_SECONDS`` between attempts, so a
+    near-simultaneous run-start (which holds the lock only for the fast graph
+    copy) no longer fails the trigger outright. Raises
+    SnapshotLockNotAvailableError only after the budget is exhausted.
     """
     # Acquire session-scoped advisory lock to serialise snapshot creation.
     key1, key2 = _pipeline_lock_keys(pipeline_id)
-    lock_result = await session.execute(
-        text("SELECT pg_try_advisory_lock(:key1, :key2)"),
-        {"key1": key1, "key2": key2},
-    )
-    if not lock_result.scalar_one():
-        raise SnapshotLockNotAvailableError(f"Cannot acquire snapshot lock for pipeline {pipeline_id}")
+    for attempt in range(1, SNAPSHOT_LOCK_ATTEMPTS + 1):
+        lock_result = await session.execute(
+            text("SELECT pg_try_advisory_lock(:key1, :key2)"),
+            {"key1": key1, "key2": key2},
+        )
+        if lock_result.scalar_one():
+            break
+        if attempt == SNAPSHOT_LOCK_ATTEMPTS:
+            raise SnapshotLockNotAvailableError(
+                f"Cannot acquire snapshot lock for pipeline {pipeline_id} after {SNAPSHOT_LOCK_ATTEMPTS} attempts"
+            )
+        await asyncio.sleep(SNAPSHOT_LOCK_RETRY_SLEEP_SECONDS)
 
     try:
         pipeline, nodes, edge_dicts = await _load_pipeline_and_edges(session, pipeline_id)
@@ -428,6 +460,10 @@ async def create_snapshot_from_live_graph(
             guardrail_pins_json=guardrail_pins,
             guardrail_pins_fingerprint=guardrail_pins_fingerprint,
             run_context_defaults=copy.deepcopy(pipeline.run_context_defaults),
+            version_kind=version_kind,
+            created_kind=created_kind,
+            draft=draft,
+            channel=channel,
         )
         session.add(snapshot)
         await session.flush()
@@ -440,3 +476,30 @@ async def create_snapshot_from_live_graph(
             text("SELECT pg_advisory_unlock(:key1, :key2)"),
             {"key1": key1, "key2": key2},
         )
+
+
+async def create_snapshot_edit(
+    session: AsyncSession,
+    *,
+    pipeline_id: uuid.UUID,
+    account_id: uuid.UUID | None = None,
+    draft: bool = False,
+    channel: str = "none",
+) -> PipelineSnapshot | None:
+    """Snapshot the live graph as a LIVE-EDIT version (FAR-402 P6).
+
+    A live-edit save reuses the snapshot machinery but tags the row as
+    ``version_kind='edit'`` / ``created_kind='edit'``, so the editor's save
+    history (the live-edit chain) is distinguishable from run-frozen snapshots.
+    Each save leaves the prior snapshot row immutable, so rollback remains a
+    pointer swap to a prior snapshot (``rollback_to_snapshot``).
+    """
+    return await create_snapshot_from_live_graph(
+        session,
+        pipeline_id=pipeline_id,
+        account_id=account_id,
+        version_kind="edit",
+        created_kind="edit",
+        draft=draft,
+        channel=channel,
+    )

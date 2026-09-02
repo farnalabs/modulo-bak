@@ -159,6 +159,29 @@ class TestListRetentionCandidates:
             # runs' real thread-ids, so their checkpoint bytes resolve to 0.
             assert item["estimated_bytes"] >= rr._run_row_bytes(_run("failed"))
 
+    async def test_terminal_total_is_surfaced_and_distinct_from_total(self) -> None:
+        """terminal_total/terminal_estimated_bytes are reported separately so the
+        purge UI can show the uncapped terminal count, not the page-capped set."""
+        session = AsyncMock()
+        total_result = MagicMock()
+        total_result.scalar_one.return_value = 10
+        terminal_result = MagicMock()
+        terminal_result.scalar_one.return_value = 7
+        # First execute = total_count (all matches); second = terminal_total.
+        session.execute = AsyncMock(side_effect=[total_result, terminal_result])
+        runs = [_run("complete"), _run("failed")]
+
+        with (
+            patch.object(rr, "_select_run_page", new=AsyncMock(return_value=runs)),
+            patch.object(rr, "_checkpoint_detail", new=AsyncMock(return_value=({}, {}))),
+            patch.object(rr, "_estimate_total_bytes", new=AsyncMock(return_value=99)),
+        ):
+            result = await rr.list_retention_candidates(session, org_id=_ORG, status=None)
+
+        assert result["total_count"] == 10
+        assert result["terminal_total"] == 7
+        assert result["terminal_estimated_bytes"] == 99
+
 
 # ---------------------------------------------------------------------------
 # purge_terminal_runs — terminal-only, checkpoint cascade, batching, idempotency
@@ -214,7 +237,9 @@ class TestPurgeTerminalRuns:
         assert delete_checkpoints.call_args.args[1] == thread_ids
         assert delete_checkpoints.call_args.args[2] == _ORG
         session.flush.assert_awaited()
-        session.begin_nested.assert_called()
+        # Exactly one SAVEPOINT for the single purge batch (the sibling
+        # test_batches_at_batch_size proves one begin_nested per batch).
+        session.begin_nested.assert_called_once()
 
     async def test_batches_at_batch_size(self) -> None:
         """A set larger than batch_size is processed in more than one SAVEPOINT."""
@@ -280,7 +305,7 @@ class TestPurgeTerminalRuns:
             return []
 
         with patch.object(rr, "_select_run_page", side_effect=fake_select):
-            await self._purge(session, status="running")
+            await self._purge(session, _status="running")
 
         assert selected_statuses == [TERMINAL_STATUSES]
 

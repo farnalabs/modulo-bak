@@ -62,14 +62,17 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 import jinja2
-import jmespath
 from jinja2.sandbox import SandboxedEnvironment
 from langchain_core.messages import HumanMessage
 from langgraph.types import interrupt
 
+from modulo.connectors.base import DEFAULT_ON_UNKNOWN, ON_UNKNOWN_MODES
+from modulo.core.secret_patterns import AWS_ACCESS_KEY_PATTERN, GITHUB_PAT_PATTERN
+
 if TYPE_CHECKING:
     from e2b import AsyncSandbox
 
+from modulo.core.capability_scope import filter_run_context_scope
 from modulo.core.cost_controller.breakdown.constants import (
     MAX_REPORTABLE_BAND_USD,
     MAX_REPORTABLE_USD_MIN,
@@ -83,8 +86,18 @@ from modulo.core.node_output_split import (
     resolve_node_contract_output,
 )
 from modulo.core.pipeline_engine.decorator import cancellable_node
+from modulo.core.pipeline_engine.errors import RouterNoMatchError
 from modulo.core.pipeline_engine.event_broker import RunEventBroker, get_registry
+from modulo.core.pipeline_engine.idempotency import (
+    node_idempotency_key,
+    read_before_write_ambiguous,
+    read_before_write_suppression,
+)
 from modulo.core.pipeline_engine.input_truncation import truncate_input
+from modulo.core.pipeline_engine.jmespath_eval import (
+    compile_jmespath,
+    evaluate_jmespath_condition,
+)
 from modulo.core.pipeline_engine.sandbox_mode import _validate_sandbox_mode_config
 from modulo.core.run_context.autonomy import (
     effective_autonomy_level,
@@ -254,6 +267,8 @@ class OutputSchemaValidationError(ValueError):
     """
 
 
+# Single source of truth for JMESPath guard truthiness — `bool(result)`.
+# Test-pinned in tests/unit/pipeline_engine/test_conditional_transitions.py.
 _is_truthy = bool
 
 # Cap for the stored artifact stdout/stderr blobs. 512KB keeps storage bounded
@@ -284,6 +299,23 @@ _NO_OUTPUT_STDOUT_TAIL = 1024
 _NO_OUTPUT_RAW_SNIPPET = 512
 
 _OUTPUT_READ_TIMEOUT = 30.0  # max seconds to wait for sandbox output after command times out
+# FAR-487: the E2B sandbox LIFETIME must outlast the runner's command timeout.
+# Both used to be set from the same ``sandbox_timeout`` value, so the platform
+# killed the sandbox (``endAt``) at the same instant the runner's command
+# timeout fired. In that race the SDK's command event stream closes first and
+# ``handle.wait()`` resolves a zero-exit CommandResult (no exit event ever
+# arrives — the process died with the sandbox), so the runner took the
+# "completed, exit 0" path and then tried to read /home/user/output.json from
+# a DEAD sandbox: the read raised, ``output_json`` stayed None, and the node
+# failed as "Sandbox agent produced no parseable output.json (exit code 0)" —
+# 15+ production PR-Reviewer runs on 2026-08-29. The grace window makes the
+# runner's OWN timeout path (clean kill + correct stall/timeout
+# classification) win the race deterministically.
+# FAR-489: this MUST be an int. The E2B create API (Go) unmarshals
+# ``NewSandbox.timeout`` into an int32 — a float payload ("360.0") is
+# rejected with HTTP 400 and every sandbox create fails instantly. The
+# int() cast at the create call site is the load-bearing guard; keep both.
+_SANDBOX_LIFETIME_GRACE_S = 120
 _DECORATOR_GRACE = 5.0  # scheduling + finally-block margin for decorator safety net
 # FAR-188 (QA round 1): the raw-output retention DB write is bounded to fit
 # inside the node decorator's grace budget (_DECORATOR_GRACE = 5.0s) so a hung
@@ -296,6 +328,15 @@ _IDEMPOTENCY_GATE_READ_TIMEOUT = 3.0
 # FAR-228: best-effort marker persist bounded inside a caught CancelledError
 # (5s — the node is being cancelled, the write must not delay the re-raise).
 _IDEMPOTENCY_GATE_CANCEL_PERSIST_TIMEOUT = 5.0
+# FAR-458: the per-connector-per-write ``on_unknown`` modes and default live in
+# ONE place — ``modulo.connectors.base`` (a stdlib-only leaf imported by both
+# the pipeline engine's gate read and the REST connector's config validation)
+# so the mode set can never drift between the two. The default
+# ``DEFAULT_ON_UNKNOWN`` (``"fail_open"``) re-fires the write on ambiguity
+# (possible duplicate, usually recoverable); ``fail_closed`` SUPPRESSES it
+# (possible silent miss; the operator reconciles); ``off`` bypasses the gate
+# entirely. A CONFIRMED-delivered write (delivery_done + matching key) is
+# ALWAYS suppressed regardless of the mode (that is the point of dedup).
 _SANDBOX_IO_TIMEOUT = 30.0  # max seconds for a single sandbox file read/write
 _SANDBOX_IDLE_TIMEOUT = 300.0  # max seconds of agent silence before treating the command as stalled (FAR-97)
 _STREAM_FLUSH_INTERVAL = 1.0  # min seconds between live stdout/stderr chunk publishes per node (FAR-98)
@@ -320,6 +361,22 @@ _SANDBOX_KILL_TIMEOUT = 15.0
 # allowlist (the iptables rules bind concrete IPs, never DNS names).
 _SANDBOX_EGRESS_RESOLVE_TIMEOUT = 5.0
 
+# FAR-510: the summary stamped on the sandbox_agent synthetic failure
+# envelopes (the generic-exception path and the schema-validation path RETURN
+# a failed envelope instead of raising). Kept as the human-readable failure
+# detail — the executor's downgrade predicate keys on the machine marker
+# below, never on this text. Single source of truth so runner and executor
+# cannot drift.
+SANDBOX_AGENT_FAILED_SUMMARY = "Sandbox agent execution failed"
+
+# FAR-510: machine marker stamped on BOTH sandbox_agent synthetic failure
+# envelopes (generic-exception + schema-validation). The executor's
+# finalize-time downgrade predicate requires ``status == "failed"`` AND this
+# field True — marker-based, so an agent-authored failure shape (which never
+# carries the runner's internal marker) can never collide. Single source of
+# truth so runner and executor cannot drift.
+MODULO_SYNTHETIC_FAILURE_MARKER = "modulo_synthetic_failure"
+
 
 async def _resolve_egress_allowlist(
     egress_allowlist: list[dict[str, Any]] | None,
@@ -343,7 +400,7 @@ async def _resolve_egress_allowlist(
         host = entry.get("host")
         if not isinstance(host, str) or not host:
             return entry
-        if _re.match(r"^[0-9.]+$", host) or ":" in host:
+        if _re.match(r"^[\d.]+$", host) or ":" in host:
             return entry
         try:
             infos = await asyncio.wait_for(
@@ -519,6 +576,54 @@ def _extract_reported_cost(
     return raw, clamped, was_clamped, out_of_band_high
 
 
+#: Producer output.json ``token_usage`` key -> node-output field. The producer
+#: contract (FAR-491) pins ``token_usage: {input, output, total, cache_read?,
+#: cache_write?}`` — producer semantics are ``total = input + output`` and the
+#: cache keys appear only when the sandbox's opencode.db exposes the columns.
+_TOKEN_USAGE_FIELD_MAP: tuple[tuple[str, str], ...] = (
+    ("model_tokens_input", "input"),
+    ("model_tokens_output", "output"),
+    ("model_tokens_total", "total"),
+    ("model_tokens_cache_read", "cache_read"),
+    ("model_tokens_cache_write", "cache_write"),
+)
+
+
+def _build_token_usage_fields(output_json: Any) -> dict[str, Any]:
+    """Build the node-output agent-reported token-usage fields (FAR-491).
+
+    Reads ``token_usage`` from the sandbox agent's output.json (the same
+    ``cost_source`` the self-reported cost extraction reads) and extracts
+    ``model_tokens_input`` / ``model_tokens_output`` / ``model_tokens_total``
+    / ``model_tokens_cache_read`` / ``model_tokens_cache_write``. A truthy
+    producer ``schema_drift`` flag returns ``{}`` (no report) — a
+    drifted-schema node reports NO tokens, mirroring
+    ``_extract_reported_cost``. Tri-state per key: absent / non-int / bool /
+    negative → the key is OMITTED (never a ``0`` or ``null`` placeholder —
+    mirrors ``_build_model_cost_fields``). A valid ``0`` report is a real
+    report and IS written. These fields are DISPLAY-ONLY: they feed
+    ``node_telemetry_json`` and the union's ``reported_*`` analytics fields,
+    never an input to the system's built-in money math (operator-defined
+    formulas may reference them).
+    """
+    if not isinstance(output_json, dict):
+        return {}
+    if output_json.get("schema_drift"):
+        return {}
+    usage = output_json.get("token_usage")
+    if not isinstance(usage, dict):
+        return {}
+    fields: dict[str, Any] = {}
+    for field_name, usage_key in _TOKEN_USAGE_FIELD_MAP:
+        value = usage.get(usage_key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        if value < 0:
+            continue
+        fields[field_name] = value
+    return fields
+
+
 def _build_model_cost_fields(output_json: Any) -> dict[str, Any]:
     """Build the node-output model-cost fields (audit + display + flags).
 
@@ -688,6 +793,34 @@ def _bounded_tail(text: str, limit: int) -> str:
     return f"...[truncated {len(text) - limit} chars]...\n{text[-limit:]}"
 
 
+def _classify_no_output_cause(*, read_error: str, read_raw: str) -> str:
+    """Name WHY output.json was unparseable (FAR-487).
+
+    The runner reads AND parses output.json inside ONE try block, so a JSON
+    parse failure surfaces here as a ``JSONDecodeError`` read error with the
+    raw bytes still captured. Classification order: a parse failure of bytes
+    that were read (invalid JSON), a missing-file read error, any other read
+    failure (dead sandbox, network), a successful read whose bytes parse to
+    JSON null. The schema-rejection case is a DIFFERENT code path (validated
+    dicts) and is not classified here. Returns "" when the evidence cannot
+    classify.
+    """
+    if read_error:
+        if "JSONDecodeError" in read_error:
+            return "output.json was written but is NOT valid JSON"
+        if "NotFound" in read_error or "FileNotFound" in read_error:
+            return "output.json was MISSING (the agent never wrote it)"
+        return f"output.json could not be read ({read_error[:200]})"
+    if read_raw:
+        try:
+            parsed = json.loads(read_raw)
+        except (ValueError, TypeError):
+            return "output.json was written but is NOT valid JSON"
+        if parsed is None:
+            return "output.json was JSON null"
+    return ""
+
+
 def _build_no_output_message(
     *,
     exit_code: int,
@@ -695,12 +828,15 @@ def _build_no_output_message(
     stderr_raw: str,
     sandbox_id: str | None,
     read_raw: str = "",
+    read_error: str = "",
     log_tail: str = "",
 ) -> str:
     """Compose the FAR-197 diagnostic for an unparseable/missing output.json.
 
     A compact, bounded message: a prefix naming the exit code and sandbox id,
-    then bounded tails ordered by diagnostic value — the best-effort E2B log
+    then a cause line naming WHY the output was unparseable (missing file /
+    unreadable / invalid JSON — FAR-487), then bounded tails ordered by
+    diagnostic value — the best-effort E2B log
     tail FIRST (the only place the kill reason lives), then the captured agent
     stderr and stdout (agent errors typically sit at the END of stderr), and
     any raw bytes read back from output.json (the invalid-JSON case) LAST.
@@ -718,6 +854,9 @@ def _build_no_output_message(
     log_tail = str(log_tail)
 
     parts = [f"Sandbox agent produced no parseable output.json (exit code {exit_code})"]
+    cause = _classify_no_output_cause(read_error=read_error, read_raw=read_raw)
+    if cause:
+        parts.append(cause)
     if isinstance(sandbox_id, str) and sandbox_id:
         parts.append(f"sandbox id: {sandbox_id}")
     log_tail_cap = _bounded_tail(log_tail, _NO_OUTPUT_LOG_TAIL)
@@ -740,7 +879,7 @@ def _build_no_output_message(
     return "\n".join(parts)
 
 
-_PR_URL_PATTERN = _re.compile(r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+")
+_PR_URL_PATTERN = _re.compile(r"https?://github\.com/[A-Za-z\d_.-]+/[A-Za-z\d_.-]+/pull/\d+")
 
 # Credential redaction for retained raw output (FAR-188 QA round 2): sandbox
 # commands run with OPENCODE_API_KEY and GITHUB_TOKEN (a PAT) injected, and
@@ -751,7 +890,13 @@ _PR_URL_PATTERN = _re.compile(r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_
 # any ``http(s)://...@host`` URL; ``_TOKEN_VALUE_PATTERN`` defensively masks
 # bare token values that follow known credential labels.
 _TOKENIZED_GIT_URL_PATTERN = _re.compile(r"(https?://)[^@\s/]+@")
-_TOKEN_VALUE_PATTERN = _re.compile(r"(x-access-token:|gh[pous]_|github_pat_|Bearer\s+|token=)[^\s\"'<>]+")
+# Label-based masking (covers short tokens including github_pat_ <50 chars)
+# plus the canonical bare-value patterns for fine-grained GitHub PATs and AWS
+# access keys, shared from the sensitive_mask canonical list.
+_TOKEN_VALUE_PATTERN = _re.compile(
+    r"(x-access-token:|gh[pous]_|github_pat_|Bearer\s+|token=)[^\s\"'<>]+"
+    r"|" + GITHUB_PAT_PATTERN.pattern + r"|" + AWS_ACCESS_KEY_PATTERN.pattern
+)
 
 
 def _extract_pr_url(raw_text: str) -> str:
@@ -878,6 +1023,8 @@ async def _retain_raw_output_marker(
     stderr_length: int,
     delivery_sentinel: str | None = None,
     status: str = "failed",
+    index: int | str | None = None,
+    payload: str | bytes | None = None,
 ) -> None:
     """Single builder + persist for a raw-output retention marker (FAR-188).
 
@@ -904,6 +1051,14 @@ async def _retain_raw_output_marker(
     monotone at the same-key write (see ``_persist_raw_output_marker``): a
     retry marker without the sentinel never unsets an existing
     ``delivery_done``.
+
+    ``index`` / ``payload`` (FAR-438) are threaded through to the persisted
+    marker's ``idempotency_key`` derivation so a fan-out cardinality position
+    and a content-version payload are folded into the key — the SAME arguments
+    the executor's suppression read passes, so both sides compute the identical
+    key. The sandbox node body call sites pass ``None`` (a single node has no
+    separate fan-out item / content-edit payload here; the node_id already
+    encodes ``parent+index`` for fan-out children).
     """
     text = _normalize_marker_text(source)
     marker: dict[str, Any] = {
@@ -928,6 +1083,8 @@ async def _retain_raw_output_marker(
         node_id=node_id,
         attempt_key=attempt_key,
         marker=marker,
+        index=index,
+        payload=payload,
     )
 
 
@@ -939,7 +1096,10 @@ async def _persist_raw_output_marker(
     node_id: str,
     attempt_key: str | None,
     marker: dict[str, Any],
-) -> None:
+    index: int | str | None = None,
+    payload: str | bytes | None = None,
+    promote_newest_key: bool = False,
+) -> bool:
     """Best-effort persist of a raw-output retention marker onto ``runs.raw_output_markers``.
 
     FAR-188 (QA round 1): the marker lives in a DEDICATED column keyed by
@@ -962,16 +1122,27 @@ async def _persist_raw_output_marker(
 
     NEVER raises (except cancellation): a persistence failure must not block the
     node's retryable raise — run terminalization depends on it.
+
+    DURABILITY GAP (known, documented, FAR-438): because the persist is
+    best-effort and swallows failures (a timeout or an exception is logged via
+    ``sandbox_agent.raw_output_marker_persist_timeout_or_error`` and the run
+    proceeds), the read-before-write dedupe's evidence (the ``delivery_done``
+    sentinel + the stamped ``idempotency_key``) can be LOST on a DB hiccup. If a
+    delivery genuinely happened but its marker was not persisted, the next
+    transient retry will NOT see ``delivery_done`` and will re-fire — a
+    potential double-write. This is a deliberate trade (failing open to preserve
+    the retryable raise beats blocking terminalization), but it means the
+    idempotency gate is best-effort, not exactly-once, under DB failure.
     """
     if session_factory is None:
         _log.warning(
             "sandbox_agent.raw_output_marker_skip_no_session",
             extra={"run_id": run_id, "node_id": node_id},
         )
-        return
+        return False
     if not run_id:
         _log.warning("sandbox_agent.raw_output_marker_skip_no_run_id", extra={"node_id": node_id})
-        return
+        return False
     org_uuid: uuid.UUID | None = None
     try:
         org_uuid = uuid.UUID(str(org_id_raw)) if org_id_raw else None
@@ -982,7 +1153,7 @@ async def _persist_raw_output_marker(
             "sandbox_agent.raw_output_marker_skip_unparseable_org",
             extra={"run_id": run_id, "node_id": node_id},
         )
-        return
+        return False
 
     try:
         await asyncio.wait_for(
@@ -993,6 +1164,9 @@ async def _persist_raw_output_marker(
                 node_id=node_id,
                 attempt_key=attempt_key,
                 marker=marker,
+                index=index,
+                payload=payload,
+                promote_newest_key=promote_newest_key,
             ),
             timeout=_RAW_OUTPUT_MARKER_PERSIST_TIMEOUT,
         )
@@ -1003,6 +1177,8 @@ async def _persist_raw_output_marker(
             "sandbox_agent.raw_output_marker_persist_timeout_or_error",
             extra={"run_id": run_id, "node_id": node_id, "attempt_key": attempt_key},
         )
+        return False
+    return True
 
 
 async def _write_raw_output_marker(
@@ -1013,6 +1189,9 @@ async def _write_raw_output_marker(
     node_id: str,
     attempt_key: str | None,
     marker: dict[str, Any],
+    index: int | str | None = None,
+    payload: str | bytes | None = None,
+    promote_newest_key: bool = False,
 ) -> None:
     """Bounded persist of a single raw-output retention marker row.
 
@@ -1043,7 +1222,31 @@ async def _write_raw_output_marker(
                 return
             markers = dict(run.raw_output_markers) if isinstance(run.raw_output_markers, dict) else {}
             key = attempt_key or f"run:{run_id}:node:{node_id}:fallback"
-            persisted_marker = _merge_existing_raw_output_marker(marker, markers.get(key))
+            # FAR-438 read-before-write: stamp the derived per-node idempotency key
+            # (from the run's PERSISTED run-level key) so a re-run that reuses the
+            # same key can suppress a duplicate write. Fail-open — a missing or
+            # malformed persisted key simply stamps nothing. Monotone: setdefault
+            # never downgrades an already-applied marker's key. ``index`` and
+            # ``payload`` are threaded into the derivation so fan-out cardinality
+            # and content-version keys are computed consistently with the
+            # suppression read (executor ``_idempotency_gate_ok``) — the same
+            # node_id at a different `index`, or the same node_id with an edited
+            # `payload`, must derive a DIFFERENT key.
+            run_ref = run.idempotency_key if hasattr(run, "idempotency_key") else None
+            if run_ref:
+                with suppress(TypeError, ValueError):
+                    derived = node_idempotency_key(run_ref, node_id, index=index, payload=payload)
+                    if promote_newest_key:
+                        # CONNECTOR path (FAR-458): a content-edit re-run that
+                        # delivers a NEWER payload must promote that newest
+                        # derived key, so the latest delivery is independently
+                        # suppressible and a superseded content-version is not.
+                        marker["idempotency_key"] = derived
+                    else:
+                        marker.setdefault("idempotency_key", derived)
+            persisted_marker = _merge_existing_raw_output_marker(
+                marker, markers.get(key), promote_newest_key=promote_newest_key
+            )
             markers[key] = persisted_marker
             run.raw_output_markers = markers
             await session.flush()
@@ -1065,13 +1268,23 @@ async def _write_raw_output_marker(
         )
 
 
-def _merge_existing_raw_output_marker(marker: dict[str, Any], existing: Any) -> dict[str, Any]:
+def _merge_existing_raw_output_marker(
+    marker: dict[str, Any], existing: Any, *, promote_newest_key: bool = False
+) -> dict[str, Any]:
     """Monotone preservation: a prior attempt's evidence is never wiped by a retry.
 
     A prior marker's non-empty ``pr_url`` and an OR'd ``delivery_done`` are
     retained; all other marker fields come from the new ``marker`` unchanged
     (pr_url is preserved as-is so a retry's empty pr_url never wipes
     attempt-1's evidence).
+
+    ``promote_newest_key`` (FAR-458 connector path) inverts the
+    ``idempotency_key`` handling: instead of pinning the marker to the first /
+    existing derived key, the NEWEST delivered content-version's key wins. This
+    is what lets a content-edit re-run promote a fresh key (so the edited
+    delivery is independently suppressible) rather than being pinned to a
+    superseded content-version's key (which would re-fire the edited payload as
+    an un-deduped double-submit).
     """
     if not isinstance(existing, dict):
         return marker
@@ -1080,14 +1293,17 @@ def _merge_existing_raw_output_marker(marker: dict[str, Any], existing: Any) -> 
         preserved["pr_url"] = existing["pr_url"]
     if existing.get("delivery_done") or marker.get("delivery_done"):
         preserved["delivery_done"] = True
-    if not preserved:
-        return marker
+    if promote_newest_key:
+        if marker.get("idempotency_key"):
+            preserved["idempotency_key"] = marker["idempotency_key"]
+    elif existing.get("idempotency_key"):
+        preserved["idempotency_key"] = existing["idempotency_key"]
     merged = dict(marker)
     merged.update(preserved)
     return merged
 
 
-def _idempotency_gate_skipped_envelope(node_id: str) -> dict[str, Any]:
+def _idempotency_gate_skipped_envelope(node_id: str, *, gate_tag: str = "email_sent") -> dict[str, Any]:
     """FAR-228: the single artifact envelope produced by BOTH guards.
 
     The ``output_json`` sub-key is REQUIRED so ``_split_sandbox_agent`` returns
@@ -1096,6 +1312,13 @@ def _idempotency_gate_skipped_envelope(node_id: str) -> dict[str, Any]:
     computes True for the single-node gated run; and ``idempotency_gate`` is
     what suppresses agent_signal re-firing (NEVER ``status == "skipped"`` —
     template-error skips fire today).
+
+    ``gate_tag`` (FAR-458) is the driver-readable reason recorded under
+    ``idempotency_gate`` — the sandbox path defaults to ``"email_sent"`` (the
+    FAR-228 delivery sentinel); a connector node that suppressed a duplicate
+    write passes ``"connector_write_suppressed"`` so observability shows the
+    real cause rather than a misleading email tag. Any non-empty tag works:
+    ``_node_output_has_idempotency_gate`` only checks truthiness.
     """
     return {
         "artifacts": [
@@ -1106,7 +1329,7 @@ def _idempotency_gate_skipped_envelope(node_id: str) -> dict[str, Any]:
                     "output_json": {
                         "status": "skipped",
                         "delivery_done": True,
-                        "idempotency_gate": "email_sent",
+                        "idempotency_gate": gate_tag,
                     }
                 },
             }
@@ -1171,6 +1394,434 @@ async def _read_run_raw_output_markers_for_gate(
             extra={"node_id": node_id, "run_id": run_id},
         )
         return None
+
+
+# FAR-458 connector-write idempotency: the connector node's write boundary is the
+# connector-specific UNKNOWN-recovery decision point. These helpers mirror the
+# sandbox marker machinery (`_retain_raw_output_marker` / `_persist_raw_output_marker`)
+# but read BOTH the run's persisted idempotency key AND its markers, and stamp a
+# `delivery_done` marker when a connector write genuinely succeeds — the evidence
+# the read-before-write suppression (`read_before_write_suppression`) requires.
+
+
+async def _read_connector_idempotency_gate_state(
+    session_factory: Callable[..., Any] | None,
+    *,
+    run_id: str,
+    org_id_raw: Any,
+    node_id: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read a rewrite-write run's ``(raw_output_markers, idempotency_key)``.
+
+    Bounded by ``_IDEMPOTENCY_GATE_READ_TIMEOUT`` (3s); fail-open to
+    ``(None, None)`` (the write proceeds, no suppression) on any failure — the
+    gate must never block a connector write. Reads the run row directly (no
+    claim-token fencing — a connector node has no dispatch lease), so only the
+    run id + org id are required. Returns the parsed markers dict (or ``None``)
+    and the persisted ``idempotency_key`` (or ``None`` when the run is missing
+    or carries no persisted key).
+
+    FENCING (FAR-458 MAJOR 3): the marker read is taken under
+    ``SELECT ... FOR UPDATE`` so concurrent re-runs of the same UNKNOWN write
+    serialise on the run row rather than both observing "no delivery_done" and
+    both firing the write. The deletion sentinel / delivery evidence is only
+    ever committed under the same row lock (``_write_raw_output_marker`` also
+    takes ``with_for_update``), so a gate decision cannot read past an
+    in-progress concurrent terminalization/stamp.
+
+    REMAINING WINDOW (honest, documented): this fences + serialises the gate
+    READS against the row, and the marker WRITE side takes the same lock, but
+    the actual upstream connector write executes between the gate returning and
+    the later ``delivery_done`` stamp — so two concurrently-started re-runs can
+    both pass the (now serialised) gate and both send the write before either
+    stamps. Fully closing that residual double-write requires a
+    ``write_started`` lease stamped under FOR UPDATE and held across the write;
+    that is intentionally NOT added here because a stale lease from a dead
+    pre-UNKNOWN execution would fail-CLOSED and block legitimate recovery
+    (the write never deferred). The marker write lock is what the sandbox path
+    relies on; this connector read now matches it.
+    """
+    if session_factory is None or not run_id:
+        return None, None
+    try:
+        org_uuid = uuid.UUID(str(org_id_raw)) if org_id_raw else None
+    except (TypeError, ValueError):
+        org_uuid = None
+    if org_uuid is None:
+        return None, None
+    from sqlalchemy import text as _sql_text
+
+    from modulo.db.rls import set_rls_execution_context, set_rls_org
+
+    async def _read() -> tuple[dict[str, Any] | None, str | None]:
+        async with session_factory() as session, session.begin():
+            await set_rls_org(session, org_uuid)
+            await set_rls_execution_context(session)
+            row = (
+                await session.execute(
+                    _sql_text(
+                        "SELECT raw_output_markers, idempotency_key FROM runs "
+                        "WHERE id=:rid AND organisation_id=:oid FOR UPDATE"
+                    ),
+                    {"rid": run_id, "oid": str(org_uuid)},
+                )
+            ).fetchone()
+            if row is None:
+                return None, None
+            markers = row[0]
+            markers_dict = markers if isinstance(markers, dict) else None
+            persisted_key = row[1]
+            return markers_dict, (str(persisted_key) if persisted_key else None)
+
+    try:
+        return await asyncio.wait_for(_read(), timeout=_IDEMPOTENCY_GATE_READ_TIMEOUT)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.warning(
+            "connector.idempotency_gate_read_failed",
+            extra={"node_id": node_id, "run_id": run_id},
+        )
+        return None, None
+
+
+def _connector_write_payload_hash(resource: str, filters: dict[str, Any] | None, data: dict[str, Any]) -> str:
+    """Stable full-write-identity hash for a connector write's key derivation.
+
+    Folds the WHOLE write identity into the key — not just ``data`` — so a
+    re-run that changes the write TARGET (``resource``, or a write-relevant
+    ``provider_ref``) with byte-identical ``data`` derives a DIFFERENT key and
+    is not wrongly suppressed. ``resource`` is the ``ConnectorPayload.resource``
+    (the write's destination/verb); ``provider_ref`` (the shell connector's
+    execution target) may live in either ``filters`` or ``data``, so both are
+    consulted. ``data`` is the rendered write body (``ConnectorPayload.data``).
+
+    It is serialised deterministically (sorted keys) so an unchanged re-run
+    produces the identical payload component — and thus the identical
+    idempotency key — while a genuinely-edited content-version OR target
+    produces a different one. ``str`` coercion covers non-JSON values (dates,
+    Paths) without raising.
+    """
+    import json as _json
+
+    provider_ref = filters.get("provider_ref") if isinstance(filters, dict) else None
+    if provider_ref is None and isinstance(data, dict):
+        provider_ref = data.get("provider_ref")
+    identity: dict[str, Any] = {"resource": resource, "provider_ref": provider_ref, "data": data}
+    # ``json.dumps(..., default=str)`` would stringify set/frozenset members via
+    # ``str(set)``, whose ordering is PYTHONHASHSEED-dependent — so the gate and
+    # stamp sides could derive DIFFERENT keys across worker processes and the
+    # connector-write dedup would be silently defeated. Pre-canonicalise only the
+    # non-JSON-native set containers to sorted lists (everything else is passed
+    # through unchanged, so the primary ``default=str`` path keeps handling
+    # dates/Paths as before and existing non-set keys are unaffected).
+    identity = _canonicalize_sets(identity)
+    try:
+        return _json.dumps(identity, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        # ``default=str`` handles the common non-JSON scalars (dates, Paths), so
+        # this branch only triggers on a genuinely unserialisable structure. Fall
+        # back to a DETERMINISTIC coercion (every value stringified, keys sorted)
+        # rather than ``repr`` — ``repr`` is NOT canonical across processes, so
+        # two different invocations could derive DIFFERENT keys and silently
+        # defeat the dedup (gate vs stamp side disagree). See
+        # ``canonical_payload_hash`` in trigger_engine/pre_guardrail.py.
+        return _json.dumps(_canonical_coerce(identity), sort_keys=True)
+
+
+def _canonicalize_sets(obj: Any) -> Any:
+    """Recursively convert set/frozenset containers to sorted lists.
+
+    ``json.dumps`` has no native encoding for sets and would otherwise fall back
+    to ``str(set)`` (via ``default=str``), whose member order depends on
+    ``PYTHONHASHSEED`` — producing different serialisations across worker
+    processes and silently defeating the connector-write dedup. Converting sets
+    to sorted lists (sorted by ``str`` of the coerced member, matching
+    :func:`_canonical_coerce`) makes the output byte-identical across processes.
+    All other containers and scalars are passed through unchanged so the primary
+    ``json.dumps(..., default=str)`` path keeps handling dates/Paths as before.
+    """
+    if isinstance(obj, dict):
+        return {k: _canonicalize_sets(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_canonicalize_sets(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        return sorted((_canonicalize_sets(v) for v in obj), key=str)
+    return obj
+
+
+def _canonical_coerce(obj: Any) -> Any:
+    """Deterministically coerce *obj* into a JSON-serialisable structure.
+
+    Every scalar becomes ``str`` and every mapping/sequence is rebuilt with
+    sorted/stable ordering so the result is byte-identical across processes —
+    used as the safe fallback in :func:`_connector_write_payload_hash` when the
+    primary ``json.dumps(..., default=str)`` still raises.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _canonical_coerce(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(obj, (list, tuple)):
+        return [_canonical_coerce(v) for v in obj]
+    if isinstance(obj, (set, frozenset)):
+        # Set iteration order is nondeterministic across processes
+        # (PYTHONHASHSEED); sort the coerced members so the serialisation stays
+        # byte-identical between the gate and stamp sides — otherwise two
+        # invocations could derive DIFFERENT keys and silently defeat the dedup.
+        return sorted((_canonical_coerce(v) for v in obj), key=str)
+    return str(obj)
+
+
+def _connector_marker_attempt_key(run_id: str, node_id: str) -> str:
+    """Stable marker key for a connector node's delivery record.
+
+    Unlike the sandbox path (which keys by ``claim_count`` per attempt), the
+    connector node makes ONE logical write per invocation, so a stable
+    ``run:{run_id}:node:{node_id}`` key lets a retry's marker merge with (and
+    preserve) the prior attempt's ``delivery_done`` via
+    ``_merge_existing_raw_output_marker``.
+    """
+    return f"run:{run_id}:node:{node_id}:connector"
+
+
+def _connector_on_unknown(connector: Any, resource: str) -> str:
+    """Read the effective ``on_unknown`` mode for a connector write to *resource*.
+
+    FAR-458: decisions of fail-open vs fail-closed on the ambiguous
+    (couldn't-confirm-delivery) path belong to the ACTION's semantics, so each
+    connector-op declares its own mode (``ConnectorBase.on_unknown_for``; REST
+    reads a per-op config value defaulting to ``fail_open``). The lookup is
+    defensive: a connector that does not expose ``on_unknown_for`` (or a reader
+    that raises) falls back to the fail-open default, so the gate never blocks a
+    write on a missing/illegible policy. Any value outside the three valid modes
+    is also coerced to ``fail_open`` (an invalid value is a config error the
+    connector surfaces loudly at parse time; the gate stays fail-open).
+    """
+    reader = getattr(connector, "on_unknown_for", None)
+    if not callable(reader):
+        return DEFAULT_ON_UNKNOWN
+    try:
+        mode = reader(resource)
+    except Exception:
+        _log.warning(
+            "connector.idempotency_gate.on_unknown_read_failed",
+            extra={"resource": resource},
+        )
+        return DEFAULT_ON_UNKNOWN
+    return mode if mode in ON_UNKNOWN_MODES else DEFAULT_ON_UNKNOWN
+
+
+async def _stamp_connector_write_delivered(
+    session_factory: Callable[..., Any] | None,
+    *,
+    run_id: str,
+    org_id_raw: Any,
+    node_id: str,
+    resource: str,
+    filters: dict[str, Any] | None,
+    data: dict[str, Any],
+    result: Any = None,
+) -> None:
+    """Best-effort persist of a ``delivery_done`` marker for a successful connector write.
+
+    FAR-458 MAJOR 1: the stamp fires only when the write GENUINELY succeeded.
+    Some connectors (e.g. ``ShellConnector.write`` for the ``command`` resource)
+    RETURN a failed result ``{"exit_code": <non-zero>}`` WITHOUT raising — so a
+    non-raising ``connector.write()`` is NOT proof of upstream delivery. Stamping
+    ``delivery_done`` on such a failed result would suppress the operator's
+    recover-by-re-run of the SAME run (the exact "silent miss" the code warns
+    about). When *result* carries a non-zero ``exit_code`` we therefore SKIP the
+    stamp entirely: the write is treated as undelivered and a re-run is free to
+    fire again. Connectors that raise on failure (or that do not report an
+    ``exit_code``) are unaffected — their success path still stamps as before.
+
+    Mirrors the sandbox marker persist (bounded, never raises) — the evidence
+    a connector write genuinely reached upstream. Fail-open: a persistence
+    failure is logged and ignored, so a DB hiccup cannot convert a successful
+    write into a failed node. When no run id / session factory is available the
+    marker is skipped (the write still succeeds).
+
+    ``resource`` / ``filters`` / ``data`` are the FULL write identity folded
+    into the marker's derived ``idempotency_key`` (via
+    :func:`_connector_write_payload_hash`) on BOTH the stamp and gate sides, so
+    a re-run that edits the content OR the target derives the matching key.
+
+    MAJOR 1 (FAR-458): the connector marker slot is keyed ONCE per
+    ``(run, node)``; a content-edit re-run must PROMOTE the newest delivered
+    key (``promote_newest_key=True``) rather than pin the slot to a superseded
+    key — otherwise a later re-run of the edited payload misfires (double
+    submit) while a re-run of the superseded original is wrongly suppressed.
+
+    DURABILITY (FAR-458 MAJOR 4): persistence is best-effort, so a lost marker
+    silently turns a delivered write into a potential double-submit on re-run.
+    Emits the structured ``connector.idempotency_marker_lost`` counter on any
+    non-persisted marker so the loss is observable in analytics/metrics; the
+    underlying failure is already logged by ``_persist_raw_output_marker``.
+    """
+    if session_factory is None or not run_id:
+        return
+    # MAJOR 1: do not stamp ``delivery_done`` for a write that reported failure
+    # without raising (e.g. shell ``command`` returning exit_code != 0). A failed
+    # write is NOT confirmed delivery, so the gate must not suppress its re-run.
+    if isinstance(result, dict) and "exit_code" in result and result.get("exit_code") != 0:
+        _log.info(
+            "connector.idempotency_marker_skip_failed_write",
+            extra={
+                "run_id": run_id,
+                "node_id": node_id,
+                "resource": resource,
+                "exit_code": result.get("exit_code"),
+                "hint": "write_reported_failure_no_delivery_done_stamp_rerun_allowed",
+            },
+        )
+        return
+    payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
+    attempt_key = _connector_marker_attempt_key(run_id, node_id)
+    marker: dict[str, Any] = {
+        "_modulo_marker": True,
+        "status": "completed",
+        "summary": "connector write delivered (delivery_done)",
+        "node_id": node_id,
+        "attempt_key": attempt_key,
+        "delivery_done": True,
+    }
+    persisted = await _persist_raw_output_marker(
+        session_factory,
+        run_id=run_id,
+        org_id_raw=org_id_raw,
+        node_id=node_id,
+        attempt_key=attempt_key,
+        marker=marker,
+        index=None,
+        payload=payload,
+        promote_newest_key=True,
+    )
+    if not persisted:
+        _log.warning(
+            "connector.idempotency_marker_lost",
+            extra={
+                "run_id": run_id,
+                "node_id": node_id,
+                "attempt_key": attempt_key,
+                "hint": "delivery_marker_not_persisted_can_double_submit_on_rerun",
+            },
+        )
+
+
+async def _connector_write_gate(
+    session_factory: Callable[..., Any] | None,
+    *,
+    run_id: str,
+    org_id_raw: Any,
+    node_id: str,
+    resource: str,
+    filters: dict[str, Any] | None,
+    data: dict[str, Any],
+    on_unknown: str = "fail_open",
+) -> dict[str, Any] | None:
+    """FAR-458 read-before-write gate for a connector write.
+
+    Suppresses (returns a skipped envelope) in EXACTLY two situations:
+
+    1. **CONFIRMED delivery** (the dedup's whole point, mode-INDEPENDENT): the
+       run's persisted idempotency key derives a per-node key that a recorded
+       marker carries WITH ``delivery_done is True`` — a genuine prior upstream
+       delivery. Always suppressed, regardless of ``on_unknown``.
+    2. **AMBIGUOUS delivery** (governed by ``on_unknown``): a recorded marker
+       carries the SAME derived key but WITHOUT ``delivery_done is True`` — a
+       prior attempt touched this exact write but its delivery could not be
+       confirmed. ``on_unknown="fail_closed"`` suppresses (possible silent miss;
+       the operator reconciles); ``on_unknown="fail_open"`` (default) does NOT
+       suppress (the write fires, possible duplicate — usually recoverable).
+
+    A first-time write (no marker) or a changed-payload/target re-run (a
+    DIFFERENT derived key) is NEVER suppressed. ``on_unknown="off"`` bypasses
+    the gate entirely — the write always fires, never deduped.
+
+    ``on_unknown`` (FAR-458) is the per-connector-per-write idempotency mode read
+    from the connector's write op config (see ``ConnectorBase.on_unknown_for`` /
+    ``_connector_on_unknown``). The default ``fail_open`` preserves the
+    pre-existing fail-open gate contract: an ambiguous-but-unconfirmed delivery is
+    re-attempted rather than silently dropped. A CONFIRMED-delivered write is
+    still suppressed in every mode except ``off``.
+
+    ``resource`` / ``filters`` / ``data`` (MAJOR 2) are the FULL write identity
+    folded into the derived key (via :func:`_connector_write_payload_hash`) on
+    BOTH this gate side and the marker-stamp side, so a re-run that edits the
+    content OR the write target (resource / ``provider_ref``) derives a
+    DIFFERENT key and is NOT suppressed (the edit or new target is never
+    silently deduped), while an unchanged re-run reuses the same key and IS
+    suppressed. Threads the write-content ``payload`` into the key derivation.
+
+    Fail-open in every direction (missing run id / session factory / persisted
+    key, killswitch off, DB error, malformed key) returns ``None`` — the write
+    proceeds, never blocked. The killswitch
+    ``modulo_connector_write_gate_enabled`` is GENUINELY OPT-IN: it defaults to
+    ``False`` (set in ``modulo.settings``), so a deploy never silently suppresses
+    byte-identical re-executed connector writes — a behavioural change vs. the
+    pre-FAR-458 contract where every visit fired. Operators enable it explicitly.
+    """
+    if session_factory is None or not run_id:
+        return None
+    # FAR-458 per-op bypass: ``off`` never dedupes — the write always fires. This
+    # short-circuits BEFORE the killswitch and the marker read (the gate is
+    # bypassed entirely for this op).
+    if on_unknown == "off":
+        return None
+    try:
+        from modulo.settings import get_settings
+
+        if not getattr(get_settings(), "modulo_connector_write_gate_enabled", False):
+            return None
+    except Exception:
+        # Killswitch read failure must not block a write — proceed (fail-open).
+        _log.warning(
+            "connector.idempotency_gate_killswitch_check_failed",
+            extra={"node_id": node_id, "run_id": run_id},
+        )
+        return None
+    payload = _connector_write_payload_hash(resource=resource, filters=filters, data=data)
+    markers, persisted_key = await _read_connector_idempotency_gate_state(
+        session_factory,
+        run_id=run_id,
+        org_id_raw=org_id_raw,
+        node_id=node_id,
+    )
+    if not persisted_key:
+        return None
+    try:
+        suppressed = read_before_write_suppression(
+            markers,
+            run_ref=persisted_key,
+            node_ref=node_id,
+            index=None,
+            payload=payload,
+        )
+    except ValueError:
+        return None
+    if suppressed:
+        _log.info(
+            "connector.idempotency_gate.suppressed_write",
+            extra={"run_id": run_id, "node_id": node_id},
+        )
+        return _idempotency_gate_skipped_envelope(node_id, gate_tag="connector_write_suppressed")
+    if on_unknown == "fail_closed":
+        try:
+            ambiguous = read_before_write_ambiguous(
+                markers,
+                run_ref=persisted_key,
+                node_ref=node_id,
+                index=None,
+                payload=payload,
+            )
+        except ValueError:
+            ambiguous = False
+        if ambiguous:
+            _log.info(
+                "connector.idempotency_gate.fail_closed_suppressed",
+                extra={"run_id": run_id, "node_id": node_id},
+            )
+            return _idempotency_gate_skipped_envelope(node_id, gate_tag="connector_write_fail_closed")
+    return None
 
 
 def _evaluate_eval_condition(score: float, threshold: float, operator: str) -> bool:
@@ -1485,9 +2136,15 @@ def _render_agent_prompt(
     """
     env = SandboxedEnvironment()
     template = env.from_string(prompt_template)
+    # FAR-418 / FAR-436: context_scope — the agent's run_context VIEW (the keys
+    # fed to the prompt template) is allowlist-gated to the node's need-to-know
+    # set. Internal control keys are always preserved by filter_run_context_scope
+    # (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy (full run_context view).
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
     template_vars: dict[str, Any] = {
         "state": state,
-        "run_context": run_context,
+        "run_context": scoped_run_context,
         "input": raw_input,
     }
     resolved = node_def.get("_resolved_parameters")
@@ -1560,7 +2217,7 @@ def make_node_fn(
     role: str | None = None,
     timeout: float | None = None,
     max_input_length: int | None = None,
-    token_budget: int | None = None,
+    token_budget: int | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); budget enforced at executor level
 ) -> Any:
     """Return a decorated async node function for use in a StateGraph.
 
@@ -1632,9 +2289,23 @@ def make_node_fn(
         if not model_backend_id_str:
             return {"artifacts": [{"node_id": node_id, "status": "executed"}]}
 
+        # FAR-418: context_scope — the agent's run_context VIEW (the keys fed to
+        # the prompt template) is allowlist-gated to the node's need-to-know set.
+        # The machinery reads (run_overrides, autonomy) still use the full
+        # run_context so internal control keys are never starved.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+        # FAR-418 (MAJOR-3 fix): the need-to-know boundary must also bind the
+        # ``state.run_context`` view. ``state`` otherwise carries the full,
+        # unscoped run_context, so a template could read gated keys via
+        # ``{{ state.run_context.<key> }}`` and defeat the boundary. Pass a
+        # shallow copy with the scoped run_context in place — the live state dict
+        # is never mutated.
+        scoped_state = dict(state)
+        scoped_state["run_context"] = scoped_run_context
         rendered_prompt, routing_mode = _render_agent_prompt(
-            state=state,
-            run_context=run_context,
+            state=scoped_state,
+            run_context=scoped_run_context,
             raw_input=raw_input,
             prompt_template=prompt_template,
             node_def=node_def,
@@ -1646,6 +2317,65 @@ def make_node_fn(
 
     _node.__name__ = f"node_{node_id}"
     return _node
+
+
+def make_router_node_fn(
+    router_config: dict[str, Any],
+    *,
+    node_id: str | None = None,
+) -> Callable[[dict[str, Any]], str]:
+    """Build a LangGraph *routing* function for a Router node (FAR-402 P1 / F2-A).
+
+    Evaluates ordered ``rules`` ``{guard (JMESPath), target}`` against state,
+    first-match-wins. An explicit ``default`` rule maps to its target. LLM
+    routing mode (``mode == "classifier"``) matches the ``_llm_next_node`` state
+    value against each rule's ``label`` (falling back to the default rule).
+
+    The function reuses the shared JMESPath evaluator
+    (:func:`evaluate_jmespath_condition`) — the same engine the existing
+    conditional-edge compile path uses — so Router lowers onto that machinery.
+    Every other branching primitive shares one truthiness rule.
+
+    When no rule matches and there is no ``default`` rule, raises
+    :class:`RouterNoMatchError` so the executor terminalizes the run with the
+    ``router_no_match`` status (a terminal, non-failure outcome). Compile-time
+    default-rule enforcement (see :func:`_validate_router_config`) is the
+    primary guard; this runtime raise is the backstop for a mis-configured
+    graph that slipped past validation.
+    """
+    rules: list[dict[str, Any]] = list(router_config.get("rules", []))
+    classifier_mode: bool = router_config.get("mode") == "classifier"
+
+    # Store (guard_expr, target) tuples. The guards are evaluated through the
+    # shared JMESPath evaluator so Router and the conditional-edge compile path
+    # share ONE truthiness rule.
+    rule_targets: list[tuple[str | None, str | None]] = []
+    default_target: str | None = None
+    for rule in rules:
+        target = rule.get("target") or rule.get("target_port")
+        if rule.get("default"):
+            default_target = target
+            continue
+        rule_targets.append((rule.get("guard"), target))
+
+    def _router(state: dict[str, Any]) -> str:
+        for guard, target in rule_targets:
+            if target is not None and evaluate_jmespath_condition(state, guard):
+                return target
+        if classifier_mode:
+            label = state.get("_llm_next_node")
+            if label is not None:
+                for rule in rules:
+                    if rule.get("label") == label:
+                        matched: str | None = rule.get("target") or rule.get("target_port")
+                        if matched is not None:
+                            return matched
+        if default_target:
+            return default_target
+        raise RouterNoMatchError(node_id=node_id)
+
+    _router.__name__ = f"router_{node_id}" if node_id else "router"
+    return _router
 
 
 async def _invoke_backend(
@@ -1943,13 +2673,14 @@ def _hitl_gate_condition_skip(gate_id: str, condition_expr: str | None, state: d
     """Evaluate the conditional-gate JMESPath expression; skip artifact when falsy."""
     if condition_expr:
         try:
-            compiled = jmespath.compile(condition_expr)
-        except jmespath.exceptions.JMESPathError:
+            compiled = compile_jmespath(condition_expr)
+        except ValueError:
             _log.exception("hitl_gate.invalid_condition", extra={"condition": condition_expr})
             raise ValueError(f"Invalid HITL gate condition expression: {condition_expr}") from None
         result = compiled.search(state)
-        if not _is_truthy(result):
-            # Condition falsy — skip the gate entirely.
+        if not bool(result):
+            # Condition falsy — skip the gate entirely. Preserve the raw result
+            # in the artifact (mirrors the pre-refactor behaviour).
             return _build_hitl_gate_artifact(
                 gate_id, "condition_skipped", condition=condition_expr, condition_result=result
             )
@@ -2226,7 +2957,7 @@ def make_hitl_gate_fn(
 def make_manual_node_fn(
     node_def: dict[str, Any],
     *,
-    timeout: float | None = None,
+    timeout: float | None = None,  # NOSONAR S1172 - API kwarg (graph_cache); manual nodes never time out
 ) -> Any:
     """Return a node function for a manual-input node.
 
@@ -2295,13 +3026,25 @@ def make_manual_node_fn(
 def _resolve_binding_connector(
     binding: dict[str, Any],
     node_id: str,
+    *,
+    allowed_connectors: list[str] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve a bound connector instance for *node_id*.
 
     Returns ``(connector, None)`` on success, or ``(None, error_artifact)``
-    when the hub is unavailable, the instance id is missing, or the connector
-    cannot be resolved — the error artifact is already enveloped for return.
+    when the hub is unavailable, the instance id is missing, the connector
+    is outside the node's ``capability_scope.allowed_connectors``, or the
+    connector cannot be resolved — the error artifact is already enveloped.
+
+    FAR-418: when *allowed_connectors* is set, a bound connector excluded by
+    the scope fails FAST with a typed, logged, metric-emitting
+    ``ScopeViolationError`` (never silently). Absent = unrestricted.
     """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        is_connector_allowed,
+        record_scope_violation,
+    )
     from modulo.core.pipeline_engine.decorator import get_connector_hub
 
     hub = get_connector_hub()
@@ -2317,8 +3060,23 @@ def _resolve_binding_connector(
 
     import uuid as _uuid
 
+    instance_uuid = _uuid.UUID(str(instance_id_str))
+
+    # FAR-418: deny-by-default within the node's connector scope.
+    connector_type: str = binding.get("type", "")
+    if not is_connector_allowed(
+        connector_instance_id=instance_uuid,
+        connector_type=connector_type,
+        allowed_connectors=allowed_connectors,
+    ):
+        target = connector_type or str(instance_uuid)
+        scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+        record_scope_violation(node_id=node_id, target=target, kind="connector")
+        _log.error("scope.violation node=%s connector=%s", node_id, target)
+        return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
     try:
-        connector = hub.get(_uuid.UUID(str(instance_id_str)))
+        connector = hub.get(instance_uuid)
     except Exception as _conn_exc:
         return None, {"artifacts": [{"node_id": node_id, "status": "failed", "error": f"connector error: {_conn_exc}"}]}
     return connector, None
@@ -2346,10 +3104,89 @@ def _connector_inputs(binding: dict[str, Any], state: dict[str, Any]) -> tuple[s
     return resource, filters, data
 
 
+def _enforce_connector_scope(
+    binding: dict[str, Any],
+    node_id: str,
+    connector_type: str,
+    allowed_connectors: list[str] | None,
+) -> dict[str, Any] | None:
+    """FAR-418 deny-by-default scope gate for a connector node.
+
+    Fires BEFORE the connector is resolved from the hub, so a node that targets
+    a connector excluded by its ``capability_scope`` never decrypts or touches
+    the connection (fail-fast with a typed, logged, metric-emitting
+    ``ScopeViolationError``). The hub is only consulted for in-scope connectors.
+    Returns a failed-artifact dict on violation, else ``None``.
+    """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        is_connector_allowed,
+        record_scope_violation,
+    )
+
+    instance_id_str = binding.get("instance_id")
+    if not instance_id_str:
+        return None
+    import uuid as _uuid
+
+    instance_uuid = _uuid.UUID(str(instance_id_str))
+    if is_connector_allowed(
+        connector_instance_id=instance_uuid,
+        connector_type=connector_type,
+        allowed_connectors=allowed_connectors,
+    ):
+        return None
+    target = connector_type or str(instance_uuid)
+    scope_err = ScopeViolationError(node_id=node_id, target=target, kind="connector")
+    record_scope_violation(node_id=node_id, target=target, kind="connector")
+    _log.error("scope.violation node=%s connector=%s", node_id, target)
+    return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+
+
+async def _run_connector_action(
+    connector: Any,
+    op: str,
+    resource: str,
+    filters: dict[str, Any],
+    data: dict[str, Any],
+) -> Any:
+    """Execute a connector ``write``/``query`` action and return its result."""
+    from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+
+    if op == "write":
+        payload = ConnectorPayload(resource=resource, data=data)
+        return await connector.write(payload)
+    query = ConnectorQuery(resource=resource, filters=filters)
+    return await connector.query(query)
+
+
+def _guard_connector_secret_output(result: Any, node_id: str) -> dict[str, Any] | None:
+    """FAR-418 secret hygiene: connector/secret OBJECTS are never valid port
+    payload types — only opaque connector IDs may enter state.
+
+    Guards the output before it is written into the run's state/ports. Returns
+    a failed-artifact dict on violation, else ``None``.
+    """
+    from modulo.core.capability_scope import (
+        ScopeViolationError,
+        assert_no_secret_objects,
+        record_scope_violation,
+    )
+
+    try:
+        assert_no_secret_objects(result, node_id=node_id)
+    except ScopeViolationError as scope_err:
+        record_scope_violation(node_id=node_id, target=scope_err.target, kind="secret")
+        _log.error("scope.violation node=%s secret=%s", node_id, scope_err.target)
+        return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(scope_err)}]}
+    return None
+
+
 def make_connector_fn(
     node_def: dict[str, Any],
     *,
     timeout: float | None = None,
+    session_factory: Callable[..., Any] | None = None,
 ) -> Any:
     """Return a decorated async node function that resolves a connector
     from the ConnectorHub and executes a connector action (query/write).
@@ -2359,10 +3196,36 @@ def make_connector_fn(
       - type: connector type (e.g. 'shell')
       - operation: 'query' or 'write' (optional, default 'query')
       - input: dict of input parameters (optional)
+
+    ``session_factory`` (FAR-458) enables the connector-write UNKNOWN-recovery
+    read-before-write dedupe: for a ``write`` operation the node loads the run's
+    persisted idempotency key + markers and, when ``read_before_write_suppression``
+    reports the write was already delivered on the SAME derived key, returns a
+    skipped envelope WITHOUT re-sending the duplicate upstream write. On a
+    successful write it stamps a ``delivery_done`` marker (the evidence the
+    suppression consumes). Both paths are STRICTLY fail-open: a missing run id /
+    session factory / persisted key, or a DB error, proceeds exactly as before
+    (write sent, no suppression), so the gate can never block or change a
+    connector write that has no idempotency context.
+
+    FAR-458 refinement: the AMBIGUOUS (couldn't-confirm-delivery) decision is
+    per-connector-per-write via the connector's ``on_unknown`` mode
+    (``ConnectorBase.on_unknown_for`` / ``_connector_on_unknown``). The default
+    ``fail_open`` keeps the gate fail-open on ambiguity (possible duplicate);
+    ``fail_closed`` suppresses an ambiguous write (possible silent miss);
+    ``off`` bypasses the gate entirely. The CONFIRMED-delivered suppression is
+    mode-independent.
     """
     node_id: str = str(node_def["id"])
     binding = node_def.get("connector_binding") or {}
     op: str = binding.get("operation", "query")
+    # FAR-418: node-level capability_scope. ``allowed_connectors`` narrows (never
+    # widens) which connectors this node may resolve — deny-by-default within the
+    # scope. Absent/empty (the UNRESTRICTED default) preserves the pre-scope
+    # behaviour: the node may use anything the hub fetched.
+    scope = node_def.get("capability_scope") or {}
+    allowed_connectors: list[str] | None = scope.get("allowed_connectors")
+    connector_type: str = binding.get("type", "")
 
     @cancellable_node(timeout=timeout)
     async def _connector_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -2376,23 +3239,70 @@ def make_connector_fn(
             connector_instance_ids=[instance_id] if instance_id is not None else [],
         )
 
-        from modulo.connectors.base import ConnectorPayload, ConnectorQuery
+        scope_block = _enforce_connector_scope(binding, node_id, connector_type, allowed_connectors)
+        if scope_block is not None:
+            return scope_block
 
-        connector, error_artifact = _resolve_binding_connector(binding, node_id)
+        connector, error_artifact = _resolve_binding_connector(
+            binding,
+            node_id,
+            allowed_connectors=allowed_connectors,
+        )
         if error_artifact is not None:
             return error_artifact
 
         resource, filters, data = _connector_inputs(binding, state)
 
+        # FAR-458 connector-write UNKNOWN-recovery: the read-before-write dedupe
+        # decision point. Only a WRITE is side-effecting; a query never double-
+        # submits. The gate reads the run's persisted idempotency key + markers,
+        # and suppresses a CONFIRMED-delivered duplicate (matching key +
+        # ``delivery_done``) in EVERY mode, and additionally suppresses an
+        # AMBIGUOUS (matching key, no ``delivery_done``) write when the
+        # connector's ``on_unknown`` policy is ``fail_closed``. Fail-open in
+        # every direction — no run id / session factory / persisted key, the
+        # killswitch, a DB error, or ``on_unknown="off"`` all proceed to send the
+        # write normally; default ``fail_open`` lets an unconfirmed write fire.
+        if op == "write":
+            run_id = str(state.get("_run_id", "") or "")
+            gate_result = await _connector_write_gate(
+                session_factory,
+                run_id=run_id,
+                org_id_raw=state.get("_org_id"),
+                node_id=node_id,
+                resource=resource,
+                filters=filters,
+                data=data,
+                on_unknown=_connector_on_unknown(connector, resource),
+            )
+            if gate_result is not None:
+                return gate_result
+
         try:
-            if op == "write":
-                payload = ConnectorPayload(resource=resource, data=data)
-                result = await connector.write(payload)
-            else:
-                query = ConnectorQuery(resource=resource, filters=filters)
-                result = await connector.query(query)
+            result = await _run_connector_action(connector, op, resource, filters, data)
         except Exception as exc:
             return {"artifacts": [{"node_id": node_id, "status": "failed", "error": str(exc)}]}
+
+        # FAR-458: a successful connector WRITE genuinely reached upstream —
+        # stamp the delivery marker (bounded, fail-open) so a re-run reusing the
+        # SAME persisted key suppresses the duplicate. The full write identity
+        # (resource + filters + data) is folded into the derived key on BOTH the
+        # gate and the stamp so a target/content edit derives a fresh key.
+        if op == "write":
+            await _stamp_connector_write_delivered(
+                session_factory,
+                run_id=str(state.get("_run_id", "") or ""),
+                org_id_raw=state.get("_org_id"),
+                node_id=node_id,
+                resource=resource,
+                filters=filters,
+                data=data,
+                result=result,
+            )
+
+        scope_block = _guard_connector_secret_output(result, node_id)
+        if scope_block is not None:
+            return scope_block
 
         return {
             "artifacts": [{"node_id": node_id, "status": "completed", "output": result}],
@@ -2413,8 +3323,12 @@ async def resolve_env_var_refs(
     """Resolve ``{{ secrets.KEY }}`` references in env var values.
 
     Non-reference values pass through unchanged. ``{{ secrets.KEY }}`` values
-    are resolved via *resolver*; a missing secret resolves to ``""`` and logs a
-    warning (legacy behaviour), never raising.
+    are resolved via *resolver*; an UNRESOLVED reference (resolver returns
+    None) is OMITTED from the returned dict with a warning naming the key
+    (FAR-480). It is never resolved to an empty string: an empty value would
+    still reach the sandbox envs dict and CLOBBER the system-injected default
+    (e.g. the host GITHUB_TOKEN), silently breaking the sandbox credential.
+    Never raises.
     """
     resolved: dict[str, str] = {}
     for key, value in env_vars.items():
@@ -2423,10 +3337,14 @@ async def resolve_env_var_refs(
             secret_key = m.group(1)
             resolved_value = await resolver(secret_key)
             if resolved_value is None:
-                _log.warning("env_var.secret_ref_not_found", extra={"key": key, "secret_key": secret_key})
-                resolved[key] = ""
-            else:
-                resolved[key] = resolved_value
+                _log.warning(
+                    "env_var.secret_ref_not_found: env var %s references secret %r "
+                    "which could not be resolved — key omitted from sandbox envs",
+                    key,
+                    secret_key,
+                )
+                continue
+            resolved[key] = resolved_value
         else:
             resolved[key] = value
     return resolved
@@ -2637,6 +3555,11 @@ async def _sandbox_resolve_secret_ref(
     rotation on every run. Returns None if the key is not in the vault
     (does NOT fall back to the process environment to prevent secret
     exfiltration via pipeline references).
+
+    FAR-480: the unresolvable-context paths (no session_factory, missing or
+    invalid org_id) log a warning naming the secret key — they used to be
+    silent, which made an unresolved ``{{ secrets.X }}`` env ref invisible in
+    production until the sandbox failed on the missing credential.
     """
     if session_factory is not None:
         org_uuid: uuid.UUID | None = None
@@ -2661,6 +3584,18 @@ async def _sandbox_resolve_secret_ref(
                 pass  # not in vault -> return None
             except Exception:
                 _log.exception("env_var.secret_resolve_error", extra={"secret_key": secret_key})
+        else:
+            _log.warning(
+                "env_var.secret_ref_no_org_context: secret %r cannot be resolved from the "
+                "org vault (run org_id is missing or invalid) — ref will be omitted from sandbox envs",
+                secret_key,
+            )
+    else:
+        _log.warning(
+            "env_var.secret_ref_no_db_context: secret %r cannot be resolved from the "
+            "org vault (no DB session factory on this execution path) — ref will be omitted from sandbox envs",
+            secret_key,
+        )
     return None
 
 
@@ -2988,7 +3923,6 @@ class _SandboxWatchdog:
         sandbox_mode: str,
         stdout_percentage_delta: float | None,
         stream_broker: RunEventBroker | None,
-        stream_enabled: bool,
         drained_chunks: list[str],
         wallclock_budget_seconds: int | None,
         start_time: float,
@@ -3005,7 +3939,7 @@ class _SandboxWatchdog:
         self._sandbox_mode = sandbox_mode
         self._stdout_ratio = stdout_percentage_delta
         self._stream_broker = stream_broker
-        self._stream_enabled = stream_enabled
+        self._stream_enabled = isinstance(stream_broker, RunEventBroker)
         self._drained_chunks = drained_chunks
         self._activity: dict[str, Any] = {"last": time.monotonic()}
         self._stdout_prev: str | None = None
@@ -3544,6 +4478,35 @@ class _SandboxNodeOutput(NamedTuple):
     error_message: Any = _UNSET
     sandbox_id: Any = _UNSET
     sandbox_log_tail: Any = _UNSET
+    # FAR-510: True ONLY on the runner's synthetic failure envelopes (the
+    # executor's downgrade predicate keys on this marker, never on summary
+    # text). Default False so honest envelopes carry no marker key at all.
+    modulo_synthetic_failure: bool = False
+
+
+def _format_sandbox_provider_error(exc: Exception, provider_exc_type: type | None = None) -> str:
+    """Compose a run-output-safe error message, enriching provider exceptions.
+
+    FAR-511: a bare ``str(exc)`` for an e2b ``SandboxException`` already carries
+    the HTTP status (e.g. ``400: Timeout cannot be greater than 1 hours``), but
+    the provider's response body may carry extra detail. When ``provider_exc_type``
+    (e.g. ``e2b.exceptions.SandboxException``) is supplied and matches, append the
+    response body so ``get_run_output`` reveals the full provisioning failure
+    rather than a masked "Sandbox agent execution failed".
+    """
+    msg = str(exc)[:_MAX_ERROR_MSG]
+    if provider_exc_type is not None and isinstance(exc, provider_exc_type):
+        response = getattr(exc, "response", None)
+        if response is not None:
+            body = getattr(response, "text", None)
+            if not body and isinstance(response, (dict, list)):
+                try:
+                    body = json.dumps(response)
+                except (TypeError, ValueError):
+                    body = None
+            if body:
+                msg = f"{msg} — {body}"[:_MAX_ERROR_MSG]
+    return msg
 
 
 def _build_sandbox_node_envelope(
@@ -3561,7 +4524,12 @@ def _build_sandbox_node_envelope(
     success path's ``changed_files``/``pr_url``, the generic-exception path's
     ``error_type``/``error_message``). Optional fields are omitted when left at
     the ``_UNSET`` sentinel so each path emits exactly the key set it did
-    before this extraction.
+    before this extraction. The FAR-510 synthetic-failure marker
+    (``MODULO_SYNTHETIC_FAILURE_MARKER``) is stamped into BOTH views only when
+    ``output.modulo_synthetic_failure`` is True — honest envelopes carry no
+    marker key at all, and the marker is deliberately NOT in
+    ``exclude_from_output`` so it survives into the persisted telemetry view
+    (and, after the P1b split, into ``node_telemetry_json``).
     """
     inner: dict[str, Any] = {
         "status": output.status,
@@ -3570,6 +4538,7 @@ def _build_sandbox_node_envelope(
         "wall_clock_time_ms": output.wall_clock_time_ms,
         "cost_estimate_usd": output.cost_estimate_usd,
         **_build_model_cost_fields(output.cost_source),
+        **_build_token_usage_fields(output.cost_source),
     }
     if output.output_json is not _UNSET:
         inner["output_json"] = output.output_json
@@ -3597,6 +4566,8 @@ def _build_sandbox_node_envelope(
         inner["sandbox_id"] = output.sandbox_id
     if output.sandbox_log_tail is not _UNSET:
         inner["sandbox_log_tail"] = output.sandbox_log_tail
+    if output.modulo_synthetic_failure:
+        inner[MODULO_SYNTHETIC_FAILURE_MARKER] = True
     inner["attempt_key"] = output.attempt_key
     excluded = frozenset(("output_json", "exit_code")) | exclude_from_output
     outer = {key: value for key, value in inner.items() if key not in excluded}
@@ -3721,7 +4692,7 @@ def _script_enforcement_requires_remote(
     )
 
 
-async def _sandbox_agent_impl(
+async def _sandbox_agent_impl(  # NOSONAR S3776 - sandbox root dispatch; delegates to extracted helpers (FAR-310)
     state: dict[str, Any],
     *,
     config: _SandboxNodeConfig,
@@ -3756,7 +4727,7 @@ async def _sandbox_agent_impl(
     single_sandbox_node = config.single_sandbox_node
 
     from e2b import AsyncSandbox
-    from e2b.exceptions import RateLimitException
+    from e2b.exceptions import RateLimitException, SandboxException
     from opentelemetry import trace as _otel_trace
 
     from modulo.core.guardrails.loop_intercept import (
@@ -3778,9 +4749,23 @@ async def _sandbox_agent_impl(
     run_context: dict[str, Any] = state.get("run_context") or {}
     raw_input: Any = run_context.get("input", {})
 
-    run_id: str = str(state.get("_run_id", ""))
-    pipeline_id: str = str(state.get("_pipeline_id", ""))
-    org_id: str = str(state.get("_org_id", ""))
+    # FAR-418 (MAJOR-3 fix, sandbox_agent path): the sandbox agent's render view
+    # must be bound by context_scope too — otherwise a gated run_context key leaks
+    # into the rendered prompt (written to /home/user/prompt.md) and agent_command
+    # via ``{{ run_context.<key> }}`` / ``{{ state.run_context.<key> }}``. Mirror
+    # the make_node_fn scoped_state/scoped_run_context boundary. ``raw_input`` stays
+    # sourced from the full run_context so input routing is unaffected.
+    _node_cap = node_def.get("capability_scope") or {}
+    scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
+    scoped_state = dict(state)
+    scoped_state["run_context"] = scoped_run_context
+
+    _run_id = state.get("_run_id")
+    _pipeline_id = state.get("_pipeline_id")
+    _org_id = state.get("_org_id")
+    run_id: str = str(_run_id) if _run_id is not None else ""
+    pipeline_id: str = str(_pipeline_id) if _pipeline_id is not None else ""
+    org_id: str = str(_org_id) if _org_id is not None else ""
 
     # FAR-296 mode split: llm mode renders the prompt + agent_command through
     # the SandboxedEnvironment; script mode runs script_command VERBATIM —
@@ -3791,9 +4776,15 @@ async def _sandbox_agent_impl(
     else:
         env = SandboxedEnvironment()
         template = env.from_string(agent_prompt_template)
+        # FAR-436: context_scope — the sandbox agent's run_context VIEW (the keys
+        # fed to the prompt + agent_command templates) is allowlist-gated to the
+        # node's need-to-know set. Internal control keys are always preserved by
+        # filter_run_context_scope (_CONTEXT_ALWAYS_KEPT). Absent scope = legacy.
+        _node_cap = node_def.get("capability_scope") or {}
+        scoped_run_context = filter_run_context_scope(run_context, _node_cap.get("context_scope"))
         template_vars: dict[str, Any] = {
-            "state": state,
-            "run_context": run_context,
+            "state": scoped_state,
+            "run_context": scoped_run_context,
             "input": raw_input,
         }
         resolved = node_def.get("_resolved_parameters")
@@ -4113,7 +5104,17 @@ async def _sandbox_agent_impl(
                 sandbox = await asyncio.wait_for(
                     AsyncSandbox.create(
                         template=template_id,
-                        timeout=sandbox_timeout,
+                        # FAR-487: lifetime STRICTLY greater than the command
+                        # timeout (+ _SANDBOX_LIFETIME_GRACE_S) so the platform
+                        # endAt kill can never preempt the runner's own timeout
+                        # path — a mid-command sandbox death fabricated a
+                        # zero-exit completion and misreported the failure as
+                        # "no parseable output.json (exit code 0)".
+                        # FAR-489: int() — the e2b SDK's attrs model does NOT
+                        # coerce a float, and E2B's Go server rejects
+                        # "1320.0" with 400 (int32 unmarshal), instantly
+                        # failing every sandbox create.
+                        timeout=int(sandbox_timeout + _SANDBOX_LIFETIME_GRACE_S),
                         allow_internet_access=(egress_policy not in ("deny_all", "selected")),
                         # deny_all/selected -> no internet; default/None ->
                         # internet allowed (e2b default). IMPORTANT
@@ -4170,11 +5171,10 @@ async def _sandbox_agent_impl(
         # Persist the real sandbox id so the heartbeat-lost path
         # (run_executor_with_watchdog) can kill the sandbox by id.
         await _store_dispatch_marker_sandbox(_sandbox_id)
-        for path, content in context_files.items():
-            if path.endswith(".b64"):
-                content = base64.b64decode(content).decode()
-                path = path[:-4]
-            await asyncio.wait_for(sandbox.files.write(path, content), timeout=_SANDBOX_IO_TIMEOUT)
+        for raw_path, raw_content in context_files.items():
+            write_path = raw_path.removesuffix(".b64") if raw_path.endswith(".b64") else raw_path
+            write_content = base64.b64decode(raw_content).decode() if raw_path.endswith(".b64") else raw_content
+            await asyncio.wait_for(sandbox.files.write(write_path, write_content), timeout=_SANDBOX_IO_TIMEOUT)
 
         # FAR-296 mode split: llm mode writes the rendered prompt to
         # prompt.md; script mode writes the FULL run input (no 10KB
@@ -4203,6 +5203,18 @@ async def _sandbox_agent_impl(
                 org_id=org_id,
             ),
         )
+
+        # FAR-418: expose the node's capability_scope.allowed_tools to the sandbox
+        # agent runtime (FAR-402 P4 / FAR-418) so the agent's MCP client can
+        # forward it as the ``X-Modulo-Allowed-Tools`` header. The MCP server's
+        # McpAuthMiddleware lifts that header into the request-scoped allow-list
+        # consumed by check_tool_scope, enforcing node-level tool scoping in the
+        # production run path. Absent/empty (the UNRESTRICTED default) sets nothing,
+        # preserving pre-scope behaviour.
+        _node_scope = node_def.get("capability_scope") or {}
+        _allowed_tools = _node_scope.get("allowed_tools")
+        if _allowed_tools:
+            env_vars_extra["MODULO_ALLOWED_TOOLS"] = ",".join(str(t) for t in _allowed_tools)
 
         # FAR-212 PR B: apply the enforced sandbox policy AFTER the Modulo-owned
         # context files / prompt / input are written but BEFORE the agent/script
@@ -4275,7 +5287,6 @@ async def _sandbox_agent_impl(
                     _stream_broker = get_registry().get(uuid.UUID(run_id))
                 except (TypeError, ValueError):
                     _stream_broker = None
-            _stream_enabled = isinstance(_stream_broker, RunEventBroker)
 
             watchdog = _SandboxWatchdog(
                 sandbox=sandbox,
@@ -4288,7 +5299,6 @@ async def _sandbox_agent_impl(
                 sandbox_mode=sandbox_mode,
                 stdout_percentage_delta=stdout_percentage_delta,
                 stream_broker=_stream_broker,
-                stream_enabled=_stream_enabled,
                 drained_chunks=_drained_chunks,
                 wallclock_budget_seconds=wallclock_budget_seconds,
                 start_time=start_time,
@@ -4676,6 +5686,7 @@ async def _sandbox_agent_impl(
                             stderr_raw=agent_stderr_raw,
                             sandbox_id=_sandbox_id,
                             read_raw=raw_output,
+                            read_error=output_read_error,
                             log_tail=_no_output_log_tail,
                         )
                     )
@@ -4686,6 +5697,7 @@ async def _sandbox_agent_impl(
                         stderr_raw=agent_stderr_raw,
                         sandbox_id=_sandbox_id,
                         read_raw=raw_output,
+                        read_error=output_read_error,
                         log_tail=_no_output_log_tail,
                     ),
                     node_id=node_id,
@@ -4735,7 +5747,7 @@ async def _sandbox_agent_impl(
         if isinstance(output_schema_json, dict) and isinstance(output_json, dict):
             try:
                 _validate_against_schema(output_json, output_schema_json)
-            except ValueError:
+            except ValueError as _schema_exc:
                 _log.exception(
                     "sandbox_agent.schema_validation_failed",
                     extra={"node_id": node_id},
@@ -4751,7 +5763,7 @@ async def _sandbox_agent_impl(
                     # generic ``schema_validation_failure`` code is SHARED
                     # with LLM-mode/manual paths and must stay retryable.
                     raise ScriptInvalidOutputError(
-                        f"Script-mode output failed schema validation for node '{node_id}'"
+                        f"Script-mode output failed schema validation for node '{node_id}': {_schema_exc}"
                     ) from None
                 elapsed = time.monotonic() - start_time
                 _cost_estimate_usd = _compute_sandbox_cost(elapsed, output_json)
@@ -4759,7 +5771,11 @@ async def _sandbox_agent_impl(
                     node_id=node_id,
                     output=_SandboxNodeOutput(
                         status="failed",
-                        summary="Output failed schema validation",
+                        # FAR-487: name the rejected field so an operator can
+                        # align the agent's output shape (e.g. a synthesized
+                        # failed-output) with what the schema accepts —
+                        # without loosening the schema itself.
+                        summary=f"Output failed schema validation: {_schema_exc}",
                         exit_code=exit_code,
                         wall_clock_time_ms=int(elapsed * 1000),
                         cost_estimate_usd=_cost_estimate_usd,
@@ -4770,6 +5786,7 @@ async def _sandbox_agent_impl(
                         stdout_length=_stdout_len,
                         stderr_length=_stderr_len,
                         attempt_key=attempt_key,
+                        modulo_synthetic_failure=True,
                     ),
                 )
 
@@ -4964,7 +5981,13 @@ async def _sandbox_agent_impl(
     except Exception as _exc:
         elapsed = time.monotonic() - start_time
         _exc_type = type(_exc).__name__
-        _exc_msg = str(_exc)[:_MAX_ERROR_MSG]
+        # FAR-511: surface the provider error in the run output. The generic
+        # exception envelope previously excluded error_type/error_message, so a
+        # sandbox-provisioning failure (e.g. e2b ``400: Timeout cannot be greater
+        # than 1 hours``) was only visible in Fly logs as a bare
+        # "Sandbox agent execution failed". For an e2b SandboxException also pull
+        # the provider response body so the 400 detail is visible via get_run_output.
+        _exc_msg = _format_sandbox_provider_error(_exc, SandboxException)
         _log.exception(
             "sandbox_agent.execution_failed",
             extra={
@@ -4997,7 +6020,7 @@ async def _sandbox_agent_impl(
             node_id=node_id,
             output=_SandboxNodeOutput(
                 status="failed",
-                summary="Sandbox agent execution failed",
+                summary=SANDBOX_AGENT_FAILED_SUMMARY,
                 exit_code=-1,
                 wall_clock_time_ms=int(elapsed * 1000),
                 cost_estimate_usd=_cost_estimate_usd,
@@ -5011,8 +6034,12 @@ async def _sandbox_agent_impl(
                 error_message=_exc_msg,
                 sandbox_id=_sandbox_id,
                 sandbox_log_tail=_exc_log_tail,
+                modulo_synthetic_failure=True,
             ),
-            exclude_from_output=frozenset({"error_type", "error_message"}),
+            # FAR-511: stop hiding error_type/error_message. The node-failure
+            # envelope now carries the provider error (e.g. the e2b 400 detail)
+            # instead of masking it as a bare "Sandbox agent execution failed".
+            exclude_from_output=frozenset(),
         )
     finally:
         # FAR-211: stop the loop-interception callback server. Best-effort
@@ -5297,8 +6324,12 @@ def make_sandbox_agent_fn(
 
     env_vars values may reference secrets with ``{{ secrets.KEY }}``. These are
     resolved at run time from the org vault (when a ``session_factory`` is
-    provided) and fall back to the process environment, so secret rotation
-    takes effect on the next run and secrets never enter the compiled graph.
+    provided), so secret rotation takes effect on the next run and secrets
+    never enter the compiled graph. There is NO process-environment fallback
+    (anti-exfiltration). An unresolved reference is OMITTED from the sandbox
+    envs with a warning (FAR-480) — never resolved to an empty string, which
+    would clobber the system-injected default (e.g. the host GITHUB_TOKEN) and
+    silently break the sandbox credential.
     """
     config = _build_sandbox_node_config(
         node_def,

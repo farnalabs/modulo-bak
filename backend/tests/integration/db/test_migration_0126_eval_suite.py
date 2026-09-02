@@ -19,10 +19,12 @@ restores the head state in ``finally`` so the shared session schema is
 undisturbed for later tests.
 """
 
+import os
 import types
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -132,7 +134,7 @@ def _swap_db_name(db_url: str, new_db: str) -> str:
 
 
 @pytest_asyncio.fixture
-async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
+async def isolated_db_url(db_url: str, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
     """A fresh, private Postgres database migrated only up to ``PREV_REV``.
 
     ``test_0126`` downgrades the schema (dropping ``eval_suites`` /
@@ -141,14 +143,30 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
     integration test uses, cascading into spurious ``eval_suite_id does not
     exist`` failures across the suite. Give this test its own database so the
     shared schema is never touched.
+
+    The isolated database is provisioned from ``template0`` (guaranteed empty)
+    rather than the default ``template1``. ``migrations/env.py`` overrides the
+    alembic ``sqlalchemy.url`` with ``DATABASE_URL``/``DATABASE_ADMIN_URL`` from
+    the environment, so we point those vars at the isolated database here —
+    otherwise ``command.upgrade`` would run against the shared session database
+    and the migrations that create tables such as ``library_sync_state`` would
+    collide with the already-applied schema (DuplicateTable).
     """
     admin_engine = create_async_engine(db_url, poolclass=NullPool, execution_options={"isolation_level": "AUTOCOMMIT"})
     db_name = f"eval_suite_iso_{uuid.uuid4().hex[:10]}"
     async with admin_engine.connect() as conn:
-        await conn.execute(text(f'CREATE DATABASE "{db_name}"'))
+        # Clone template0 (always empty) rather than the default template1,
+        # which in CI can already carry the modulo schema. A non-empty clone
+        # would make ``command.upgrade(PREV_REV)`` recreate tables and fail with
+        # ``DuplicateTable: relation "library_sync_state" already exists``.
+        await conn.execute(text(f'CREATE DATABASE "{db_name}" WITH TEMPLATE template0'))
     await admin_engine.dispose()
 
     iso_url = _swap_db_name(db_url, db_name)
+    # Ensure env.py's DATABASE_URL / DATABASE_ADMIN_URL override resolves to this
+    # isolated database, not the shared session database.
+    monkeypatch.setenv("DATABASE_URL", iso_url)
+    monkeypatch.setenv("DATABASE_ADMIN_URL", iso_url)
     eng = create_async_engine(iso_url, poolclass=NullPool)
     async with eng.connect() as conn:
         await conn.execute(
@@ -157,7 +175,17 @@ async def isolated_db_url(db_url: str) -> AsyncIterator[str]:
         await conn.commit()
     await eng.dispose()
 
-    command.upgrade(_alembic_config(iso_url), PREV_REV)
+    # alembic env.py resolves the target DB from DATABASE_ADMIN_URL /
+    # DATABASE_URL (preferring DATABASE_ADMIN_URL), NOT from the Config URL. The
+    # CI "Start Postgres" step sets these to the shared service Postgres, so
+    # without overriding them here the upgrade would run against that DB (where
+    # library_sync_state already exists) and blow up with DuplicateTable. Pin
+    # both to the isolated database for the fixture's bootstrap upgrade.
+    with patch.dict(
+        os.environ,
+        {"DATABASE_URL": iso_url, "DATABASE_ADMIN_URL": iso_url},
+    ):
+        command.upgrade(_alembic_config(iso_url), PREV_REV)
 
     try:
         yield iso_url
@@ -274,7 +302,11 @@ async def _count_suites(engine, org: uuid.UUID | None = None) -> int:
 
 async def test_0126_eval_suite_backfill_rls_and_downgrade(isolated_db_url, monkeypatch) -> None:
     db_url = isolated_db_url
+    # env.py prefers DATABASE_ADMIN_URL over DATABASE_URL; pin both to the
+    # isolated database so every command.upgrade/downgrade in this test targets
+    # it (and not the shared CI service Postgres).
     monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("DATABASE_ADMIN_URL", db_url)
     config = _alembic_config(db_url)
     engine = create_async_engine(db_url, poolclass=NullPool)
 
@@ -421,11 +453,6 @@ async def test_0126_eval_suite_backfill_rls_and_downgrade(isolated_db_url, monke
                     ).fetchall()
                     visible = {r[0] for r in rows}
                 assert visible == {str(suite_b)}, f"org B should see only its suite; got {visible}"
-        finally:
-            async with engine.connect() as conn:
-                await conn.execute(text(f'DROP OWNED BY "{role}"'))
-                await conn.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
-                await conn.execute(text("COMMIT"))
 
             # --- Downgrade reverses the migration cleanly (-1 = one step back) ---
             # env.py's boot fast-path skips migrations when invoked programmatically
@@ -449,6 +476,16 @@ async def test_0126_eval_suite_backfill_rls_and_downgrade(isolated_db_url, monke
                     )
                 ).scalar()
                 assert col == 0, "eval_suite_id column should be dropped after downgrade"
+        finally:
+            # Drop the temporary RLS role so it never outlives the test. The
+            # downgrade assertions live in the try body, NOT here: an assert in a
+            # finally block runs on every exit path and, when the try body already
+            # failed, silently replaces the original exception (and its traceback)
+            # with a bare AssertionError (test_no_assert_inside_finally).
+            async with engine.connect() as conn:
+                await conn.execute(text(f'DROP OWNED BY "{role}"'))
+                await conn.execute(text(f'DROP ROLE IF EXISTS "{role}"'))
+                await conn.execute(text("COMMIT"))
     finally:
         # Restore the head state: drop seeded data, re-run migration to head.
         async with engine.begin() as conn:

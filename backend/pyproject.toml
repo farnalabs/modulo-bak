@@ -57,6 +57,13 @@ dependencies = [
     "aiomysql>=0.3.2",
     "pymysql>=1.1.1",
     # HTTP client (GitHub connector)
+    # SSRF pinned transport (modulo.core.ssrf) installs the pin by overriding
+    # httpcore's PRIVATE `_pool._network_backend` seam. Pin this to a
+    # KNOWN-GOOD compatible range so a breaking upgrade is explicit rather than
+    # silent: if httpcore stops routing that attribute into connection creation,
+    # the DNS-rebinding pin silently drops (guarded loudly in
+    # PinnedAsyncHTTPTransport). Known-good pair: httpx 0.28.1 -> httpcore 1.0.9.
+    # A constraint tightening beyond this range must be reflected in uv.lock.
     "httpx>=0.28.1",
     # Auth + crypto
     "PyJWT[crypto]>=2.10.1",
@@ -74,7 +81,7 @@ dependencies = [
     "jinja2>=3.1.4",
     # YAML
     "pyyaml>=6.0.3",
-    "jsonschema>=4.25.1,<4.26.dev0",
+    "jsonschema>=4.26,<4.27",
     # Observability
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp>=1.24.0",
@@ -82,7 +89,7 @@ dependencies = [
     "python-json-logger>=3.1.0",
     "croniter>=6.2.2",
     "jmespath>=1.0.1",
-    "mcp>=1.28.1",
+    "mcp>=1.28.1,<2",
     # Fixes CVE-2025-64439 (RCE via jsonplus), CVE-2026-27794 (RCE via pickle),
     # and GHSA-47pj-3jcm-6whg (namespace prefix matching crosses segment boundaries; fixed in 3.1.1)
     "langgraph-checkpoint-postgres>=3.1.1",
@@ -95,7 +102,7 @@ dependencies = [
     "click>=8.1.0",
     "tqdm>=4.68.3",
     "langchain-ibm>=1.1.0",
-    "redis>=6.4.0",
+    "redis>=6.4.0,<7",
     "saq[web]==0.26.4",
     "aiohttp>=3.14.3",
 ]
@@ -128,7 +135,7 @@ dev = [
     "requests>=2.31.0",
     "factory-boy>=3.3.3",
     "mypy>=1.10.0",
-    "ruff>=0.4.0",
+    "ruff>=0.16.5,<0.17",
     "bandit>=1.7.8",
     "semgrep>=1.70.0",
     "vulture>=2.16",
@@ -145,7 +152,7 @@ dev = [
 
 docker = ["aiodocker>=0.21.0"]
 redis = [
-    "redis>=6.4.0",
+    "redis>=6.4.0,<7",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -160,12 +167,12 @@ exclude = ["*.feature", "tests/connectors/__init__.py", ".semgrep/tests/"]
 [tool.ruff.lint]
 select = [
     "E", "W",   # pycodestyle
-    "F",        # pyflakes (dead code, unused imports ├óÔé¼ÔÇØ F841 catches uncovered vars, F811 catches redefs)
+    "F",        # pyflakes (dead code, unused imports — F841 catches uncovered vars, F811 catches redefs)
     "I",        # isort
     "N",        # pep8-naming
     "UP",       # pyupgrade
-    "B",        # flake8-bugbear (real bugs ├óÔé¼ÔÇØ B006 mutating defaults, B023 loop var in closure)
-    "S",        # flake8-bandit (security ├óÔé¼ÔÇØ S608 detects raw f-string SQL injection)
+    "B",        # flake8-bugbear (real bugs — B006 mutating defaults, B023 loop var in closure)
+    "S",        # flake8-bandit (security — S608 detects raw f-string SQL injection)
     "ASYNC",    # flake8-async (ASYNC251 catches unclosed event loops, ASYNC109 sync in async)
     "RUF",      # ruff-specific rules (RUF012 mutable class defaults)
     "SIM",      # flake8-simplify (SIM115 `open()` without context manager, SIM222 bool expr)
@@ -173,7 +180,180 @@ select = [
     "T20",      # flake8-print (T201 bare print in production code)
     "RET",      # flake8-return (RET503 missing explicit return)
     "PYI",      # flake8-pyi (PYI041 redundant `Optional` on union)
-    "FURB",     # refurb (FURB125 `while` ├óÔÇáÔÇÖ `for` loop, FURB163 unnecessary `None` check)
+     "FURB",     # refurb (FURB125 `while` → `for` loop, FURB163 unnecessary `None` check)
+     "PERF",     # perflint (PERF401 manual list-building loop — use comprehension/extend)
+     "ISC",      # flake8-implicit-str-concat (ISC003/ISC004 inconsistent string concatenation)
+     "PIE",      # flake8-pie (PIE810 single startswith/endswith tuple, PIE807 useless lambda)
+    # Defensive gate-strengthening: every rule below was verified to have zero
+    # current violations (run `ruff check . --extend-select <codes> --statistics`),
+    # so enabling them tightens the lint gate against future regressions without
+    # touching existing code. These mirror the repo-root ruff.toml gate (added in
+    # PR #2203) so the CI Lint (Backend) gate enforces what pre-commit already
+    # requires, plus zero-violation families that would otherwise drift in.
+    "G001", "G002", "G003", "G004", "G201",
+    "PERF101", "PERF203", "PERF402", "PERF403",
+    "PT020", "PT021", "PT027",
+    "Q000", "Q003",
+    "ICN",
+    "FA",
+    "NPY",
+    "RUF100",
+    # --- Second wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.15.20: `ruff check . --extend-select <codes>
+    # --statistics`). These mirror the repo-root ruff.toml gate. ---
+    "PLC3002", "PLR0206", "PLR1711", "PLR1722", "PLR5501",
+    "PLW0120", "PLW0127", "PLW0131", "PLW0211", "PLW0642",
+    "PLW2901",
+    "PYI025",
+    "UP032",
+    # Third wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate. Combines the two
+    # independent third-wave additions from this branch and origin/main.
+    "B017",
+    "B019",
+    "B025",
+    "B905",
+    "SIM105",
+    "SIM107",
+    "SIM108",
+    "SIM115",
+    "SIM118",
+    "SIM201",
+    "SIM202",
+    "SIM210",
+    "SIM211",
+    "SIM212",
+    "SIM220",
+    "SIM221",
+    "SIM222",
+    "SIM223",
+    "SIM300",
+    "SIM910",
+    "C401",
+    "C408",
+    "C409",
+    "C410",
+    "C411",
+    "C413",
+    "C414",
+    "C415",
+    "C416",
+    "C417",
+    "C418",
+    "C419",
+    "C420",
+    "PGH",
+    "RUF005",
+    "RUF010",
+    "RUF015",
+    "RUF016",
+    "RUF018",
+    "RUF019",
+    "RUF022",
+    "RUF026",
+    "RUF051",
+    "TRY400",
+    "RSE102",
+    "PLW0406",
+    "PLR0124",
+    "PLR1714",
+    "PLR0133",
+    "PLW1508",
+    "PLC0414",
+    "PLC0205",
+    "PLR1730",
+    "PLR1733",
+    "PLR1736",
+    "PLC2401",
+    # Fourth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate.
+    "PLC0105",
+    "PLC0131",
+    "PLC0206",
+    "PLC2403",
+    "PLR1716",
+    "PLW0129",
+    "PLW0133",
+    "PLW0245",
+    "PLW0604",
+    # Fifth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate. Combines the two
+    # independent fifth-wave additions from this branch and origin/main.
+    "YTT101", "YTT102", "YTT103",
+    "YTT201", "YTT202", "YTT203", "YTT204",
+    "YTT301", "YTT302", "YTT303",
+    "SLOT002",
+    # flake8-use-pathlib: every member of the family now has zero current call
+    # sites across the whole tree (incl. scripts/, which were migrated to match)
+    # — the PTH118/PTH120/PTH123 backlog was cleared in a scan-by-scan migration.
+    "PTH100", "PTH101", "PTH102", "PTH103", "PTH104", "PTH105", "PTH106", "PTH107",
+    "PTH108", "PTH109", "PTH110", "PTH111", "PTH112", "PTH113", "PTH114", "PTH115",
+    "PTH116", "PTH117", "PTH118", "PTH119", "PTH120", "PTH121", "PTH122", "PTH123",
+    "PTH124", "PTH201", "PTH202", "PTH203", "PTH204", "PTH205", "PTH206", "PTH207",
+    "PTH208", "PTH210", "PTH211",
+    # flake8-logging hygiene: logger must be obtained via getLogger() with
+    # __name__ (LOG001/LOG002), never the deprecated WARN constant (LOG009),
+    # never a root-logger call (LOG015).
+    "LOG001", "LOG002", "LOG009", "LOG015",
+    # Sixth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate. These families
+    # close drift and block future regressions: B007 (unused loop variable),
+    # B904 (raise without `from` — chain exceptions), RUF009/RUF012/RUF013
+    # (mutable defaults / typed-class hygiene), the TODO-comment TD family
+    # (author/link/capitalization hygiene), and FIX001 (no stray FIXME).
+    "B007", "B904",
+    "RUF009", "RUF012", "RUF013",
+    "TD004", "TD006", "TD007",
+    "FIX001",
+    # flake8-datetimez: production time handling must be timezone-aware;
+    # remaining violations are intentional naive datetime fixtures in tests/,
+    # covered by the tests/** per-file-ignore.
+    "DTZ",
+    # Seventh wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5 under both this gate and the repo-root
+    # ruff.toml: `ruff check . --select PT023,PT026`). Mirrors the repo-root
+    # ruff.toml gate. Upon any future regression the newly-flagged decorators
+    # must be normalized rather than the rule re-ignored.
+    "PT023",  # consistent @pytest.mark.<marker>() parentheses style
+    "PT026",  # reject useless arg-free @pytest.mark.usefixtures()
+    # Eighth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5 under both this gate and the repo-root
+    # ruff.toml: `ruff check . --select PT001,PT002,PT003,PT007,PT008,PT009,
+    # PT010,PT014,PT015,PT016,PT017,PT022,PT024,PT025,PT030,PT031
+    # --statistics`). Mirrors the repo-root ruff.toml gate. All of these
+    # pytest-style rules are pass-to-enable (zero current violations across the
+    # whole tree), so the gate tightens without touching existing tests.
+    "PT001",  # consistent @pytest.fixture() parentheses style
+    "PT002",  # no positional arguments to @pytest.fixture()/@pytest.mark.parametrize()
+    "PT003",  # @pytest.fixture(scope=...) should not be spelled with scope="function"
+    "PT007",  # @pytest.mark.parametrize() values must be a collection, not a bare dict/list
+    "PT008",  # no lambda argument to mocker.patch()
+    "PT009",  # use plain asserts rather than unittest-style assertEquals() etc.
+    "PT010",  # pytest.raises()/pytest.warns() must name at least one exception/warning
+    "PT014",  # no duplicated test cases in @pytest.mark.parametrize()
+    "PT015",  # no assert that is always False
+    "PT016",  # no pytest.fail() without a message
+    "PT017",  # no assert inside an except block
+    "PT022",  # no unused-yield fixture (use plain return instead)
+    "PT024",  # no redundant @pytest.mark.asyncio on an already-coroutine fixture
+    "PT025",  # no erroneous use_fixtures() marker on a fixture
+    "PT030",  # pytest.warns() too broad (bare Exception) — narrow to the concrete warning
+    "PT031",  # pytest.warns() with multiple statements — assert inside the block
+    # Ninth wave of defensive gate-strengthening: unlike the pass-to-enable waves
+    # above, these rules had a small existing backlog that this PR FIXED, so the
+    # gate now also locks the fixes in against future regressions (verified zero
+    # remaining violations with ruff==0.16.5 under both the backend and repo-root
+    # gates: `ruff check . --select LOG004,LOG014,PLW1510,ARG003,ARG004
+    # --statistics`). Mirrors the repo-root ruff.toml gate.
+    "LOG004",  # logger.exception() must not be used outside an exception handler
+    "LOG014",  # exc_info= must carry the real exception, not rely on ambient state
+    "PLW1510", # subprocess.run() needs an explicit `check=` argument
+    "ARG003",  # unused class-method argument
+    "ARG004",  # unused static-method argument
 ]
 ignore = [
     "S101",     # assert allowed in tests
@@ -183,12 +363,12 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "src/modulo/api/mcp_server.py" = ["RET503"]
-"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008"]
+"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008", "PERF", "ISC", "DTZ"]
 
 "src/modulo/api/routes/scim.py" = ["N815", "N803"]
 "tests/unit/scim/test_scim_provisioning.py" = ["N815", "N803"]
 
-"scripts/*" = ["T20"]
+"scripts/**" = ["T20", "PERF", "ISC"]
 "scripts/gen_seed_sql.py" = ["S608"]
 "scripts/generate_remy_primer.py" = ["ASYNC240"]
 "deploy/*" = ["T20"]
@@ -254,8 +434,9 @@ markers = [
     "e2e: marks tests as end-to-end (require browser + running app)",
     "slow: marks tests as slow",
     "awaiting-implementation: marks scenarios that define desired behaviour not yet delivered",
-    "connector_conformance: connector contract conformance suite ├óÔé¼ÔÇØ every ConnectorType must pass",
+    "connector_conformance: connector contract conformance suite — every ConnectorType must pass",
     "breakglass_gate: break-glass admin recovery deploy-gate regression (boot allow-list posture + connectivity smoke)",
+    "real_ssrf_dns: opt out of the autouse SSRF DNS shim so the real fail-closed guard runs",
 ]
 
 [tool.coverage.run]
@@ -315,13 +496,16 @@ dev = [
     "pre-commit>=4.6.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "pytest-bdd>=7.2.0",
+    # Pinned to the pytest-9.1 fix for the _register_fixture(nodeid=...) deprecation
+    # (pytest-dev/pytest-bdd#823): no PyPI release carries it yet (8.1.0 is latest).
+    # Replace with a >=8.1.1 PyPI pin once the fix is released.
+    "pytest-bdd @ git+https://github.com/pytest-dev/pytest-bdd@60f6625b71b5552af02a4830e3d520f5ab6838e4",
     "pytest-cov>=7.1.0",
     "pytest-playwright>=0.8.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.5.0",
     "respx>=0.23.1",
-    "ruff>=0.15.18",
+    "ruff>=0.16.5,<0.17",
     "semgrep>=1.70.0",
     "vulture>=2.16",
     "testcontainers[postgres]>=4.14.2",
@@ -337,6 +521,7 @@ dev = [
     "schemathesis>=3.30.0",
     "pytest-recording>=0.13.0",
     "pip-audit>=2.9.0",
+    "types-jsonschema>=4.26.0",
 ]
 
 [tool.uv]

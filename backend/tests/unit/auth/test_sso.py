@@ -4,6 +4,7 @@ import base64
 import json
 import uuid
 from collections.abc import Generator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import defusedxml.ElementTree as ElementTree
@@ -12,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from modulo.api.dependencies import _get_engine, get_db_session, get_plan_context
+from modulo.api.dependencies import _get_engine, get_db_session, get_plan_context, get_system_db_session
 from modulo.api.routes.sso import router as sso_router
 from modulo.auth.sso import (
     parse_oidc_providers,
@@ -66,13 +67,14 @@ _app.include_router(sso_router)
 
 @pytest.fixture
 def client() -> Generator[TestClient, None, None]:
-    mock_session = AsyncMock(spec=AsyncSession)
+    mock_session = _mock_session()
 
     async def _override_session() -> AsyncMock:
         yield mock_session
 
     _app.dependency_overrides[get_settings] = lambda: _override()
     _app.dependency_overrides[get_db_session] = _override_session
+    _app.dependency_overrides[get_system_db_session] = _override_session
     _app.dependency_overrides[_get_engine] = lambda: MagicMock()
     _app.dependency_overrides[get_plan_context] = lambda: DbPlanContext(FeatureFlagRegistry(current_tier="team"))
     try:
@@ -88,6 +90,20 @@ def _override_settings(**kwargs: str | bool) -> None:
     _app.dependency_overrides[get_plan_context] = lambda: DbPlanContext(
         FeatureFlagRegistry(current_tier="team" if settings.modulo_license_key else "community")
     )
+
+
+def _mock_session(scalar: object = None) -> AsyncMock:
+    """Build an AsyncMock session whose DB lookups return ``scalar`` (default None).
+
+    Returning None from scalar_one_or_none preserves the env-var fallback path
+    in the SSO runtime helpers for the existing tests.
+    """
+    session = AsyncMock(spec=AsyncSession)
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = scalar
+    result.scalars.return_value.all.return_value = []
+    session.execute.return_value = result
+    return session
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +183,7 @@ class TestJitProvisioning:
         from modulo.auth.sso import jit_provision_user
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         with patch("modulo.auth.sso.get_account_by_email", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
@@ -186,8 +202,20 @@ class TestJitProvisioning:
 
 
 class TestSsoProvidersEndpoint:
+    """The /api/v1/auth/sso/providers discovery endpoint (pre-auth, login page).
+
+    Plan resolution is anonymous (no user dependency): SSO enabled via a
+    licensed tier is simulated by stubbing the in-memory license store.
+    """
+
+    _TEAM_SSO_LICENSE = SimpleNamespace(tier="team", features=["sso"], expires_at=None)
+
     def test_returns_oidc_providers(self, client: TestClient) -> None:
-        resp = client.get("/api/v1/auth/sso/providers")
+        with (
+            patch("modulo.core.license.get_license", return_value=self._TEAM_SSO_LICENSE),
+            patch.dict("modulo.core.feature_flags.FeatureFlagRegistry._overrides", {}, clear=True),
+        ):
+            resp = client.get("/api/v1/auth/sso/providers")
         assert resp.status_code == 200
         body = resp.json()
         assert len(body["oidc"]) == 2
@@ -201,15 +229,29 @@ class TestSsoProvidersEndpoint:
             modulo_saml_enabled=True,
             modulo_saml_idp_metadata_url="https://idp.example.com/metadata",
         )
-        resp = client.get("/api/v1/auth/sso/providers")
+        with (
+            patch("modulo.core.license.get_license", return_value=self._TEAM_SSO_LICENSE),
+            patch.dict("modulo.core.feature_flags.FeatureFlagRegistry._overrides", {}, clear=True),
+        ):
+            resp = client.get("/api/v1/auth/sso/providers")
         assert resp.status_code == 200
         assert resp.json()["saml"] is True
 
-    def test_saml_disabled_without_license(self, client: TestClient) -> None:
-        """SSO providers list returns 402 when license is absent."""
+    def test_sso_providers_disabled_returns_200_empty(self, client: TestClient) -> None:
+        """Unlicensed/feature-disabled -> normal 200 with an EMPTY providers list.
+
+        The endpoint is fetched by the login page BEFORE authentication, so it
+        must never raise an auth/plan error (the old 402 behaviour put a console
+        error on every login).
+        """
         _override_settings(modulo_license_key="", modulo_saml_enabled=True)
-        resp = client.get("/api/v1/auth/sso/providers")
-        assert resp.status_code == 402
+        with (
+            patch("modulo.core.license.get_license", return_value=None),
+            patch.dict("modulo.core.feature_flags.FeatureFlagRegistry._overrides", {}, clear=True),
+        ):
+            resp = client.get("/api/v1/auth/sso/providers")
+        assert resp.status_code == 200
+        assert resp.json() == {"oidc": [], "saml": False}
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +281,17 @@ class TestSamlMetadataParsing:
             modulo_saml_idp_metadata_xml=self.SAMPLE_IDP_METADATA,
         )
 
-        with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
+        session = _mock_session()
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db,
+            patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
+        ):
+            mock_db.return_value = None
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
 
-            url, _req_id = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs")
+            url, _req_id = await saml_get_auth_url(
+                settings, "https://modulo.example.com/api/v1/auth/saml/acs", session, session
+            )
             assert "idp.example.com" in url
             assert "SAMLRequest" in url
 
@@ -414,7 +463,7 @@ class TestJitProvisioningExtended:
         from modulo.auth.sso import jit_provision_user
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         org_id = uuid.uuid4()
 
         with (
@@ -445,7 +494,7 @@ class TestJitProvisioningExtended:
         from modulo.auth.sso import jit_provision_user
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         existing = MagicMock()
         existing.email = "existing@example.com"
         existing.sso_subject = None
@@ -473,7 +522,7 @@ class TestJitProvisioningExtended:
         from modulo.auth.sso import jit_provision_user
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         org_id = uuid.uuid4()
 
         exec_mock = MagicMock()
@@ -503,7 +552,7 @@ class TestJitProvisioningExtended:
         from modulo.auth.sso import jit_provision_user
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         with patch("modulo.auth.sso.get_account_by_email", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = None
@@ -525,7 +574,7 @@ class TestIssueSsoTokens:
         from modulo.auth.sso import issue_sso_tokens
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         user = MagicMock()
         user.id = uuid.uuid4()
         user.email = "user@example.com"
@@ -565,34 +614,95 @@ class TestOidcGetAuthorizeUrl:
         from modulo.auth.sso import oidc_get_authorize_url
 
         settings = _override()
+        session = _mock_session()
         with pytest.raises(ValueError, match="not configured"):
-            await oidc_get_authorize_url("nonexistent", settings, "http://localhost/callback")
+            await oidc_get_authorize_url("nonexistent", settings, "http://localhost/callback", session, session)
 
     async def test_raises_when_discovery_missing_authz_endpoint(self) -> None:
         from modulo.auth.sso import oidc_get_authorize_url
 
         settings = _override()
+        session = _mock_session()
         with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
             mock_disc.return_value = {"token_endpoint": "https://example.com/token"}
 
             with pytest.raises(ValueError, match="No authorization_endpoint"):
-                await oidc_get_authorize_url("google", settings, "http://localhost/callback")
+                await oidc_get_authorize_url("google", settings, "http://localhost/callback", session, session)
 
     async def test_returns_url_and_state(self) -> None:
         from modulo.auth.sso import oidc_get_authorize_url
 
         settings = _override()
+        session = _mock_session()
         with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
             mock_disc.return_value = {
                 "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
             }
 
-            url, raw_state = await oidc_get_authorize_url("google", settings, "http://localhost/callback")
+            url, raw_state = await oidc_get_authorize_url(
+                "google", settings, "http://localhost/callback", session, session
+            )
 
             assert url.startswith("https://accounts.google.com/o/oauth2/v2/auth")
             assert "client_id=google-client-id" in url
             assert "response_type=code" in url
             assert len(raw_state) > 0
+
+    async def test_env_scopes_string_not_character_joined(self) -> None:
+        """FAR-464 CHANGES_REQUESTED #3: env-var providers may carry ``scopes`` as a
+        plain string. ``" ".join`` on a string would splat it into single characters
+        ('o p e ...'); the scope must be passed through verbatim."""
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override(
+            modulo_oidc_providers=json.dumps(
+                [
+                    {
+                        "provider_id": "google",
+                        "client_id": "google-client-id",
+                        "client_secret": "google-client-secret",
+                        "discovery_url": "https://accounts.google.com/.well-known/openid-configuration",
+                        "scopes": "openid email profile",
+                    }
+                ]
+            )
+        )
+        session = _mock_session()
+        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            }
+
+            url, _ = await oidc_get_authorize_url("google", settings, "http://localhost/cb", session, session)
+
+            assert "scope=openid+email+profile" in url
+
+    async def test_env_scopes_list_joined(self) -> None:
+        """Env-var providers may also carry ``scopes`` as a list — still joined safely."""
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override(
+            modulo_oidc_providers=json.dumps(
+                [
+                    {
+                        "provider_id": "google",
+                        "client_id": "google-client-id",
+                        "client_secret": "google-client-secret",
+                        "discovery_url": "https://accounts.google.com/.well-known/openid-configuration",
+                        "scopes": ["openid", "email"],
+                    }
+                ]
+            )
+        )
+        session = _mock_session()
+        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            }
+
+            url, _ = await oidc_get_authorize_url("google", settings, "http://localhost/cb", session, session)
+
+            assert "scope=openid+email" in url
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +715,7 @@ class TestOidcProcessCallback:
         from modulo.auth.sso import oidc_process_callback
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         raw_state = "test-raw-state"
 
         signed = sign_state(f"google:{raw_state}", settings.secret_key)
@@ -628,8 +738,8 @@ class TestOidcProcessCallback:
             patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
         ):
             mock_disc.return_value = {
-                "token_endpoint": "https://oauth2.googleapis.com/token",
-                "jwks_uri": "https://oauth2.googleapis.com/certs",
+                "token_endpoint": "https://accounts.google.com/token",
+                "jwks_uri": "https://accounts.google.com/certs",
                 "issuer": "https://accounts.google.com",
             }
             mock_ex.return_value = {"id_token": id_token}
@@ -650,6 +760,7 @@ class TestOidcProcessCallback:
                 signed,
                 settings,
                 session,
+                session,
                 "http://localhost/callback",
             )
 
@@ -662,20 +773,22 @@ class TestOidcProcessCallback:
         from modulo.auth.sso import oidc_process_callback
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         with pytest.raises(ValueError, match="CSRF"):
-            await oidc_process_callback("code", "tampered-state", settings, session, "http://localhost/callback")
+            await oidc_process_callback(
+                "code", "tampered-state", settings, session, session, "http://localhost/callback"
+            )
 
     async def test_raises_when_provider_not_found_after_state_check(self) -> None:
         from modulo.auth.sso import oidc_process_callback
 
         settings = _override()
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         signed = sign_state("ghost:state", settings.secret_key)
 
         with pytest.raises(ValueError, match="not found"):
-            await oidc_process_callback("code", signed, settings, session, "http://localhost/callback")
+            await oidc_process_callback("code", signed, settings, session, session, "http://localhost/callback")
 
 
 # ---------------------------------------------------------------------------
@@ -688,15 +801,21 @@ class TestSamlGetAuthUrl:
         from modulo.auth.sso import saml_get_auth_url
 
         settings = _override(modulo_saml_enabled=False)
-        with pytest.raises(ValueError, match="SAML is not enabled"):
-            await saml_get_auth_url(settings, "http://localhost/acs")
+        session = _mock_session()
+        with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db:
+            mock_db.return_value = None
+            with pytest.raises(ValueError, match="SAML is not enabled"):
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
     async def test_raises_when_no_license(self) -> None:
         from modulo.auth.sso import saml_get_auth_url
 
         settings = _override(modulo_license_key="", modulo_saml_enabled=True)
-        with pytest.raises(ValueError, match="requires a license"):
-            await saml_get_auth_url(settings, "http://localhost/acs")
+        session = _mock_session()
+        with patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db:
+            mock_db.return_value = None
+            with pytest.raises(ValueError, match="requires a license"):
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
     async def test_raises_when_no_metadata_source(self) -> None:
         from modulo.auth.sso import saml_get_auth_url
@@ -705,10 +824,15 @@ class TestSamlGetAuthUrl:
             modulo_license_key="lic-123",
             modulo_saml_enabled=True,
         )
-        with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
+        session = _mock_session()
+        with (
+            patch("modulo.auth.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_db,
+            patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch,
+        ):
+            mock_db.return_value = None
             mock_fetch.side_effect = ValueError("SAML IdP metadata not configured")
             with pytest.raises(ValueError, match="metadata not configured"):
-                await saml_get_auth_url(settings, "http://localhost/acs")
+                await saml_get_auth_url(settings, "http://localhost/acs", session, session)
 
 
 class TestSamlProcessResponse:
@@ -749,17 +873,17 @@ class TestSamlProcessResponse:
         from modulo.auth.sso import saml_process_response
 
         settings = _override(modulo_saml_enabled=False)
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         with pytest.raises(ValueError, match="SAML is not enabled"):
-            await saml_process_response("response", settings, session)
+            await saml_process_response("response", settings, session, session)
 
     async def test_raises_when_no_license(self) -> None:
         from modulo.auth.sso import saml_process_response
 
         settings = _override(modulo_license_key="", modulo_saml_enabled=True)
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
         with pytest.raises(ValueError, match="requires a license"):
-            await saml_process_response("response", settings, session)
+            await saml_process_response("response", settings, session, session)
 
     async def test_raises_when_no_assertion(self) -> None:
         from modulo.auth.sso import saml_process_response
@@ -769,13 +893,13 @@ class TestSamlProcessResponse:
             modulo_saml_enabled=True,
             modulo_saml_idp_metadata_xml=self.SAMPLE_IDP_METADATA,
         )
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         empty_response = base64.b64encode(b"<root/>").decode()
         with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
             with pytest.raises(ValueError, match="SAML response validation failed"):
-                await saml_process_response(empty_response, settings, session)
+                await saml_process_response(empty_response, settings, session, session)
 
     async def test_full_success_flow(self) -> None:
         from modulo.auth.saml_handler import ModuloSamlAuth
@@ -786,7 +910,7 @@ class TestSamlProcessResponse:
             modulo_saml_enabled=True,
             modulo_saml_idp_metadata_xml=self.SAMPLE_IDP_METADATA,
         )
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         encoded = base64.b64encode(self.SAML_RESPONSE_XML.encode()).decode()
 
@@ -811,7 +935,7 @@ class TestSamlProcessResponse:
                 "token_type": "bearer",
             }
 
-            result = await saml_process_response(encoded, settings, session)
+            result = await saml_process_response(encoded, settings, session, session)
 
             assert result["access_token"] == "at-saml"
             mock_jit.assert_awaited_once_with(
@@ -821,6 +945,7 @@ class TestSamlProcessResponse:
                 "Test User",
                 "saml",
                 "saml:https://idp.example.com:user@example.com",
+                default_org_id=None,
             )
             mock_tok.assert_awaited_once()
 
@@ -868,7 +993,7 @@ class TestSamlProcessResponse:
             modulo_saml_idp_metadata_xml=self.SAMPLE_IDP_METADATA,
             modulo_public_url="https://app.example.com",
         )
-        session = AsyncMock(spec=AsyncSession)
+        session = _mock_session()
 
         xml = self.SAML_RESPONSE_XML.replace(
             "<samlp:Response",
@@ -879,7 +1004,7 @@ class TestSamlProcessResponse:
         with patch("modulo.auth.sso._saml_fetch_idp_metadata", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = self.SAMPLE_IDP_METADATA
             with pytest.raises(ValueError, match="Destination does not match"):
-                await saml_process_response(encoded, settings, session)
+                await saml_process_response(encoded, settings, session, session)
 
 
 class TestSamlFetchIdpMetadata:
@@ -1023,6 +1148,36 @@ class TestSamlRoutesExtended:
             )
             assert resp.status_code == 401
 
+    def test_saml_metadata_served_for_db_provider_when_env_flag_off(self, client: TestClient) -> None:
+        """FAR-464 CHANGES_REQUESTED #2: a DB-configured SAML provider is self-sufficient,
+        so /saml/metadata must serve even when modulo_saml_enabled is False — matching
+        saml_login/saml_acs which resolve the DB provider without the env flag."""
+        _override_settings(
+            modulo_license_key="lic-123",
+            modulo_saml_enabled=False,
+        )
+
+        db_provider = SimpleNamespace(entity_id="urn:db-saml")
+        with patch("modulo.api.routes.sso._get_enabled_saml_global", new_callable=AsyncMock) as m:
+            m.return_value = db_provider
+            resp = client.get("/api/v1/auth/saml/metadata", follow_redirects=False)
+
+        assert resp.status_code == 200
+        assert "urn:db-saml" in resp.text
+
+    def test_saml_metadata_rejected_when_no_db_provider_and_env_flag_off(self, client: TestClient) -> None:
+        """Preserves the pure-env-var contract: no DB provider AND flag off -> 400."""
+        _override_settings(
+            modulo_license_key="lic-123",
+            modulo_saml_enabled=False,
+        )
+
+        with patch("modulo.api.routes.sso._get_enabled_saml_global", new_callable=AsyncMock) as m:
+            m.return_value = None
+            resp = client.get("/api/v1/auth/saml/metadata", follow_redirects=False)
+
+        assert resp.status_code == 400
+
 
 # ---------------------------------------------------------------------------
 # OIDC route — callback success
@@ -1055,8 +1210,8 @@ class TestOidcCallbackEndpointExtended:
             patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
         ):
             mock_disc.return_value = {
-                "token_endpoint": "https://oauth2.googleapis.com/token",
-                "jwks_uri": "https://oauth2.googleapis.com/certs",
+                "token_endpoint": "https://accounts.google.com/token",
+                "jwks_uri": "https://accounts.google.com/certs",
                 "issuer": "https://accounts.google.com",
             }
             mock_ex.return_value = {"id_token": id_token}
@@ -1081,3 +1236,631 @@ class TestOidcCallbackEndpointExtended:
             location = resp.headers.get("location", "")
             assert "access_token=at-oidc" in location
             assert "refresh_token=rt-oidc" in location
+
+
+# ---------------------------------------------------------------------------
+# DB-backed provider resolution (admin UI is now the runtime source of truth)
+# ---------------------------------------------------------------------------
+
+
+class TestOidcGetAuthorizeUrlDb:
+    async def test_uses_db_provider(self) -> None:
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override()
+        provider = SimpleNamespace(
+            provider_type="oidc",
+            enabled=True,
+            client_id="db-client-id",
+            client_secret="db-client-secret",
+            discovery_url="https://example.auth0.com/.well-known/openid-configuration",
+            scopes=json.dumps(["openid", "email"]),
+        )
+        session = _mock_session(scalar=provider)
+        with patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://example.auth0.com/authorize",
+            }
+            url, _ = await oidc_get_authorize_url("auth0", settings, "http://localhost/cb", session, session)
+            assert "client_id=db-client-id" in url
+            assert "example.auth0.com/authorize" in url
+            assert "scope=openid+email" in url
+
+
+class TestOidcProcessCallbackDb:
+    async def test_uses_db_provider_secret(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        provider = SimpleNamespace(
+            provider_type="oidc",
+            enabled=True,
+            client_id="db-client-id",
+            client_secret="db-client-secret",
+            discovery_url="https://example.auth0.com/.well-known/openid-configuration",
+            scopes=None,
+            group_mappings=[],
+            organisation_id=uuid.uuid4(),
+        )
+        session = _mock_session(scalar=provider)
+        signed = sign_state("auth0:raw-state", settings.secret_key)
+        id_token = (
+            base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+            + "."
+            + base64.urlsafe_b64encode(b'{"email":"user@example.com","name":"Test User","sub":"abc"}')
+            .rstrip(b"=")
+            .decode()
+            + "."
+            + "sig"
+        )
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "https://example.auth0.com/token",
+                "jwks_uri": "https://example.auth0.com/certs",
+                "issuer": "https://example.auth0.com",
+            }
+            mock_ex.return_value = {"id_token": id_token}
+            mock_verify.return_value = {
+                "email": "user@example.com",
+                "name": "Test User",
+                "sub": "abc",
+            }
+            mock_jit.return_value = (MagicMock(), uuid.uuid4(), "runner")
+            mock_tok.return_value = {
+                "access_token": "at-db",
+                "refresh_token": "rt-db",
+                "token_type": "bearer",
+            }
+
+            result = await oidc_process_callback(
+                "auth-code", signed, settings, session, session, "http://localhost/callback"
+            )
+
+            assert result["access_token"] == "at-db"
+            mock_ex.assert_awaited_once_with(
+                "https://example.auth0.com/token",
+                "db-client-id",
+                "db-client-secret",
+                "auth-code",
+                "http://localhost/callback",
+            )
+
+
+class TestSsoProvidersEndpointDb:
+    def test_returns_db_configured_provider(self, client: TestClient) -> None:
+
+        db_provider = SimpleNamespace(provider_id="auth0")
+        with (
+            patch(
+                "modulo.core.license.get_license",
+                return_value=SimpleNamespace(tier="team", features=["sso"], expires_at=None),
+            ),
+            patch.dict("modulo.core.feature_flags.FeatureFlagRegistry._overrides", {}, clear=True),
+            patch("modulo.api.routes.sso.list_enabled_oidc_providers", new_callable=AsyncMock) as mock_list,
+            patch("modulo.api.routes.sso.get_enabled_saml_provider", new_callable=AsyncMock) as mock_saml,
+        ):
+            mock_list.return_value = [db_provider]
+            mock_saml.return_value = None
+            resp = client.get("/api/v1/auth/sso/providers")
+            assert resp.status_code == 200
+            body = resp.json()
+            ids = [p["provider_id"] for p in body["oidc"]]
+            assert "auth0" in ids
+            assert body["saml"] is False
+
+
+class TestSamlGetAuthUrlDb:
+    SAMPLE_IDP_METADATA = """<?xml version="1.0"?>
+    <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+                         entityID="https://idp.example.com">
+      <md:IDPSSODescriptor
+       protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+        <md:SingleSignOnService
+         Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
+         Location="https://idp.example.com/sso"/>
+      </md:IDPSSODescriptor>
+    </md:EntityDescriptor>"""
+
+    async def test_uses_db_saml_provider(self) -> None:
+        from modulo.auth.sso import saml_get_auth_url
+
+        settings = _override(modulo_saml_enabled=False, modulo_license_key="")
+        provider = SimpleNamespace(
+            metadata_xml=self.SAMPLE_IDP_METADATA,
+            metadata_url=None,
+            entity_id="https://idp.example.com",
+        )
+        session = _mock_session(scalar=provider)
+        url, _ = await saml_get_auth_url(settings, "https://modulo.example.com/api/v1/auth/saml/acs", session, session)
+        assert "idp.example.com" in url
+        assert "SAMLRequest" in url
+
+
+# ---------------------------------------------------------------------------
+# System-scoped (modulo_system role) provider resolution — FAR-464 option (a)
+# ---------------------------------------------------------------------------
+
+
+class TestSystemSessionProviderResolution:
+    def _oidc_provider(self, org_id: uuid.UUID) -> SimpleNamespace:
+        return SimpleNamespace(
+            provider_type="oidc",
+            enabled=True,
+            client_id="db-client-id",
+            client_secret="db-client-secret",
+            discovery_url="https://example.auth0.com/.well-known/openid-configuration",
+            scopes=None,
+            group_mappings=[],
+            organisation_id=org_id,
+        )
+
+    async def test_system_session_resolves_non_first_org_provider(self) -> None:
+        """A provider in a NON-first org is resolved through the system session.
+
+        The system session (``modulo_system``, BYPASSRLS) returns the provider
+        regardless of org, so the resolution is instance-global — it must NOT
+        fall back to the app session (which would pin to the first org).
+        """
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session(scalar=provider)
+        app_session = _mock_session()
+
+        with patch("modulo.auth.sso._set_default_rls_org", new_callable=AsyncMock) as mock_default_org:
+            client_id, _client_secret, discovery_url, _scopes, db_provider = await _resolve_oidc_provider(
+                "auth0", system_session, app_session, settings
+            )
+
+        assert db_provider is provider
+        assert db_provider.organisation_id == org_id
+        assert client_id == "db-client-id"
+        assert discovery_url == "https://example.auth0.com/.well-known/openid-configuration"
+        mock_default_org.assert_not_awaited()
+
+    async def test_oidc_callback_uses_resolved_provider_org_for_jit(self) -> None:
+        """The resolved (system) provider's organisation_id drives JIT placement.
+
+        The app session is RLS-scoped to the resolved provider's org and that
+        org is passed as ``default_org_id`` so the user is provisioned into it.
+        """
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session(scalar=provider)
+        app_session = _mock_session()
+        signed = sign_state("auth0:raw-state", settings.secret_key)
+        id_token = (
+            base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+            + "."
+            + base64.urlsafe_b64encode(b'{"email":"user@example.com","name":"Test User","sub":"abc"}')
+            .rstrip(b"=")
+            .decode()
+            + "."
+            + "sig"
+        )
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery_pinned", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+            patch("modulo.auth.sso.set_rls_org", new_callable=AsyncMock) as mock_set_rls,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "https://example.auth0.com/token",
+                "jwks_uri": "https://example.auth0.com/certs",
+                "issuer": "https://example.auth0.com",
+            }
+            mock_ex.return_value = {"id_token": id_token}
+            mock_verify.return_value = {
+                "email": "user@example.com",
+                "name": "Test User",
+                "sub": "abc",
+            }
+            mock_jit.return_value = (MagicMock(), org_id, "runner")
+            mock_tok.return_value = {
+                "access_token": "at-db",
+                "refresh_token": "rt-db",
+                "token_type": "bearer",
+            }
+
+            await oidc_process_callback(
+                "auth-code", signed, settings, system_session, app_session, "http://localhost/callback"
+            )
+
+        mock_set_rls.assert_awaited_once_with(app_session, org_id)
+        mock_jit.assert_awaited_once_with(
+            app_session,
+            settings,
+            "user@example.com",
+            "Test User",
+            "oidc",
+            "auth0:abc",
+            default_org_id=org_id,
+        )
+        mock_tok.assert_awaited_once()
+
+    async def test_app_session_fallback_when_system_resolves_none(self) -> None:
+        """Single-org fallback: when the system read returns nothing the app session is used.
+
+        The system role may be unprovisioned (returns zero rows), or the
+        provider may genuinely be absent — in either case the resolver falls
+        back to the app session scoped to the first org before the env path.
+        """
+        from modulo.auth.sso import _resolve_oidc_provider
+
+        settings = _override()
+        org_id = uuid.uuid4()
+        provider = self._oidc_provider(org_id)
+        system_session = _mock_session()
+        app_session = _mock_session(scalar=provider)
+
+        with patch("modulo.auth.sso._set_default_rls_org", new_callable=AsyncMock) as mock_default_org:
+            _client_id, _cs, _du, _scopes, db_provider = await _resolve_oidc_provider(
+                "auth0", system_session, app_session, settings
+            )
+
+        assert db_provider is provider
+        mock_default_org.assert_awaited_once_with(app_session)
+
+
+# ---------------------------------------------------------------------------
+# FAR-506: OIDC derived-endpoint host allowlist (SSRF + client_secret disclosure)
+# ---------------------------------------------------------------------------
+
+
+class TestOidcEndpointHostAllowlist:
+    """A compromised/malicious discovery document must NOT be able to point a
+    derived endpoint at an internal/cloud-metadata host (the **pinned client** is
+    the real SSRF boundary — it blocks metadata/loopback and never POSTs
+    ``client_secret`` to a hostile host). The exact-host allowlist is
+    defense-in-depth only: multi-host IdPs (Google: ``token_endpoint`` on
+    oauth2.googleapis.com, ``jwks_uri`` on www.googleapis.com) are legitimate
+    and must NOT be rejected (FAR-506)."""
+
+    _DISCOVERY = "https://issuer.example/.well-known/openid-configuration"
+    _ISSUER = "https://issuer.example"
+
+    async def test_callback_accepts_cross_host_token_endpoint_and_exchanges(self) -> None:
+        """FAR-506: a sibling-host token endpoint (Google) is allowed — the code
+        exchange proceeds and the ``client_secret`` goes only to the pinned,
+        publicly-validated host."""
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:state", settings.secret_key)
+
+        with (
+            patch(
+                "modulo.auth.sso._resolve_oidc_provider",
+                new_callable=AsyncMock,
+                return_value=("cid", "client-secret", self._DISCOVERY, None, None),
+            ),
+            patch(
+                "modulo.auth.sso._fetch_discovery",
+                new_callable=AsyncMock,
+                return_value={
+                    "token_endpoint": "https://oauth2.googleapis.com/token",
+                    "jwks_uri": "https://issuer.example/jwks",
+                    "issuer": self._ISSUER,
+                },
+            ),
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+        ):
+            mock_ex.return_value = {"id_token": "jwt"}
+            mock_verify.return_value = {"email": "u@e.z", "sub": "s"}
+            mock_jit.return_value = (MagicMock(), uuid.uuid4(), "runner")
+            mock_tok.return_value = {"access_token": "at", "refresh_token": "rt", "token_type": "bearer"}
+
+            result = await oidc_process_callback("code", signed, settings, session, session, "http://cb")
+
+        assert result["access_token"] == "at"
+        mock_ex.assert_awaited_once()
+        mock_verify.assert_awaited_once()
+
+    async def test_callback_rejects_internal_token_endpoint_no_exchange(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:state", settings.secret_key)
+
+        with (
+            patch(
+                "modulo.auth.sso._resolve_oidc_provider",
+                new_callable=AsyncMock,
+                return_value=("cid", "client-secret", self._DISCOVERY, None, None),
+            ),
+            patch(
+                "modulo.auth.sso._fetch_discovery",
+                new_callable=AsyncMock,
+                return_value={
+                    "token_endpoint": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+                    "jwks_uri": "https://issuer.example/jwks",
+                    "issuer": self._ISSUER,
+                },
+            ),
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            pytest.raises(ValueError, match="Rejected OIDC token endpoint"),
+        ):
+            await oidc_process_callback("code", signed, settings, session, session, "http://cb")
+
+        mock_ex.assert_not_called()
+
+    async def test_callback_accepts_cross_host_jwks_uri_and_verifies(self) -> None:
+        """FAR-506: a sibling-host ``jwks_uri`` (Google's www.googleapis.com) is
+        allowed — the ID-token signature verification proceeds rather than being
+        rejected before the JWKS fetch."""
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:state", settings.secret_key)
+
+        with (
+            patch(
+                "modulo.auth.sso._resolve_oidc_provider",
+                new_callable=AsyncMock,
+                return_value=("cid", "client-secret", self._DISCOVERY, None, None),
+            ),
+            patch(
+                "modulo.auth.sso._fetch_discovery",
+                new_callable=AsyncMock,
+                return_value={
+                    "token_endpoint": "https://issuer.example/token",
+                    "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+                    "issuer": self._ISSUER,
+                },
+            ),
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock, return_value={"id_token": "jwt"}),
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+        ):
+            mock_verify.return_value = {"email": "u@e.z", "sub": "s"}
+            mock_jit.return_value = (MagicMock(), uuid.uuid4(), "runner")
+            mock_tok.return_value = {"access_token": "at", "refresh_token": "rt", "token_type": "bearer"}
+
+            result = await oidc_process_callback("code", signed, settings, session, session, "http://cb")
+
+        assert result["access_token"] == "at"
+        mock_verify.assert_awaited_once()
+
+    async def test_authorize_accepts_cross_host_authorization_endpoint(self) -> None:
+        """FAR-506: a sibling-host ``authorization_endpoint`` is allowed (Google
+        redirects to accounts.google.com/auth while discovery hosts differ)."""
+        from modulo.auth.sso import oidc_get_authorize_url
+
+        settings = _override()
+        session = _mock_session()
+        with patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc:
+            mock_disc.return_value = {
+                "authorization_endpoint": "https://oauth2.googleapis.com/authorize",
+                "issuer": self._ISSUER,
+            }
+            url, _ = await oidc_get_authorize_url("google", settings, "http://cb", session, session)
+
+        assert url.startswith("https://oauth2.googleapis.com/authorize")
+
+    async def test_callback_same_host_path_works(self) -> None:
+        """The legit same-host path still reaches the token exchange (mocked)."""
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:state", settings.secret_key)
+
+        with (
+            patch(
+                "modulo.auth.sso._resolve_oidc_provider",
+                new_callable=AsyncMock,
+                return_value=("cid", "client-secret", self._DISCOVERY, None, None),
+            ),
+            patch(
+                "modulo.auth.sso._fetch_discovery",
+                new_callable=AsyncMock,
+                return_value={
+                    "token_endpoint": "https://issuer.example/token",
+                    "jwks_uri": "https://issuer.example/jwks",
+                    "issuer": self._ISSUER,
+                },
+            ),
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+        ):
+            mock_ex.return_value = {"id_token": "jwt"}
+            mock_verify.return_value = {"email": "u@e.z", "sub": "s"}
+            mock_jit.return_value = (MagicMock(), uuid.uuid4(), "runner")
+            mock_tok.return_value = {"access_token": "at", "refresh_token": "rt", "token_type": "bearer"}
+
+            result = await oidc_process_callback("code", signed, settings, session, session, "http://cb")
+
+        assert result["access_token"] == "at"
+        mock_ex.assert_awaited_once_with("https://issuer.example/token", "cid", "client-secret", "code", "http://cb")
+        mock_verify.assert_awaited_once()
+
+
+class TestEnforceOidcEndpointHost:
+    def test_accepts_cross_host_sibling(self) -> None:
+        """FAR-506: a sibling-host endpoint (Google's token endpoint on
+        oauth2.googleapis.com, not accounts.google.com) is NEWLY allowed. The
+        exact-host allowlist is now a preferred-log nicety, not a hard gate."""
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://oauth2.googleapis.com/token",
+                "https://accounts.google.com/.well-known/openid-configuration",
+                "https://accounts.google.com",
+                "token",
+            )
+            is None
+        )
+
+    def test_rejects_metadata_address(self) -> None:
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        with pytest.raises(ValueError, match="Rejected OIDC jwks endpoint"):
+            _enforce_oidc_endpoint_host(
+                "http://169.254.169.254/jwks",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "jwks",
+            )
+
+    def test_rejects_https_internal_literal(self) -> None:
+        """A HTTPS internal/metadata literal is still blocked by the SSRF preflight."""
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        with pytest.raises(ValueError, match="Rejected OIDC token endpoint"):
+            _enforce_oidc_endpoint_host(
+                "https://169.254.169.254/latest/meta-data/credentials",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "token",
+            )
+
+    def test_accepts_same_host(self) -> None:
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://issuer.example/token",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "token",
+            )
+            is None
+        )
+
+    def test_issuer_host_also_allowed(self) -> None:
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        # The jwks_uri may target the issuer host even when it differs (in path)
+        # from the discovery URL host — the issuer is an OIDC trust anchor.
+        assert (
+            _enforce_oidc_endpoint_host(
+                "https://issuer.example/jwks",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "jwks",
+            )
+            is None
+        )
+
+    def test_rejects_non_http_scheme(self) -> None:
+        from modulo.auth.sso import _enforce_oidc_endpoint_host
+
+        with pytest.raises(ValueError, match="Rejected OIDC token endpoint"):
+            _enforce_oidc_endpoint_host(
+                "file:///etc/passwd",
+                "https://issuer.example/.well-known/openid-configuration",
+                "https://issuer.example",
+                "token",
+            )
+
+
+# ---------------------------------------------------------------------------
+# FAR-506: multi-host IdP (Google) regression — relaxed endpoint host guard
+# ---------------------------------------------------------------------------
+
+
+class TestOidcMultiHostIdp:
+    """FAR-506 regression: Google's real discovery document returns sibling hosts
+    (token_endpoint on oauth2.googleapis.com, jwks_uri on www.googleapis.com)
+    that are NOT the discovery/issuer host (accounts.google.com). The relaxed
+    endpoint guard must let the flow proceed, while an internal/metadata or
+    non-HTTPS endpoint is still rejected before the code exchange — the
+    client_secret is never sent to a hostile host."""
+
+    async def test_google_multi_host_endpoints_proceed(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:multi-host", settings.secret_key)
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+            patch("modulo.auth.sso.verify_id_token", new_callable=AsyncMock) as mock_verify,
+            patch("modulo.auth.sso.jit_provision_user", new_callable=AsyncMock) as mock_jit,
+            patch("modulo.auth.sso.issue_sso_tokens", new_callable=AsyncMock) as mock_tok,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "https://oauth2.googleapis.com/token",
+                "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs",
+                "issuer": "https://accounts.google.com",
+            }
+            mock_ex.return_value = {"id_token": "header.payload.signature"}
+            mock_verify.return_value = {"email": "user@example.com", "name": "Test User", "sub": "abc123"}
+            mock_jit.return_value = (MagicMock(), uuid.uuid4(), "runner")
+            mock_tok.return_value = {"access_token": "at", "refresh_token": "rt", "token_type": "bearer"}
+
+            result = await oidc_process_callback(
+                "auth-code", signed, settings, session, session, "http://localhost/callback"
+            )
+
+            assert result["access_token"] == "at"
+            mock_ex.assert_awaited_once()  # token exchange was reached — no cross-host rejection
+
+    async def test_metadata_token_endpoint_rejected_before_exchange(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:meta", settings.secret_key)
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "https://169.254.169.254/latest/meta-data/credentials",
+                "issuer": "https://accounts.google.com",
+            }
+            with pytest.raises(ValueError, match="Rejected OIDC token endpoint"):
+                await oidc_process_callback(
+                    "auth-code", signed, settings, session, session, "http://localhost/callback"
+                )
+            mock_ex.assert_not_awaited()  # client_secret never POSTed to the metadata host
+
+    async def test_non_https_token_endpoint_rejected_before_exchange(self) -> None:
+        from modulo.auth.sso import oidc_process_callback
+
+        settings = _override()
+        session = _mock_session()
+        signed = sign_state("google:http", settings.secret_key)
+
+        with (
+            patch("modulo.auth.sso._fetch_discovery", new_callable=AsyncMock) as mock_disc,
+            patch("modulo.auth.sso._exchange_code", new_callable=AsyncMock) as mock_ex,
+        ):
+            mock_disc.return_value = {
+                "token_endpoint": "http://oauth2.googleapis.com/token",
+                "issuer": "https://accounts.google.com",
+            }
+            with pytest.raises(ValueError, match="must use https:// scheme"):
+                await oidc_process_callback(
+                    "auth-code", signed, settings, session, session, "http://localhost/callback"
+                )
+            mock_ex.assert_not_awaited()

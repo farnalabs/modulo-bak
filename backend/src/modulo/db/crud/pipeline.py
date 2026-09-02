@@ -513,7 +513,10 @@ async def _clone_edges(
             source_node_id=edge["source_node_id"],
             target_node_id=edge["target_node_id"],
             edge_type=edge["edge_type"],
+            condition_expression=edge.get("condition_expression"),
             hitl_gate_config=copy.deepcopy(edge["hitl_gate_config"]),
+            source_port=edge.get("source_port") or "out",
+            target_port=edge.get("target_port") or "in",
         )
         session.add(cloned_edge)
         if edge["hitl_gate_config"] is not None:
@@ -592,7 +595,10 @@ def _edge_to_plain_dict(e: PipelineEdge) -> dict[str, Any]:
         "source_node_id": e.source_node_id,
         "target_node_id": e.target_node_id,
         "edge_type": e.edge_type,
+        "source_port": e.source_port or "out",
+        "target_port": e.target_port or "in",
         "hitl_gate_config": copy.deepcopy(e.hitl_gate_config),
+        "condition_expression": getattr(e, "condition_expression", None),
     }
 
 
@@ -847,7 +853,10 @@ async def replace_pipeline_graph(
             "source_node_id": str(e.source_node_id),
             "target_node_id": str(e.target_node_id),
             "edge_type": e.edge_type,
+            "condition_expression": getattr(e, "condition_expression", None),
             "hitl_gate_config": copy.deepcopy(e.hitl_gate_config),
+            "source_port": getattr(e, "source_port", None) or "out",
+            "target_port": getattr(e, "target_port", None) or "in",
         }
         for e in old_rows
     ]
@@ -912,7 +921,10 @@ async def replace_pipeline_graph(
             source_node_id=uuid.UUID(str(edge["source_node_id"])),
             target_node_id=uuid.UUID(str(edge["target_node_id"])),
             edge_type=edge["edge_type"],
+            condition_expression=edge.get("condition_expression"),
             hitl_gate_config=_preserve_omitted_gate_config(edge, old_by_key),
+            source_port=edge.get("source_port") or "out",
+            target_port=edge.get("target_port") or "in",
         )
         for edge in edges
     ]

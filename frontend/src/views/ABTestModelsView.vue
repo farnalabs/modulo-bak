@@ -66,6 +66,7 @@
           <Button
             as="router-link"
             :to="`/pipelines/${selectedPipelineId}/editor`"
+            type="button"
             data-testid="variant-builder-create-snapshot"
           >
             {{ $t('views.variantCreator.create_snapshot') }}
@@ -81,16 +82,18 @@
                 {{ $t('views.variantCreator.advanced_overrides_note') }}
               </p>
             <div class="flex items-center gap-3">
-              <span
-                role="status"
+              <span class="sr-only" id="variant-builder-headroom-label">{{ $t('views.variantCreator.variants_title') }}</span>
+              <output
                 data-testid="variant-builder-headroom"
+                aria-labelledby="variant-builder-headroom-label"
                 class="text-xs text-muted-foreground"
               >
                 {{ $t('views.variantCreator.headroom', { used: variants.length, max: MAX_VARIANTS }) }}
-              </span>
+              </output>
               <Button
                 :disabled="variants.length >= MAX_VARIANTS"
                 size="small"
+                type="button"
                 data-testid="variant-builder-add"
                 class="px-3 py-1.5"
                 @click="addVariant"
@@ -180,6 +183,7 @@
                   </td>
                   <td class="py-2 text-right whitespace-nowrap">
                     <button
+                      type="button"
                       :data-testid="`variant-builder-duplicate-${i}`"
                       :disabled="variants.length >= MAX_VARIANTS"
                       class="mr-2 text-xs text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
@@ -189,6 +193,7 @@
                       {{ $t('views.variantCreator.duplicate') }}
                     </button>
                     <button
+                      type="button"
                       :data-testid="`variant-builder-remove-${i}`"
                       class="text-xs text-destructive hover:underline"
                       :aria-label="$t('views.variantCreator.remove')"
@@ -202,14 +207,15 @@
             </table>
           </div>
 
-          <p
+          <output
             v-if="variants.length < 2"
-            role="status"
             data-testid="variant-builder-min-two"
+            aria-labelledby="variant-builder-min-two-label"
             class="text-sm text-muted-foreground"
           >
+            <span class="sr-only" id="variant-builder-min-two-label">{{ $t('views.variantCreator.aria_min_variants') }}</span>
             {{ $t('views.variantCreator.min_two_hint') }}
-          </p>
+          </output>
 
           <ErrorAlert
             v-if="fireError"
@@ -222,6 +228,7 @@
             <Button
               :disabled="!canFire || firing"
               data-testid="variant-builder-fire"
+              type="button"
               class="px-5 py-2"
               @click="openFireDialog"
             >
@@ -263,6 +270,7 @@
         <Button
           severity="secondary"
           outlined
+          type="button"
           :disabled="firing"
           data-testid="variant-builder-cancel"
           @click="showFireDialog = false"
@@ -271,6 +279,7 @@
         </Button>
         <Button
           severity="primary"
+          type="button"
           :disabled="firing"
           data-testid="variant-builder-confirm-fire"
           @click="fireBatch"

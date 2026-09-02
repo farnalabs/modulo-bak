@@ -46,6 +46,7 @@ def _make_pipeline() -> MagicMock:
     p.max_duration_seconds = None
     p.archived_at = None
     p.snapshot_count = 0
+    p.graph_nodes_json = []
     p.id = _PIPELINE_ID
     p.organisation_id = _ORG_ID
     p.name = "Test Pipeline"
@@ -183,6 +184,57 @@ def test_list_pipelines_returns_200(client: TestClient) -> None:
     body = resp.json()
     assert body["total"] == 1
     assert body["items"][0]["name"] == "Test Pipeline"
+
+
+def test_list_pipelines_includes_node_count(client: TestClient) -> None:
+    """Prove-the-fix: each list item carries node_count derived from the row's
+    stored graph_nodes_json (the count the /pipelines Nodes column renders).
+    Without the response-builder change, node_count stays at the additive
+    default (0) and this test fails."""
+    pipeline = _make_pipeline()
+    pipeline.graph_nodes_json = [{"id": "n1"}, {"id": "n2"}, {"id": "n3"}]
+    page_result = MagicMock()
+    page_result.items = [pipeline]
+    page_result.total = 1
+    page_result.page = 1
+    page_result.page_size = 20
+    page_result.next_cursor = None
+    page_result.has_more = False
+
+    with (
+        patch("modulo.api.routes.pipelines.list_pipelines", return_value=page_result),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = client.get("/api/v1/pipelines")
+
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["node_count"] == 3
+
+
+def test_list_pipelines_node_count_defaults_to_zero_for_empty_graph(client: TestClient) -> None:
+    """A pipeline with an empty stored graph reports node_count 0 (not an
+    error and not a missing field) — the empty/0 rendering contract of the
+    Nodes column."""
+    pipeline = _make_pipeline()
+    pipeline.graph_nodes_json = []
+    page_result = MagicMock()
+    page_result.items = [pipeline]
+    page_result.total = 1
+    page_result.page = 1
+    page_result.page_size = 20
+    page_result.next_cursor = None
+    page_result.has_more = False
+
+    with (
+        patch("modulo.api.routes.pipelines.list_pipelines", return_value=page_result),
+        patch("modulo.api.routes.pipelines.set_rls_org"),
+        patch("modulo.api.routes.pipelines.set_rls_user_context"),
+    ):
+        resp = client.get("/api/v1/pipelines")
+
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["node_count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +380,8 @@ def test_get_pipeline_graph_returns_authoritative_graph(client: TestClient) -> N
     edge.edge_type = "normal"
     edge.condition_expression = None
     edge.hitl_gate_config = None
+    edge.source_port = "out"
+    edge.target_port = "in"
     nodes = [
         {
             "id": str(node_id),
@@ -549,7 +603,7 @@ def test_pipeline_graph_node_stall_detector_round_trip() -> None:
 def test_pipeline_graph_node_stall_detector_bounds() -> None:
     """FAR-306: stdout_percentage_delta is bounded to [0, 1] by Pydantic.
     Pydantic v2 ValidationError is a ValueError subclass."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="less than or equal to 1"):
         PipelineGraphNode.model_validate({**_sandbox_node_json(), "stdout_percentage_delta": 1.5})
 
 
@@ -663,6 +717,8 @@ def test_get_pipeline_graph_returns_correction_target(client: TestClient) -> Non
     edge.target_node_id = uuid.uuid4()
     edge.edge_type = "normal"
     edge.condition_expression = None
+    edge.source_port = "out"
+    edge.target_port = "in"
     edge.hitl_gate_config = {
         "label": "Review",
         "description": "Gate",
@@ -945,6 +1001,10 @@ def test_admin_can_strip_guardrail_binding_via_snapshot_rollback(client: TestCli
     new_snapshot.notes = None
     new_snapshot.created_at = _NOW
     new_snapshot.account_id = uuid.uuid4()
+    new_snapshot.version_kind = "run"
+    new_snapshot.created_kind = "run"
+    new_snapshot.draft = False
+    new_snapshot.channel = "none"
 
     with (
         patch("modulo.api.routes.pipelines.rollback_to_snapshot", return_value=new_snapshot),

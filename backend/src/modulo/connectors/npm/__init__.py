@@ -14,7 +14,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _API_BASE = "https://registry.npmjs.org"
 _NPM_SEARCH_ENDPOINT = "/-/v1/search"
@@ -33,7 +35,8 @@ class NpmConnector(ConnectorBase):
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
-        return httpx.AsyncClient(
+        return pinned_async_client_sync(
+            _API_BASE,
             base_url=_API_BASE,
             headers=headers,
             timeout=30,
@@ -55,7 +58,7 @@ class NpmConnector(ConnectorBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:

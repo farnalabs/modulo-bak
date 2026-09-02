@@ -28,7 +28,7 @@ class EvalDefinition(OrgScoped):
         nullable=False,
         index=True,
     )
-    node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(), nullable=True)
+    node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(), ForeignKey("nodes.id", ondelete="SET NULL"))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     eval_type: Mapped[str] = mapped_column(String(30), nullable=False)
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -47,7 +47,7 @@ class EvalDefinition(OrgScoped):
         index=True,
     )
     account_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(), ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False
+        Uuid(), ForeignKey("accounts.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     # Eval-definition versioning (FAR-382): each definition carries an integer
     # ``version`` starting at 1, bumped on every create and update so a rubric

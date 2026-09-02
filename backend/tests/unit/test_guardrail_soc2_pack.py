@@ -56,7 +56,10 @@ def _redact_control_guardrail() -> GuardrailConfigItem:
 
 
 def test_soc2_pack_is_ci_ready():
-    assert_pack_ci_ready(SOC2_PACK)  # must not raise
+    result = assert_pack_ci_ready(SOC2_PACK)  # must not raise
+    # The CI gate is a validator: a fully-mapped pack passes without raising
+    # AND keeps its no-return contract (returns None).
+    assert result is None
 
 
 def test_soc2_pack_gap_report_shows_all_controls_mapped():
@@ -223,7 +226,7 @@ def test_soc2_pack_detection_patterns_are_linear(pattern):
 
 
 @pytest.mark.parametrize(
-    "pattern,should_match,should_not_match",
+    ("pattern", "should_match", "should_not_match"),
     [
         (
             AWS_ACCESS_KEY_PATTERN,

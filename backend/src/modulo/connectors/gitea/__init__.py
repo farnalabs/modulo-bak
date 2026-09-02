@@ -13,7 +13,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 REQUIRED_SCOPES = frozenset({"read:user", "read:repository", "write:repository"})
 
@@ -55,7 +57,15 @@ class GiteaConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin. The
+        # validated host is ``self._base_url``; the API client base_url is the
+        # same host with an ``/api/v1`` path suffix.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=f"{self._base_url}/api/v1",
             headers=self._headers(),
             timeout=30,
@@ -104,7 +114,7 @@ class GiteaConnector(ConnectorBase):
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Gitea API connection error")
         except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
         missing = await self._get_missing_scopes()
         if missing:

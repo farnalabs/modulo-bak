@@ -17,6 +17,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _BUILDKITE_API = "https://api.buildkite.com/v2"
 
@@ -42,12 +43,8 @@ def _duration_seconds(raw: dict[str, Any]) -> int | None:
     finished_at = raw.get("finished_at")
     if started_at and finished_at:
         try:
-            fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
-            started = datetime.strptime(started_at, fmt) if "T" in started_at else datetime.fromisoformat(started_at)
-            if "T" in finished_at:
-                finished = datetime.strptime(finished_at, fmt)
-            else:
-                finished = datetime.fromisoformat(finished_at)
+            started = datetime.fromisoformat(started_at)
+            finished = datetime.fromisoformat(finished_at)
             return int((finished - started).total_seconds())
         except (ValueError, TypeError):
             return None
@@ -74,7 +71,7 @@ class BuildkiteConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=_BUILDKITE_API, headers=self._headers(), timeout=30)
+        return pinned_async_client_sync(_BUILDKITE_API, base_url=_BUILDKITE_API, headers=self._headers(), timeout=30)
 
     def _parse_run(self, raw: dict[str, Any]) -> CIRun:
         raw_state = raw.get("state", "")

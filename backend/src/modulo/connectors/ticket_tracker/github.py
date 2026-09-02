@@ -6,8 +6,17 @@ from typing import Any
 import httpx
 
 from modulo.connectors._safe_datetime import safe_datetime as _safe_datetime
-from modulo.connectors.base import ConnectorPayload, ConnectorQuery, ConnectorResult, ConnectorType, HealthResult
+from modulo.connectors.base import (
+    ConnectorPayload,
+    ConnectorQuery,
+    ConnectorResult,
+    ConnectorType,
+    HealthResult,
+    health_check_failure,
+)
+from modulo.connectors.security import CredentialRedactor, redacting
 from modulo.connectors.ticket_tracker.base import Ticket, TicketFilter, TicketTrackerBase
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 class GitHubTicketTracker(TicketTrackerBase):
@@ -17,6 +26,7 @@ class GitHubTicketTracker(TicketTrackerBase):
         self._token = creds.get("token") or creds.get("api_key", "")
         self._repo = config.get("repo", "")
         self._base_url = config.get("base_url", "https://api.github.com")
+        self._redactor = CredentialRedactor.from_creds(creds)
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -28,10 +38,17 @@ class GitHubTicketTracker(TicketTrackerBase):
             "Accept": "application/vnd.github.v3+json",
         }
 
+    def _client(self) -> httpx.AsyncClient:
+        # PINNED TRANSPORT (FAR-526B): build the client through the pinned
+        # transport so the validated base_url address is pinned onto the
+        # connection (never re-resolved at connect time — closes DNS rebinding).
+        # The token is in the Authorization header, so no creds reach the URL.
+        return pinned_async_client_sync(self._base_url)
+
     async def health_check(self) -> HealthResult:
         headers = self._headers()
         try:
-            async with httpx.AsyncClient() as client:
+            async with self._client() as client:
                 resp = await client.get(f"{self._base_url}/repos/{self._repo}", headers=headers, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
@@ -39,8 +56,9 @@ class GitHubTicketTracker(TicketTrackerBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return HealthResult(ok=False, detail=str(e)[:200])
+            return health_check_failure(self._redactor.redact_exc(e))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         filters = q.filters or {}
         if "ticket_id" in filters:
@@ -57,9 +75,10 @@ class GitHubTicketTracker(TicketTrackerBase):
         )
         return ConnectorResult(records=[t.__dict__ for t in tickets], total=len(tickets))
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         data = payload.data
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             resp = await client.post(
                 f"{self._base_url}/repos/{self._repo}/issues",
                 json={"title": data.get("title", ""), "body": data.get("description", "")},
@@ -81,7 +100,7 @@ class GitHubTicketTracker(TicketTrackerBase):
             params["state"] = ticket_filter.status.lower()
         if ticket_filter and ticket_filter.labels:
             params["labels"] = ",".join(ticket_filter.labels)
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             resp = await client.get(
                 f"{self._base_url}/repos/{self._repo}/issues",
                 headers=self._headers(),
@@ -93,7 +112,7 @@ class GitHubTicketTracker(TicketTrackerBase):
         return [self._to_ticket(t) for t in raw_tickets]
 
     async def get_ticket(self, ticket_id: str) -> Ticket:
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             resp = await client.get(
                 f"{self._base_url}/repos/{self._repo}/issues/{ticket_id}",
                 headers=self._headers(),
@@ -108,7 +127,7 @@ class GitHubTicketTracker(TicketTrackerBase):
             body["body"] = description
         if "labels" in kwargs:
             body["labels"] = kwargs["labels"]
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             resp = await client.post(
                 f"{self._base_url}/repos/{self._repo}/issues",
                 json=body,
@@ -126,7 +145,7 @@ class GitHubTicketTracker(TicketTrackerBase):
             body["labels"] = kwargs["labels"]
         if "title" in kwargs:
             body["title"] = kwargs["title"]
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             resp = await client.patch(
                 f"{self._base_url}/repos/{self._repo}/issues/{ticket_id}",
                 json=body,

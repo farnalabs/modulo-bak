@@ -14,7 +14,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 class GrafanaConnector(ConnectorBase):
@@ -27,7 +29,13 @@ class GrafanaConnector(ConnectorBase):
         return ConnectorType.GRAFANA
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=self._base_url,
             headers={
                 "Authorization": f"Bearer {self._token}",
@@ -48,7 +56,7 @@ class GrafanaConnector(ConnectorBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:

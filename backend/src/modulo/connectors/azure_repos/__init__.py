@@ -14,7 +14,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 class AzureReposConnector(ConnectorBase):
@@ -61,7 +63,13 @@ class AzureReposConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=self._base_url,
             headers=self._headers(),
             timeout=30,
@@ -70,7 +78,17 @@ class AzureReposConnector(ConnectorBase):
     async def health_check(self) -> HealthResult:
         """Verify API access by fetching the authenticated user's profile."""
         try:
-            async with httpx.AsyncClient(headers=self._headers(), timeout=30) as client:
+            # PINNED TRANSPORT (FAR-520): the profile endpoint lives on the
+            # Microsoft host app.vssps.visualstudio.com, not the repo base_url
+            # (dev.azure.com/<org>). Validate + pin THAT host and drop the stale
+            # validate_outbound_url(self._base_url) that guarded a host this
+            # connection never used. A blocked host is REPORTED as unhealthy by
+            # the ValueError handler below, never raised out of a health check.
+            async with pinned_async_client_sync(
+                "https://app.vssps.visualstudio.com",
+                headers=self._headers(),
+                timeout=30,
+            ) as client:
                 r = await client.get(
                     "https://app.vssps.visualstudio.com/_apis/profile/profiles/me",
                     params={"api-version": "7.0"},
@@ -94,7 +112,7 @@ class AzureReposConnector(ConnectorBase):
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Azure Repos API connection error")
         except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as client:

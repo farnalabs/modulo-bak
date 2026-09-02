@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from modulo.db.models.base import Base, OrgScoped
@@ -23,9 +23,7 @@ class Notification(OrgScoped):
 
     scope: Mapped[str] = mapped_column(String(20), nullable=False)
     target_user_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid(),
-        ForeignKey(_FK_ACCOUNTS_ID, ondelete="SET NULL"),
-        nullable=True,
+        Uuid(), ForeignKey(_FK_ACCOUNTS_ID, ondelete="SET NULL"), nullable=True, index=True
     )
     level: Mapped[str] = mapped_column(String(20), nullable=False)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -97,9 +95,16 @@ class Dismissal(Base):
     __table_args__ = (
         CheckConstraint("dismiss_scope IN ('self', 'scope')", name="ck_dismissals_scope"),
         UniqueConstraint("notification_id", "dismissed_by_user_id", name="uq_dismissal_user_notification"),
+        Index("ix_dismissals_dismissed_by_user_id", "dismissed_by_user_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
+    organisation_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey("organisations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     notification_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(),
         ForeignKey("notifications.id", ondelete="CASCADE"),

@@ -23,6 +23,7 @@ from modulo.api.constants import MSG_UNEXPECTED_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_permission
 from modulo.auth.jwt import TenantPrincipal
+from modulo.auth.secret_storage import decode_stored_secret_scoped
 from modulo.core.notifier import (
     EVENT_BUDGET_EXCEEDED,
     EVENT_CIRCUIT_BREAKER_TRIPPED,
@@ -30,6 +31,7 @@ from modulo.core.notifier import (
     EVENT_TRIGGER_DEACTIVATED,
     endpoint_events_to_list,
 )
+from modulo.core.ssrf import pinned_async_client
 from modulo.db.models.notification_delivery import NotificationDeliveryLog
 from modulo.db.models.notification_endpoint import NotificationEndpoint
 from modulo.db.models.team import Team
@@ -415,21 +417,35 @@ async def _retry_one_delivery(
     headers = {"Content-Type": _MSG_APPLICATION_JSON, "User-Agent": _MSG_MODULO_NOTIFIER_1_0}
     if ep.secret_ciphertext:
         try:
-            fernet = Fernet(settings.fernet_key.encode())
-            raw_secret = fernet.decrypt(ep.secret_ciphertext)
-            sig = hmac.new(raw_secret, body, hashlib.sha256).hexdigest()
+            async with session.begin():
+                await set_rls_org(session, principal.organisation_id)
+                raw_secret = await decode_stored_secret_scoped(
+                    session, ep.secret_ciphertext, settings.fernet_key, org_id=principal.organisation_id
+                )
+            sig = hmac.new(raw_secret.encode(), body, hashlib.sha256).hexdigest()
             headers["X-Modulo-Signature"] = f"sha256={sig}"
         except Exception:
             logger.exception("Failed to sign retry payload")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(ep.url, content=body, headers=headers)
+        client = await pinned_async_client(ep.url)
+        client.timeout = httpx.Timeout(15.0)
+    except ValueError as exc:
+        logger.warning(
+            "admin.notifications.retry_delivery.ssrf_rejected",
+            extra={"endpoint_id": str(ep.id), "error": str(exc)},
+        )
+        await _record_delivery_error(session, principal, delivery, ep, exc)
+        return None, str(exc)
+    try:
+        resp = await client.post(ep.url, content=body, headers=headers)
         await _record_delivery_result(session, principal, delivery, ep, resp)
         return resp, None
     except httpx.RequestError as exc:
         await _record_delivery_error(session, principal, delivery, ep, exc)
         return None, str(exc)
+    finally:
+        await client.aclose()
 
 
 async def _record_delivery_result(
@@ -546,7 +562,7 @@ async def _bump_dead_letter_count(session: AsyncSession, ep: NotificationEndpoin
 @router.get("/available-events")
 @handle_db_errors("admin.notifications.list_available_events")
 async def list_available_events(
-    principal: TenantPrincipal = require_permission(_CODE_ADMIN_NOTIFICATION_MANAGE),
+    _principal: TenantPrincipal = require_permission(_CODE_ADMIN_NOTIFICATION_MANAGE),
 ) -> list[str]:
     return AVAILABLE_EVENTS
 
@@ -843,16 +859,32 @@ async def test_webhook(
     headers = {"Content-Type": _MSG_APPLICATION_JSON, "User-Agent": _MSG_MODULO_NOTIFIER_1_0}
     if ep.secret_ciphertext:
         try:
-            fernet = Fernet(settings.fernet_key.encode())
-            raw_secret = fernet.decrypt(ep.secret_ciphertext)
-            sig = hmac.new(raw_secret, payload, hashlib.sha256).hexdigest()
+            async with session.begin():
+                await set_rls_org(session, principal.organisation_id)
+                raw_secret = await decode_stored_secret_scoped(
+                    session, ep.secret_ciphertext, settings.fernet_key, org_id=principal.organisation_id
+                )
+            sig = hmac.new(raw_secret.encode(), payload, hashlib.sha256).hexdigest()
             headers["X-Modulo-Signature"] = f"sha256={sig}"
         except Exception:
             logger.exception("Failed to sign test payload")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(ep.url, content=payload, headers=headers)
+        client = await pinned_async_client(ep.url)
+        client.timeout = httpx.Timeout(15.0)
+    except ValueError as exc:
+        logger.warning(
+            "admin.notifications.test_webhook.ssrf_rejected",
+            extra={"endpoint_id": str(ep.id), "error": str(exc)},
+        )
+        return TestResult(
+            success=False,
+            status_code=None,
+            response_body=None,
+            error=str(exc),
+        )
+    try:
+        resp = await client.post(ep.url, content=payload, headers=headers)
         response_body = resp.text[:500]
         return TestResult(
             success=resp.is_success,
@@ -867,6 +899,8 @@ async def test_webhook(
             response_body=None,
             error=str(exc),
         )
+    finally:
+        await client.aclose()
 
 
 # ── Re-enable ──────────────────────────────────────────────────────────

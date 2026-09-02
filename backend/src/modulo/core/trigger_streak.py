@@ -33,7 +33,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -395,6 +395,94 @@ def _streak_config(config: dict[str, Any] | None) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_streak_threshold(trigger: Any, config_threshold: int | None) -> int:
+    """Resolve the threshold: caller-supplied wins, else the trigger's config."""
+    if config_threshold is not None:
+        return int(config_threshold)
+    threshold, _ = _streak_config(trigger.config_json)
+    return threshold
+
+
+async def _read_streak_count(session: AsyncSession, org_id: uuid.UUID, trigger_id: uuid.UUID) -> int:
+    """Read the current no-delivery streak (the same walk the sweep uses)."""
+    result = await session.execute(
+        text(_STREAK_STATUS_COUNT_SQL),
+        {"oid": str(org_id), "tid": str(trigger_id)},
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def _read_streak_outcomes(
+    session: AsyncSession, org_id: uuid.UUID, trigger_id: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Read the trigger's last terminal-classified runs (newest first, <=5)."""
+    from modulo.db.models.run import Run
+
+    rows = (
+        await session.execute(
+            select(Run.id, Run.run_classification, Run.completed_at)
+            .where(
+                Run.organisation_id == org_id,
+                Run.trigger_id == trigger_id,
+                Run.completed_at.is_not(None),
+                Run.completed_at >= text(_STREAK_BOUNDARY_SQL),
+            )
+            .order_by(Run.completed_at.desc(), Run.id.desc())
+            .limit(5),
+            {"oid": str(org_id), "tid": str(trigger_id)},
+        )
+    ).all()
+    last_outcomes: list[dict[str, Any]] = []
+    for run_id, classification, completed_at in rows:
+        if not isinstance(classification, dict):
+            continue
+        last_outcomes.append(
+            {
+                "run_id": str(run_id),
+                "classification": classification.get("value"),
+                "reason": classification.get("reason"),
+                "completed_at": completed_at.isoformat() if completed_at is not None else None,
+            }
+        )
+    return last_outcomes
+
+
+async def _read_streak_deactivation_reason(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    trigger_id: uuid.UUID,
+    trigger: Any,
+) -> str | None:
+    """Read the newest auto-deactivation reason SINCE the last active=True."""
+    from modulo.db.models.audit_event import AuditEvent
+
+    streak_epoch = getattr(trigger, "streak_epoch", None)
+    epoch_cutoff = streak_epoch if streak_epoch is not None else datetime.now(UTC)
+    audit_row = (
+        await session.execute(
+            select(AuditEvent.payload_json)
+            .where(
+                AuditEvent.organisation_id == org_id,
+                AuditEvent.resource_type == "trigger",
+                AuditEvent.resource_id == trigger_id,
+                AuditEvent.event_type == STREAK_DEACTIVATION_EVENT_TYPE,
+                AuditEvent.created_at >= epoch_cutoff,
+            )
+            .order_by(AuditEvent.created_at.desc())
+            .limit(1)
+        )
+    ).first()
+    if audit_row is None:
+        return None
+    payload = audit_row[0] or {}
+    deactivated_by = payload.get("deactivated_by") if isinstance(payload, dict) else None
+    return (
+        STREAK_DEACTIVATED_BY_CONFIG_FAILURE
+        if deactivated_by == STREAK_DEACTIVATED_BY_CONFIG_FAILURE
+        else STREAK_DEACTIVATED_BY_STREAK
+    )
+
+
 async def get_trigger_streak_status(
     session: AsyncSession,
     trigger: Any,
@@ -436,14 +524,7 @@ async def get_trigger_streak_status(
     reason keeps everything already computed — a deactivated trigger must never
     be reported as 'unconfigured' just because the reason read hiccuped.
     """
-    base: dict[str, Any] = {
-        "enabled": False,
-        "streak": 0,
-        "threshold": 0,
-        "state": "unconfigured",
-        "deactivated_reason": None,
-        "last_outcomes": [],
-    }
+    base = _streak_status_base()
     if getattr(trigger, "trigger_type", None) != "ongoing":
         return base
     org_id = getattr(trigger, "organisation_id", None)
@@ -454,33 +535,17 @@ async def get_trigger_streak_status(
     # Threshold resolution is part of the reader's self-contained contract: a
     # caller-supplied ``config_threshold`` (resolved by the serializer) wins,
     # otherwise resolve from the trigger's own config_json.
-    threshold: int
-    try:
-        if config_threshold is not None:
-            threshold = int(config_threshold)
-        else:
-            threshold, _ = _streak_config(trigger.config_json)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _log.warning("streak.threshold_resolve_failed trigger=%s", getattr(trigger, "id", None), exc_info=True)
-        return base
+    threshold, degraded = _resolve_streak_status_threshold(trigger, config_threshold)
+    if degraded is not None:
+        return degraded
 
     # 1) The current streak — the SAME walk the sweep uses, read without the
     # deactivation guards. ``text()`` raw SQL bypasses the tenant-filter
     # listener, so the walk's ``organisation_id = :oid`` predicates scope it
     # (the count fragment carries its own org/trigger bind params). A failure
     # here degrades to the bare base (no streak computable).
-    try:
-        count_result = await session.execute(
-            text(_STREAK_STATUS_COUNT_SQL),
-            {"oid": str(org_id), "tid": str(trigger_id)},
-        )
-        streak = int(count_result.scalar_one() or 0)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _log.warning("streak.status_count_failed trigger=%s", getattr(trigger, "id", None), exc_info=True)
+    streak, ok = await _read_streak_status_count(session, org_id, trigger_id)
+    if not ok:
         return base
 
     # 2) Last-N outcome summary — the trigger's own terminal classified runs
@@ -488,47 +553,7 @@ async def get_trigger_streak_status(
     # panel can never contradict the badge after a re-enable re-anchors the
     # epoch). In-flight runs (completed_at NULL) are excluded. A failure here
     # keeps the computed streak + threshold and degrades the outcomes to [].
-    last_outcomes: list[dict[str, Any]] = []
-    try:
-        from modulo.db.models.run import Run
-
-        outcome_rows = (
-            await session.execute(
-                select(Run.id, Run.run_classification, Run.completed_at)
-                .where(
-                    Run.organisation_id == org_id,
-                    Run.trigger_id == trigger_id,
-                    Run.completed_at.is_not(None),
-                    Run.completed_at >= text(_STREAK_BOUNDARY_SQL),
-                )
-                .order_by(Run.completed_at.desc(), Run.id.desc())
-                .limit(5),
-                # FIX 2 — bind the raw boundary fragment's :oid/:tid. The ORM
-                # auto-binds organisation_id_1/trigger_id_1 from the column
-                # predicates, but the text() fragment carries its OWN named
-                # params; without this dict execution raises
-                # ``InvalidRequestError: A value is required for bind
-                # parameter 'oid'``, which the per-sub-read except swallows —
-                # last_outcomes silently degraded to [] on every call.
-                {"oid": str(org_id), "tid": str(trigger_id)},
-            )
-        ).all()
-        for run_id, classification, completed_at in outcome_rows:
-            if not isinstance(classification, dict):
-                continue
-            last_outcomes.append(
-                {
-                    "run_id": str(run_id),
-                    "classification": classification.get("value"),
-                    "reason": classification.get("reason"),
-                    "completed_at": completed_at.isoformat() if completed_at is not None else None,
-                }
-            )
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _log.warning("streak.status_outcomes_failed trigger=%s", getattr(trigger, "id", None), exc_info=True)
-        last_outcomes = []
+    last_outcomes = await _read_streak_status_outcomes(session, org_id, trigger_id)
 
     # 3) Deactivation reason — an auto-deactivated trigger (active=False) whose
     # NEWEST auto-deactivation audit record SINCE the last activation says
@@ -547,46 +572,12 @@ async def get_trigger_streak_status(
     deactivated_reason: str | None = None
     reason_read_failed = False
     if not getattr(trigger, "active", True):
-        try:
-            from modulo.db.models.audit_event import AuditEvent
+        # A reason-read failure on an INACTIVE trigger must never collapse to
+        # 'unconfigured': surface 'deactivated' with the reason unknown so the
+        # operator sees something needs attention.
+        deactivated_reason, reason_read_failed = await _read_streak_status_reason(session, org_id, trigger_id, trigger)
 
-            streak_epoch = getattr(trigger, "streak_epoch", None)
-            epoch_cutoff = streak_epoch if streak_epoch is not None else datetime.now(UTC)
-            audit_row = (
-                await session.execute(
-                    select(AuditEvent.payload_json)
-                    .where(
-                        AuditEvent.organisation_id == org_id,
-                        AuditEvent.resource_type == "trigger",
-                        AuditEvent.resource_id == trigger_id,
-                        AuditEvent.event_type == STREAK_DEACTIVATION_EVENT_TYPE,
-                        AuditEvent.created_at >= epoch_cutoff,
-                    )
-                    .order_by(AuditEvent.created_at.desc())
-                    .limit(1)
-                )
-            ).first()
-            if audit_row is not None:
-                payload = audit_row[0] or {}
-                deactivated_by = payload.get("deactivated_by") if isinstance(payload, dict) else None
-                deactivated_reason = (
-                    STREAK_DEACTIVATED_BY_CONFIG_FAILURE
-                    if deactivated_by == STREAK_DEACTIVATED_BY_CONFIG_FAILURE
-                    else STREAK_DEACTIVATED_BY_STREAK
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A reason-read failure on an INACTIVE trigger must never collapse
-            # to 'unconfigured': surface 'deactivated' with the reason unknown
-            # so the operator sees something needs attention.
-            reason_read_failed = True
-            _log.warning("streak.status_reason_failed trigger=%s", getattr(trigger, "id", None), exc_info=True)
-
-    if deactivated_reason is not None or reason_read_failed:
-        state: str = "deactivated"
-    else:
-        state = "ok"
+    state = "deactivated" if deactivated_reason is not None or reason_read_failed else "ok"
 
     return {
         "enabled": _streak_deactivate_enabled(),
@@ -596,6 +587,73 @@ async def get_trigger_streak_status(
         "deactivated_reason": deactivated_reason,
         "last_outcomes": last_outcomes,
     }
+
+
+def _streak_status_base() -> dict[str, Any]:
+    """Bare unconfigured reader response (nothing computable yet)."""
+    return {
+        "enabled": False,
+        "streak": 0,
+        "threshold": 0,
+        "state": "unconfigured",
+        "deactivated_reason": None,
+        "last_outcomes": [],
+    }
+
+
+def _resolve_streak_status_threshold(trigger: Any, config_threshold: int | None) -> tuple[int, dict[str, Any] | None]:
+    """Resolve the reader threshold; a failure degrades to the bare base.
+
+    Returns ``(threshold, None)`` on success or ``(0, base)`` when the
+    caller-supplied / config threshold cannot be resolved.
+    """
+    base = _streak_status_base()
+    try:
+        return _resolve_streak_threshold(trigger, config_threshold), None
+    except Exception:
+        _log.warning("streak.threshold_resolve_failed trigger=%s", getattr(trigger, "id", None), exc_info=True)
+        return 0, base
+
+
+async def _read_streak_status_count(
+    session: AsyncSession, org_id: uuid.UUID, trigger_id: uuid.UUID
+) -> tuple[int, bool]:
+    """Read the current streak; ``(streak, ok)`` — ``False`` means degrade."""
+    try:
+        return await _read_streak_count(session, org_id, trigger_id), True
+    except Exception:
+        _log.warning("streak.status_count_failed trigger=%s", trigger_id, exc_info=True)
+        return 0, False
+
+
+async def _read_streak_status_outcomes(
+    session: AsyncSession, org_id: uuid.UUID, trigger_id: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Read the last-N outcome summary; ``[]`` on failure (keeps streak+threshold)."""
+    try:
+        return await _read_streak_outcomes(session, org_id, trigger_id)
+    except Exception:
+        _log.warning("streak.status_outcomes_failed trigger=%s", trigger_id, exc_info=True)
+        return []
+
+
+async def _read_streak_status_reason(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    trigger_id: uuid.UUID,
+    trigger: Any,
+) -> tuple[str | None, bool]:
+    """Read the deactivation reason; ``(reason, failed)`` on outcome.
+
+    A read failure surfaces ``(None, True)`` so the caller reports
+    ``deactivated`` with the reason unknown rather than collapsing to
+    'unconfigured'.
+    """
+    try:
+        return await _read_streak_deactivation_reason(session, org_id, trigger_id, trigger), False
+    except Exception:
+        _log.warning("streak.status_reason_failed trigger=%s", trigger_id, exc_info=True)
+        return None, True
 
 
 # ---------------------------------------------------------------------------
@@ -939,6 +997,37 @@ async def _record_streak_notify_failed(
         _log.warning("streak.notify_failed_audit_write_failed org=%s", org_id)
 
 
+async def _pend_streak_notify_retry(
+    org_id: uuid.UUID,
+    *,
+    data: dict[str, Any],
+    threshold: int,
+    reason: str,
+    pipeline_name: str,
+    redis_client: AsyncRedis | None,
+    retry_count: int = 0,
+) -> bool:
+    """Record a first-attempt audit failure and pend a Redis retry.
+
+    Shared tail of every deactivation-notify failure path: first-attempt
+    failures (``retry_count == 0``) get a CRITICAL audit row via
+    :func:`_record_streak_notify_failed`; every failure gets a per-org pending
+    marker via :func:`_write_streak_notify_pending` so the next scheduler tick
+    retries. Returns ``False`` so callers can ``return False`` directly.
+    """
+    if retry_count == 0:
+        await _record_streak_notify_failed(org_id, data=data, threshold=threshold, reason=reason)
+    await _write_streak_notify_pending(
+        redis_client,
+        org_id,
+        data=data,
+        threshold=threshold,
+        pipeline_name=pipeline_name,
+        retry_count=retry_count,
+    )
+    return False
+
+
 async def _notify_streak_deactivation(
     org_id: uuid.UUID,
     *,
@@ -1005,16 +1094,15 @@ async def _notify_streak_deactivation(
         )
         if retry_count == 0:
             _log.critical("streak.deactivation_notify_failed org=%s trigger=%s (timeout)", org_id, data["id"])
-            await _record_streak_notify_failed(org_id, data=data, threshold=threshold, reason=safe_reason)
-        await _write_streak_notify_pending(
-            redis_client,
+        return await _pend_streak_notify_retry(
             org_id,
             data=data,
             threshold=threshold,
+            reason=safe_reason,
             pipeline_name=pipeline_name,
+            redis_client=redis_client,
             retry_count=retry_count,
         )
-        return False
     except Exception:
         _log.critical(
             "streak.deactivation_notify_failed org=%s trigger=%s",
@@ -1022,17 +1110,15 @@ async def _notify_streak_deactivation(
             data["id"],
             exc_info=True,
         )
-        if retry_count == 0:
-            await _record_streak_notify_failed(org_id, data=data, threshold=threshold, reason=safe_reason)
-        await _write_streak_notify_pending(
-            redis_client,
+        return await _pend_streak_notify_retry(
             org_id,
             data=data,
             threshold=threshold,
+            reason=safe_reason,
             pipeline_name=pipeline_name,
+            redis_client=redis_client,
             retry_count=retry_count,
         )
-        return False
     # dispatch_event does NOT raise on per-endpoint delivery failure (it
     # dead-letters internally after 4 attempts) — inspect the results.
     if results and any(getattr(r, "status", "") == "dead_lettered" for r in results):
@@ -1041,17 +1127,15 @@ async def _notify_streak_deactivation(
             org_id,
             data["id"],
         )
-        if retry_count == 0:
-            await _record_streak_notify_failed(org_id, data=data, threshold=threshold, reason=safe_reason)
-        await _write_streak_notify_pending(
-            redis_client,
+        return await _pend_streak_notify_retry(
             org_id,
             data=data,
             threshold=threshold,
+            reason=safe_reason,
             pipeline_name=pipeline_name,
+            redis_client=redis_client,
             retry_count=retry_count,
         )
-        return False
     return True
 
 
@@ -1091,6 +1175,201 @@ async def _srem_streak_member(redis_client: AsyncRedis, key: str, raw: str) -> N
         _log.warning("streak.notify_pending_remove_failed key=%s", key)
 
 
+def _build_deactivation_payload(
+    trigger_id: uuid.UUID,
+    pipeline_id: uuid.UUID | None,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the deactivation payload forwarded to the notifier."""
+    return {
+        "id": trigger_id,
+        "pipeline_id": pipeline_id,
+        "streak": int(data.get("streak") or 0),
+        "reason": data.get("reason") or "no_delivery",
+    }
+
+
+async def _reenqueue_streak_notify_member(
+    redis_client: AsyncRedis,
+    org_id: uuid.UUID,
+    key: str,
+    raw: str,
+    deactivation: dict[str, Any],
+    threshold: int,
+    pipeline_name: str,
+    retry_count: int,
+) -> None:
+    """Drop the member from the pending set and re-enqueue it with a bumped
+    retry_count + cooldown stamp (the SET's TTL is refreshed by the write), so
+    the member is retried at most once per 15 min and never floods the audit
+    chain. Best-effort — never raises.
+    """
+    await _srem_streak_member(redis_client, key, raw)
+    await _write_streak_notify_pending(
+        redis_client,
+        org_id,
+        data=deactivation,
+        threshold=threshold,
+        pipeline_name=pipeline_name,
+        retry_count=retry_count + 1,
+        last_retry_at=int(time.time()),
+    )
+
+
+async def _retry_one_pending_member(
+    org_id: uuid.UUID,
+    redis_client: AsyncRedis,
+    key: str,
+    raw: str,
+    attempted: int,
+    max_retries: int,
+) -> tuple[str, int]:
+    """Retry one pending notifier member; returns ``(status, attempted)``.
+
+    ``status`` is one of:
+
+    * ``"ok"``      — notified; caller counts a retry.
+    * ``"failed"``  — notifier failed again; re-enqueued with a bumped retry.
+    * ``"skip"``    — cooldown / corrupt / activity-read-failure; leave pending.
+    * ``"dropped"`` — trigger re-enabled; member removed from the pending set.
+    * ``"stop"``    — per-tick dispatch cap reached; caller stops the pass.
+
+    Never raises out: unparseable/corrupt members are srem'd so they are not
+    retried forever.
+    """
+    data = _decode_pending_member(raw)
+    if data is None:
+        # corrupt / unparseable member — srem'd, never retried forever.
+        _log.warning("streak.notify_pending_retry_failed org=%s", org_id)
+        await _srem_streak_member(redis_client, key, raw)
+        return "failed", attempted
+    if _streak_member_in_cooldown(data):
+        return "skip", attempted  # per-member cooldown — retry at most once per 15 min
+    try:
+        trigger_id = uuid.UUID(data["trigger_id"])
+        pipeline_id = uuid.UUID(data["pipeline_id"]) if data.get("pipeline_id") else None
+        threshold = int(data.get("threshold") or 0)
+        retry_count = int(data.get("retry_count") or 0)
+        # Re-check the trigger's active state before dispatching. A pending
+        # member exists precisely because the trigger was JUST auto-
+        # deactivated (active=False), so dispatch while it stays deactivated;
+        # drop only when it has been re-enabled (active=True) — a re-enabled
+        # trigger must NOT receive a stale "auto-deactivated" notification.
+        # A read failure (None) skips the member this tick without dropping.
+        active = await _trigger_active_state(org_id, trigger_id)
+        if active is None:
+            return "skip", attempted  # read failure — skip, don't drop
+        if active:
+            await _srem_streak_member(redis_client, key, raw)
+            _log.warning(
+                "streak.notify_pending_dropped org=%s trigger=%s (re-enabled)",
+                org_id,
+                trigger_id,
+            )
+            return "dropped", attempted
+        attempted += 1
+        if attempted > max_retries:
+            return "stop", attempted  # per-tick dispatch cap reached — leave the rest pending
+        return await _dispatch_pending_member_notify(
+            org_id,
+            redis_client,
+            key,
+            raw,
+            data,
+            trigger_id,
+            pipeline_id,
+            threshold,
+            retry_count,
+            attempted,
+        )
+    except Exception:
+        _log.warning("streak.notify_pending_retry_failed org=%s", org_id)
+        await _srem_streak_member(redis_client, key, raw)
+        return "failed", attempted
+
+
+def _decode_pending_member(raw: str) -> dict[str, Any] | None:
+    """Parse a pending notifier member; ``None`` on corrupt / unparseable."""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+async def _dispatch_pending_member_notify(
+    org_id: uuid.UUID,
+    redis_client: AsyncRedis,
+    key: str,
+    raw: str,
+    data: dict[str, Any],
+    trigger_id: uuid.UUID,
+    pipeline_id: uuid.UUID | None,
+    threshold: int,
+    retry_count: int,
+    attempted: int,
+) -> tuple[str, int]:
+    """Dispatch one pending member's deactivation notification.
+
+    Returns ``("ok", attempted)`` when the notifier accepted (member srem'd) or
+    ``("failed", attempted)`` after re-enqueueing with a bumped ``retry_count``
+    + cooldown stamp (the SET's TTL is refreshed by the write), so the member is
+    retried at most once per 15 min and never floods the audit chain.
+    """
+    deactivation = _build_deactivation_payload(trigger_id, pipeline_id, data)
+    ok = await _notify_streak_deactivation(
+        org_id,
+        data=deactivation,
+        threshold=threshold,
+        reason=deactivation["reason"],
+        pipeline_name=data.get("pipeline_name") or "",
+        # None: the retry path owns the re-enqueue (bumped retry_count +
+        # cooldown) below — never a bare re-add.
+        redis_client=None,
+        retry_count=retry_count,
+    )
+    if ok:
+        await _srem_streak_member(redis_client, key, raw)
+        return "ok", attempted
+    # Re-enqueue with a bumped retry_count + cooldown stamp (the SET's TTL is
+    # refreshed by the write) so the member is retried at most once per 15 min
+    # and never floods the audit chain.
+    await _reenqueue_streak_notify_member(
+        redis_client,
+        org_id,
+        key,
+        raw,
+        deactivation,
+        threshold,
+        data.get("pipeline_name") or "",
+        retry_count,
+    )
+    return "failed", attempted
+
+
+def _streak_member_in_cooldown(data: dict[str, Any]) -> bool:
+    """True when this pending member is inside its retry cooldown window."""
+    last_retry_at = data.get("last_retry_at")
+    if not isinstance(last_retry_at, (int, float)):
+        return False
+    return time.time() - float(last_retry_at) < _STREAK_RETRY_COOLDOWN_SECONDS
+
+
+async def _read_streak_pending_members(redis_client: AsyncRedis, org_id: uuid.UUID) -> set[str] | None:
+    """Read the per-org pending notify set; ``None`` on failure (skip the pass)."""
+    try:
+        # redis.asyncio stubs type the set ops as ``Union[Awaitable, value]``
+        # (dual sync/async); we always hold the async client, so cast.
+        return await cast(Awaitable[set[str]], redis_client.smembers(_streak_notify_pending_key(org_id)))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.warning("streak.notify_pending_read_failed org=%s", org_id)
+        return None
+
+
 async def _retry_pending_streak_notifications(
     org_id: uuid.UUID,
     redis_client: AsyncRedis | None,
@@ -1111,96 +1390,20 @@ async def _retry_pending_streak_notifications(
         return 0
     if deadline is not None and time.monotonic() > deadline:
         return 0  # sweep budget already exhausted — skip the pass entirely
-    key = _streak_notify_pending_key(org_id)
-    try:
-        # redis.asyncio stubs type the set ops as ``Union[Awaitable, value]``
-        # (dual sync/async); we always hold the async client, so cast.
-        members = await cast(Awaitable[set[str]], redis_client.smembers(key))
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        _log.warning("streak.notify_pending_read_failed org=%s", org_id)
+    members = await _read_streak_pending_members(redis_client, org_id)
+    if members is None:
         return 0
+    key = _streak_notify_pending_key(org_id)
     retried = 0
     attempted = 0
     for raw in members or []:
         if deadline is not None and time.monotonic() > deadline:
             break  # budget exhausted mid-pass — truncate, never drop
-        try:
-            data = json.loads(raw)
-            if not isinstance(data, dict):
-                raise ValueError("pending member is not an object")
-            retry_count = int(data.get("retry_count") or 0)
-            last_retry_at = data.get("last_retry_at")
-            if isinstance(last_retry_at, (int, float)) and time.time() - float(last_retry_at) < (
-                _STREAK_RETRY_COOLDOWN_SECONDS
-            ):
-                continue  # per-member cooldown — retry at most once per 15 min
-            trigger_id = uuid.UUID(data["trigger_id"])
-            pipeline_id = uuid.UUID(data["pipeline_id"]) if data.get("pipeline_id") else None
-            threshold = int(data.get("threshold") or 0)
-            # Re-check the trigger's active state before dispatching. A pending
-            # member exists precisely because the trigger was JUST auto-
-            # deactivated (active=False), so dispatch while it stays deactivated;
-            # drop only when it has been re-enabled (active=True) — a re-enabled
-            # trigger must NOT receive a stale "auto-deactivated" notification.
-            # A read failure (None) skips the member this tick without dropping.
-            active = await _trigger_active_state(org_id, trigger_id)
-            if active is None:
-                continue  # read failure — skip, don't drop
-            if active is True:
-                await _srem_streak_member(redis_client, key, raw)
-                _log.warning(
-                    "streak.notify_pending_dropped org=%s trigger=%s (re-enabled)",
-                    org_id,
-                    trigger_id,
-                )
-                continue
-            attempted += 1
-            if attempted > max_retries:
-                break  # per-tick dispatch cap reached — leave the rest pending
-            deactivation: dict[str, Any] = {
-                "id": trigger_id,
-                "pipeline_id": pipeline_id,
-                "streak": int(data.get("streak") or 0),
-                "reason": data.get("reason") or "no_delivery",
-            }
-            ok = await _notify_streak_deactivation(
-                org_id,
-                data=deactivation,
-                threshold=threshold,
-                reason=deactivation["reason"],
-                pipeline_name=data.get("pipeline_name") or "",
-                # None: the retry path owns the re-enqueue (bumped retry_count +
-                # cooldown) below — never a bare re-add.
-                redis_client=None,
-                retry_count=retry_count,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # corrupt / unparseable member — srem'd, never retried forever.
-            _log.warning("streak.notify_pending_retry_failed org=%s", org_id)
-            await _srem_streak_member(redis_client, key, raw)
-            continue
-        if ok:
+        status, attempted = await _retry_one_pending_member(org_id, redis_client, key, raw, attempted, max_retries)
+        if status == "ok":
             retried += 1
-            await _srem_streak_member(redis_client, key, raw)
-        else:
-            # Re-enqueue with a bumped retry_count + cooldown stamp (the SET's
-            # TTL is refreshed by the write) so the member is retried at most
-            # once per 15 min and never floods the audit chain.
-            next_count = retry_count + 1
-            await _srem_streak_member(redis_client, key, raw)
-            await _write_streak_notify_pending(
-                redis_client,
-                org_id,
-                data=deactivation,
-                threshold=threshold,
-                pipeline_name=data.get("pipeline_name") or "",
-                retry_count=next_count,
-                last_retry_at=int(time.time()),
-            )
+        if status == "stop":
+            break
     return retried
 
 
@@ -1273,7 +1476,6 @@ async def _streak_mass_cascade_alerted_this_window(
 async def _maybe_alert_mass_cascade(
     factory: async_sessionmaker[AsyncSession],
     org_id: uuid.UUID,
-    redis_client: AsyncRedis | None = None,
 ) -> bool:
     """Mass-cascade guard (FAR-190 item 9): when an org has deactivated >= 5
     triggers within 24h (an infra-outage signature), raise a critical alert —
@@ -1347,6 +1549,147 @@ async def _pipeline_name(
         return ""
 
 
+_SWEEP_SUMMARY_KEYS = (
+    "scanned",
+    "deactivated",
+    "capped",
+    "alerts",
+    "notify_failed",
+    "notify_retried",
+    "notify_deferred",
+    "errors",
+)
+
+
+async def _handle_trigger_in_sweep(
+    factory: async_sessionmaker[AsyncSession],
+    org_id: uuid.UUID,
+    trigger: Any,
+    *,
+    delta: dict[str, Any],
+    notify_budget: int,
+    redis_client: AsyncRedis | None,
+    recent_deactivations: int,
+    deactivated_this_tick: int,
+) -> tuple[int, int]:
+    """Deactivate + notify ONE trigger; returns ``(notify_budget, deactivated_this_tick)``.
+
+    Capacity-capped triggers are counted and skipped without deactivating. A
+    guarded atomic deactivation below threshold is a no-op. On a deactivation,
+    the inline-notification budget is honoured (deferred to the pending-retry
+    path once exhausted) and the mass-cascade alert is checked. Isolated: any
+    per-trigger failure is swallowed (WARNING + error count) and cannot break
+    the enclosing sweep.
+    """
+    if recent_deactivations + deactivated_this_tick >= ONGOING_STREAK_DEACTIVATE_MAX_PER_ORG_PER_HOUR:
+        delta["capped"] += 1
+        _log.warning("streak.capped org=%s trigger=%s", org_id, trigger.id)
+        return notify_budget, deactivated_this_tick
+    threshold, window_hours = _streak_config(trigger.config_json)
+    window_cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
+    try:
+        deactivated = await _deactivate_trigger_on_no_delivery_streak(
+            factory,
+            org_id=org_id,
+            trigger_id=trigger.id,
+            threshold=threshold,
+            window_cutoff=window_cutoff,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        delta["errors"] += 1
+        _log.warning("streak.walk_failed org=%s trigger=%s", org_id, trigger.id, exc_info=True)
+        return notify_budget, deactivated_this_tick
+    if deactivated is None:
+        return notify_budget, deactivated_this_tick
+    deactivated_this_tick += 1
+    delta["deactivated"] += 1
+    pipeline_name = await _pipeline_name(factory, org_id, deactivated["pipeline_id"])
+    reason = deactivated.get("reason") or "no_delivery"
+    if notify_budget > 0:
+        notify_budget -= 1
+        notified = await _notify_streak_deactivation(
+            org_id,
+            data=deactivated,
+            threshold=threshold,
+            reason=reason,
+            pipeline_name=pipeline_name,
+            redis_client=redis_client,
+        )
+        if not notified:
+            delta["notify_failed"] += 1
+    else:
+        # Inline notification budget exhausted — defer this dispatch to the
+        # pending-retry path (never inline).
+        delta["notify_deferred"] += 1
+        _log.warning(
+            "streak.notify_budget_exceeded org=%s trigger=%s",
+            org_id,
+            deactivated["id"],
+        )
+        await _write_streak_notify_pending(
+            redis_client,
+            org_id,
+            data=deactivated,
+            threshold=threshold,
+            pipeline_name=pipeline_name,
+        )
+    if await _maybe_alert_mass_cascade(factory, org_id):
+        delta["alerts"] += 1
+    return notify_budget, deactivated_this_tick
+
+
+async def _sweep_org(
+    factory: async_sessionmaker[AsyncSession],
+    org_id: uuid.UUID,
+    *,
+    redis_client: AsyncRedis | None,
+    max_triggers_per_tick: int,
+    deadline: float,
+    notify_budget: int,
+) -> tuple[dict[str, Any], int]:
+    """Walk one org's active ongoing triggers (keyset pages) and deactivate.
+
+    Folds each trigger's streak count into a guarded atomic deactivation UPDATE
+    via :func:`_handle_trigger_in_sweep`, keyed by ``deactivated_this_tick`` +
+    the per-org per-hour cap. Returns ``(delta, remaining_notify_budget)`` where
+    ``delta`` aggregates the org's contribution to the sweep summary.
+    """
+    delta: dict[str, Any] = dict.fromkeys(_SWEEP_SUMMARY_KEYS, 0)
+    recent_deactivations = await _count_recent_streak_deactivations(factory, org_id, hours=1)
+    deactivated_this_tick = 0
+    after_id: uuid.UUID | None = None
+    while time.monotonic() <= deadline:
+        page = await _select_active_ongoing_triggers(
+            factory,
+            org_id,
+            max_triggers=max_triggers_per_tick,
+            after_id=after_id,
+        )
+        if not page:
+            break
+        for trigger in page:
+            if time.monotonic() > deadline:
+                break
+            delta["scanned"] += 1
+            notify_budget, deactivated_this_tick = await _handle_trigger_in_sweep(
+                factory,
+                org_id,
+                trigger,
+                delta=delta,
+                notify_budget=notify_budget,
+                redis_client=redis_client,
+                recent_deactivations=recent_deactivations,
+                deactivated_this_tick=deactivated_this_tick,
+            )
+        if len(page) < max_triggers_per_tick:
+            break
+        after_id = page[-1].id
+    delta["notify_retried"] += await _retry_pending_streak_notifications(org_id, redis_client, deadline=deadline)
+    return delta, notify_budget
+
+
 async def enforce_no_delivery_streaks(
     *,
     org_ids: list[uuid.UUID] | None = None,
@@ -1376,16 +1719,7 @@ async def enforce_no_delivery_streaks(
     enclosing tick's ongoing top-up, and can never stop the other triggers in
     the sweep. Returns a summary dict.
     """
-    summary: dict[str, Any] = {
-        "scanned": 0,
-        "deactivated": 0,
-        "capped": 0,
-        "alerts": 0,
-        "notify_failed": 0,
-        "notify_retried": 0,
-        "notify_deferred": 0,
-        "errors": 0,
-    }
+    summary: dict[str, Any] = dict.fromkeys(_SWEEP_SUMMARY_KEYS, 0)
     try:
         if not _streak_deactivate_enabled():
             summary["kill_switch"] = "off"
@@ -1393,109 +1727,97 @@ async def enforce_no_delivery_streaks(
         ch = _ch()
         factory = ch._open_factory()
         if org_ids is None:
-            from modulo.db.models.organisation import Organisation
-
-            async with factory() as session, session.begin():
-                result = await session.execute(select(Organisation.id))
-                org_ids = list(result.scalars())
+            org_ids = await _sweep_all_org_ids(factory)
         if not org_ids:
             return summary
         deadline = time.monotonic() + budget_seconds
-        notify_budget = _STREAK_NOTIFY_MAX_PER_TICK
-        for org_id in org_ids:
-            if time.monotonic() > deadline:
-                summary["budget_exceeded"] = True
-                break
-            try:
-                recent_deactivations = await _count_recent_streak_deactivations(factory, org_id, hours=1)
-                deactivated_this_tick = 0
-                after_id: uuid.UUID | None = None
-                while time.monotonic() <= deadline:
-                    page = await _select_active_ongoing_triggers(
-                        factory,
-                        org_id,
-                        max_triggers=max_triggers_per_tick,
-                        after_id=after_id,
-                    )
-                    if not page:
-                        break
-                    for trigger in page:
-                        if time.monotonic() > deadline:
-                            break
-                        summary["scanned"] += 1
-                        if recent_deactivations + deactivated_this_tick >= (
-                            ONGOING_STREAK_DEACTIVATE_MAX_PER_ORG_PER_HOUR
-                        ):
-                            summary["capped"] += 1
-                            _log.warning("streak.capped org=%s trigger=%s", org_id, trigger.id)
-                            continue
-                        threshold, window_hours = _streak_config(trigger.config_json)
-                        window_cutoff = datetime.now(UTC) - timedelta(hours=window_hours)
-                        try:
-                            deactivated = await _deactivate_trigger_on_no_delivery_streak(
-                                factory,
-                                org_id=org_id,
-                                trigger_id=trigger.id,
-                                threshold=threshold,
-                                window_cutoff=window_cutoff,
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            summary["errors"] += 1
-                            _log.warning("streak.walk_failed org=%s trigger=%s", org_id, trigger.id, exc_info=True)
-                            continue
-                        if deactivated is None:
-                            continue
-                        deactivated_this_tick += 1
-                        summary["deactivated"] += 1
-                        pipeline_name = await _pipeline_name(factory, org_id, deactivated["pipeline_id"])
-                        reason = deactivated.get("reason") or "no_delivery"
-                        if notify_budget > 0:
-                            notify_budget -= 1
-                            notified = await _notify_streak_deactivation(
-                                org_id,
-                                data=deactivated,
-                                threshold=threshold,
-                                reason=reason,
-                                pipeline_name=pipeline_name,
-                                redis_client=redis_client,
-                            )
-                            if not notified:
-                                summary["notify_failed"] += 1
-                        else:
-                            # Inline notification budget exhausted — defer this
-                            # dispatch to the pending-retry path (never inline).
-                            summary["notify_deferred"] += 1
-                            _log.warning(
-                                "streak.notify_budget_exceeded org=%s trigger=%s",
-                                org_id,
-                                deactivated["id"],
-                            )
-                            await _write_streak_notify_pending(
-                                redis_client,
-                                org_id,
-                                data=deactivated,
-                                threshold=threshold,
-                                pipeline_name=pipeline_name,
-                            )
-                        if await _maybe_alert_mass_cascade(factory, org_id, redis_client):
-                            summary["alerts"] += 1
-                    if len(page) < max_triggers_per_tick:
-                        break
-                    after_id = page[-1].id
-                summary["notify_retried"] += await _retry_pending_streak_notifications(
-                    org_id, redis_client, deadline=deadline
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                summary["errors"] += 1
-                _log.warning("enforce_no_delivery_streaks org_sweep_failed org=%s", org_id, exc_info=True)
-        return summary
+        return await _run_sweep_orgs(
+            factory,
+            org_ids,
+            redis_client,
+            max_triggers_per_tick,
+            deadline,
+            summary,
+        )
     except asyncio.CancelledError:
         raise
     except Exception:
         _log.warning("enforce_no_delivery_streaks sweep_failed", exc_info=True)
         summary["errors"] += 1
         return summary
+
+
+async def _run_sweep_orgs(
+    factory: async_sessionmaker[AsyncSession],
+    org_ids: Sequence[uuid.UUID],
+    redis_client: AsyncRedis | None,
+    max_triggers_per_tick: int,
+    deadline: float,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    """Sweep every org within the wall-clock budget; returns the summary.
+
+    Stops as soon as the deadline elapses (``budget_exceeded`` is recorded so
+    the caller can distinguish a truncated pass from a clean one). Each org is
+    isolated via :func:`_enforce_org_streak`.
+    """
+    notify_budget = _STREAK_NOTIFY_MAX_PER_TICK
+    for org_id in org_ids:
+        if time.monotonic() > deadline:
+            summary["budget_exceeded"] = True
+            break
+        notify_budget = await _enforce_org_streak(
+            factory,
+            org_id,
+            redis_client=redis_client,
+            max_triggers_per_tick=max_triggers_per_tick,
+            deadline=deadline,
+            notify_budget=notify_budget,
+            summary=summary,
+        )
+    return summary
+
+
+async def _sweep_all_org_ids(factory: async_sessionmaker[AsyncSession]) -> list[uuid.UUID]:
+    """Read every org id (system context) to sweep when none are passed in."""
+    from modulo.db.models.organisation import Organisation
+
+    async with factory() as session, session.begin():
+        result = await session.execute(select(Organisation.id))
+        return list(result.scalars())
+
+
+async def _enforce_org_streak(
+    factory: async_sessionmaker[AsyncSession],
+    org_id: uuid.UUID,
+    *,
+    redis_client: AsyncRedis | None,
+    max_triggers_per_tick: int,
+    deadline: float,
+    notify_budget: int,
+    summary: dict[str, Any],
+) -> int:
+    """Sweep one org's active ongoing triggers and fold its delta in.
+
+    Isolated: a per-org sweep failure is swallowed (WARNING + an error count in
+    ``summary``) and can never break the enclosing sweep. Returns the remaining
+    inline-notification budget for the next org.
+    """
+    try:
+        delta, notify_budget = await _sweep_org(
+            factory,
+            org_id,
+            redis_client=redis_client,
+            max_triggers_per_tick=max_triggers_per_tick,
+            deadline=deadline,
+            notify_budget=notify_budget,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        summary["errors"] += 1
+        _log.warning("enforce_no_delivery_streaks org_sweep_failed org=%s", org_id, exc_info=True)
+        return notify_budget
+    for key in _SWEEP_SUMMARY_KEYS:
+        summary[key] += delta[key]
+    return notify_budget

@@ -261,6 +261,50 @@ def test_sandbox_timeout_too_high_warns():
     assert "SANDBOX_TIMEOUT_BOUNDS" in _codes(result)
 
 
+def test_sandbox_timeout_over_e2b_cap_is_error():
+    """FAR-511: a sandbox node whose timeout_seconds exceeds the E2B 1-hour cap
+    (3300 headroom) is rejected at save time — do not clamp."""
+    graph = {"nodes": [_sandbox_node(timeout_seconds=3600)], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_sandbox_agent_config(graph, result)
+    assert "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP" in _codes(result)
+    assert not result.is_valid
+    # The message names the node id and the offending value for a clear save-time error.
+    msg = next(i.message for i in result.issues if i.code == "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP")
+    assert "3600" in msg
+    assert "3300" in msg
+
+
+def test_sandbox_timeout_at_e2b_cap_is_valid():
+    """FAR-511: timeout_seconds at the 3300 headroom ceiling saves fine."""
+    graph = {"nodes": [_sandbox_node(timeout_seconds=3300)], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_sandbox_agent_config(graph, result)
+    assert "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP" not in _codes(result)
+    assert result.is_valid
+
+
+def test_sandbox_timeout_just_over_cap_is_error():
+    """FAR-511: 3301 (one second over the 3300 headroom) is still rejected."""
+    graph = {"nodes": [_sandbox_node(timeout_seconds=3301)], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_sandbox_agent_config(graph, result)
+    assert "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP" in _codes(result)
+    assert not result.is_valid
+
+
+def test_non_sandbox_node_timeout_over_cap_unaffected():
+    """FAR-511: the E2B cap only applies to sandbox_agent nodes; an agent node
+    with timeout_seconds=3600 must not be rejected by the sandbox check."""
+    nid = str(uuid.uuid4())
+    graph = {"nodes": [{"id": nid, "node_type": "agent", "agent_command": "", "timeout_seconds": 3600}], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_sandbox_agent_config(graph, result)
+    assert "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP" not in _codes(result)
+    # The non-sandbox node is skipped by the sandbox checks entirely.
+    assert all(i.node_id != nid or "SANDBOX" not in i.code for i in result.issues)
+
+
 def test_sandbox_timeout_invalid_warns():
     graph = {"nodes": [_sandbox_node(timeout_seconds="abc")], "edges": []}
     result = ValidationResult()
@@ -640,3 +684,77 @@ def test_idempotent_non_bool_error_carries_node_id():
     issue = next(i for i in result.issues if i.code == "NODE_IDEMPOTENT_INVALID")
     assert issue.node_id == "node-x"
     assert "idempotent" in issue.message
+
+
+# ---------------------------------------------------------------------------
+# _check_node_send_budget — FAR-410 node budget reconcile warning
+# ---------------------------------------------------------------------------
+
+
+def test_send_budget_absent_is_clean():
+    """Nodes without fanout keys (every existing graph) get no warning."""
+    for node in ({"id": "node-a"}, {"id": "node-b", "timeout_seconds": 60}):
+        graph = {"nodes": [node], "edges": []}
+        result = ValidationResult()
+        GraphValidator._check_node_send_budget(graph, result)
+        assert "NODE_SEND_BUDGET_OVERSUBSCRIBED" not in _codes(result)
+        assert result.is_valid
+
+
+def test_send_budget_warns_when_fanout_exceeds_wait_for():
+    """fanout_cardinality x per_item_budget > node_wait_for → advisory warning."""
+    node = {
+        "id": "fanout-node",
+        "fanout_cardinality": 20,
+        "per_item_budget": 5.0,
+        "node_wait_for": 30.0,
+    }
+    graph = {"nodes": [node], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_node_send_budget(graph, result)
+    assert "NODE_SEND_BUDGET_OVERSUBSCRIBED" in _codes(result)
+    # advisory only — the graph stays valid
+    assert result.is_valid
+
+
+def test_send_budget_uses_timeout_seconds_as_wait_for_fallback():
+    """node_wait_for falls back to timeout_seconds when the former is absent."""
+    node = {
+        "id": "fanout-node",
+        "fanout_cardinality": 20,
+        "per_item_budget": 5.0,
+        "timeout_seconds": 30.0,
+    }
+    graph = {"nodes": [node], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_node_send_budget(graph, result)
+    assert "NODE_SEND_BUDGET_OVERSUBSCRIBED" in _codes(result)
+
+
+def test_send_budget_clean_when_within_budget():
+    """fanout x per_item <= wait_for is fine (no warning)."""
+    node = {
+        "id": "fanout-node",
+        "fanout_cardinality": 3,
+        "per_item_budget": 5.0,
+        "node_wait_for": 60.0,
+    }
+    graph = {"nodes": [node], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_node_send_budget(graph, result)
+    assert "NODE_SEND_BUDGET_OVERSUBSCRIBED" not in _codes(result)
+
+
+def test_send_budget_malformed_values_skipped():
+    """Non-numeric fanout/budget values are skipped, not warned about."""
+    node = {
+        "id": "fanout-node",
+        "fanout_cardinality": "many",
+        "per_item_budget": -1,
+        "node_wait_for": 30.0,
+    }
+    graph = {"nodes": [node], "edges": []}
+    result = ValidationResult()
+    GraphValidator._check_node_send_budget(graph, result)
+    assert "NODE_SEND_BUDGET_OVERSUBSCRIBED" not in _codes(result)
+    assert result.is_valid

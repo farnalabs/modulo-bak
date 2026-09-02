@@ -29,12 +29,14 @@ from sqlalchemy.orm import Session as SASession
 from modulo.core.pipeline_engine.classify import (
     REASON_BUDGET_EXCEEDED,
     REASON_CANCELLED,
+    REASON_COMPENSATION_FAILED,
     REASON_DELIVERED,
     REASON_DELIVERED_EMAIL,
     REASON_NEEDS_HUMAN,
     REASON_NO_DELIVERY,
     REASON_NO_WORK,
     REASON_PARSE_ERROR,
+    REASON_ROUTER_NO_MATCH,
     REASON_SOURCE_ERROR,
     ClassificationResult,
     RunClassificationValue,
@@ -94,7 +96,7 @@ class TestDecisionTable:
     """Spec §6 — keyed on (status, error_code), never prose."""
 
     @pytest.mark.parametrize(
-        "status,pr_urls,expected,expected_reason",
+        ("status", "pr_urls", "expected", "expected_reason"),
         [
             ("complete", (), RunClassificationValue.no_delivery, REASON_NO_WORK),
             ("complete", (_PR,), RunClassificationValue.delivered, REASON_DELIVERED),
@@ -108,6 +110,37 @@ class TestDecisionTable:
             ("cancelled", (_PR,), RunClassificationValue.excluded, REASON_CANCELLED),
             ("budget_exceeded", (), RunClassificationValue.excluded, REASON_BUDGET_EXCEEDED),
             ("budget_exceeded", (_PR,), RunClassificationValue.excluded, REASON_BUDGET_EXCEEDED),
+            ("router_no_match", (), RunClassificationValue.excluded, REASON_ROUTER_NO_MATCH),
+            ("router_no_match", (_PR,), RunClassificationValue.excluded, REASON_ROUTER_NO_MATCH),
+            # FAR-402 P5: compensation_failed is a COUNTABLE no_delivery with its
+            # own explicit reason (a watched node AND its compensation path both
+            # failed) — never fail-safe. A complementary `unknown` row asserts a
+            # terminal status outside the excluded/countable buckets is EXCLUDED
+            # (not silently counted as no_delivery).
+            ("compensation_failed", (), RunClassificationValue.no_delivery, REASON_COMPENSATION_FAILED),
+            ("compensation_failed", (_PR,), RunClassificationValue.no_delivery, REASON_COMPENSATION_FAILED),
+            ("unknown", (), RunClassificationValue.excluded, "unrecognized_status:unknown"),
+            ("unknown", (_PR,), RunClassificationValue.excluded, "unrecognized_status:unknown"),
+        ],
+        ids=[
+            "complete-no-pr",
+            "complete-with-pr",
+            "failed-no-pr",
+            "failed-with-pr",
+            "eval_failed-no-pr",
+            "eval_failed-with-pr",
+            "stalled-no-pr",
+            "stalled-with-pr",
+            "cancelled-no-pr",
+            "cancelled-with-pr",
+            "budget_exceeded-no-pr",
+            "budget_exceeded-with-pr",
+            "router_no_match-no-pr",
+            "router_no_match-with-pr",
+            "compensation_failed-no-pr",
+            "compensation_failed-with-pr",
+            "unknown-no-pr",
+            "unknown-with-pr",
         ],
     )
     def test_terminal_status_matrix(
@@ -123,6 +156,16 @@ class TestDecisionTable:
         assert result.value == expected
         if expected_reason is not None:
             assert result.reason == expected_reason
+
+    def test_router_no_match_is_not_mislabeled_budget_exceeded(self) -> None:
+        """Regression guard (FAR-415): a ``router_no_match`` run is an excluded
+        terminal status but must NOT inherit the ``budget_exceeded`` reason — a
+        distinct, user-visible mislabel that would otherwise surface in
+        analytics/reporting as a budget attribution. It gets its own reason."""
+        result = classify_run("router_no_match", None)
+        assert result.value == RunClassificationValue.excluded
+        assert result.reason == REASON_ROUTER_NO_MATCH
+        assert result.reason != REASON_BUDGET_EXCEEDED
 
     def test_complete_with_invalid_pr_url_is_no_delivery(self) -> None:
         # A pr_url that does not parse as http(s) + netloc is NOT a delivery.
@@ -154,7 +197,7 @@ class TestPrUrlValidity:
     """Spec §2 — urlsplit with scheme http/https + non-empty netloc."""
 
     @pytest.mark.parametrize(
-        "url,valid",
+        ("url", "valid"),
         [
             ("https://github.com/farnalabs/modulo/pull/1", True),
             ("https://github.com/farnalabs/modulo", True),
@@ -165,6 +208,17 @@ class TestPrUrlValidity:
             ("not a url", False),
             ("github.com/farnalabs/modulo/pull/3", False),
             ("", False),
+        ],
+        ids=[
+            "github-pull",
+            "github-repo",
+            "http-example",
+            "scheme-only-https",
+            "scheme-only-http",
+            "ftp-blocked",
+            "not-a-url",
+            "bare-host",
+            "empty",
         ],
     )
     def test_validity(self, url: str, valid: bool) -> None:
@@ -429,7 +483,8 @@ class TestReasons:
 
         with patch("modulo.core.pipeline_engine.error_codes.class_for", side_effect=_capturing_class_for):
             result = classify_run("failed", "RateLimitError")
-        assert seen and seen[-1] == "RateLimitError"
+        assert seen
+        assert seen[-1] == "RateLimitError"
         assert real_class_for("RateLimitError") == "provider"
         assert result.reason == REASON_SOURCE_ERROR
 

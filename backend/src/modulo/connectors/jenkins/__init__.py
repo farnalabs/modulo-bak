@@ -21,6 +21,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _logger = logging.getLogger(__name__)
 
@@ -58,7 +59,13 @@ class JenkinsConnector(ConnectorBase):
         return {"Authorization": f"Basic {encoded}"}
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=self._base_url,
             headers=self._auth_header(),
             timeout=30,
@@ -114,6 +121,11 @@ class JenkinsConnector(ConnectorBase):
             return HealthResult(ok=False, detail="Jenkins API timeout")
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Jenkins API connection error")
+        except ValueError as exc:
+            # The outbound SSRF guard in _client() rejects a private/internal
+            # base_url. Report it as unhealthy with the remediation text rather
+            # than letting it escape as a 502 from GET /connectors/{id}/health.
+            return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(
         self,

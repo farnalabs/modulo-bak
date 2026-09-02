@@ -86,10 +86,15 @@ from modulo.core.node_output_split import (
     node_telemetry,
     split_node_output,
 )
+from modulo.core.spend_ceiling import (
+    cents_from_usd,
+    evaluate_spend_ceilings,
+)
 from modulo.db.crud.run import update_run_status
 from modulo.db.models.agent import Agent
 from modulo.db.models.cost_component import CostComponent
 from modulo.db.models.journey import Journey
+from modulo.db.models.organisation import Organisation
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import Run
 from modulo.db.models.run_daily_facts import JourneyFact
@@ -480,6 +485,61 @@ def _fold_model_cost(node_dict: dict[str, Any], output_obj: dict[str, Any] | Non
     _pop_model_cost_fields(node_dict)
 
 
+#: Node-output ``model_tokens_*`` field (written by node_runner extraction,
+#: FAR-491) -> the DISTINCT union key it folds into. The union keys are
+#: deliberately named ``reported_*`` so they NEVER overwrite the
+#: SERVER-measured ``input_tokens`` / ``output_tokens`` / ``total_tokens``
+#: entries: reported tokens are DISPLAY-ONLY analytics and must not feed
+#: ``Run.total_tokens``, the ``llm_tokens`` cost component, or the system's
+#: built-in money math (operator-defined formulas may reference them).
+_REPORTED_TOKEN_FIELD_MAP: tuple[tuple[str, str], ...] = (
+    ("model_tokens_input", "reported_input_tokens"),
+    ("model_tokens_output", "reported_output_tokens"),
+    ("model_tokens_total", "reported_total_tokens"),
+    ("model_tokens_cache_read", "reported_cache_read_tokens"),
+    ("model_tokens_cache_write", "reported_cache_write_tokens"),
+)
+
+
+def _coerce_reported_token(value: Any) -> int | None:
+    """Tri-state reported-token coercion — the same rule as extraction.
+
+    Bool / non-int / negative → ``None`` (treated as ABSENT, never a ``0``
+    placeholder). A valid ``0`` report is a real report and passes through.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _fold_token_usage(node_dict: dict[str, Any], output_obj: dict[str, Any] | None) -> None:
+    """Fold agent-reported token usage into the union's DISTINCT ``reported_*`` keys.
+
+    The node-output dict carries ``model_tokens_*`` (extracted by node_runner
+    from the sandbox agent's output.json ``token_usage``). When the output is
+    PRESENT each mapped field is folded (validated tri-state — an invalid
+    stored value is treated as ABSENT and popped); when the output LACKS the
+    field any previously folded value is popped so a stale fold can never
+    survive a re-enrich. When the output is ABSENT entirely the stored-union
+    values are left untouched (the fallback authority — mirrors
+    ``_fold_model_cost``'s branch 3). Server-measured token keys are never
+    read or written here.
+    """
+    if output_obj is None:
+        return
+    for src, dst in _REPORTED_TOKEN_FIELD_MAP:
+        if src in output_obj:
+            coerced = _coerce_reported_token(output_obj[src])
+            if coerced is None:
+                node_dict.pop(dst, None)
+            else:
+                node_dict[dst] = coerced
+        else:
+            node_dict.pop(dst, None)
+
+
 def _enrich_union(
     merged_usage: dict[str, Any],
     merged_outputs: dict[str, Any],
@@ -492,9 +552,16 @@ def _enrich_union(
 
     The union is NEWLY CONSTRUCTED here: the union's token fields
     (``input_tokens``/``output_tokens``/``total_tokens``) are the SERVER
-    entries from ``node_token_usage``; sandbox nodes contribute 0. Agent
-    ``token_usage`` is never folded in (v22 M1). The SPLIT sandbox signal is
-    set from the run-frozen node-type map, NOT field presence.
+    entries from ``node_token_usage``; sandbox nodes contribute 0 to those
+    SERVER fields. Agent-supplied ``token_usage`` IS folded in — but into the
+    DISTINCT ``reported_*`` keys (``reported_input_tokens`` /
+    ``reported_output_tokens`` / ``reported_total_tokens`` /
+    ``reported_cache_read_tokens`` / ``reported_cache_write_tokens``, FAR-491)
+    which are DISPLAY-ONLY analytics: they never overwrite the server-measured
+    fields and never feed ``Run.total_tokens``, the ``llm_tokens`` cost
+    component, or the system's built-in money math (operator-defined formulas
+    may reference them). The SPLIT sandbox signal is set from the
+    run-frozen node-type map, NOT field presence.
 
     Per-node telemetry is read from the split ``node_telemetry_json`` column
     when present (FAR-125 P1b); legacy rows fall back to the shared
@@ -561,9 +628,11 @@ def _enrich_node_fields(
     """Stamp one union entry's derived fields from its node-output dict.
 
     Sets ``wall_clock_time_ms`` (server-verified when present), the split
-    sandbox flags (``sandbox_by_map`` / ``is_sandbox_for_wallclock``) and the
-    pinned model-cost fold. Returns the node's mapped type (``None`` when the
-    frozen map lacks the node — the schema-drift provenance gate).
+    sandbox flags (``sandbox_by_map`` / ``is_sandbox_for_wallclock``), the
+    pinned model-cost fold, and the agent-reported token-usage fold
+    (``reported_*`` — display-only, FAR-491). Returns the node's mapped type
+    (``None`` when the frozen map lacks the node — the schema-drift
+    provenance gate).
     """
     wall_ms = _wall_clock_ms(output_obj)
     if wall_ms is not None:
@@ -575,6 +644,7 @@ def _enrich_node_fields(
     )
 
     _fold_model_cost(node_dict, output_obj)
+    _fold_token_usage(node_dict, output_obj)
     return map_type
 
 
@@ -758,7 +828,7 @@ async def _fallback_write(
     error_detail: str | None,
     is_terminal: bool = False,
     claim_token: str | None = None,
-) -> None:
+) -> Decimal:
     """The LEGACY FALLBACK write (never-fail envelope, §1.5).
 
     Persists the UN-ENRICHED merged set (so the cumulative write-back invariant
@@ -797,6 +867,7 @@ async def _fallback_write(
     )
     if is_terminal:
         await _record_fallback_terminal_facts(session, run_id, status, merged.outputs)
+    return total
 
 
 def _fallback_wall_hours(merged_outputs: dict[str, Any], merged_telemetry: Any) -> float:
@@ -936,7 +1007,7 @@ async def _record_ledger_with_retry(
 
 
 async def _reduced_escape(
-    session: AsyncSession,
+    _session: AsyncSession,
     ctx: _LedgerEscapeContext,
 ) -> None:
     """The REDUCED terminalize-without-ledger escape (§4.2).
@@ -995,6 +1066,58 @@ async def _ledger_block(
         record_duplicate_terminal()
         await _record_duplicate_terminal_event(session, run_id)
         return
+
+    # --- FAR-391: hard spend-ceiling gate (per-run + per-org) ---
+    # Runs BEFORE the daily-ledger write so a ceiling breach refuses the ledger
+    # (the run is never billed beyond its ceiling) AND terminalizes the run as
+    # ``cost_ceiling_exceeded`` — a run that exceeds its per-run ceiling is
+    # halted (never resumed to spawn further billable steps), and an org at its
+    # lifetime budget stops spawning new runs. On the success path the org's
+    # consumed total is incremented by this run's cost.
+    org_row = (
+        await session.execute(select(Organisation).where(Organisation.id == org_id).with_for_update())
+    ).scalar_one_or_none()
+    if org_row is not None:
+        # Use the same ROUND_HALF_UP cents conversion as the API boundary so the
+        # gate value and the persisted org cumulative never diverge on sub-cent
+        # run costs (the accrual below also uses ``cents_from_usd``).
+        total_cents = cents_from_usd(total) or 0
+        decision = evaluate_spend_ceilings(
+            run_cost_so_far_cents=total_cents,
+            estimated_next_step_cents=0,
+            max_run_cost_cents=org_row.max_run_cost_cents,
+            org_cumulative_spend_cents=org_row.org_cumulative_spend_cents or 0,
+            spend_ceiling_cents=org_row.spend_ceiling_cents,
+        )
+        if not decision.allowed:
+            # Preserve an explicit terminal CANCEL (B6 / user-requested halt) so
+            # the ceiling refuse does NOT overwrite it and feed the wrong status
+            # to journey advancement. The ledger is still refused (the run is not
+            # billed beyond its ceiling) — only the status is left untouched.
+            if locked.status == "cancelled":
+                locked.ledger_refused_at = datetime.now(UTC)
+                record_limit_refused("spend_ceiling")
+                await session.flush()
+                return
+            locked.ledger_refused_at = datetime.now(UTC)
+            locked.status = "cost_ceiling_exceeded"
+            locked.error_code = decision.reason
+            locked.error_detail = decision.message
+            _log.info(
+                "cost_ledger.ceiling_exceeded",
+                extra={
+                    "run_id": str(run_id),
+                    "org_id": str(org_id),
+                    "reason": decision.reason,
+                    "total_cents": total_cents,
+                },
+            )
+            record_limit_refused("spend_ceiling")
+            await session.flush()
+            return
+        # Success: accrue this run's cost into the org's lifetime consumed total.
+        org_row.org_cumulative_spend_cents = (org_row.org_cumulative_spend_cents or 0) + total_cents
+        await session.flush()
 
     try:
         ok, reason = await _record_ledger_with_retry(
@@ -1489,7 +1612,7 @@ async def finalize_cost(
         status, error_code, error_detail = await _apply_agent_budget_override(
             session, run, merged_usage, is_terminal, status, error_code, error_detail
         )
-        await _fallback_write(
+        fallback_total = await _fallback_write(
             session,
             run_id,
             status,
@@ -1499,6 +1622,38 @@ async def finalize_cost(
             is_terminal=is_terminal,
             claim_token=claim_token,
         )
+        # FAR-391 — the never-fail fallback MUST still run the terminal ledger
+        # block so the spend-ceiling gate refuses the ledger and the org's
+        # consumed total is accrued. Otherwise a breached ceiling is silently
+        # skipped on the legacy path. Keep it inside the never-fail envelope:
+        # a ledger failure here must never resurrect the original exception.
+        if is_terminal:
+            run_date = _ledger_run_date(is_terminal, fallback_total, run)
+            if run_date is not None:
+                try:
+                    await _ledger_block(
+                        session,
+                        run_id=run_id,
+                        org_id=org_id,
+                        status=status,
+                        total=fallback_total,
+                        owner_team_id=run.owner_team_id,
+                        run_date=run_date,
+                        finalize_fields={
+                            "error_code": error_code,
+                            "error_detail": error_detail,
+                            "total_cost_usd": fallback_total,
+                        },
+                        session_factory=session_factory,
+                        claim_token=claim_token,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _log.exception(
+                        "cost_ledger.fallback_block_failed",
+                        extra={"run_id": str(run_id)},
+                    )
         return
 
     # --- Ledger block — terminal only, guarded, converged (§4.2/§4.6) ---

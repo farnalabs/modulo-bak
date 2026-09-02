@@ -626,9 +626,15 @@ class TestTriggerEngineEvaluateCondition:
     def polling_env(self):
         settings = MagicMock()
         settings.fernet_key = _VALID_32
+        # FAR-442: evaluate_condition now resolves a shared rate-limit Redis client.
+        # A truthy MagicMock redis_url would attempt a real Redis.from_url build (and
+        # fail on the MagicMock url); indicate Redis is NOT configured so the resolver
+        # short-circuits to None (the connector-local bucket is correct here).
+        settings.redis_url = ""
+        settings.modulo_db = "postgresql"
         with (
             patch("modulo.settings.get_settings", return_value=settings),
-            patch("modulo.core.trigger_engine.create_secrets_backend") as mock_sb,
+            patch("modulo.core.secrets_backend.create_secrets_backend") as mock_sb,
             patch("modulo.core.trigger_engine.polling._build_polling_connector") as mock_build,
             patch("modulo.core.trigger_engine.polling.evaluate_condition") as mock_eval,
         ):
@@ -641,10 +647,11 @@ class TestTriggerEngineEvaluateCondition:
             query_result.records = [{"number": 1}]
             query_result.total = 1
             connector.query.return_value = query_result
+            connector.close = AsyncMock()
             mock_build.return_value = connector
 
             mock_eval.return_value = True
-            yield mock_sb, mock_build, mock_eval, connector
+            yield mock_sb, mock_eval, connector
 
     @staticmethod
     def _session(instance: Any) -> AsyncMock:
@@ -658,7 +665,7 @@ class TestTriggerEngineEvaluateCondition:
     async def _run(session: AsyncMock, instance_id: uuid.UUID) -> dict[str, Any]:
         return await TriggerEngine.evaluate_condition(
             session,
-            trigger=MagicMock(),
+            _trigger=MagicMock(),
             org_id=uuid.uuid4(),
             connector_instance_id=instance_id,
             poll_query="issues",
@@ -679,7 +686,7 @@ class TestTriggerEngineEvaluateCondition:
         assert result["total"] == 1
 
     async def test_no_match_returns_records(self, polling_env) -> None:
-        _sb, _build, mock_eval, _connector = polling_env
+        _sb, mock_eval, _connector = polling_env
         mock_eval.return_value = False
         result = await self._run(self._session(MagicMock()), uuid.uuid4())
 
@@ -687,7 +694,7 @@ class TestTriggerEngineEvaluateCondition:
         assert result["records"] == [{"number": 1}]
 
     async def test_connector_init_failed_returns_error(self, polling_env) -> None:
-        mock_sb, _build, _eval, _connector = polling_env
+        mock_sb, _eval, _connector = polling_env
         mock_sb.side_effect = RuntimeError("fernet key invalid")
         result = await self._run(self._session(MagicMock()), uuid.uuid4())
 
@@ -695,7 +702,7 @@ class TestTriggerEngineEvaluateCondition:
         assert "Connector init failed" in result["error"]
 
     async def test_query_failed_returns_error(self, polling_env) -> None:
-        _sb, _build, _eval, connector = polling_env
+        _sb, _eval, connector = polling_env
         connector.query.side_effect = RuntimeError("upstream 500")
         result = await self._run(self._session(MagicMock()), uuid.uuid4())
 
@@ -703,7 +710,7 @@ class TestTriggerEngineEvaluateCondition:
         assert "Query failed" in result["error"]
 
     async def test_condition_evaluation_failed_returns_error(self, polling_env) -> None:
-        _sb, _build, mock_eval, _connector = polling_env
+        _sb, mock_eval, _connector = polling_env
         mock_eval.side_effect = ValueError("Invalid JMESPath expression")
         result = await self._run(self._session(MagicMock()), uuid.uuid4())
 
@@ -715,7 +722,7 @@ class TestTriggerEngineEvaluateCondition:
         ["connector_init", "query", "condition_eval"],
     )
     async def test_cancelled_error_propagates(self, polling_env, stage: str) -> None:
-        mock_sb, _build, mock_eval, connector = polling_env
+        mock_sb, mock_eval, connector = polling_env
         if stage == "connector_init":
             mock_sb.side_effect = asyncio.CancelledError()
         elif stage == "query":
@@ -1780,7 +1787,7 @@ async def test_schedule_polling_trigger_default_interval() -> None:
     session = AsyncMock()
     session.flush = AsyncMock()
 
-    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, org_id=_ORG)
+    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, _org_id=_ORG)
 
     assert trigger.next_fire_at is not None
     delta = (trigger.next_fire_at - datetime.datetime.now(datetime.UTC)).total_seconds()
@@ -1793,7 +1800,7 @@ async def test_schedule_polling_trigger_custom_interval() -> None:
     session = AsyncMock()
     session.flush = AsyncMock()
 
-    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, org_id=_ORG)
+    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, _org_id=_ORG)
 
     delta = (trigger.next_fire_at - datetime.datetime.now(datetime.UTC)).total_seconds()
     assert 115 <= delta <= 125
@@ -1803,7 +1810,7 @@ async def test_schedule_polling_trigger_custom_interval() -> None:
 async def test_schedule_polling_trigger_invalid_interval(bad_interval: Any) -> None:
     trigger = _make_trigger(extra_config={"poll_interval_seconds": bad_interval})
     with pytest.raises(ValueError, match="poll_interval_seconds must be >= 1"):
-        await TriggerEngine().schedule_polling_trigger(AsyncMock(), trigger=trigger, org_id=_ORG)
+        await TriggerEngine().schedule_polling_trigger(AsyncMock(), trigger=trigger, _org_id=_ORG)
 
 
 async def test_schedule_polling_trigger_none_interval_defaults() -> None:
@@ -1811,7 +1818,7 @@ async def test_schedule_polling_trigger_none_interval_defaults() -> None:
     session = AsyncMock()
     session.flush = AsyncMock()
 
-    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, org_id=_ORG)
+    await TriggerEngine().schedule_polling_trigger(session, trigger=trigger, _org_id=_ORG)
 
     assert trigger.next_fire_at is not None
     session.flush.assert_awaited_once()
@@ -1924,6 +1931,17 @@ async def test_cleanup_expired_payloads_none_expired() -> None:
             _replay_auth_headers,
             {},
         ),
+    ],
+    ids=[
+        "trigger-not-found",
+        "timestamp-expired",
+        "hmac-invalid",
+        "duplicate",
+        "concurrent-limit",
+        "non-json-body",
+        "success",
+        "replay-success",
+        "replay-not-found",
     ],
 )
 def test_webhook_route(

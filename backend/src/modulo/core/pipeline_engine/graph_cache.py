@@ -16,10 +16,12 @@ kept for correctness if compilation becomes async in the future.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
 import uuid
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, cast
 
 import jmespath
@@ -27,20 +29,39 @@ from langgraph.graph import StateGraph
 
 from modulo.core.eval_engine import EvalDefinition
 from modulo.core.node_output_split import DEFAULT_NODE_TYPE
+from modulo.core.pipeline_engine.jmespath_eval import evaluate_jmespath_condition
 from modulo.core.pipeline_engine.node_runner import (
-    _is_truthy,
     make_connector_fn,
     make_hitl_gate_fn,
     make_manual_node_fn,
     make_node_fn,
+    make_router_node_fn,
     make_sandbox_agent_fn,
+)
+from modulo.core.pipeline_engine.port_resolver import (
+    synthesize_node_ports,
+)
+from modulo.core.pipeline_engine.runtime_retry import (
+    make_retrying_node_fn,
+)
+from modulo.core.pipeline_engine.scatter_join import (
+    run_join_node,
+    run_scatter_node,
+    validate_scatter_join_node,
 )
 
 # Cache key: (pipeline_id, snapshot_id, pipeline_node_timeout_seconds). The
 # third element matters because the compiled graph bakes the effective per-node
 # timeout in — without it, PATCHing node_timeout_seconds would be a no-op until
-# LRU eviction/restart.
-CacheKey = tuple[uuid.UUID, uuid.UUID, int]
+# LRU eviction/restart. The fourth element is a deterministic structural hash of
+# the graph's port topology (FAR-416 / F1): it forces a recompile when ports or
+# node types change, even though the (pipeline_id, snapshot_id, timeout) triple
+# is unchanged. The executor further folds content hashes into that fourth
+# element via ``struct_hash_with_eval_defs`` — the pipeline retry policy
+# (FAR-402 P5) and the node-scoped eval definitions (FAR-502) are baked into
+# node/gate closures at compile time, so a change to either must miss the cache
+# and recompile rather than serve a stale graph to a replay/resume.
+CacheKey = tuple[uuid.UUID, uuid.UUID, int, str]
 
 # OrderedDict-based LRU cache. Accessing an entry moves it to the end;
 # when full, the least-recently-used entry (first in order) is evicted.
@@ -57,18 +78,21 @@ def get_or_compile(
     factory: Callable[[], Any],
     *,
     pipeline_node_timeout_seconds: int = 300,
+    graph_struct_hash: str = "",
 ) -> Any:
     """Return cached compiled graph or call factory() and cache the result.
 
     The cache key includes ``pipeline_node_timeout_seconds`` because the
     compiled graph embeds the effective per-node timeout (the pipeline value is
     used for every node with a null ``timeout_seconds``). Keying on it means a
-    PATCH to the pipeline setting takes effect immediately.
+    PATCH to the pipeline setting takes effect immediately. ``graph_struct_hash``
+    (FAR-416 / F1) folds the port topology into the key so a port change forces
+    a fresh compile rather than serving a stale cached graph.
 
     Uses a per-key lock so concurrent calls for the same uncached key
     compile only once.
     """
-    key = (pipeline_id, snapshot_id, pipeline_node_timeout_seconds)
+    key = (pipeline_id, snapshot_id, pipeline_node_timeout_seconds, graph_struct_hash)
     if key in _CACHE:
         _CACHE.move_to_end(key)
         return _CACHE[key]
@@ -83,6 +107,48 @@ def get_or_compile(
         result = factory()
         _CACHE[key] = result
     return result
+
+
+def compute_eval_defs_hash(eval_defs_by_node: dict[str, list[EvalDefinition]] | None) -> str:
+    """Deterministic content hash of the node-scoped eval definitions (FAR-502).
+
+    ``build_graph_from_json`` bakes ``eval_definitions_by_node`` into the HITL
+    gate closures (eval-before-interrupt). Replays / variant runs / resumes
+    reuse a snapshot_id, so on those paths the compiled graph is served from
+    this cache even though the executor loads eval definitions FRESH per run —
+    the closures would silently keep the FIRST run's definitions. The executor
+    folds this hash into ``graph_struct_hash`` so changed eval definitions miss
+    the cache and force a recompile with the fresh definitions.
+
+    Canonicalisation: per-node lists are sorted by eval id (DB result order is
+    not guaranteed) and serialised with sorted JSON keys. ``created_at`` is
+    excluded — the ``EvalDefinition`` DTO stamps ``datetime.now()`` on every
+    load, so including it would force a spurious recompile on every run.
+    """
+    if not eval_defs_by_node:
+        return ""
+    canonical: dict[str, list[dict[str, Any]]] = {
+        node: sorted(
+            (d.model_dump(mode="json", exclude={"created_at"}) for d in defs),
+            key=lambda d: json.dumps(d, sort_keys=True, default=str),
+        )
+        for node, defs in eval_defs_by_node.items()
+    }
+    payload = json.dumps(canonical, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def struct_hash_with_eval_defs(
+    struct_hash: str,
+    eval_defs_by_node: dict[str, list[EvalDefinition]] | None,
+) -> str:
+    """Fold :func:`compute_eval_defs_hash` into a compile-cache struct hash.
+
+    Empty / None eval defs leave *struct_hash* unchanged so graphs compiled
+    without eval defs keep sharing one cache entry.
+    """
+    evals_hash = compute_eval_defs_hash(eval_defs_by_node)
+    return f"{struct_hash}:{evals_hash}" if evals_hash else struct_hash
 
 
 def _get_edge_val(edge: dict[str, Any], canonical: str, persisted: str) -> str:
@@ -104,6 +170,41 @@ def _make_gate_id(source: str, target: str) -> str:
 # ---------------------------------------------------------------------------
 # Conditional edge routing
 # ---------------------------------------------------------------------------
+
+
+def _make_router_pass_fn(node_id: str) -> Callable[[dict[str, Any]], Coroutine[Any, Any, dict[str, Any]]]:
+    """A pass-through node function for Router nodes.
+
+    A Router node makes no tool/agent call — it exists solely to host the
+    outgoing conditional-edges router (built in ``build_graph_from_json``). It
+    returns an empty update so the merged state is unchanged.
+    """
+
+    async def _pass(state: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    _pass.__name__ = f"router_pass_{node_id}"
+    return _pass
+
+
+class RouterConfigError(ValueError):
+    """Typed compile-time error for an invalid Router node configuration."""
+
+
+def _validate_router_config(router_config: dict[str, Any], node_id: str) -> None:
+    """Enforce Router-node compile-time invariants (FAR-402 P1 / F2-A).
+
+    A Router node MUST declare a ``default`` rule so every run has a defined
+    terminal hop. This is enforced ONLY for new Router nodes (backward-compat:
+    legacy ``conditional`` edges without a default remain valid — they fall
+    back to the first normal target via ``_make_conditional_router``).
+    """
+    rules = router_config.get("rules") or []
+    has_default = any(rule.get("default") for rule in rules)
+    if not has_default and router_config.get("mode") != "classifier":
+        raise RouterConfigError(
+            f"Router node {node_id!r} has no 'default' rule; every Router node must declare an explicit default target."
+        )
 
 
 def _make_gate_kickback_router(
@@ -146,16 +247,15 @@ def _make_conditional_router(
     If there are no normal targets, *default_target* (or the last conditional
     edge's target) is used as the fallback.
     """
-    compiled: list[tuple[Any, str]] = []
+    compiled: list[tuple[str, str]] = []
     for edge in conditional_edges:
         expr: str = edge.get("condition_expression", "")
         target = _get_edge_val(edge, "target", "target_node_id")
-        compiled.append((jmespath.compile(expr), target))
+        compiled.append((expr, target))
 
     def _router(state: dict[str, Any]) -> str:
-        for compiled_expr, target in compiled:
-            result = compiled_expr.search(state)
-            if _is_truthy(result):
+        for expr, target in compiled:
+            if evaluate_jmespath_condition(state, expr):
                 return target
         if normal_targets:
             return normal_targets[0]
@@ -266,8 +366,7 @@ def _make_loop_counter_router(
         if _hit_max_iterations(state, loop_key, max_iterations):
             return default_target
         if compiled_expr is not None:
-            result = compiled_expr.search(state)
-            if bool(result):
+            if evaluate_jmespath_condition(state, condition_expression):
                 return target
             return default_target
         return target
@@ -348,49 +447,206 @@ def _count_sandbox_nodes(nodes: list[dict[str, Any]]) -> bool:
     return sum(1 for n in nodes if str(n.get("node_type", "")).strip() == "sandbox_agent") == 1
 
 
-def _add_node_to_graph(
-    graph: StateGraph[Any],
+def _make_node_fn(
     node_def: dict[str, Any],
     *,
     timeout: int,
     session_factory: Callable[..., Any] | None,
     single_sandbox_node: bool,
-) -> None:
-    """Add a single node to the graph based on its type and config."""
+) -> Any:
+    """Build the LangGraph node function for a single node def (no graph add)."""
     node_id: str = str(node_def["id"])
     role: str | None = node_def.get("role")
     node_type: str = node_def.get("node_type", "agent")
     max_input_length: int | None = node_def.get("max_input_length")
     token_budget: int | None = node_def.get("token_budget")
 
-    if node_type not in ("agent", "manual", "connector", "sandbox_agent"):
+    if node_type not in ("agent", "manual", "connector", "sandbox_agent", "router", "hitl"):
         raise ValueError(f"Unknown node_type {node_type!r} for node {node_id!r}")
 
     connector_binding = node_def.get("connector_binding")
 
-    node_fn: Any
     if node_type == "sandbox_agent":
-        node_fn = make_sandbox_agent_fn(
+        return make_sandbox_agent_fn(
             node_def,
             timeout=timeout,
             session_factory=session_factory,
             single_sandbox_node=single_sandbox_node,
         )
-    elif connector_binding and not (node_type == "agent" and node_def.get("agent_id")):
-        node_fn = make_connector_fn(node_def, timeout=timeout)
-    elif node_type == "manual":
-        node_fn = make_manual_node_fn(node_def, timeout=timeout)
-    else:
-        # agent nodes (with or without a frozen agent_id) and connector nodes
-        # without a binding default to the general agent node factory.
-        node_fn = make_node_fn(
+    if connector_binding and not (node_type == "agent" and node_def.get("agent_id")):
+        return make_connector_fn(node_def, timeout=timeout, session_factory=session_factory)
+    if node_type == "manual":
+        return make_manual_node_fn(node_def, timeout=timeout)
+    if node_type == "router":
+        # Router node: a pure decision node. It produces no artifact of its
+        # own — it simply passes state through so the conditional-edges router
+        # (built in build_graph_from_json) can pick the next hop.
+        return _make_router_pass_fn(node_id)
+    if node_type == "hitl":
+        # HITL node: produces output like a normal node (agent / connector /
+        # manual) and its OUTGOING edges are gated by the node's hitl_config
+        # (injected at compile time in build_graph_from_json). The gate path is
+        # identical to the legacy edge-level HITL gate.
+        if node_def.get("agent_id"):
+            return make_node_fn(
+                node_def,
+                role=role,
+                timeout=timeout,
+                max_input_length=max_input_length,
+                token_budget=token_budget,
+            )
+        if connector_binding:
+            return make_connector_fn(node_def, timeout=timeout, session_factory=session_factory)
+        return make_manual_node_fn(node_def, timeout=timeout)
+    # agent nodes (with or without a frozen agent_id) and connector nodes
+    # without a binding default to the general agent node factory.
+    return make_node_fn(
+        node_def,
+        role=role,
+        timeout=timeout,
+        max_input_length=max_input_length,
+        token_budget=token_budget,
+    )
+
+
+def make_scatter_node_fn(
+    node_def: dict[str, Any],
+    *,
+    timeout: int,
+    session_factory: Callable[..., Any] | None = None,
+    single_sandbox_node: bool = False,
+) -> Any:
+    """Build the runtime node function for a scatter (fan-out) node.
+
+    At execution the split source port is read from ``state``; it is expanded
+    into N child branches (each a unique ``child_id``) which are executed
+    sequentially by the standard node factory in P3. Per-child outputs are
+    written back into state keyed by their child id, plus a
+    ``__scatter_manifest__`` map so a downstream join can locate them. An empty
+    split source succeeds vacuously (no child calls).
+    """
+    parent_id = str(node_def["id"])
+    fan_out = node_def["fan_out"]
+    split = fan_out.get("split") if isinstance(fan_out, dict) else fan_out.split
+
+    async def _fn(state: dict[str, Any]) -> dict[str, Any]:
+        items = state.get(split) or [] if split is not None else []
+        status_map: dict[str, str] = {}
+
+        async def execute_child(child_def: dict[str, Any]) -> Any:
+            child_fn = _make_node_fn(
+                child_def,
+                timeout=timeout,
+                session_factory=session_factory,
+                single_sandbox_node=single_sandbox_node,
+            )
+            child_id = str(child_def["id"])
+            item = child_def.get("scatter_item")
+            # Deliver the per-item payload to the child so each branch processes
+            # its OWN item rather than an identical copy of the parent state.
+            # The item is injected as the child's run_context input (the
+            # conventional agent input channel, rendered into the prompt as
+            # ``{{ input }}``) and mirrored under ``__scatter_item__`` for direct
+            # template reference (``{{ state.__scatter_item__ }}``).
+            child_state = dict(state)
+            run_ctx = dict(child_state.get("run_context") or {})
+            run_ctx["input"] = item
+            child_state["run_context"] = run_ctx
+            child_state["__scatter_item__"] = item
+            try:
+                out = await child_fn(child_state)
+                status_map[child_id] = "succeeded"
+                return out
+            except Exception as exc:  # record per-branch failure
+                # A child failure must NOT abort the whole scatter: record the
+                # failed branch so a downstream join can apply its partial-failure
+                # policy (``join_partial_policy="fail"`` raises; the default
+                # ``collect_and_proceed`` aggregates the partial result). This is
+                # what makes ``__scatter_read`` statuses real at runtime (FAR-402
+                # §4 B).
+                status_map[child_id] = "failed"
+                return {"error": str(exc), "_scatter_child_failed": True}
+
+        results = await run_scatter_node(node_def, items=list(items), execute_child=execute_child)
+        manifest = [str(k) for k in results]
+        update: dict[str, Any] = dict(results)
+        if manifest:
+            update["__scatter_manifest__"] = {parent_id: manifest}
+        if status_map:
+            update["__scatter_status__"] = status_map
+        return update
+
+    return _fn
+
+
+def make_join_node_fn(
+    node_def: dict[str, Any],
+) -> Any:
+    """Build the runtime node function for a join (fan-in) node.
+
+    Gathers each collected branch's output from ``state`` (located via the
+    ``__scatter_manifest__`` written by the upstream scatter node), then
+    aggregates them per the node's ``aggregate`` spec. The aggregated value is
+    written back under the join node's own id.
+    """
+    node_id = str(node_def["id"])
+    collect = node_def.get("collect") or []
+
+    def _fn(state: dict[str, Any]) -> dict[str, Any]:
+        manifest_map = state.get("__scatter_manifest__", {})
+        status_map = state.get("__scatter_status__", {})
+        collected = [
+            {
+                "node_id": child_id,
+                "output": state.get(child_id),
+                "status": status_map.get(child_id, "succeeded"),
+            }
+            for spec in collect
+            for child_id in manifest_map.get(spec.get("node") if isinstance(spec, dict) else spec.node, [])
+        ]
+        result = run_join_node(node_def, collected=collected)
+        return {node_id: result.get("aggregated")}
+
+    return _fn
+
+
+def _build_raw_node_fn(
+    node_def: dict[str, Any],
+    *,
+    timeout: int,
+    session_factory: Callable[..., Any] | None,
+    single_sandbox_node: bool,
+) -> Any:
+    """Return the raw (un-retry-wrapped) callable for a node def.
+
+    The same branching used by the node-adding path (join / scatter /
+    agent / connector / manual / sandbox). Returns the callable rather than
+    adding it to the graph so the retry/compensation wrapper can be applied
+    around it (FAR-402 P5 runtime wiring).
+    """
+    node_type: str = node_def.get("node_type", "agent")
+
+    # FAR-402 P3 / FAR-417: compile-time fail-closed validation of scatter/join
+    # configuration (typed error surfaces before any execution).
+    validate_scatter_join_node(node_def)
+
+    if node_type == "join":
+        return make_join_node_fn(node_def)
+
+    if node_def.get("fan_out") is not None and node_type in ("agent", "sandbox_agent"):
+        return make_scatter_node_fn(
             node_def,
-            role=role,
             timeout=timeout,
-            max_input_length=max_input_length,
-            token_budget=token_budget,
+            session_factory=session_factory,
+            single_sandbox_node=single_sandbox_node,
         )
-    graph.add_node(node_id, node_fn)
+
+    return _make_node_fn(
+        node_def,
+        timeout=timeout,
+        session_factory=session_factory,
+        single_sandbox_node=single_sandbox_node,
+    )
 
 
 def _build_reject_targets(edges: list[dict[str, Any]]) -> dict[str, str]:
@@ -621,6 +877,8 @@ def build_graph_from_json(
     session_factory: Callable[..., Any] | None = None,
     org_id: uuid.UUID | None = None,
     pipeline_node_timeout_seconds: int = 300,
+    pipeline_retry_policy: dict[str, Any] | None = None,
+    node_idempotency_key: Callable[[str, dict[str, Any]], str | None] | None = None,
 ) -> Any:
     """Compile a StateGraph from the serialised graph_json stored in a snapshot.
 
@@ -662,7 +920,11 @@ def build_graph_from_json(
     state_schema = cast("type[Any]", Annotated[dict[str, Any], _pipeline_state_reducer])
     graph: StateGraph[Any] = StateGraph(state_schema)
 
-    nodes: list[dict[str, Any]] = graph_json.get("nodes", [])
+    # FAR-416 (FAR-402 F1): lazy backfill. Synthesize default out/in ports for
+    # legacy (port-less) nodes at load/first-compile. Ports are ADDITIVE metadata
+    # over the flat run_context/artifact dict — the runtime still reads/writes
+    # the flat dict unchanged; this only ensures every node has a port model.
+    nodes: list[dict[str, Any]] = [synthesize_node_ports(n) for n in graph_json.get("nodes", [])]
     edges: list[dict[str, Any]] = graph_json.get("edges", [])
 
     if not nodes:
@@ -679,17 +941,49 @@ def build_graph_from_json(
     # can require it without re-deriving from the node's own def.
     single_sandbox_node = _count_sandbox_nodes(nodes)
 
+    # Build EVERY node's raw callable first, then wrap each with the P5
+    # retry/compensation wrapper. Wrapping after a full pass lets the wrapper
+    # resolve OTHER nodes' raw fns (per-edge retry re-executes the SOURCE; a
+    # compensation edge invokes the on_failure_target), which is impossible in a
+    # single pass (the source/target fn may not exist yet).
+    raw_fns: dict[str, Any] = {}
     for node_def in nodes:
-        timeout: int | None = node_def.get("timeout_seconds")
-        if timeout is None:
-            timeout = pipeline_node_timeout_seconds
-        _add_node_to_graph(
-            graph,
+        node_timeout = node_def.get("timeout_seconds")
+        timeout = pipeline_node_timeout_seconds if node_timeout is None else node_timeout
+        raw_fns[str(node_def["id"])] = _build_raw_node_fn(
             node_def,
             timeout=timeout,
             session_factory=session_factory,
             single_sandbox_node=single_sandbox_node,
         )
+
+    # Node-id-to-def lookup for the retry wrapper (source fail-closed + retry config).
+    retry_nodes_by_id: dict[str, dict[str, Any]] = {str(n["id"]): n for n in nodes}
+    # Per-node incoming/outgoing edge sets for per-edge retry + compensation.
+    incoming_by_node: dict[str, list[dict[str, Any]]] = {str(n["id"]): [] for n in nodes}
+    outgoing_by_node: dict[str, list[dict[str, Any]]] = {str(n["id"]): [] for n in nodes}
+    for edge_def in edges:
+        if _get_edge_type(edge_def) == "reject":
+            continue
+        src = _get_edge_val(edge_def, "source", "source_node_id")
+        tgt = _get_edge_val(edge_def, "target", "target_node_id")
+        outgoing_by_node.setdefault(str(src), []).append(edge_def)
+        incoming_by_node.setdefault(str(tgt), []).append(edge_def)
+
+    for node_def in nodes:
+        node_id = str(node_def["id"])
+        wrapped = make_retrying_node_fn(
+            raw_fns[node_id],
+            node_id=node_id,
+            node_def=node_def,
+            pipeline_retry_policy=pipeline_retry_policy,
+            outgoing_edges=outgoing_by_node.get(node_id, []),
+            incoming_edges=incoming_by_node.get(node_id, []),
+            raw_fn_resolver=lambda nid: raw_fns.get(nid),
+            idempotency_key=node_idempotency_key,
+            node_defs=retry_nodes_by_id,
+        )
+        graph.add_node(node_id, wrapped)
 
     # Build reject-edge lookup for kick-back routing.
     reject_targets_by_source = _build_reject_targets(edges)
@@ -703,15 +997,58 @@ def build_graph_from_json(
     # Build a node-id-to-def lookup for quick access.
     nodes_by_id: dict[str, dict[str, Any]] = {str(n["id"]): n for n in nodes}
 
+    # Router nodes route via `router_config` (not outgoing edges), so their rule
+    # targets are never seen by the edge-driven `target_ids` population below.
+    # Register every router rule/default target here so the entry-point selection
+    # cannot pick a router's rule target as the pipeline entry node (FAR-415: a
+    # router whose rule target sorts first in `nodes` would otherwise become the
+    # entry, leaving the real entry + router dead).
+    for _n in nodes:
+        if (_n.get("node_type") or "agent") == "router":
+            _rc = _n.get("router_config") or {}
+            for _rule in _rc.get("rules", []) or []:
+                _tgt = _rule.get("target") or _rule.get("target_port")
+                if _tgt is not None:
+                    target_ids.add(str(_tgt))
+
     for source, src_edges in source_edges.items():
         source_node_def = nodes_by_id.get(source, {})
         routing_mode: str | None = source_node_def.get("routing_mode")
+        source_node_type: str = source_node_def.get("node_type", "agent")
 
         conditional = [e for e in src_edges if _get_edge_type(e) == "conditional"]
         loop_edges = [e for e in src_edges if _get_edge_type(e) == "loop"]
         normal = [e for e in src_edges if _get_edge_type(e) not in ("conditional", "loop")]
 
-        if loop_edges:
+        if source_node_type == "router":
+            # Router node (FAR-402 P1 / F2-A): lowers to the existing
+            # conditional-edge compile path via the shared JMESPath evaluator.
+            # Compile-time default-rule enforcement guards mis-configured graphs.
+            router_config = dict(source_node_def.get("router_config") or {})
+            _validate_router_config(router_config, source)
+            graph.add_conditional_edges(source, make_router_node_fn(router_config, node_id=source))
+        elif source_node_type == "hitl":
+            # HITL node (FAR-402 P1 / F2-D): compile-equivalent to the legacy
+            # edge-level HITL gate. Inject the node's hitl_config onto every
+            # outgoing (normal) edge so the existing synthetic-gate path picks
+            # it up unchanged.
+            hitl_config = dict(source_node_def.get("hitl_config") or {})
+            for edge in normal:
+                gate_id = _make_gate_id(source, _get_edge_val(edge, "target", "target_node_id"))
+                edge["hitl_gate_config"] = {**hitl_config, "gate_id": gate_id}
+            _add_normal_edges(
+                graph,
+                source,
+                normal,
+                target_ids=target_ids,
+                gate_node_ids=gate_node_ids,
+                reject_targets_by_source=reject_targets_by_source,
+                eval_definitions_by_node=eval_definitions_by_node,
+                session_factory=session_factory,
+                org_id=org_id,
+                node_type_map=node_type_map,
+            )
+        elif loop_edges:
             _add_loop_edges(graph, source, loop_edges, normal, target_ids)
         elif routing_mode == "llm":
             _add_llm_routing(graph, source, source_node_def, conditional, normal, target_ids)

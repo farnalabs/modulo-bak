@@ -4,8 +4,9 @@ The backend is the SOLE bucketing authority: day/hour/ISO-week bucketing and
 zero-fill happen in the shared service (``modulo.core.analytics.service``),
 never on the client. Tenant isolation relies on the EXPLICIT
 ``organisation_id = :org`` predicate injected by the SQL builder (modulo_app is
-BYPASSRLS on Postgres and the ORM tenant filter is NOT registered there) — RLS
-via ``set_rls_org`` is defense-in-depth, not the control. Every request sets a
+NOBYPASSRLS on Postgres and the ORM tenant filter is NOT registered there) — RLS
+via ``set_rls_org`` is a further defense-in-depth, and the explicit predicate is
+the control on the analytics writes. Every request sets a
 bounded ``statement_timeout`` so a runaway date range degrades to a clean 503
 instead of hogging a pooled connection.
 
@@ -279,6 +280,60 @@ def _build_params(
     )
 
 
+def _analytics_query_filters(
+    group_by: AnalyticsGroupBy = Query(AnalyticsGroupBy.DAY),
+    auto_granularity: bool = Query(False),
+    dimension: AnalyticsDimension | None = Query(None),
+    trigger_type: AnalyticsTriggerType | None = Query(None),
+    status: AnalyticsStatus | None = Query(None),
+    pipeline_id: list[uuid.UUID] | None = Query(None),
+    error_code: str | None = Query(None),
+    folder_id: uuid.UUID | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    limit: int = Query(1000, ge=1, le=1000),
+) -> AnalyticsParams:
+    return _build_params(
+        group_by=group_by,
+        auto_granularity=auto_granularity,
+        dimension=dimension,
+        trigger_type=trigger_type,
+        status=status,
+        pipeline_ids=tuple(pipeline_id or ()),
+        error_code=error_code,
+        folder_id=folder_id,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+
+def _analytics_export_filters(
+    dimension: AnalyticsDimension | None = Query(None),
+    trigger_type: AnalyticsTriggerType | None = Query(None),
+    status: AnalyticsStatus | None = Query(None),
+    pipeline_id: list[uuid.UUID] | None = Query(None),
+    error_code: str | None = Query(None),
+    folder_id: uuid.UUID | None = Query(None),
+    date_from: datetime | None = Query(None),
+    date_to: datetime | None = Query(None),
+    limit: int = Query(_EXPORT_DEFAULT_LIMIT, ge=1, le=_EXPORT_MAX_LIMIT),
+) -> AnalyticsParams:
+    return _build_params(
+        group_by=AnalyticsGroupBy.DAY,
+        auto_granularity=False,
+        dimension=dimension,
+        trigger_type=trigger_type,
+        status=status,
+        pipeline_ids=tuple(pipeline_id or ()),
+        error_code=error_code,
+        folder_id=folder_id,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+    )
+
+
 def _require_org(principal: TenantPrincipal) -> uuid.UUID:
     org_id = principal.organisation_id
     if org_id is None:
@@ -322,17 +377,7 @@ def _map_service_error(exc: Exception) -> HTTPException:
 
 @router.get("/query")
 async def analytics_query(
-    group_by: AnalyticsGroupBy = Query(AnalyticsGroupBy.DAY),
-    auto_granularity: bool = Query(False),
-    dimension: AnalyticsDimension | None = Query(None),
-    trigger_type: AnalyticsTriggerType | None = Query(None),
-    status: AnalyticsStatus | None = Query(None),
-    pipeline_id: list[uuid.UUID] | None = Query(None),
-    error_code: str | None = Query(None),
-    folder_id: uuid.UUID | None = Query(None),
-    date_from: datetime | None = Query(None),
-    date_to: datetime | None = Query(None),
-    limit: int = Query(1000, ge=1, le=1000),
+    params: AnalyticsParams = Depends(_analytics_query_filters),
     settings: Settings = Depends(get_settings),
     principal: TenantPrincipal = require_permission(_CODE_ANALYTICS_QUERY),
     _: object = require_feature("analytics_page"),
@@ -347,19 +392,6 @@ async def analytics_query(
     from the effective range span (hour ≤3d, day ≤90d, week otherwise).
     """
     org_id = _require_org(principal)
-    params = _build_params(
-        group_by=group_by,
-        auto_granularity=auto_granularity,
-        dimension=dimension,
-        trigger_type=trigger_type,
-        status=status,
-        pipeline_ids=tuple(pipeline_id or ()),
-        error_code=error_code,
-        folder_id=folder_id,
-        date_from=date_from,
-        date_to=date_to,
-        limit=limit,
-    )
     try:
         result = await run_analytics_query(
             org_id=org_id,
@@ -472,15 +504,7 @@ async def analytics_guardrails(
 async def analytics_export(
     format: str = Query("json", pattern="^(json|csv)$"),
     offset: int = Query(0, ge=0),
-    limit: int = Query(_EXPORT_DEFAULT_LIMIT, ge=1, le=_EXPORT_MAX_LIMIT),
-    dimension: AnalyticsDimension | None = Query(None),
-    trigger_type: AnalyticsTriggerType | None = Query(None),
-    status: AnalyticsStatus | None = Query(None),
-    pipeline_id: list[uuid.UUID] | None = Query(None),
-    error_code: str | None = Query(None),
-    folder_id: uuid.UUID | None = Query(None),
-    date_from: datetime | None = Query(None),
-    date_to: datetime | None = Query(None),
+    params: AnalyticsParams = Depends(_analytics_export_filters),
     settings: Settings = Depends(get_settings),
     principal: TenantPrincipal = require_permission(_CODE_ANALYTICS_QUERY),
     _: object = require_feature("analytics_page"),
@@ -494,19 +518,6 @@ async def analytics_export(
     surface parity but ignored — export has no bucketing.
     """
     org_id = _require_org(principal)
-    params = _build_params(
-        group_by=AnalyticsGroupBy.DAY,
-        auto_granularity=False,
-        dimension=dimension,
-        trigger_type=trigger_type,
-        status=status,
-        pipeline_ids=tuple(pipeline_id or ()),
-        error_code=error_code,
-        folder_id=folder_id,
-        date_from=date_from,
-        date_to=date_to,
-        limit=limit,
-    )
     try:
         result = await export_facts(
             org_id=org_id,
@@ -516,7 +527,7 @@ async def analytics_export(
             account_id=principal.account_id,
             org_role=principal.org_role,
             offset=offset,
-            limit=limit,
+            limit=params.limit,
         )
     except Exception as exc:
         if isinstance(exc, HTTPException):

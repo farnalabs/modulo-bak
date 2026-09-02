@@ -245,7 +245,8 @@ async def test_sandbox_agent_success_output_includes_cost_estimate_usd():
 
 
 # ---------------------------------------------------------------------------
-# {{ secrets.KEY }} env var resolution (org vault -> host env fallback)
+# {{ secrets.KEY }} env var resolution (org vault; unresolved refs are omitted,
+# never empty-string clobbers — FAR-480)
 # ---------------------------------------------------------------------------
 
 
@@ -268,8 +269,9 @@ def _run_state() -> dict:
     }
 
 
-async def test_env_var_secret_ref_missing_resolves_to_empty_string(caplog):
-    """No session_factory and no host env value -> '' plus a warning (legacy)."""
+async def test_env_var_secret_ref_missing_omits_key_and_warns(caplog):
+    """No session_factory -> unresolved ref is OMITTED (not '') plus a warning
+    naming the env var and secret key (FAR-480)."""
     node_def = _base_node_def(env_vars={"FOO": "{{ secrets.FOO }}"})
     fn = make_sandbox_agent_fn(node_def)
     sandbox = _make_sandbox_mock()
@@ -283,8 +285,11 @@ async def test_env_var_secret_ref_missing_resolves_to_empty_string(caplog):
 
     assert result["output"]["status"] == "completed"
     envs = sandbox.commands.run.call_args.kwargs["envs"]
-    assert not envs["FOO"]
-    assert any("env_var.secret_ref_not_found" in m for m in caplog.messages)
+    assert "FOO" not in envs
+    warnings = [m for m in caplog.messages if "env_var.secret_ref_not_found" in m]
+    assert warnings, "expected an env_var.secret_ref_not_found warning"
+    assert "FOO" in warnings[0]
+    assert any("env_var.secret_ref_no_db_context" in m for m in caplog.messages)
 
 
 async def test_env_var_secret_ref_resolves_from_vault():
@@ -345,7 +350,7 @@ async def test_env_var_secret_ref_does_not_fall_back_to_host_env(caplog):
 
     assert result["output"]["status"] == "completed"
     envs = sandbox.commands.run.call_args.kwargs["envs"]
-    assert not envs["FOO"]
+    assert "FOO" not in envs
     assert any("env_var.secret_ref_not_found" in m for m in caplog.messages)
 
 
@@ -373,7 +378,79 @@ async def test_resolve_env_var_refs_calls_resolver_per_ref():
 
     resolved = await resolve_env_var_refs({"A": "{{ secrets.A }}", "B": "plain", "C": "{{ secrets.C }}"}, _resolver)
     assert calls == ["A", "C"]
-    assert resolved == {"A": "a-secret", "B": "plain", "C": ""}
+    # C is unresolved -> omitted entirely (FAR-480), never an empty string.
+    assert resolved == {"A": "a-secret", "B": "plain"}
+
+
+async def test_resolve_env_var_refs_unresolved_ref_warns_with_key_names(caplog):
+    """An unresolved {{ secrets.X }} ref logs a WARNING naming the env var key
+    and the secret key (FAR-480) and is omitted from the result."""
+    calls: list[str] = []
+
+    async def _resolver(secret_key: str) -> str | None:
+        calls.append(secret_key)
+        return None
+
+    with caplog.at_level(logging.WARNING):
+        resolved = await resolve_env_var_refs({"GITHUB_TOKEN": "{{ secrets.GITHUB_TOKEN }}", "PLAIN": "x"}, _resolver)
+
+    assert calls == ["GITHUB_TOKEN"]
+    assert resolved == {"PLAIN": "x"}
+    warnings = [m for m in caplog.messages if "env_var.secret_ref_not_found" in m]
+    assert warnings, "expected an env_var.secret_ref_not_found warning"
+    assert "GITHUB_TOKEN" in warnings[0]
+
+
+async def test_unresolved_secret_ref_does_not_clobber_system_default(caplog):
+    """FAR-480 regression: an unresolved {{ secrets.GITHUB_TOKEN }} env ref must
+    NOT emit an empty GITHUB_TOKEN that clobbers the system-injected default
+    (host GITHUB_DOGFOOD_PAT_* / GITHUB_TOKEN) — the system token survives."""
+    node_def = _base_node_def(env_vars={"GITHUB_TOKEN": "{{ secrets.GITHUB_TOKEN }}"})
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock()
+
+    with (
+        caplog.at_level(logging.WARNING),
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        patch.dict(os.environ, {"GITHUB_TOKEN": "system-default-pat"}, clear=False),
+    ):
+        result = await fn(_run_state())
+
+    assert result["output"]["status"] == "completed"
+    envs = sandbox.commands.run.call_args.kwargs["envs"]
+    assert envs["GITHUB_TOKEN"] == "system-default-pat"
+    assert any("env_var.secret_ref_not_found" in m for m in caplog.messages)
+
+
+async def test_sandbox_resolve_secret_ref_warns_on_missing_db_context(caplog):
+    """_sandbox_resolve_secret_ref with no session_factory returns None and
+    logs a warning naming the secret key (FAR-480 — was silent)."""
+    from modulo.core.pipeline_engine.node_runner import _sandbox_resolve_secret_ref
+
+    with caplog.at_level(logging.WARNING):
+        result = await _sandbox_resolve_secret_ref("GITHUB_TOKEN", session_factory=None, org_id=_ORG_ID)
+
+    assert result is None
+    assert any("env_var.secret_ref_no_db_context" in m and "GITHUB_TOKEN" in m for m in caplog.messages)
+
+
+async def test_sandbox_resolve_secret_ref_warns_on_invalid_org_id(caplog):
+    """_sandbox_resolve_secret_ref with an unparseable org_id returns None and
+    logs a warning naming the secret key (FAR-480 — was silent)."""
+    from modulo.core.pipeline_engine.node_runner import _sandbox_resolve_secret_ref
+
+    session = MagicMock()
+
+    def _fake_session_factory():
+        return session
+
+    with caplog.at_level(logging.WARNING):
+        result = await _sandbox_resolve_secret_ref(
+            "GITHUB_TOKEN", session_factory=_fake_session_factory, org_id="not-a-uuid"
+        )
+
+    assert result is None
+    assert any("env_var.secret_ref_no_org_context" in m and "GITHUB_TOKEN" in m for m in caplog.messages)
 
 
 async def test_sandbox_agent_command_timeout_raises_retryable_failure():
@@ -1603,8 +1680,8 @@ def test_stall_detector_disable_removes_channel():
 def test_stall_detector_no_channels_never_stalls():
     """With zero enabled channels last_activity() returns now, so the watchdog
     never fires (belt-and-braces against a fully-disabled node)."""
-    d = _StallDetector()
-    assert d.last_activity() >= time.monotonic() - 1.0
+    d = _StallDetector(now=lambda: 1234.5)
+    assert d.last_activity() == 1234.5
 
 
 def test_delta_ratio_semantics():
@@ -1848,16 +1925,22 @@ def test_heartbeat_disabled_but_agent_output_keeps_run_alive():
     Asserted via the detector's liveness semantics: repeated ``output`` touches
     keep ``last_activity()`` fresh, so the watchdog's stale-check never fires.
     """
-    detector = _StallDetector()
+    now: list[float] = [100.0]
+
+    def _clock() -> float:
+        return now[0]
+
+    detector = _StallDetector(now=_clock)
     detector.enable("output")
     assert "heartbeat" not in detector.enabled  # strict mode
 
     for _ in range(5):
+        now[0] += 10.0
         detector.touch("output")
 
-    # The output channel is continually refreshed -> last_activity tracks now,
-    # never going stale.
-    assert time.monotonic() - detector.last_activity() < 1.0
+    # The output channel is continually refreshed -> last_activity tracks the
+    # freshest touch (== now), never going stale.
+    assert detector.last_activity() == now[0]
 
 
 def test_heartbeat_enabled_default_silent_connected_agent_does_not_stall():
@@ -1869,7 +1952,12 @@ def test_heartbeat_enabled_default_silent_connected_agent_does_not_stall():
     successful get_info (without any output growth) keeps ``last_activity()``
     fresh, so the watchdog never treats the run as stalled.
     """
-    detector = _StallDetector()
+    now: list[float] = [0.0]
+
+    def _clock() -> float:
+        return now[0]
+
+    detector = _StallDetector(now=_clock)
     detector.enable("output")
     detector.enable("heartbeat")
     assert "heartbeat" in detector.enabled  # default enabled
@@ -1877,9 +1965,10 @@ def test_heartbeat_enabled_default_silent_connected_agent_does_not_stall():
     # Simulate many silent drain ticks that only refresh the heartbeat (get_info
     # success, no output growth).
     for _ in range(50):
+        now[0] += 1.0
         detector.touch("heartbeat")
         # last_activity() is the max across enabled channels and stays fresh.
-        assert time.monotonic() - detector.last_activity() < 1.0
+        assert detector.last_activity() == now[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1921,3 +2010,461 @@ async def test_agent_command_tojson_on_undefined_skips():
     assert result["status"] == "skipped"
     assert "agent_command" in result["summary"]
     sandbox.commands.run.assert_not_called()
+
+
+async def test_context_scope_gates_sandbox_agent_render_view():
+    """FAR-418 MAJOR-3 fix for the sandbox_agent path: ``capability_scope.context_scope``
+    must bind the sandbox agent's render view, not just the plain ``agent`` node path.
+
+    A ``sandbox_agent`` node whose template reads a gated ``run_context`` key (via
+    ``{{ run_context.<key> }}`` or ``{{ state.run_context.<key> }}``) must NOT have
+    that key appear in the rendered prompt written to ``/home/user/prompt.md`` — the
+    same bypass class the make_node_fn fix closed, still open on this node type.
+    """
+    node_def = _base_node_def(
+        agent_prompt=(
+            "tier={{ run_context.model_tier }}|"
+            "leak-rc={{ run_context.secret }}|"
+            "leak-state={{ state.run_context.secret }}"
+        ),
+        capability_scope={"context_scope": ["model_tier"]},
+    )
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock()
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)):
+        result = await fn(
+            {
+                "run_context": {"model_tier": "tier-2", "secret": "X", "input": {}},
+                "_run_id": "run-1",
+                "_pipeline_id": "pipe-1",
+                "_org_id": _ORG_ID,
+            }
+        )
+
+    assert result["output"]["status"] == "completed"
+
+    # Pull the rendered prompt back out of the /home/user/prompt.md write.
+    prompt_writes = [
+        c.args[1] for c in sandbox.files.write.call_args_list if c.args and c.args[0] == "/home/user/prompt.md"
+    ]
+    assert prompt_writes, "rendered prompt was not written to /home/user/prompt.md"
+    rendered = prompt_writes[0]
+
+    # The scoped key is visible; the gated key must NOT leak into the prompt
+    # (neither via the run_context var nor the state.run_context view).
+    assert "tier=tier-2" in rendered
+    assert "leak-rc=X" not in rendered
+    assert "leak-state=X" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# FAR-488b: sandbox teardown audit — kill asserted on EVERY exit path
+# ---------------------------------------------------------------------------
+
+
+def _dead_connection_sandbox(cmd_result: MagicMock) -> MagicMock:
+    """A sandbox mock whose command COMPLETED (cmd_result returned) but whose
+    connection is otherwise inert (drain probe transfers nothing)."""
+    handle = MagicMock()
+    handle.wait = AsyncMock(return_value=cmd_result)
+
+    sandbox = MagicMock()
+    sandbox.files.write = AsyncMock()
+    sandbox.files.get_info = AsyncMock(return_value=MagicMock(size=0))
+    sandbox.commands.run = AsyncMock(return_value=handle)
+    sandbox.kill = AsyncMock()
+    return sandbox
+
+
+async def test_cancelled_command_still_kills_sandbox():
+    """A CancelledError escaping the command wait still reaches the
+    finally-block teardown — the sandbox is killed, never leaked (FAR-488b:
+    the E2B 20-concurrent-sandbox cap outage)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+
+    sandbox = MagicMock()
+    sandbox.files.write = AsyncMock()
+    sandbox.files.read = AsyncMock(return_value='{"summary": "done"}')
+    sandbox.files.get_info = AsyncMock(return_value=MagicMock(size=0))
+    handle = MagicMock()
+    handle.wait = AsyncMock(side_effect=asyncio.CancelledError)
+    handle.kill = AsyncMock()
+    sandbox.commands.run = AsyncMock(return_value=handle)
+    sandbox.kill = AsyncMock()
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await fn(_run_state())
+
+    sandbox.kill.assert_awaited()
+
+
+async def test_failure_between_create_and_command_still_kills_sandbox():
+    """A failure AFTER the sandbox is created but BEFORE the command starts
+    (e.g. context-file/prompt write blows up) lands in the generic failed
+    envelope and the finally-block teardown still kills the sandbox (FAR-488b)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+
+    sandbox = MagicMock()
+    sandbox.files.write = AsyncMock(side_effect=RuntimeError("e2b file write exploded"))
+    sandbox.files.read = AsyncMock(return_value="")
+    sandbox.files.get_info = AsyncMock(return_value=MagicMock(size=0))
+    sandbox.commands.run = AsyncMock()
+    sandbox.kill = AsyncMock()
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)):
+        result = await fn(_run_state())
+
+    assert result["output"]["status"] == "failed"
+    sandbox.kill.assert_awaited()
+    sandbox.commands.run.assert_not_called()
+
+
+async def test_output_read_failure_still_kills_sandbox():
+    """A dead sandbox at output.json read time still reaches the finally-block
+    kill and raises the retryable no-output failure (FAR-488b)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+
+    cmd_result = MagicMock()
+    cmd_result.exit_code = 0
+    cmd_result.stdout = "agent ran"
+    cmd_result.stderr = ""
+
+    def _read(path, format="text", **kwargs):
+        if str(path).endswith("output.json"):
+            raise OSError("sandbox connection lost")
+        return ""
+
+    sandbox = _dead_connection_sandbox(cmd_result)
+    sandbox.files.read = AsyncMock(side_effect=_read)
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        pytest.raises(SandboxNodeFailedError),
+    ):
+        await fn(_run_state())
+
+    sandbox.kill.assert_awaited()
+
+
+async def test_schema_validation_failure_still_kills_sandbox():
+    """A schema-rejected output returns the failed envelope AND the sandbox is
+    still killed in the finally block (FAR-488b)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    node_def["output_schema_json"] = {"required": ["status", "summary"]}
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock(output_json='{"summary": "done"}')
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)):
+        result = await fn(_run_state())
+
+    assert result["output"]["status"] == "failed"
+    assert "schema validation" in result["output"]["summary"]
+    sandbox.kill.assert_awaited()
+
+
+async def test_rate_limit_retry_loop_leaves_no_sandbox_behind():
+    """A RateLimitException attempt never leaves a sandbox object behind (the
+    create coroutine either returns a sandbox or raises before assignment), so
+    the retry loop cannot accumulate sandboxes; the single successful sandbox
+    is killed in teardown (FAR-488b)."""
+    from e2b.exceptions import RateLimitException
+
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock()
+    create = AsyncMock(side_effect=[RateLimitException("429"), RateLimitException("429"), sandbox])
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=create),
+        patch("modulo.core.pipeline_engine.node_runner._SANDBOX_RATE_LIMIT_BASE_BACKOFF_S", 0.001),
+    ):
+        result = await fn(_run_state())
+
+    assert result["output"]["status"] == "completed"
+    assert create.await_count == 3
+    sandbox.kill.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# FAR-487: no-parseable-output diagnostics name the CAUSE
+# ---------------------------------------------------------------------------
+
+
+def test_classify_no_output_cause_missing_file():
+    from modulo.core.pipeline_engine.node_runner import _classify_no_output_cause
+
+    cause = _classify_no_output_cause(read_error="NotFoundException: file not found", read_raw="")
+    assert "MISSING" in cause
+
+
+def test_classify_no_output_cause_unreadable():
+    from modulo.core.pipeline_engine.node_runner import _classify_no_output_cause
+
+    cause = _classify_no_output_cause(read_error="OSError: connection reset", read_raw="")
+    assert "could not be read" in cause
+    assert "connection reset" in cause
+
+
+def test_classify_no_output_cause_invalid_json():
+    from modulo.core.pipeline_engine.node_runner import _classify_no_output_cause
+
+    cause = _classify_no_output_cause(read_error="", read_raw="<<< not json >>>")
+    assert "NOT valid JSON" in cause
+
+
+def test_classify_no_output_cause_json_null():
+    from modulo.core.pipeline_engine.node_runner import _classify_no_output_cause
+
+    cause = _classify_no_output_cause(read_error="", read_raw="null")
+    assert "JSON null" in cause
+
+
+async def test_missing_output_json_message_names_missing_file():
+    """FAR-487: a failed output.json read whose error names a missing file is
+    reported as MISSING — distinguishing 'the agent never wrote it' from a
+    parse failure of bytes that exist."""
+    from e2b.exceptions import NotFoundException
+
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+    cmd_result = MagicMock()
+    cmd_result.exit_code = 0
+    cmd_result.stdout = "agent finished"
+    cmd_result.stderr = ""
+
+    def _read(path, format="text", **kwargs):
+        if str(path).endswith("output.json"):
+            raise NotFoundException("/home/user/output.json not found")
+        return ""
+
+    sandbox = _dead_connection_sandbox(cmd_result)
+    sandbox.files.read = AsyncMock(side_effect=_read)
+    sandbox.sandbox_id = "sbx-missing"
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        patch("modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail", new=AsyncMock(return_value="")),
+        pytest.raises(SandboxNodeFailedError) as excinfo,
+    ):
+        await fn(_run_state())
+
+    message = str(excinfo.value)
+    assert "MISSING" in message
+    assert "exit code 0" in message
+
+
+async def test_unreadable_output_json_message_names_read_error():
+    """FAR-487: a read failure that is NOT a missing-file error names the
+    underlying read error in the raised message."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+    cmd_result = MagicMock()
+    cmd_result.exit_code = 0
+    cmd_result.stdout = "agent finished"
+    cmd_result.stderr = ""
+
+    def _read(path, format="text", **kwargs):
+        if str(path).endswith("output.json"):
+            raise OSError("connection reset by peer")
+        return ""
+
+    sandbox = _dead_connection_sandbox(cmd_result)
+    sandbox.files.read = AsyncMock(side_effect=_read)
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        patch("modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail", new=AsyncMock(return_value="")),
+        pytest.raises(SandboxNodeFailedError) as excinfo,
+    ):
+        await fn(_run_state())
+
+    message = str(excinfo.value)
+    assert "could not be read" in message
+    assert "connection reset by peer" in message
+
+
+async def test_invalid_json_output_message_says_invalid():
+    """FAR-487: bytes were read but json.loads failed -> the message says the
+    file is NOT valid JSON (the synthesized-output case)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = await _completed_sandbox(0, stdout="booting agent", output_json="{not json")
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        patch("modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail", new=AsyncMock(return_value="")),
+        pytest.raises(SandboxNodeFailedError) as excinfo,
+    ):
+        await fn(_run_state())
+
+    message = str(excinfo.value)
+    assert "NOT valid JSON" in message
+    assert "{not json" in message
+
+
+async def test_json_null_output_message_says_null():
+    """FAR-487: output.json containing literal JSON null is named as such."""
+    node_def = _base_node_def(timeout_seconds=30)
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = await _completed_sandbox(0, stdout="agent ran", output_json="null")
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)),
+        patch("modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail", new=AsyncMock(return_value="")),
+        pytest.raises(SandboxNodeFailedError) as excinfo,
+    ):
+        await fn(_run_state())
+
+    message = str(excinfo.value)
+    assert "JSON null" in message
+
+
+async def test_schema_validation_summary_names_missing_field():
+    """FAR-487: the schema-rejection summary names the rejected field so an
+    operator can align the agent's output shape with the schema (no schema
+    loosening)."""
+    node_def = _base_node_def(timeout_seconds=30)
+    node_def["output_schema_json"] = {"required": ["status", "summary"]}
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock(output_json='{"summary": "done"}')
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)):
+        result = await fn(_run_state())
+
+    summary = result["output"]["summary"]
+    assert "schema validation" in summary
+    assert "'status'" in summary
+
+
+# ---------------------------------------------------------------------------
+# FAR-487: the E2B sandbox LIFETIME must strictly exceed the command timeout
+# ---------------------------------------------------------------------------
+
+
+async def test_sandbox_lifetime_exceeds_command_timeout():
+    """FAR-487 mechanism: AsyncSandbox.create is given a lifetime strictly
+    greater than the node's command timeout (grace window), so the E2B
+    endAt platform kill can never preempt the runner's own timeout path.
+    Without the grace, a mid-command sandbox death closed the SDK's command
+    event stream, ``handle.wait()`` fabricated a zero-exit completion, and the
+    node misreported the failure as "no parseable output.json (exit code 0)"
+    (15+ production PR-Reviewer runs, 2026-08-29)."""
+    from modulo.core.pipeline_engine.node_runner import _SANDBOX_LIFETIME_GRACE_S
+
+    node_def = _base_node_def(timeout_seconds=60)
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock()
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)) as create:
+        await fn(_run_state())
+
+    create.assert_awaited_once()
+    lifetime = create.await_args.kwargs["timeout"]
+    assert lifetime == 60 + _SANDBOX_LIFETIME_GRACE_S
+    assert lifetime > 60
+
+
+async def test_sandbox_lifetime_is_int():
+    """FAR-489: the lifetime passed to AsyncSandbox.create must be an int.
+
+    E2B's Go server unmarshals NewSandbox.timeout into an int32 and REJECTS
+    a float payload ("360.0") with HTTP 400. The e2b SDK's attrs-based
+    NewSandbox model does not coerce, so a float reaches the wire verbatim.
+    With the float grace constant (120.0) every production sandbox create
+    failed instantly ("Sandbox agent execution failed", ~1.4s node wall
+    clock, zero LLM tokens) from 2026-08-29T19:43Z until this fix."""
+    node_def = _base_node_def(timeout_seconds=60)
+    fn = make_sandbox_agent_fn(node_def)
+    sandbox = _make_sandbox_mock()
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)) as create:
+        await fn(_run_state())
+
+    lifetime = create.await_args.kwargs["timeout"]
+    assert isinstance(lifetime, int), f"lifetime must be int, got {type(lifetime).__name__}: {lifetime!r}"
+
+    # The guard must hold even when the node's configured timeout is a
+    # float (defensive: sandbox_timeout comes from node_def JSON).
+    node_def = _base_node_def(timeout_seconds=60.5)
+    fn = make_sandbox_agent_fn(node_def)
+
+    with patch("e2b.AsyncSandbox.create", new=AsyncMock(return_value=sandbox)) as create:
+        await fn(_run_state())
+
+    lifetime = create.await_args.kwargs["timeout"]
+    assert isinstance(lifetime, int), f"lifetime must be int, got {type(lifetime).__name__}: {lifetime!r}"
+    assert lifetime > 60
+
+
+# ---------------------------------------------------------------------------
+# FAR-511: sandbox-provisioning failures surface the provider error in the
+# node output (error_type / error_message), not a masked "execution failed".
+# ---------------------------------------------------------------------------
+
+
+async def test_sandbox_generic_exception_envelope_includes_error_type_and_message():
+    """FAR-511: a sandbox provisioning failure (generic exception) returns a
+    failed-node envelope whose output carries error_type + error_message so the
+    failure is visible via get_run_output — the old envelope hid both."""
+    node_def = _base_node_def(timeout_seconds=60)
+    fn = make_sandbox_agent_fn(node_def)
+
+    class _BoomError(Exception):
+        pass
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(side_effect=_BoomError("connection reset"))),
+        patch(
+            "modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail",
+            new=AsyncMock(return_value=""),
+        ),
+    ):
+        result = await fn(_run_state())
+
+    assert result["output"]["status"] == "failed"
+    # The failure envelope must now carry the exception type and message.
+    inner = result["artifacts"][0]["output"]
+    assert inner["error_type"] == "_BoomError"
+    assert "connection reset" in inner["error_message"]
+    # And the reduced top-level output view must surface them too (not masked).
+    assert result["output"]["error_type"] == "_BoomError"
+    assert "connection reset" in result["output"]["error_message"]
+
+
+async def test_sandbox_provider_exception_message_visible_in_output():
+    """FAR-511: an e2b SandboxException's 400 detail (e.g. the 1-hour timeout
+    cap) is included in the node output so diagnosis does not require Fly logs."""
+    from e2b.exceptions import SandboxException
+
+    node_def = _base_node_def(timeout_seconds=3600)
+    fn = make_sandbox_agent_fn(node_def)
+
+    exc = SandboxException("400: Timeout cannot be greater than 1 hours")
+
+    class _ProviderResponse:
+        text = "Timeout cannot be greater than 1 hours"
+
+    exc.response = _ProviderResponse()
+
+    with (
+        patch("e2b.AsyncSandbox.create", new=AsyncMock(side_effect=exc)),
+        patch(
+            "modulo.core.pipeline_engine.node_runner._fetch_sandbox_log_tail",
+            new=AsyncMock(return_value=""),
+        ),
+    ):
+        result = await fn(_run_state())
+
+    inner = result["artifacts"][0]["output"]
+    assert inner["error_type"] == "SandboxException"
+    # The provider error detail must be present in the output message.
+    assert "Timeout cannot be greater than 1 hours" in inner["error_message"]
+    assert result["output"]["error_type"] == "SandboxException"
+    assert "Timeout cannot be greater than 1 hours" in result["output"]["error_message"]

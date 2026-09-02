@@ -41,6 +41,11 @@ from modulo.db.models.base import Base
 from modulo.db.models.run import Run
 from modulo.db.models.run_evidence import RunEvidence
 
+# The run_evidence table is org-scoped (0133); unit tests run on SQLite where
+# RLS is absent but the NOT NULL organisation_id must still be supplied.
+_TEST_ORG = uuid.uuid4()
+_NODE_A = uuid.UUID("00000000-0000-0000-0000-0000000000aa")
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -110,27 +115,27 @@ class TestExtractOutputJson:
 class TestExtractStoredOutputJson:
     def test_legacy_envelope(self) -> None:
         outputs = {
-            "node-a": {
+            str(_NODE_A): {
                 "artifacts": [{"output": {"output_json": {"changed": True}, "status": "completed"}}],
                 "status": "completed",
             }
         }
-        assert extract_stored_output_json(outputs, {}, "node-a") == {"changed": True}
+        assert extract_stored_output_json(outputs, {}, str(_NODE_A)) == {"changed": True}
 
     def test_pure_return_used_when_no_envelope(self) -> None:
         # A P1 split row: node_return returns the pure output_json dict.
-        outputs = {"node-a": {"pr_url": "https://github.com/farnalabs/modulo/pull/1"}}
-        assert extract_stored_output_json(outputs, {}, "node-a") == {
+        outputs = {str(_NODE_A): {"pr_url": "https://github.com/farnalabs/modulo/pull/1"}}
+        assert extract_stored_output_json(outputs, {}, str(_NODE_A)) == {
             "pr_url": "https://github.com/farnalabs/modulo/pull/1"
         }
 
     def test_non_dict_return_is_none(self) -> None:
-        assert extract_stored_output_json(None, {}, "node-a") is None
-        assert extract_stored_output_json({"node-a": "just-a-string"}, {}, "node-a") is None
+        assert extract_stored_output_json(None, {}, str(_NODE_A)) is None
+        assert extract_stored_output_json({str(_NODE_A): "just-a-string"}, {}, str(_NODE_A)) is None
 
     def test_envelope_without_output_json_is_none(self) -> None:
-        outputs = {"node-a": {"output": {"status": "completed"}}}
-        assert extract_stored_output_json(outputs, {}, "node-a") is None
+        outputs = {str(_NODE_A): {"output": {"status": "completed"}}}
+        assert extract_stored_output_json(outputs, {}, str(_NODE_A)) is None
 
 
 class TestCombineProbeResults:
@@ -243,8 +248,8 @@ def _scan_files(root: Path) -> list[FileInfo]:
     files: list[FileInfo] = []
     for dirpath, _dirnames, filenames in os.walk(str(root)):
         for fname in filenames:
-            full = os.path.join(dirpath, fname)
-            files.append(FileInfo(name=os.path.relpath(full, root), size=os.path.getsize(full)))
+            full = Path(dirpath) / fname
+            files.append(FileInfo(name=os.path.relpath(full, root), size=Path(full).stat().st_size))
     return files
 
 
@@ -265,33 +270,33 @@ def _provider(repo: Path, output_json: dict[str, Any] | None = None, root: Path 
 class TestGitDiffEmptyProbe:
     async def test_clean_repo_with_empty_output_json_is_verified_empty(self, repo_dir: Path) -> None:
         provider = _provider(repo_dir, output_json={})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.verified_empty
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.verified_empty
 
     async def test_substantive_change_is_has_work(self, repo_dir: Path) -> None:
         (repo_dir / "base.txt").write_text("changed\n")
         provider = _provider(repo_dir, output_json={})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.has_work
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.has_work
 
     async def test_whitespace_only_change_ignored_is_verified_empty(self, repo_dir: Path) -> None:
         # A trailing-space-only change is whitespace-ignorable for `git diff -w`.
         (repo_dir / "base.txt").write_text("base   \n")
         provider = _provider(repo_dir, output_json={})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.verified_empty
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.verified_empty
 
     async def test_untracked_file_is_has_work(self, repo_dir: Path) -> None:
         (repo_dir / "new.txt").write_text("new\n")
         provider = _provider(repo_dir, output_json={})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.has_work
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.has_work
 
     async def test_output_json_content_counts_as_has_work(self, repo_dir: Path) -> None:
         provider = _provider(repo_dir, output_json={"tickets_groomed": 3})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.has_work
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.has_work
 
     async def test_no_repo_is_unverifiable(self, tmp_path: Path) -> None:
         empty = tmp_path / "no-repo"
         empty.mkdir()
         provider = _provider(empty, output_json={})
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.unverifiable
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.unverifiable
 
     async def test_no_sandbox_is_unverifiable(self, repo_dir: Path) -> None:
         provider = SandboxEvidenceProvider(
@@ -300,7 +305,7 @@ class TestGitDiffEmptyProbe:
             output_json_loader=lambda _rid, _nid: {},
             timeout_seconds=30.0,
         )
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.unverifiable
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.unverifiable
 
     async def test_timeout_propagates(self, repo_dir: Path) -> None:
         async def _slow(_sandbox_id: str, _command: str) -> CommandResult:
@@ -314,7 +319,7 @@ class TestGitDiffEmptyProbe:
             timeout_seconds=0.1,
         )
         with pytest.raises(asyncio.TimeoutError):
-            await provider.git_diff_empty(uuid.uuid4(), "node-a")
+            await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A))
 
     async def test_no_output_json_loader_is_unverifiable_on_clean_repo(self, repo_dir: Path) -> None:
         provider = SandboxEvidenceProvider(
@@ -323,27 +328,27 @@ class TestGitDiffEmptyProbe:
             output_json_loader=None,
             timeout_seconds=30.0,
         )
-        assert await provider.git_diff_empty(uuid.uuid4(), "node-a") == EvidenceResult.unverifiable
+        assert await provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.unverifiable
 
 
 class TestSandboxFilesystemProbe:
     async def test_fs_with_content_is_has_work(self, repo_dir: Path) -> None:
         provider = _provider(repo_dir)
-        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), "node-a") == EvidenceResult.has_work
+        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.has_work
 
     async def test_empty_fs_is_verified_empty(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
         empty.mkdir()
         provider = _provider(empty, root=empty)
-        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), "node-a") == EvidenceResult.verified_empty
+        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.verified_empty
 
     async def test_no_sandbox_is_unverifiable(self) -> None:
         provider = SandboxEvidenceProvider(sandbox_id_resolver=lambda _rid, _nid: None)
-        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), "node-a") == EvidenceResult.unverifiable
+        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.unverifiable
 
     async def test_no_list_files_is_unverifiable(self) -> None:
         provider = SandboxEvidenceProvider(sandbox_id_resolver=lambda _rid, _nid: "sandbox-1", list_files=None)
-        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), "node-a") == EvidenceResult.unverifiable
+        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.unverifiable
 
     async def test_directory_only_fs_is_verified_empty(self, tmp_path: Path) -> None:
         root = tmp_path / "dirs"
@@ -358,7 +363,7 @@ class TestSandboxFilesystemProbe:
             list_files=_list,
             timeout_seconds=30.0,
         )
-        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), "node-a") == EvidenceResult.verified_empty
+        assert await provider.sandbox_filesystem_probe(uuid.uuid4(), str(_NODE_A)) == EvidenceResult.verified_empty
 
 
 class TestProviderResolverConvenience:
@@ -375,7 +380,7 @@ class TestProviderResolverConvenience:
         # Reaching the command runner with a resolved sandbox id proves the
         # awaitable resolver path was awaited (non-awaitable resolver covered
         # implicitly by _provider() above).
-        result = await provider._resolve_sandbox_id(uuid.uuid4(), "node-a")
+        result = await provider._resolve_sandbox_id(uuid.uuid4(), str(_NODE_A))
         assert result == "sandbox-1"
 
     async def test_awaitable_output_json_loader_is_awaited(self) -> None:
@@ -383,7 +388,7 @@ class TestProviderResolverConvenience:
             return {"a": 1}
 
         provider = SandboxEvidenceProvider(output_json_loader=_load)
-        result = await provider._load_output_json(uuid.uuid4(), "node-a")
+        result = await provider._load_output_json(uuid.uuid4(), str(_NODE_A))
         assert result == {"a": 1}
 
 
@@ -431,39 +436,63 @@ class TestRunEvidenceProbe:
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
         run_id = uuid.uuid4()
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id="node-a"
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
-        assert provider.git_calls == [(run_id, "node-a")]
+        assert provider.git_calls == [(run_id, str(_NODE_A))]
 
         async with sqlite_factory() as session, session.begin():
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
         assert rows[0].run_id == run_id
-        assert rows[0].node_id == "node-a"
+        assert rows[0].node_id == _NODE_A
         assert rows[0].evidence_state == "verified_empty"
 
     async def test_has_work_any_positive_wins(self, sqlite_factory) -> None:
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.has_work)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.has_work
 
     async def test_unverifiable_never_flags(self, sqlite_factory) -> None:
         provider = FakeEvidenceProvider(EvidenceResult.unverifiable, EvidenceResult.unverifiable)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
 
     async def test_race_on_conflict_do_nothing(self, sqlite_factory) -> None:
         run_id = uuid.uuid4()
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
-        await run_evidence_probe(provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id="node-a")
+        await run_evidence_probe(
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
+        )
         # A second write (the reconciliation sweep racing the async probe) must
         # not raise on the UNIQUE(run_id, node_id) constraint.
-        await run_evidence_probe(provider=provider, session_factory=sqlite_factory, run_id=run_id, node_id="node-a")
+        await run_evidence_probe(
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=run_id,
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
+        )
         async with sqlite_factory() as session, session.begin():
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
@@ -472,13 +501,54 @@ class TestRunEvidenceProbe:
         run_id = uuid.uuid4()
         async with sqlite_factory() as session, session.begin():
             await write_evidence_row(
-                session, run_id=run_id, node_id="node-a", evidence_state="unverifiable", evidence_detail="timeout"
+                session,
+                run_id=run_id,
+                node_id=str(_NODE_A),
+                evidence_state="unverifiable",
+                evidence_detail="timeout",
+                organisation_id=_TEST_ORG,
             )
         async with sqlite_factory() as session, session.begin():
             row = (await session.execute(select(RunEvidence))).scalars().one()
         assert row.evidence_state == "unverifiable"
         assert row.evidence_detail == "timeout"
         assert row.evidence_written_at is not None
+
+    async def test_write_evidence_row_omitted_org_resolves_from_parent_run(self, sqlite_factory) -> None:
+        """With ``organisation_id`` omitted the tenant anchor is resolved from
+        the parent run, so the row lands under the run's real org."""
+        run_id = uuid.uuid4()
+        org_id = uuid.uuid4()
+        async with sqlite_factory() as session, session.begin():
+            session.add(_complete_run(run_id, org_id, outputs_json={}, telemetry={}))
+            await session.flush()
+            await write_evidence_row(
+                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="verified_empty", evidence_detail=None
+            )
+        async with sqlite_factory() as session, session.begin():
+            row = (await session.execute(select(RunEvidence))).scalars().one()
+        assert row.run_id == run_id
+        assert row.organisation_id == org_id
+
+    async def test_write_evidence_row_missing_run_skips_write(self, sqlite_factory) -> None:
+        """An unresolvable parent run (orphaned / purged) must NOT raise and must
+        NOT fabricate a placeholder tenant.
+
+        ``run_evidence.organisation_id`` is a NOT NULL FK -> ``organisations``
+        under FORCE RLS (migration 0133), so a synthesised org could never
+        persist on Postgres — the row is skipped instead of being written under a
+        tenant that does not exist. See the Postgres-backed companion test in
+        tests/integration/test_run_evidence_tenant_anchor.py, which pins this
+        against the real FK + RLS constraints.
+        """
+        run_id = uuid.uuid4()
+        async with sqlite_factory() as session, session.begin():
+            await write_evidence_row(
+                session, run_id=run_id, node_id=str(_NODE_A), evidence_state="verified_empty", evidence_detail=None
+            )
+        async with sqlite_factory() as session, session.begin():
+            rows = (await session.execute(select(RunEvidence))).scalars().all()
+        assert not rows
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +645,8 @@ class TestHeuristicMetrics:
         evidence.record_heuristic_error("probe_raised")
         counter = fake_meter.counter("modulo_heuristic_errors_total")
         assert counter is not None
-        assert counter.calls and counter.calls[0]["attributes"] == {"reason": "probe_raised"}
+        assert counter.calls
+        assert counter.calls[0]["attributes"] == {"reason": "probe_raised"}
 
     def test_unverifiable_total_fires_when_row_unverifiable(
         self, monkeypatch: pytest.MonkeyPatch, fake_meter: _FakeMeter
@@ -592,15 +663,21 @@ class TestHeuristicMetrics:
         _stub_meter(monkeypatch, fake_meter)
         provider = FakeEvidenceProvider(EvidenceResult.verified_empty, EvidenceResult.verified_empty)
         result = await run_evidence_probe(
-            provider=provider, session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+            provider=provider,
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
         hist = fake_meter.histogram("modulo_heuristic_probe_latency")
         assert hist is not None
-        assert hist.records and hist.records[0] >= 0
+        assert hist.records
+        assert hist.records[0] >= 0
         gauge = fake_meter.gauge("modulo_heuristic_probe_cost")
         assert gauge is not None
-        assert gauge.values and gauge.values[0] >= 0
+        assert gauge.values
+        assert gauge.values[0] >= 0
 
     async def test_probe_latency_bounded_at_3s_and_unverifiable_on_timeout(
         self, sqlite_factory, monkeypatch: pytest.MonkeyPatch, fake_meter: _FakeMeter
@@ -616,15 +693,21 @@ class TestHeuristicMetrics:
                 return EvidenceResult.verified_empty
 
         result = await run_evidence_probe(
-            provider=_SlowProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+            provider=_SlowProvider(),
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
         hist = fake_meter.histogram("modulo_heuristic_probe_latency")
         assert hist is not None
-        assert hist.records and hist.records[0] <= EVIDENCE_PROBE_TIMEOUT_SECONDS + 1.0
+        assert hist.records
+        assert hist.records[0] <= EVIDENCE_PROBE_TIMEOUT_SECONDS + 1.0
         unv = fake_meter.counter("modulo_heuristic_unverifiable_total")
         assert unv is not None
-        assert unv.calls and "bounded window" in unv.calls[0]["attributes"]["reason"]
+        assert unv.calls
+        assert "bounded window" in unv.calls[0]["attributes"]["reason"]
 
     def test_metrics_noop_without_meter_provider(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _stub_meter(monkeypatch, None)
@@ -679,7 +762,7 @@ class TestMetadataKeySkip:
 class TestSandboxProviderUnavailablePaths:
     def test_resolve_sandbox_id_none_resolver(self) -> None:
         provider = SandboxEvidenceProvider()
-        assert asyncio.run(provider._resolve_sandbox_id(uuid.uuid4(), "node-a")) is None
+        assert asyncio.run(provider._resolve_sandbox_id(uuid.uuid4(), str(_NODE_A))) is None
 
     def test_resolve_sandbox_id_none_resolver_reconcile(self, sqlite_factory) -> None:
         provider = SandboxEvidenceProvider()
@@ -688,7 +771,8 @@ class TestSandboxProviderUnavailablePaths:
                 provider=provider,
                 session_factory=sqlite_factory,
                 run_id=uuid.uuid4(),
-                node_id="node-a",
+                node_id=str(_NODE_A),
+                organisation_id=_TEST_ORG,
             )
         )
         assert result == EvidenceResult.unverifiable
@@ -698,7 +782,7 @@ class TestSandboxProviderUnavailablePaths:
             return None
 
         provider = SandboxEvidenceProvider(sandbox_id_resolver=_no_sandbox)
-        result = asyncio.run(provider.git_diff_empty(uuid.uuid4(), "node-a"))
+        result = asyncio.run(provider.git_diff_empty(uuid.uuid4(), str(_NODE_A)))
         assert result == EvidenceResult.unverifiable
 
     def test_run_evidence_probe_cancelled_error_propagates(self, sqlite_factory) -> None:
@@ -712,7 +796,8 @@ class TestSandboxProviderUnavailablePaths:
                     provider=_CancellingProvider(),
                     session_factory=sqlite_factory,
                     run_id=uuid.uuid4(),
-                    node_id="node-a",
+                    node_id=str(_NODE_A),
+                    organisation_id=_TEST_ORG,
                 )
             )
 
@@ -766,14 +851,14 @@ class TestReconcileNoopEvidence:
                     run_id,
                     org_id,
                     outputs_json={
-                        "node-a": {
+                        str(_NODE_A): {
                             "artifacts": [
                                 {"output": {"output_json": {}, "agent_status": "completed", "agent_outcome": "success"}}
                             ],
                             "output": {"agent_status": "completed", "agent_outcome": "success"},
                         }
                     },
-                    telemetry={"node-a": {"agent_status": "completed", "agent_outcome": "success"}},
+                    telemetry={str(_NODE_A): {"agent_status": "completed", "agent_outcome": "success"}},
                 )
             )
             await session.flush()
@@ -788,7 +873,7 @@ class TestReconcileNoopEvidence:
             rows = (await session.execute(select(RunEvidence))).scalars().all()
         assert len(rows) == 1
         assert rows[0].run_id == run_id
-        assert rows[0].node_id == "node-a"
+        assert rows[0].node_id == _NODE_A
 
     async def test_skips_runs_that_already_have_evidence(self, sqlite_factory) -> None:
         run_id = uuid.uuid4()
@@ -797,13 +882,18 @@ class TestReconcileNoopEvidence:
                 _complete_run(
                     run_id,
                     uuid.uuid4(),
-                    outputs_json={"node-a": {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
-                    telemetry={"node-a": {"agent_status": "completed", "agent_outcome": "success"}},
+                    outputs_json={str(_NODE_A): {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
+                    telemetry={str(_NODE_A): {"agent_status": "completed", "agent_outcome": "success"}},
                 )
             )
             await session.flush()
             await write_evidence_row(
-                session, run_id=run_id, node_id="node-a", evidence_state="verified_empty", evidence_detail=""
+                session,
+                run_id=run_id,
+                node_id=str(_NODE_A),
+                evidence_state="verified_empty",
+                evidence_detail="",
+                organisation_id=_TEST_ORG,
             )
 
         provider = FakeEvidenceProvider(EvidenceResult.has_work, EvidenceResult.has_work)
@@ -819,8 +909,8 @@ class TestReconcileNoopEvidence:
                 _complete_run(
                     run_id,
                     uuid.uuid4(),
-                    outputs_json={"node-a": {"output": {"agent_status": "completed"}}},
-                    telemetry={"node-a": {"agent_status": "completed"}},
+                    outputs_json={str(_NODE_A): {"output": {"agent_status": "completed"}}},
+                    telemetry={str(_NODE_A): {"agent_status": "completed"}},
                 )
             )
             await session.flush()
@@ -838,8 +928,8 @@ class TestReconcileNoopEvidence:
                 _complete_run(
                     run_id,
                     uuid.uuid4(),
-                    outputs_json={"node-a": {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
-                    telemetry={"node-a": {"agent_status": "completed", "agent_outcome": "success"}},
+                    outputs_json={str(_NODE_A): {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
+                    telemetry={str(_NODE_A): {"agent_status": "completed", "agent_outcome": "success"}},
                 )
             )
             await session.flush()
@@ -876,8 +966,8 @@ class TestReconcileNoopEvidence:
                 _complete_run(
                     run_id,
                     uuid.uuid4(),
-                    outputs_json={"node-a": {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
-                    telemetry={"node-a": {"agent_status": "completed", "agent_outcome": "success"}},
+                    outputs_json={str(_NODE_A): {"output": {"agent_status": "completed", "agent_outcome": "success"}}},
+                    telemetry={str(_NODE_A): {"agent_status": "completed", "agent_outcome": "success"}},
                 )
             )
             await session.flush()
@@ -944,7 +1034,8 @@ class TestEvidenceEnabled:
             provider=object(),  # type: ignore[arg-type]  # never touched when disabled
             session_factory=object(),  # type: ignore[arg-type]
             run_id=uuid.uuid4(),
-            node_id="node-a",
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
 
@@ -959,7 +1050,11 @@ class TestRunEvidenceProbeErrorPaths:
                 return EvidenceResult.verified_empty
 
         result = await run_evidence_probe(
-            provider=_BrokenProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+            provider=_BrokenProvider(),
+            session_factory=sqlite_factory,
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.unverifiable
         async with sqlite_factory() as session, session.begin():
@@ -975,19 +1070,27 @@ class TestRunEvidenceProbeErrorPaths:
                 raise RuntimeError("db down")
 
         result = await run_evidence_probe(
-            provider=provider, session_factory=_BrokenFactory(), run_id=uuid.uuid4(), node_id="node-a"
+            provider=provider,
+            session_factory=_BrokenFactory(),
+            run_id=uuid.uuid4(),
+            node_id=str(_NODE_A),
+            organisation_id=_TEST_ORG,
         )
         assert result == EvidenceResult.verified_empty
 
     async def test_cancelled_error_propagates(self, sqlite_factory) -> None:
         class _CancelProvider:
             async def git_diff_empty(self, run_id, node_id):
-                raise asyncio.CancelledError()
+                raise asyncio.CancelledError
 
             async def sandbox_filesystem_probe(self, run_id, node_id):
                 return EvidenceResult.verified_empty
 
         with pytest.raises(asyncio.CancelledError):
             await run_evidence_probe(
-                provider=_CancelProvider(), session_factory=sqlite_factory, run_id=uuid.uuid4(), node_id="node-a"
+                provider=_CancelProvider(),
+                session_factory=sqlite_factory,
+                run_id=uuid.uuid4(),
+                node_id=str(_NODE_A),
+                organisation_id=_TEST_ORG,
             )

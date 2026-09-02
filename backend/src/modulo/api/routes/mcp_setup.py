@@ -64,7 +64,7 @@ async def complete_model_backend_setup(
                 )
 
             existing = await get_model_backend(session, backend_id)
-            if existing is None:
+            if existing is None or existing.organisation_id != principal.organisation_id:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail={"error": "backend_not_found", "backend_id": str(backend_id)},
@@ -86,7 +86,7 @@ async def complete_model_backend_setup(
             try:
                 fernet = Fernet(fernet_key.encode())
             except (InvalidToken, ValueError, TypeError) as exc:
-                _log.error("Failed to initialise Fernet: %s", exc)
+                _log.exception("Failed to initialise Fernet: %s", exc)
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail={"error": "encryption_error", "detail": "Failed to initialise encryption"},

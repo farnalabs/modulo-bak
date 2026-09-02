@@ -167,8 +167,8 @@ _CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_claim_update(
     *,
-    stale_seconds: int,
-    claim_cap: int | None = None,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a pipeline run.
@@ -275,7 +275,7 @@ async def claim_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_claim_update(stale_seconds=window, claim_cap=cap, claim_token=claim_token),
+                build_claim_update(_stale_seconds=window, _claim_cap=cap, claim_token=claim_token),
                 _claim_params(run_id, org_id, window, cap, claim_token),
             )
             claimed = result.fetchone() is not None
@@ -419,29 +419,82 @@ async def heartbeat_loop(
         claim_token = await _read_current_claim_token(aeng, run_id, org_id)
     consecutive_failures = 0
     while True:
-        try:
-            await asyncio.sleep(interval_seconds)
-            await heartbeat_once(aeng, run_id, org_id, job=job, claim_token=claim_token)
-            consecutive_failures = 0
-        except ClaimSupersededError:
-            _log.warning("Heartbeat superseded for run %s — aborting heartbeat", run_id)
-            if superseded is not None:
-                superseded.set()
+        keep_going, consecutive_failures = await _heartbeat_round(
+            aeng,
+            run_id,
+            org_id,
+            interval_seconds=interval_seconds,
+            job=job,
+            claim_token=claim_token,
+            superseded=superseded,
+            health_failed=health_failed,
+            consecutive_failures=consecutive_failures,
+        )
+        if not keep_going:
             break
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            consecutive_failures += 1
-            _log.warning("Heartbeat failed for run %s (%d consecutive)", run_id, consecutive_failures)
-            if consecutive_failures >= 3:
-                _log.error(
-                    "Heartbeat lost for run %s after %d consecutive failures — failing closed",
-                    run_id,
-                    consecutive_failures,
-                )
-                if health_failed is not None:
-                    health_failed.set()
-                break
+
+
+async def _heartbeat_round(
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    *,
+    interval_seconds: int,
+    job: Any,
+    claim_token: str | None,
+    superseded: asyncio.Event | None,
+    health_failed: asyncio.Event | None,
+    consecutive_failures: int,
+) -> tuple[bool, int]:
+    """Run one heartbeat cycle and return ``(keep_going, consecutive_failures)``.
+
+    Sleeps the configured interval then writes a fenced heartbeat. Returns
+    ``False`` when the loop must stop: the run was superseded (the *superseded*
+    event is set first) or the fail-closed threshold of three consecutive
+    failures was reached. A transient failure counts toward
+    *consecutive_failures* (reset to ``0`` on success); CancelledError
+    propagates unchanged.
+    """
+    try:
+        await asyncio.sleep(interval_seconds)
+        await heartbeat_once(aeng, run_id, org_id, job=job, claim_token=claim_token)
+        return True, 0
+    except ClaimSupersededError:
+        _log.warning("Heartbeat superseded for run %s — aborting heartbeat", run_id)
+        if superseded is not None:
+            superseded.set()
+        return False, consecutive_failures
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        consecutive_failures = _heartbeat_failure(consecutive_failures, health_failed, run_id)
+        return consecutive_failures < 3, consecutive_failures
+
+
+def _heartbeat_failure(
+    consecutive_failures: int,
+    health_failed: asyncio.Event | None,
+    run_id: str,
+) -> int:
+    """Count a heartbeat failure and fail closed after three in a row.
+
+    Increments the consecutive-failure counter, logs it, and — once the
+    threshold is reached — logs the fatal condition and signals *health_failed*
+    (if provided) so the enclosing wrapper can kill the sandbox and
+    terminal-fail the run with ``executor_heartbeat_lost``. Returns the updated
+    counter for the caller's break decision.
+    """
+    consecutive_failures += 1
+    _log.warning("Heartbeat failed for run %s (%d consecutive)", run_id, consecutive_failures)
+    if consecutive_failures >= 3:
+        _log.error(
+            "Heartbeat lost for run %s after %d consecutive failures — failing closed",
+            run_id,
+            consecutive_failures,
+        )
+        if health_failed is not None:
+            health_failed.set()
+    return consecutive_failures
 
 
 async def mark_complete(
@@ -686,11 +739,110 @@ async def zombie_watchdog(
     )
 
 
+async def _await_first_node(
+    node_started_event: asyncio.Event,
+    run_done_event: asyncio.Event,
+    exec_task: asyncio.Task[Any],
+) -> bool:
+    """Wait for a node to start, the run to finish, or the executor to finish.
+
+    Blocks until a node starts (``node_started_event``), the run becomes
+    terminal (``run_done_event``), or the executor task completes. Returns
+    ``True`` to continue the watchdog loop, ``False`` to stand down (the run
+    finished or the executor finished). Clears ``node_started_event`` when a
+    node started so the caller can recompute the in-flight deadline set.
+    """
+    started_wait = asyncio.ensure_future(node_started_event.wait())
+    done_wait = asyncio.ensure_future(run_done_event.wait())
+    try:
+        await asyncio.wait({started_wait, done_wait, exec_task}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        started_wait.cancel()
+        done_wait.cancel()
+    if run_done_event.is_set() or exec_task.done():
+        return False
+    if node_started_event.is_set():
+        node_started_event.clear()
+    return True
+
+
+async def _await_progress(
+    node_completed_event: asyncio.Event,
+    node_started_event: asyncio.Event,
+    run_done_event: asyncio.Event,
+    exec_task: asyncio.Task[Any],
+    remaining: float,
+) -> bool:
+    """Wait for a node completion/start, run finish, executor finish, or deadline.
+
+    Uses the nearest in-flight deadline (``remaining``) as the wait bound so the
+    watchdog never blocks past its hard deadline. Clears the single-shot
+    wake-up events so the next iteration re-arms them. Returns ``True`` to keep
+    looping, ``False`` to stand down (run finished / executor finished).
+    """
+    c = asyncio.ensure_future(node_completed_event.wait())
+    s = asyncio.ensure_future(node_started_event.wait())
+    d = asyncio.ensure_future(run_done_event.wait())
+    try:
+        await asyncio.wait({c, s, d, exec_task}, return_when=asyncio.FIRST_COMPLETED, timeout=remaining)
+    finally:
+        c.cancel()
+        s.cancel()
+        d.cancel()
+    node_started_event.clear()
+    node_completed_event.clear()
+    return not (run_done_event.is_set() or exec_task.done())
+
+
+async def _fail_overdue_node(
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    node_deadlines: dict[str, tuple[float, int]],
+    exec_task: asyncio.Task[Any],
+    run_done_event: asyncio.Event,
+    stall_requested: asyncio.Event | None,
+) -> None:
+    """Fail the most-overdue in-flight node that blew its deadline.
+
+    Cancels ``exec_task`` FIRST, signals ``stall_requested`` (so the wrapper
+    distinguishes a watchdog-initiated cancellation from worker shutdown), then
+    terminal-fails the run with ``node_deadline_exceeded``. Does nothing when
+    the run finished or the executor finished concurrently (stands down so it
+    never double-fails an already-finished run).
+    """
+    exceeded = [nid for nid, (dl, _to) in node_deadlines.items() if dl <= time.monotonic()]
+    exceeded.sort(key=lambda nid: node_deadlines[nid][0])
+    node_id = exceeded[0]
+    _timeout = node_deadlines[node_id][1]
+    if run_done_event.is_set() or exec_task.done():
+        return
+    _log.warning(
+        "node_deadline_watchdog.exceeded run=%s node=%s exceeded timeout_seconds=%ds — "
+        "cancelling executor and failing run",
+        run_id,
+        node_id,
+        _timeout,
+    )
+    exec_task.cancel()
+    if stall_requested is not None:
+        stall_requested.set()
+    await fail_run_terminal(
+        aeng,
+        run_id,
+        org_id,
+        error_code=NODE_DEADLINE_EXCEEDED_ERROR_CODE,
+        error_detail=(
+            f"Node '{node_id}' did not complete within its configured timeout_seconds "
+            f"({_timeout}s) — absolute node-deadline watchdog (half-alive stall)"
+        ),
+    )
+
+
 async def node_deadline_watchdog(
     aeng: AsyncEngine,
     run_id: str,
     org_id: str,
-    node_timeouts: dict[str, int],
     *,
     exec_task: asyncio.Task[Any],
     stall_requested: asyncio.Event | None = None,
@@ -756,97 +908,59 @@ async def node_deadline_watchdog(
         # stands down cleanly instead of blocking on node_started_event.
         if run_done_event.is_set() or exec_task.done():
             return
-        # If no node is currently in flight, wait for one to start executing OR
-        # the run to finish — so we never block forever after the last node
-        # completes. ``node_deadlines`` is the source of truth for in-flight
-        # nodes (populated by on_node_started / on_node_completed), so a parallel
-        # fan-out merely adds a second entry rather than replacing the first.
-        if not node_deadlines:
-            started_wait = asyncio.ensure_future(node_started_event.wait())
-            done_wait = asyncio.ensure_future(run_done_event.wait())
-            try:
-                await asyncio.wait(
-                    {started_wait, done_wait, exec_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-            finally:
-                started_wait.cancel()
-                done_wait.cancel()
-            if run_done_event.is_set() or exec_task.done():
-                return
-            if not node_started_event.is_set():
-                # Only run_done / exec_task fired while we were waiting; loop.
-                continue
-            node_started_event.clear()
-            # A node was added to node_deadlines by on_node_started; recompute.
-            continue
+        # Advance one watchdog step: either wait for a fresh in-flight node to
+        # appear, or enforce the soonest in-flight deadline. ``node_deadlines``
+        # is the source of truth for in-flight nodes (populated by
+        # on_node_started / on_node_completed), so a parallel fan-out merely
+        # adds a second entry rather than replacing the first. ``False`` means
+        # the run finished / the executor finished / the deadline blew — stand
+        # down.
+        if not await _node_deadline_step(
+            aeng,
+            run_id,
+            org_id,
+            exec_task=exec_task,
+            stall_requested=stall_requested,
+            node_started_event=node_started_event,
+            node_completed_event=node_completed_event,
+            run_done_event=run_done_event,
+            node_deadlines=node_deadlines,
+        ):
+            return
 
-        # At least one node is in flight. Enforce EACH entry's own deadline —
-        # parallel fan-out means multiple siblings may be running at once, and a
-        # stalled one must be failed independently of its siblings' progress.
+
+async def _node_deadline_step(
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    *,
+    exec_task: asyncio.Task[Any],
+    stall_requested: asyncio.Event | None,
+    node_started_event: asyncio.Event,
+    node_completed_event: asyncio.Event,
+    run_done_event: asyncio.Event,
+    node_deadlines: dict[str, tuple[float, int]],
+) -> bool:
+    """Advance the node-deadline watchdog by one step; ``False`` to stand down.
+
+    When at least one node is in flight, enforce EACH entry's own deadline —
+    parallel fan-out means multiple siblings may be running at once, and a
+    stalled one must be failed independently of its siblings' progress. When
+    no node is in flight, wait for one to start executing OR the run to finish —
+    so we never block forever after the last node completes. Returns ``True``
+    to keep looping.
+    """
+    if node_deadlines:
         soonest_deadline = min(dl for dl, _to in node_deadlines.values())
         remaining = soonest_deadline - time.monotonic()
         if remaining <= 0:
-            # One or more in-flight nodes blew their deadline. Fail on the most
-            # overdue one (stable pick for logging).
-            exceeded = [nid for nid, (dl, _to) in node_deadlines.items() if dl <= time.monotonic()]
-            exceeded.sort(key=lambda nid: node_deadlines[nid][0])
-            node_id = exceeded[0]
-            _timeout = node_deadlines[node_id][1]
-            # Deadline exceeded and the node is still running and the run is not
-            # terminal — cancel and fail. Double-check to avoid racing a
-            # completion that landed in the same event-loop step.
-            if run_done_event.is_set() or exec_task.done():
-                return
-            _log.warning(
-                "node_deadline_watchdog.exceeded run=%s node=%s exceeded timeout_seconds=%ds — "
-                "cancelling executor and failing run",
-                run_id,
-                node_id,
-                _timeout,
-            )
-            exec_task.cancel()
-            if stall_requested is not None:
-                stall_requested.set()
-            await fail_run_terminal(
-                aeng,
-                run_id,
-                org_id,
-                error_code=NODE_DEADLINE_EXCEEDED_ERROR_CODE,
-                error_detail=(
-                    f"Node '{node_id}' did not complete within its configured timeout_seconds "
-                    f"({_timeout}s) — absolute node-deadline watchdog (half-alive stall)"
-                ),
-            )
-            return
-
+            await _fail_overdue_node(aeng, run_id, org_id, node_deadlines, exec_task, run_done_event, stall_requested)
+            return False
         # Wait until a node completes, a new node starts, the run finishes, the
         # executor is cancelled, or the soonest deadline elapses — whichever
-        # comes first. Each wait() is wrapped in ensure_future: asyncio.wait on a
-        # bare coroutine is illegal on Python 3.12+, and these are single-shot
-        # waits (safe to cancel — see the shield lesson).
-        c = asyncio.ensure_future(node_completed_event.wait())
-        s = asyncio.ensure_future(node_started_event.wait())
-        d = asyncio.ensure_future(run_done_event.wait())
-        try:
-            await asyncio.wait(
-                {c, s, d, exec_task},
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=remaining,
-            )
-        finally:
-            c.cancel()
-            s.cancel()
-            d.cancel()
-        if run_done_event.is_set() or exec_task.done():
-            return
-        # A node completed (removed from node_deadlines by on_node_completed) or
-        # a new node started (added by on_node_started): the dict is already the
-        # authoritative in-flight set, so just clear the stale wake-up signals
-        # and recompute the soonest deadline on the next loop iteration.
-        node_started_event.clear()
-        node_completed_event.clear()
-        continue
+        # comes first, then recompute on the next loop iteration.
+        return await _await_progress(node_completed_event, node_started_event, run_done_event, exec_task, remaining)
+    return await _await_first_node(node_started_event, run_done_event, exec_task)
 
 
 async def _read_run_status(aeng: AsyncEngine, run_id: str, org_id: str) -> str | None:
@@ -1004,7 +1118,6 @@ async def run_executor_with_watchdog(
             aeng,
             run_id,
             org_id,
-            node_timeouts,
             exec_task=exec_task,
             stall_requested=stall_requested,
             node_started_event=node_started_event,
@@ -1035,99 +1148,31 @@ async def run_executor_with_watchdog(
         finally:
             for w in waiters:
                 w.cancel()
-        if exec_task is not None and not exec_task.done():
+        if not exec_task.done():
             exec_task.cancel()
-        if watchdog_task is not None and not watchdog_task.done():
+        if not watchdog_task.done():
             watchdog_task.cancel()
-        if node_deadline_task is not None and not node_deadline_task.done():
+        if not node_deadline_task.done():
             node_deadline_task.cancel()
 
     abort_watch_task = asyncio.create_task(_abort_watcher(), name=f"saq-abort-watch-{rid}")
 
-    exec_exc: Exception | None = None
-    exec_result: Any = None
-    try:
-        exec_result = await exec_task
-        # The run reached a terminal/complete outcome via the executor — signal
-        # the node-deadline watchdog to stand down (never fail a finished run).
-        run_done_event.set()
-    except asyncio.CancelledError:
-        # Distinguish watchdog-initiated cancellation, supersession, and
-        # heartbeat-loss from worker shutdown. Await the watchdog to completion
-        # first so its ``fail_run_terminal`` transaction commits before the
-        # ``finally`` below cancels it — cancelling the watchdog mid-write
-        # would abort the terminal-fail transaction and leave the run
-        # ``running`` forever.
-        if watchdog_task is not None and not watchdog_task.done():
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog_task
-        if node_deadline_task is not None and not node_deadline_task.done():
-            # Await the node-deadline watchdog to completion FIRST, before any
-            # cancel — its fail_run_terminal transaction must commit. The
-            # watchdog waits on exec_task.done() (see node_deadline_watchdog),
-            # so once exec_task is cancelled here it stands down promptly and
-            # this await cannot deadlock. Cancelling it mid-write would roll
-            # back the terminal-fail and leave the run ``running`` — the hung
-            # state this watchdog exists to eliminate (FAR-369).
-            with contextlib.suppress(asyncio.CancelledError):
-                await node_deadline_task
-        if stall_requested.is_set():
-            _log.warning("run_executor_with_watchdog: execution cancelled by node/executor watchdog for run %s", rid)
-        elif health_failed.is_set():
-            _log.error(
-                "run_executor_with_watchdog: heartbeat lost for run %s — killing sandbox and failing run",
-                rid,
-            )
-            await _kill_sandbox_best_effort(aeng, run_id, org_id)
-            await fail_run_terminal(
-                aeng,
-                run_id,
-                org_id,
-                error_code=EXECUTOR_HEARTBEAT_LOST_ERROR_CODE,
-                error_detail=(
-                    "Heartbeat loop failed fail-closed after 3 consecutive DB/network failures "
-                    "(executor_heartbeat_lost)"
-                ),
-                claim_token=claim_token,
-            )
-        elif superseded.is_set():
-            _log.warning(
-                "run_executor_with_watchdog: execution aborted for run %s (superseded by a newer claim)",
-                rid,
-            )
-        else:
-            raise
-    except NodeCancelledError:
-        # Transient node cancellation — execute() already reset the run to
-        # pending; re-raise so SAQ retries the job.
-        raise
-    except Exception as exc:
-        exec_exc = exc
-        # A generic executor failure will be terminal-failed below — signal the
-        # node-deadline watchdog to stand down so it does not double-fail.
-        run_done_event.set()
-        _log.exception("run_executor_with_watchdog: execute failed for run %s", rid)
-    finally:
-        if abort_watch_task is not None:
-            abort_watch_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await abort_watch_task
-        if watchdog_task is not None:
-            watchdog_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog_task
-        if node_deadline_task is not None:
-            node_deadline_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await node_deadline_task
-        if exec_task is not None and not exec_task.done():
-            exec_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exec_task
-        if heartbeat_task is not None:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
+    exec_exc, exec_result = await _await_executor_task(
+        aeng=aeng,
+        run_id=run_id,
+        org_id=org_id,
+        claim_token=claim_token,
+        rid=rid,
+        exec_task=exec_task,
+        run_done_event=run_done_event,
+        watchdog_task=watchdog_task,
+        node_deadline_task=node_deadline_task,
+        heartbeat_task=heartbeat_task,
+        abort_watch_task=abort_watch_task,
+        stall_requested=stall_requested,
+        health_failed=health_failed,
+        superseded=superseded,
+    )
 
     if exec_exc is not None:
         # Honest outcome: a generic executor failure is terminal-failed
@@ -1145,20 +1190,190 @@ async def run_executor_with_watchdog(
     # Derive the outcome from the executor task result (the returned Run row)
     # and the run row status. A watchdog/supersession/heartbeat cancellation
     # leaves exec_result None — fall back to the run row.
-    result_status = getattr(exec_result, "status", None)
-    if result_status in (None, "pending"):
-        try:
-            result_status = await _read_run_status(aeng, run_id, org_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.warning("run_executor_with_watchdog: could not read run status for %s", rid)
-            result_status = None
+    result_status = await _resolve_result_status(aeng, run_id, org_id, exec_result, rid)
     if result_status == "complete":
         return {"status": "complete"}
     if result_status == "awaiting_human":
         return {"status": "awaiting_human"}
     return {"status": "failed"}
+
+
+async def _await_executor_task(
+    *,
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    claim_token: str | None,
+    rid: uuid.UUID,
+    exec_task: asyncio.Task[Any],
+    run_done_event: asyncio.Event,
+    watchdog_task: asyncio.Task[Any] | None,
+    node_deadline_task: asyncio.Task[Any],
+    heartbeat_task: asyncio.Task[Any] | None,
+    abort_watch_task: asyncio.Task[Any] | None,
+    stall_requested: asyncio.Event,
+    health_failed: asyncio.Event,
+    superseded: asyncio.Event,
+) -> tuple[Exception | None, Any]:
+    """Await the executor task and classify its outcome.
+
+    Returns ``(exc, result)``: ``(None, result)`` on a clean completion,
+    ``(exc, None)`` on a generic executor failure (terminal-failed by the
+    caller). A watchdog / supersession / heartbeat-loss cancellation is
+    classified via :func:`_resolve_cancel_outcome` (which re-raises for a
+    genuine worker-shutdown cancellation) and returns ``(None, None)`` so the
+    caller falls back to the run row. A transient ``NodeCancelledError`` is
+    re-raised so SAQ retries the job. The ``finally`` cancels and drains every
+    helper task before the outcome is resolved.
+    """
+    try:
+        result = await exec_task
+        # The run reached a terminal/complete outcome via the executor — signal
+        # the node-deadline watchdog to stand down (never fail a finished run).
+        run_done_event.set()
+        return None, result
+    except asyncio.CancelledError:
+        # Heartbeat-loss, watchdog stall, or supersession. Await the watchdogs
+        # to completion first so their ``fail_run_terminal`` transactions commit
+        # before the ``finally`` below cancels them — cancelling a watchdog
+        # mid-write would abort its terminal-fail transaction and leave the run
+        # ``running`` forever.
+        await _resolve_cancel_outcome(
+            watchdog_task=watchdog_task,
+            node_deadline_task=node_deadline_task,
+            stall_requested=stall_requested,
+            health_failed=health_failed,
+            superseded=superseded,
+            aeng=aeng,
+            run_id=run_id,
+            org_id=org_id,
+            claim_token=claim_token,
+            rid=rid,
+        )
+        return None, None
+    except NodeCancelledError:
+        # Transient node cancellation — execute() already reset the run to
+        # pending; re-raise so SAQ retries the job.
+        raise
+    except Exception as exc:
+        # A generic executor failure will be terminal-failed by the caller —
+        # signal the node-deadline watchdog to stand down so it does not
+        # double-fail.
+        run_done_event.set()
+        _log.exception("run_executor_with_watchdog: execute failed for run %s", rid)
+        return exc, None
+    finally:
+        await _cancel_and_await_tasks(abort_watch_task, watchdog_task, node_deadline_task, exec_task, heartbeat_task)
+
+
+async def _resolve_cancel_outcome(
+    *,
+    watchdog_task: asyncio.Task[Any] | None,
+    node_deadline_task: asyncio.Task[Any],
+    stall_requested: asyncio.Event,
+    health_failed: asyncio.Event,
+    superseded: asyncio.Event,
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    claim_token: str | None,
+    rid: uuid.UUID,
+) -> None:
+    """Classify a cancelled execution: watchdog / heartbeat / supersession.
+
+    Awaits the in-flight watchdogs to completion FIRST so their
+    ``fail_run_terminal`` transactions commit, then handles the abort cause:
+    the node/executor watchdog (``stall_requested``), heartbeat loss
+    (``health_failed`` — kill the sandbox and terminal-fail with
+    ``executor_heartbeat_lost``), or a supersession (``superseded``). A
+    genuine worker-shutdown cancellation is re-raised so SAQ can retry.
+    """
+    if watchdog_task is not None and not watchdog_task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
+    if not node_deadline_task.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await node_deadline_task
+    if stall_requested.is_set():
+        _log.warning("run_executor_with_watchdog: execution cancelled by node/executor watchdog for run %s", rid)
+    elif health_failed.is_set():
+        _log.error(
+            "run_executor_with_watchdog: heartbeat lost for run %s — killing sandbox and failing run",
+            rid,
+        )
+        await _kill_sandbox_best_effort(aeng, run_id, org_id)
+        await fail_run_terminal(
+            aeng,
+            run_id,
+            org_id,
+            error_code=EXECUTOR_HEARTBEAT_LOST_ERROR_CODE,
+            error_detail=(
+                "Heartbeat loop failed fail-closed after 3 consecutive DB/network failures (executor_heartbeat_lost)"
+            ),
+            claim_token=claim_token,
+        )
+    elif superseded.is_set():
+        _log.warning(
+            "run_executor_with_watchdog: execution aborted for run %s (superseded by a newer claim)",
+            rid,
+        )
+    else:
+        raise asyncio.CancelledError
+
+
+async def _cancel_and_await_tasks(
+    abort_watch_task: asyncio.Task[Any] | None,
+    watchdog_task: asyncio.Task[Any] | None,
+    node_deadline_task: asyncio.Task[Any],
+    exec_task: asyncio.Task[Any] | None,
+    heartbeat_task: asyncio.Task[Any] | None,
+) -> None:
+    """Cancel and drain all helper tasks before returning (fail-safe)."""
+    if abort_watch_task is not None:
+        abort_watch_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await abort_watch_task
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
+    node_deadline_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await node_deadline_task
+    if exec_task is not None and not exec_task.done():
+        exec_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await exec_task
+    if heartbeat_task is not None:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+
+async def _resolve_result_status(
+    aeng: AsyncEngine,
+    run_id: str,
+    org_id: str,
+    exec_result: Any,
+    rid: uuid.UUID,
+) -> str | None:
+    """Resolve the run's effective status for the outcome decision.
+
+    Prefers the status of the executor's returned Run row, falling back to a
+    re-read of the row when the result is missing or still ``pending`` (a
+    watchdog/supersession/heartbeat cancellation leaves ``exec_result`` None).
+    Never raises: a row read failure logs and degrades to ``None``.
+    """
+    status = getattr(exec_result, "status", None)
+    if status in (None, "pending"):
+        try:
+            status = await _read_run_status(aeng, run_id, org_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.warning("run_executor_with_watchdog: could not read run status for %s", rid)
+            status = None
+    return status
 
 
 async def _re_dispatch_capacity_blocked(run_id: str, org_id: str) -> str:
@@ -1193,6 +1408,150 @@ async def _re_dispatch_capacity_blocked(run_id: str, org_id: str) -> str:
     except Exception:
         _log.exception("pipeline_execution.redispatched_capacity_blocked_failed run=%s", run_id)
         return "failed"
+
+
+async def _sweep_org_stale_runs(
+    conn: Any,
+    *,
+    org_id: uuid.UUID,
+    nd_window: int,
+    wl_window: int,
+    stranded_rows: list[Any],
+    terminalised_run_ids: list[tuple[uuid.UUID, uuid.UUID]],
+) -> tuple[int, int, int]:
+    """Run one org's stale-run UPDATE set; return (never, capacity_timeout, lost) counts.
+
+    Runs inside the caller's RLS-scoped transaction and mutates ``stranded_rows``
+    and ``terminalised_run_ids`` in place so the caller can post-process them once
+    the transaction commits. Extracted from :func:`stale_run_recovery_sweep` to keep
+    that function's control flow shallow.
+    """
+    await conn.execute(
+        text(_SQL_SET_ORG_ID),
+        {"val": str(org_id)},
+    )
+    never_result = await conn.execute(
+        text(
+            "UPDATE runs "
+            "SET status = 'failed', error_code = 'never_dispatched', "
+            "error_detail = :detail, completed_at = now() "
+            "WHERE status = 'pending' "
+            "AND organisation_id = :oid "
+            "AND created_at < now() - (:nd_window * interval '1 second') "
+            "AND dispatched_at IS NULL "
+            "AND cancellation_requested = false "
+            "AND (error_code IS NULL OR error_code NOT IN ('org_capacity_limited', 'pipeline_capacity')) "
+            "AND (dispatcher IS NULL OR dispatcher != 'saq') "
+            "RETURNING id"
+        ),
+        {
+            "oid": str(org_id),
+            "nd_window": nd_window,
+            "detail": "Run was not dispatched within the stale threshold.",
+        },
+    )
+    never_count = never_result.rowcount or 0
+    terminalised_run_ids.extend((row[0], org_id) for row in never_result.all())
+
+    stranded_result = await conn.execute(
+        text(
+            "UPDATE runs "
+            "SET heartbeat_at = now() "
+            "WHERE status = 'pending' "
+            "AND organisation_id = :oid "
+            "AND error_code IN ('org_capacity_limited', 'pipeline_capacity') "
+            "AND (heartbeat_at IS NULL OR heartbeat_at < now() - (:redispatch_ttl * interval '1 minute')) "
+            "AND created_at >= now() - (:fail_ttl * interval '1 minute') "
+            "AND cancellation_requested = false "
+            "RETURNING id, organisation_id"
+        ),
+        {
+            "oid": str(org_id),
+            "redispatch_ttl": _STRANDED_REDISPATCH_TTL_MINUTES,
+            "fail_ttl": CAPACITY_TIMEOUT_TTL_MINUTES,
+        },
+    )
+    stranded_rows.extend(stranded_result.all())
+
+    capacity_timeout_result = await conn.execute(
+        text(
+            "UPDATE runs "
+            "SET status = 'failed', error_code = 'capacity_timeout', "
+            "error_detail = :detail, completed_at = now() "
+            "WHERE status = 'pending' "
+            "AND organisation_id = :oid "
+            "AND error_code IN ('org_capacity_limited', 'pipeline_capacity') "
+            "AND created_at < now() - (:ttl * interval '1 minute') "
+            "AND cancellation_requested = false "
+            "RETURNING id"
+        ),
+        {
+            "oid": str(org_id),
+            "ttl": CAPACITY_TIMEOUT_TTL_MINUTES,
+            "detail": "Waited in capacity queue past the TTL.",
+        },
+    )
+    capacity_timeout_count = capacity_timeout_result.rowcount or 0
+    terminalised_run_ids.extend((row[0], org_id) for row in capacity_timeout_result.all())
+
+    lost_result = await conn.execute(
+        text(
+            "UPDATE runs "
+            "SET status = 'failed', error_code = 'worker_lost', "
+            "error_detail = :detail, completed_at = now() "
+            "WHERE status = 'running' "
+            "AND organisation_id = :oid "
+            "AND heartbeat_at < now() - (:wl_window * interval '1 second') "
+            "AND claim_count >= 5 "
+            "AND (dispatcher IS NULL OR dispatcher != 'saq') "
+            "RETURNING id"
+        ),
+        {
+            "oid": str(org_id),
+            "wl_window": wl_window,
+            "detail": "Worker lost heartbeat for this run.",
+        },
+    )
+    lost_count = lost_result.rowcount or 0
+    terminalised_run_ids.extend((row[0], org_id) for row in lost_result.all())
+    return never_count, capacity_timeout_count, lost_count
+
+
+async def _redispatch_stranded_rows(stranded_rows: list[Any]) -> dict[str, int]:
+    """Re-dispatch stranded capacity-blocked rows; return per-outcome counts.
+
+    Runs AFTER each org's sweep transaction commits so ``dispatch_run``'s own
+    sessions (and the row lock the UPDATE held) never overlap a live
+    transaction.
+    """
+    redispatch_outcomes: dict[str, int] = {}
+    for row in stranded_rows:
+        outcome = await _re_dispatch_capacity_blocked(str(row.id), str(row.organisation_id))
+        redispatch_outcomes[outcome] = redispatch_outcomes.get(outcome, 0) + 1
+    return redispatch_outcomes
+
+
+async def _advance_terminalised_run(
+    async_engine: AsyncEngine,
+    run_id: uuid.UUID,
+    org_id: uuid.UUID,
+) -> None:
+    """Advance a terminalised sweep run's journeys and record its daily fact.
+
+    The sweep's raw terminal UPDATEs never run ``finalize_cost``, so the swept
+    runs' journeys would never advance (FAR-143 follow-up) and the runs would
+    be invisible to the analytics failure/stall dimensions (FAR-162, P6'). Each
+    helper opens its own RLS-scoped session after the sweep's UPDATEs have
+    committed, so it reads the run as ``failed`` with ``completed_at`` set.
+    Fail-open per run — one run's facts failure must not fail the whole sweep.
+    """
+    await _advance_journeys_from_stored_refs(async_engine, str(run_id), str(org_id), "failed")
+    try:
+        await _record_fact_for_terminal_failed_run(async_engine, str(run_id), str(org_id))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.warning("pipeline_execution.sweep_terminal_facts_failed run=%s", run_id, exc_info=True)
 
 
 async def stale_run_recovery_sweep(
@@ -1266,129 +1625,36 @@ async def stale_run_recovery_sweep(
         never_count = 0
         lost_count = 0
         capacity_timeout_count = 0
-        stranded_count = 0
         # Runs terminalised to ``failed`` by this sweep — (run_id, org_id) —
         # whose journeys must advance once the UPDATEs commit (FAR-143 follow-up).
         terminalised_run_ids: list[tuple[uuid.UUID, uuid.UUID]] = []
         for org_id in org_ids:
             async with async_engine.connect() as conn, conn.begin():
-                await conn.execute(
-                    text(_SQL_SET_ORG_ID),
-                    {"val": str(org_id)},
+                never_delta, capacity_delta, lost_delta = await _sweep_org_stale_runs(
+                    conn,
+                    org_id=org_id,
+                    nd_window=nd_window,
+                    wl_window=wl_window,
+                    stranded_rows=stranded_rows,
+                    terminalised_run_ids=terminalised_run_ids,
                 )
-                never_result = await conn.execute(
-                    text(
-                        "UPDATE runs "
-                        "SET status = 'failed', error_code = 'never_dispatched', "
-                        "error_detail = :detail, completed_at = now() "
-                        "WHERE status = 'pending' "
-                        "AND organisation_id = :oid "
-                        "AND created_at < now() - (:nd_window * interval '1 second') "
-                        "AND dispatched_at IS NULL "
-                        "AND cancellation_requested = false "
-                        "AND (error_code IS NULL OR error_code NOT IN ('org_capacity_limited', 'pipeline_capacity')) "
-                        "AND (dispatcher IS NULL OR dispatcher != 'saq') "
-                        "RETURNING id"
-                    ),
-                    {
-                        "oid": str(org_id),
-                        "nd_window": nd_window,
-                        "detail": "Run was not dispatched within the stale threshold.",
-                    },
-                )
-                never_count += never_result.rowcount or 0
-                terminalised_run_ids.extend((row[0], org_id) for row in never_result.all())
-
-                stranded_result = await conn.execute(
-                    text(
-                        "UPDATE runs "
-                        "SET heartbeat_at = now() "
-                        "WHERE status = 'pending' "
-                        "AND organisation_id = :oid "
-                        "AND error_code IN ('org_capacity_limited', 'pipeline_capacity') "
-                        "AND (heartbeat_at IS NULL OR heartbeat_at < now() - (:redispatch_ttl * interval '1 minute')) "
-                        "AND created_at >= now() - (:fail_ttl * interval '1 minute') "
-                        "AND cancellation_requested = false "
-                        "RETURNING id, organisation_id"
-                    ),
-                    {
-                        "oid": str(org_id),
-                        "redispatch_ttl": _STRANDED_REDISPATCH_TTL_MINUTES,
-                        "fail_ttl": CAPACITY_TIMEOUT_TTL_MINUTES,
-                    },
-                )
-                org_stranded_rows = list(stranded_result.all())
-                stranded_count += len(org_stranded_rows)
-                stranded_rows.extend(org_stranded_rows)
-
-                capacity_timeout_result = await conn.execute(
-                    text(
-                        "UPDATE runs "
-                        "SET status = 'failed', error_code = 'capacity_timeout', "
-                        "error_detail = :detail, completed_at = now() "
-                        "WHERE status = 'pending' "
-                        "AND organisation_id = :oid "
-                        "AND error_code IN ('org_capacity_limited', 'pipeline_capacity') "
-                        "AND created_at < now() - (:ttl * interval '1 minute') "
-                        "AND cancellation_requested = false "
-                        "RETURNING id"
-                    ),
-                    {
-                        "oid": str(org_id),
-                        "ttl": CAPACITY_TIMEOUT_TTL_MINUTES,
-                        "detail": "Waited in capacity queue past the TTL.",
-                    },
-                )
-                capacity_timeout_count += capacity_timeout_result.rowcount or 0
-                terminalised_run_ids.extend((row[0], org_id) for row in capacity_timeout_result.all())
-
-                lost_result = await conn.execute(
-                    text(
-                        "UPDATE runs "
-                        "SET status = 'failed', error_code = 'worker_lost', "
-                        "error_detail = :detail, completed_at = now() "
-                        "WHERE status = 'running' "
-                        "AND organisation_id = :oid "
-                        "AND heartbeat_at < now() - (:wl_window * interval '1 second') "
-                        "AND claim_count >= 5 "
-                        "AND (dispatcher IS NULL OR dispatcher != 'saq') "
-                        "RETURNING id"
-                    ),
-                    {
-                        "oid": str(org_id),
-                        "wl_window": wl_window,
-                        "detail": "Worker lost heartbeat for this run.",
-                    },
-                )
-                lost_count += lost_result.rowcount or 0
-                terminalised_run_ids.extend((row[0], org_id) for row in lost_result.all())
+                never_count += never_delta
+                capacity_timeout_count += capacity_delta
+                lost_count += lost_delta
+        stranded_count = len(stranded_rows)
 
         # Re-dispatch AFTER each org's sweep transaction commits so dispatch_run's
         # own sessions (and the row lock the UPDATE held) never overlap a live
         # transaction.
-        redispatch_outcomes: dict[str, int] = {}
-        for row in stranded_rows:
-            outcome = await _re_dispatch_capacity_blocked(str(row.id), str(row.organisation_id))
-            redispatch_outcomes[outcome] = redispatch_outcomes.get(outcome, 0) + 1
+        redispatch_outcomes = await _redispatch_stranded_rows(stranded_rows)
 
         # FAR-143 follow-up — the sweep's raw terminal UPDATEs never run
         # finalize_cost, so the swept runs' journeys would never advance. Advance
         # each from its CREATE-STAMPED refs, fail-open per run (same pattern as
         # mark_complete / fail_run_terminal). Runs only re-dispatched (stranded
-        # capacity-blocked) are NOT terminal — no advance. Each helper opens its
-        # own session after the UPDATEs have committed, so it reads the run as
-        # ``failed`` with ``completed_at`` set.
+        # capacity-blocked) are NOT terminal — no advance.
         for run_id, run_org_id in terminalised_run_ids:
-            await _advance_journeys_from_stored_refs(async_engine, str(run_id), str(run_org_id), "failed")
-            # FAR-162 (P6') — compensating daily fact for the same terminal
-            # runs (separate RLS-scoped session, fail-open per run — one run's
-            # facts failure must not fail the whole sweep).
-            try:
-                await _record_fact_for_terminal_failed_run(async_engine, str(run_id), str(run_org_id))
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _log.warning("pipeline_execution.sweep_terminal_facts_failed run=%s", run_id, exc_info=True)
+            await _advance_terminalised_run(async_engine, run_id, run_org_id)
 
         if never_count or lost_count or capacity_timeout_count or stranded_count:
             _log.info(
@@ -1447,8 +1713,8 @@ _RESUME_CLAIM_UPDATE_SQL_WITH_TOKEN = text(
 
 def build_resume_claim_update(
     *,
-    stale_seconds: int,
-    claim_cap: int | None = None,
+    _stale_seconds: int,
+    _claim_cap: int | None = None,
     claim_token: str | None = None,
 ) -> Any:
     """Build the atomic claim UPDATE for a resumed HITL run.
@@ -1526,7 +1792,7 @@ async def claim_resume_run_async(
                 {"val": org_id},
             )
             result = await c.execute(
-                build_resume_claim_update(stale_seconds=stale_seconds, claim_cap=cap, claim_token=claim_token),
+                build_resume_claim_update(_stale_seconds=stale_seconds, _claim_cap=cap, claim_token=claim_token),
                 _resume_claim_params(run_id, org_id, stale_seconds, cap, claim_token),
             )
             claimed = result.fetchone() is not None

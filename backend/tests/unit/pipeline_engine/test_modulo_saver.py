@@ -1,4 +1,4 @@
-"""Unit tests for ModuloPostgresSaver â€” org isolation, encryption, SQL."""
+"""Unit tests for ModuloPostgresSaver — org isolation, encryption, SQL."""
 
 import asyncio
 import json
@@ -407,7 +407,7 @@ class TestDecryptEdgePaths:
 
     async def test_decrypt_writes_short_entry_skipped(self, mock_conn):
         saver = await _make_saver(mock_conn)
-        writes = [[b"task", b"ch"]]  # len < 4 â€” skipped
+        writes = [[b"task", b"ch"]]  # len < 4 — skipped
         assert not saver._decrypt_writes(writes)
 
 
@@ -563,7 +563,7 @@ class TestAputExtraPaths:
         saver._cursor = MagicMock(side_effect=OperationalError("connection is closed"))
 
         async def _reconnect_timeout():
-            raise TimeoutError()
+            raise TimeoutError
 
         saver._reconnect = _reconnect_timeout
         saver.get_next_version = MagicMock(return_value="ckp-id")

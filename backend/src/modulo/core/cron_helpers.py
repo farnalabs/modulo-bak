@@ -43,6 +43,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.dispatch import SAQ_RUN_TIMEOUT
 from modulo.core.exceptions import TriggersPausedError
 from modulo.core.pipeline_engine.error_codes import sanitize_error_text
@@ -142,9 +143,18 @@ CAPACITY_REDISPATCH_SECONDS = 120
 # LangGraph checkpoints for its thread) after SAQ_CLAIMED_NODELESS_MINUTES is a
 # zombie: the execute_run watchdog (pipeline_execution.zombie_watchdog) normally
 # fails these at SAQ_SETUP_GRACE_SECONDS, but a wedged worker process that can
-# still refresh the DB heartbeat would otherwise slip through. This branch
-# terminal-fails the run (never re-dispatches — a re-dispatch could
-# double-execute a live-but-stuck execute_run).
+# still refresh the DB heartbeat would otherwise slip through. The reconcile
+# re-dispatches these (safe: zero nodes executed, so nothing can double-execute)
+# bounded by the retry budget (_should_redispatch_nodeless — retry_policy or
+# SAQ_NODELESS_REDISPATCH_BUDGET) and THROTTLED to one re-dispatch per
+# SAQ_CLAIMED_NODELESS_MINUTES window per run (_is_nodeless_redispatch_throttled
+# — the fresh key_suffix defeats SAQ dedupe, so without the throttle a
+# budget-eligible zombie would collect one duplicate no-op job per 60s tick),
+# CAPPED at NODELESS_REDISPATCH_MAX_PER_TICK re-dispatches per tick (fleet-wide
+# — mirrors the B3 enqueue-failed cap); terminal-fail once the budget is
+# exhausted (_fail_nodeless_run). A
+# never-re-claimable zombie is ultimately bounded by the B4 mid-graph-wedge age
+# backstop.
 _NODELESS_ZOMBIE_ERROR_CODE = "executor_stalled"
 
 # ---------------------------------------------------------------------------
@@ -166,6 +176,16 @@ ENQUEUE_FAILED_REDISPATCH_SECONDS = 120
 # window that hit hundreds of webhooks must not flood the queue the moment it
 # recovers. Beyond the cap the remaining rows are deferred to later ticks.
 ENQUEUE_FAILED_REDISPATCH_MAX_PER_TICK = 50
+
+# Per-tick re-dispatch cap for the nodeless-zombie branch — mirrors
+# ENQUEUE_FAILED_REDISPATCH_MAX_PER_TICK. After a fleet-wide worker wedge every
+# aged nodeless zombie becomes throttle-eligible in the SAME tick, and the
+# fresh key_suffix defeats SAQ dedupe, so without the cap the first recovery
+# tick floods the queue with one duplicate no-op job per zombie. Beyond the cap
+# the remaining zombies are deferred (no enqueue, no terminal-fail — they stay
+# running and become eligible again next tick); budget-exhausted rows still
+# terminal-fail (terminal-fail reduces load; it never enqueues).
+NODELESS_REDISPATCH_MAX_PER_TICK = 50
 
 # TTL backstop: an enqueue-failed run whose marker is older than this is
 # terminal-failed with ``dispatch_failed`` — but ONLY when Redis is verifiably
@@ -205,6 +225,7 @@ _dispatcher_reconcile_stats: dict[str, Any] = {
     "deduped": 0,
     "nodeless_failed": 0,
     "nodeless_redispatched": 0,
+    "nodeless_capped": 0,
     "claim_cap_terminalized": 0,
     "mid_graph_wedge_terminalized": 0,
     "age_terminalized": 0,
@@ -235,6 +256,7 @@ def set_dispatcher_reconcile_stats(stats: dict[str, Any]) -> None:
     _dispatcher_reconcile_stats["deduped"] = stats.get("deduped", 0)
     _dispatcher_reconcile_stats["nodeless_failed"] = stats.get("nodeless_failed", 0)
     _dispatcher_reconcile_stats["nodeless_redispatched"] = stats.get("nodeless_redispatched", 0)
+    _dispatcher_reconcile_stats["nodeless_capped"] = stats.get("nodeless_capped", 0)
     _dispatcher_reconcile_stats["capacity_deferred"] = stats.get("capacity_deferred", 0)
     _dispatcher_reconcile_stats["claim_cap_terminalized"] = stats.get("claim_cap_terminalized", 0)
     _dispatcher_reconcile_stats["mid_graph_wedge_terminalized"] = stats.get("mid_graph_wedge_terminalized", 0)
@@ -340,12 +362,16 @@ def _get_engine() -> AsyncEngine:
 def _get_system_engine() -> AsyncEngine:
     """Engine for cross-org system crons using the modulo_system role.
 
-    Falls back to the regular engine when MODULO_SYSTEM_DATABASE_URL is not set,
-    so deployments that haven't provisioned the system role still work. The
-    fallback runs system crons as modulo_app, which is NOBYPASSRLS (see
+    FAIL CLOSED when MODULO_SYSTEM_DATABASE_URL is not set: cross-org system
+    crons require the modulo_system role (LOGIN, BYPASSRLS). Falling back to the
+    regular engine would run them as modulo_app, which is NOBYPASSRLS (see
     bootstrap_role.py: the app role asserts ``rolbypassrls = false``), so any
-    RLS-scoped reads silently return zero rows — a warning is emitted to surface
-    that the system role is unprovisioned.
+    RLS-scoped read silently returns zero rows — a silent no-op that masks a
+    misconfigured deployment. Instead, a clear ``RuntimeError`` is raised. The
+    engine is created LAZILY on first use inside a cron invocation (never at
+    worker startup), so this raise fails only the specific system cron — which
+    SAQ logs — while the worker stays up to serve every other job. Mirrors
+    ``saq_worker._get_system_async_engine``.
     """
     global _SYSTEM_ENGINE
     if _SYSTEM_ENGINE is None:
@@ -359,16 +385,21 @@ def _get_system_engine() -> AsyncEngine:
                 connect_args={"ssl": False, "statement_cache_size": 0},
             )
         else:
-            _log.warning(
-                "cron_helpers.system_engine_fallback",
+            _log.error(
+                "cron_helpers.system_engine_misconfigured",
                 extra={
                     "reason": (
-                        "MODULO_SYSTEM_DATABASE_URL not set — system crons run as modulo_app "
-                        "(NOBYPASSRLS); RLS-scoped reads return zero rows"
+                        "MODULO_SYSTEM_DATABASE_URL not set — refusing to run cross-org "
+                        "system crons as modulo_app (NOBYPASSRLS); RLS-scoped reads would "
+                        "silently return zero rows. Set the modulo_system role URL."
                     )
                 },
             )
-            _SYSTEM_ENGINE = _get_engine()
+            raise RuntimeError(
+                "MODULO_SYSTEM_DATABASE_URL is not set: cross-org system crons require "
+                "the modulo_system role (LOGIN, BYPASSRLS). Refusing to fail open to "
+                "modulo_app (NOBYPASSRLS), which would silently return zero rows."
+            )
     return _SYSTEM_ENGINE
 
 
@@ -832,24 +863,41 @@ async def _build_polling_connector(
     trigger: Any,
     org_id: uuid.UUID,
     trigger_id: uuid.UUID,
-) -> Any:
-    """Build the polling connector from stored creds; None on init failure."""
-    import json
+) -> tuple[Any, Any]:
+    """Build the polling connector from stored creds; ``(None, None)`` on init failure.
 
-    from modulo.core.secrets_backend import create_secrets_backend
-    from modulo.core.trigger_engine.polling import _build_polling_connector as _build_connector
+    FAR-442: REST connectors invoked via a polling trigger are wired to the SHARED
+    fleet-wide per-destination rate budget (same as run-executor connectors) by
+    resolving a shared Redis client keyed to ``tenant_id=str(org_id)``. Each org
+    gets its own budget (no cross-tenant ``"default"`` key). Delegates the wiring
+    to the single shared helper (:func:`_build_polling_connector_from_instance`)
+    so the trigger path can never fork from the executor path again.
 
-    settings = get_settings()
+    Returns ``(connector, redis_client)`` where ``redis_client`` may be ``None``
+    (Redis not configured). The caller OWNS both — it MUST release them via
+    :func:`_close_polling_resources` in a ``finally`` (the connector is a fresh
+    per-fire build and the Redis client is a fresh ``Redis.from_url``).
+
+    When Redis is configured but the shared budget cannot be resolved
+    (settings-read failure or client-construction failure) the resolver RAISES
+    SharedBudgetUnavailableError, which is deliberately NOT swallowed here — a
+    trigger must fail closed rather than silently fall back to the local bucket
+    (which would reconstruct the fleet-wide ``N x burst`` fail-open FAR-439
+    removed).
+    """
+    from modulo.core.trigger_engine.polling import (
+        _build_polling_connector_from_instance,
+    )
+
     try:
-        secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
-        raw_creds = await secrets_backend.get_secret(str(connector_instance.id))
-        creds: dict[str, Any] = json.loads(raw_creds)
-        return _build_connector(
-            connector_instance.connector_type_id,
-            connector_instance.config_json,
-            creds,
-        )
+        connector, redis_client = await _build_polling_connector_from_instance(session, connector_instance, org_id)
+        return connector, redis_client
     except asyncio.CancelledError:
+        raise
+    except SharedBudgetUnavailableError:
+        # Fail-closed: a configured-but-unresolvable shared budget must NOT be
+        # downgraded to the per-process local bucket. Propagate so the fire job
+        # surfaces the outage rather than silently enforcing a per-worker cap.
         raise
     except Exception as exc:
         _log.warning("Failed to initialise connector for polling trigger %s: %s", trigger_id, str(exc)[:200])
@@ -860,7 +908,7 @@ async def _build_polling_connector(
             result="poll_error",
             error_detail=f"Failed to initialise connector: {str(exc)[:200]}",
         )
-        return None
+        return None, None
 
 
 async def _run_poll_query(
@@ -892,6 +940,13 @@ async def _run_poll_query(
         )
         return None, {"status": "error", "reason": "query_timeout"}
     except asyncio.CancelledError:
+        raise
+    except SharedBudgetUnavailableError:
+        # Fail-closed (FAR-442): the shared Redis rate budget is configured but
+        # could not be charged during the poll query. Re-raise so the fire job
+        # surfaces the outage instead of degrading to a "query_failed" skip — the
+        # connector must never fall back to a per-process bucket under a shared
+        # budget. The request was never sent on an unaccountable budget.
         raise
     except Exception as exc:
         _log.warning("Poll query failed for trigger %s: %s", trigger_id, str(exc)[:200])
@@ -1119,6 +1174,151 @@ async def fire_cron_trigger(
     return {"status": "error", "reason": "unexpected"}
 
 
+async def _polling_pre_fire_gate(
+    session: AsyncSession,
+    *,
+    trigger_id: uuid.UUID,
+    org_id: uuid.UUID,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Advisory-lock + fetch the polling trigger; ``(trigger, None)`` when due to fire.
+
+    Also enforces the kill-switch pause, the concurrency gate and the daily
+    spend gate so the fire-job body stays within the cognitive-complexity
+    bound. Returns ``(None, skip)`` with the outcome dict when the fire must be
+    skipped (``trigger_busy`` first, mirroring ``fire_cron_trigger``).
+    """
+    from modulo.core.connector_hub.locking import _uuid_to_lock_keys
+    from modulo.db.models.trigger import Trigger
+
+    key1, key2 = _uuid_to_lock_keys(trigger_id)
+    lock_result = await session.execute(
+        text(_SQL_TRY_ADVISORY_LOCK),
+        {"key1": key1, "key2": key2},
+    )
+    if not lock_result.scalar_one():
+        return None, {"status": "skipped", "reason": "trigger_busy"}
+    trigger = (
+        await session.execute(
+            select(Trigger).where(
+                Trigger.id == trigger_id,
+                Trigger.organisation_id == org_id,
+                Trigger.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if trigger is None or not trigger.active:
+        return None, {"status": "skipped", "reason": "trigger_inactive_or_missing"}
+
+    # Org-wide pause (kill-switch). No paused TriggerEvent here (race backstop
+    # only; the create_run gate is the authority). Degraded on a pre-migration
+    # ProgrammingError (not-paused) inside a savepoint.
+    if await _org_is_paused_degraded(session, org_id):
+        return None, {"status": "skipped", "reason": PAUSE_SKIP_REASON}
+
+    active_count = await _count_active_runs(session, trigger_id)
+    if active_count >= trigger.max_concurrent_runs:
+        await _log_poll_event(
+            session,
+            trigger=trigger,
+            org_id=org_id,
+            result="concurrency_limit_reached",
+            error_detail=(f"Active runs: {active_count}, limit: {trigger.max_concurrent_runs}"),
+        )
+        return None, {"status": "skipped", "reason": "concurrency_limit", "active_runs": active_count}
+
+    # Daily spend limit check (mirrors fire_cron_trigger) — run BEFORE the
+    # connector query so an over-budget trigger stops polling the external
+    # service instead of running the query every cycle.
+    skip = await _polling_spend_gate_skip(session, trigger, org_id, trigger_id)
+    if skip is not None:
+        return None, skip
+    return trigger, None
+
+
+async def _run_poll_fire(
+    session: AsyncSession,
+    *,
+    trigger: Any,
+    connector: Any,
+    org_id: uuid.UUID,
+    trigger_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+    poll_query: str,
+    condition_expression: str | None,
+) -> dict[str, Any]:
+    """Run the poll query, evaluate the condition and create the run when met.
+
+    Encapsulates the whole poll-fire decision (query -> condition -> create) so
+    the fire-job body stays within the cognitive-complexity bound. The caller
+    OWNS the connector/Redis lifecycle (released in a ``finally``) and the
+    ``SharedBudgetUnavailableError`` / ``CancelledError`` propagation.
+    """
+    from sqlalchemy import update
+
+    from modulo.db.crud.run import create_run
+    from modulo.db.models.trigger import Trigger
+
+    query_result, query_skip = await _run_poll_query(session, connector, trigger, org_id, trigger_id, poll_query)
+    if query_skip is not None:
+        return query_skip
+
+    condition_met, condition_error = await _evaluate_poll_condition(
+        session, query_result, trigger, org_id, trigger_id, condition_expression
+    )
+    if condition_error is not None:
+        return {"status": "error", "reason": "condition_eval_failed", "error": condition_error}
+
+    if not condition_met:
+        await _log_poll_event(
+            session,
+            trigger=trigger,
+            org_id=org_id,
+            result="no_match",
+        )
+        return {"status": "no_match"}
+
+    config = trigger.config_json or {}
+    snapshot_id_str = config.get("snapshot_id")
+    try:
+        snapshot_id = uuid.UUID(str(snapshot_id_str)) if snapshot_id_str else uuid.UUID(int=0)
+    except (ValueError, TypeError):
+        snapshot_id = uuid.UUID(int=0)
+
+    input_payload: dict[str, Any] = {
+        "records": query_result.records,
+        "total": query_result.total,
+        "poll_query": poll_query,
+    }
+
+    try:
+        run = await create_run(
+            session,
+            org_id=org_id,
+            pipeline_id=pipeline_id,
+            snapshot_id=snapshot_id,
+            trigger_type="polling",
+            trigger_id=trigger_id,
+            input_payload=input_payload,
+        )
+    except TriggersPausedError:
+        _log.info(_LOG_TRIGGERS_PAUSED_SKIP, trigger_id, org_id)
+        return {"status": "skipped", "reason": PAUSE_SKIP_REASON}
+
+    event = await _log_poll_event(
+        session,
+        trigger=trigger,
+        org_id=org_id,
+        result="condition_met",
+        run_id=run.id,
+    )
+
+    # last_fired_at only — next_fire_at was advanced at enqueue time.
+    await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))
+
+    _log.info("Polling trigger %s fired -> run %s (condition met)", trigger_id, run.id)
+    return {"status": "fired", "run_id": str(run.id), "event_id": str(event.id)}
+
+
 async def fire_polling_trigger(
     *,
     trigger_id: uuid.UUID,
@@ -1135,11 +1335,8 @@ async def fire_polling_trigger(
     created (condition met). It does NOT re-check ``next_fire_at`` (the advance
     is enqueue-time by design).
     """
-
     from sqlalchemy import update
 
-    from modulo.core.connector_hub.locking import _uuid_to_lock_keys
-    from modulo.db.crud.run import create_run
     from modulo.db.models.connector_instance import ConnectorInstance
     from modulo.db.models.trigger import Trigger
 
@@ -1148,45 +1345,7 @@ async def fire_polling_trigger(
     async with factory() as session, session.begin():
         await _set_rls_org(session, org_id)
 
-        key1, key2 = _uuid_to_lock_keys(trigger_id)
-        lock_result = await session.execute(
-            text(_SQL_TRY_ADVISORY_LOCK),
-            {"key1": key1, "key2": key2},
-        )
-        if not lock_result.scalar_one():
-            return {"status": "skipped", "reason": "trigger_busy"}
-        result = await session.execute(
-            select(Trigger).where(
-                Trigger.id == trigger_id,
-                Trigger.organisation_id == org_id,
-                Trigger.deleted_at.is_(None),
-            )
-        )
-        trigger = result.scalar_one_or_none()
-        if trigger is None or not trigger.active:
-            return {"status": "skipped", "reason": "trigger_inactive_or_missing"}
-
-        # Org-wide pause (kill-switch). No paused TriggerEvent here (race
-        # backstop only; the create_run gate is the authority). Degraded on a
-        # pre-migration ProgrammingError (not-paused) inside a savepoint.
-        if await _org_is_paused_degraded(session, org_id):
-            return {"status": "skipped", "reason": PAUSE_SKIP_REASON}
-
-        active_count = await _count_active_runs(session, trigger_id)
-        if active_count >= trigger.max_concurrent_runs:
-            await _log_poll_event(
-                session,
-                trigger=trigger,
-                org_id=org_id,
-                result="concurrency_limit_reached",
-                error_detail=(f"Active runs: {active_count}, limit: {trigger.max_concurrent_runs}"),
-            )
-            return {"status": "skipped", "reason": "concurrency_limit", "active_runs": active_count}
-
-        # Daily spend limit check (mirrors fire_cron_trigger) — run BEFORE the
-        # connector query so an over-budget trigger stops polling the external
-        # service instead of running the query every cycle.
-        skip = await _polling_spend_gate_skip(session, trigger, org_id, trigger_id)
+        trigger, skip = await _polling_pre_fire_gate(session, trigger_id=trigger_id, org_id=org_id)
         if skip is not None:
             return skip
 
@@ -1208,75 +1367,60 @@ async def fire_polling_trigger(
             )
             return {"status": "error", "reason": "connector_not_found"}
 
-        connector = await _build_polling_connector(
-            session,
-            connector_instance,
-            trigger,
-            org_id,
-            trigger_id,
-        )
-        if connector is None:
-            return {"status": "error", "reason": "connector_init_failed"}
+        # The connector + its shared Redis client are fresh per-fire builds
+        # (FAR-442) — the caller owns both and must release them regardless of
+        # outcome (a poll hit, a fail-closed budget outage, or an exception).
+        from modulo.core.trigger_engine.polling import _close_polling_resources
 
-        query_result, query_skip = await _run_poll_query(session, connector, trigger, org_id, trigger_id, poll_query)
-        if query_skip is not None:
-            return query_skip
-
-        condition_met, condition_error = await _evaluate_poll_condition(
-            session, query_result, trigger, org_id, trigger_id, condition_expression
-        )
-        if condition_error is not None:
-            return {"status": "error", "reason": "condition_eval_failed", "error": condition_error}
-
-        if not condition_met:
+        connector = None
+        redis_client = None
+        try:
+            connector, redis_client = await _build_polling_connector(
+                session,
+                connector_instance,
+                trigger,
+                org_id,
+                trigger_id,
+            )
+            if connector is None:
+                return {"status": "error", "reason": "connector_init_failed"}
+            return await _run_poll_fire(
+                session,
+                trigger=trigger,
+                connector=connector,
+                org_id=org_id,
+                trigger_id=trigger_id,
+                pipeline_id=pipeline_id,
+                poll_query=poll_query,
+                condition_expression=condition_expression,
+            )
+        except asyncio.CancelledError:
+            raise
+        except SharedBudgetUnavailableError as exc:
+            # Fail-closed (FAR-442): the shared Redis rate budget is configured but
+            # could not be charged during the poll query. The connector must never
+            # fall back to a per-process bucket under a shared budget; the epoch was
+            # ALREADY claimed at enqueue time, so treat this as "epoch NOT consumed"
+            # — reset next_fire_at to due-now so the next fire_due_triggers tick
+            # re-selects and re-enqueues it instead of silently dropping the cadence
+            # when the outage outlasts FIRE_JOB_RETRIES.
+            await session.execute(
+                update(Trigger).where(Trigger.id == trigger_id).values(next_fire_at=datetime.now(UTC))
+            )
             await _log_poll_event(
                 session,
                 trigger=trigger,
                 org_id=org_id,
-                result="no_match",
+                result="poll_error",
+                error_detail=f"shared rate-limit budget unavailable: {exc}",
             )
-            return {"status": "no_match"}
-
-        config = trigger.config_json or {}
-        snapshot_id_str = config.get("snapshot_id")
-        try:
-            snapshot_id = uuid.UUID(str(snapshot_id_str)) if snapshot_id_str else uuid.UUID(int=0)
-        except (ValueError, TypeError):
-            snapshot_id = uuid.UUID(int=0)
-
-        input_payload: dict[str, Any] = {
-            "records": query_result.records,
-            "total": query_result.total,
-            "poll_query": poll_query,
-        }
-
-        try:
-            run = await create_run(
-                session,
-                org_id=org_id,
-                pipeline_id=pipeline_id,
-                snapshot_id=snapshot_id,
-                trigger_type="polling",
-                trigger_id=trigger_id,
-                input_payload=input_payload,
-            )
-        except TriggersPausedError:
-            _log.info(_LOG_TRIGGERS_PAUSED_SKIP, trigger_id, org_id)
-            return {"status": "skipped", "reason": PAUSE_SKIP_REASON}
-
-        event = await _log_poll_event(
-            session,
-            trigger=trigger,
-            org_id=org_id,
-            result="condition_met",
-            run_id=run.id,
-        )
-
-        # last_fired_at only — next_fire_at was advanced at enqueue time.
-        await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))
-
-        _log.info("Polling trigger %s fired -> run %s (condition met)", trigger_id, run.id)
-        return {"status": "fired", "run_id": str(run.id), "event_id": str(event.id)}
+            return {
+                "status": "error",
+                "reason": "shared_budget_unavailable",
+                "error": f"shared rate-limit budget unavailable: {exc}",
+            }
+        finally:
+            await _close_polling_resources(connector, redis_client)
 
     return {"status": "error", "reason": "unexpected"}
 
@@ -1931,6 +2075,307 @@ async def fire_ongoing_trigger(
             await redis_client.aclose()
 
 
+async def _acquire_suite_run_trigger(
+    session: AsyncSession,
+    *,
+    trigger_id: uuid.UUID,
+    org_id: uuid.UUID,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Advisory-lock + fetch the suite_run trigger; ``(trigger, None)`` when due to fire.
+
+    Guarded by the same lock-then-fetch order as ``fire_cron_trigger``; also
+    enforces the ``run_kind == 'suite_run'`` contract and the org-wide pause
+    (kill-switch). Returns ``(None, skip)`` with the outcome dict on any skip so
+    the fire-job body stays within the cognitive-complexity bound.
+    """
+    from modulo.core.connector_hub.locking import _uuid_to_lock_keys
+    from modulo.db.models.trigger import Trigger
+
+    key1, key2 = _uuid_to_lock_keys(trigger_id)
+    lock_result = await session.execute(text(_SQL_TRY_ADVISORY_LOCK), {"key1": key1, "key2": key2})
+    if not lock_result.scalar_one():
+        return None, {"status": "skipped", "reason": "trigger_busy"}
+
+    trigger = (
+        await session.execute(
+            select(Trigger).where(
+                Trigger.id == trigger_id,
+                Trigger.organisation_id == org_id,
+                Trigger.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if trigger is None or not trigger.active:
+        return None, {"status": "skipped", "reason": "trigger_inactive_or_missing"}
+    if trigger.run_kind != "suite_run" or trigger.eval_suite_id is None:
+        return None, {"status": "skipped", "reason": "not_suite_run_trigger"}
+
+    # Org-wide pause (kill-switch) — race backstop before building the run.
+    if await _org_is_paused_degraded(session, org_id):
+        return None, {"status": "skipped", "reason": PAUSE_SKIP_REASON}
+    return trigger, None
+
+
+def _resolve_suite_run_config(
+    config: dict[str, Any],
+) -> tuple[uuid.UUID | None, uuid.UUID | None, dict[str, Any] | None]:
+    """Resolve dataset/model-backend ids from the trigger config.
+
+    Returns ``(dataset_id, model_backend_id, None)`` on success or
+    ``(None, None, skip)`` when the config is missing/invalid.
+    """
+    dataset_id_raw = config.get("dataset_id")
+    model_backend_id_raw = config.get("model_backend_id")
+    if not dataset_id_raw or not model_backend_id_raw:
+        return None, None, {"status": "skipped", "reason": "missing_suite_run_config"}
+    try:
+        return uuid.UUID(str(dataset_id_raw)), uuid.UUID(str(model_backend_id_raw)), None
+    except (ValueError, TypeError):
+        return None, None, {"status": "skipped", "reason": "invalid_suite_run_config"}
+
+
+async def _suite_run_fire_gates(
+    session: AsyncSession,
+    trigger: Any,
+    org_id: uuid.UUID,
+    trigger_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Enforce the suite-run concurrency + daily-spend pools; ``skip`` when gated.
+
+    Uses the SUITE-RUN pools (never ``runs``): non-terminal ``suite_runs`` for
+    the trigger's suite + dataset, and the per-trigger daily spend over
+    ``suite_runs.extra``. Skip-not-defer (PR #982): a gated fire stamps
+    ``last_fired_at`` so a serviced low-cadence trigger does not trip the
+    hourly missed-fire alert on a stale ``last_fired_at``.
+    """
+    from sqlalchemy import func, update
+
+    from modulo.core.eval_engine.execute_suite_run import (
+        suite_run_daily_spend_exceeded,
+        suite_run_daily_spend_used_for_trigger,
+    )
+    from modulo.db.models.eval_suite_run import SuiteRun, SuiteRunState
+    from modulo.db.models.trigger import Trigger
+
+    # Separate concurrency pool: non-terminal SuiteRuns for this suite+dataset.
+    active_count = (
+        await session.execute(
+            select(func.count()).where(
+                SuiteRun.organisation_id == org_id,
+                SuiteRun.suite_id == trigger.eval_suite_id,
+                SuiteRun.dataset_id == dataset_id,
+                SuiteRun.state.in_([SuiteRunState.PENDING.value, SuiteRunState.RUNNING.value]),
+            )
+        )
+    ).scalar_one() or 0
+    if int(active_count) >= int(trigger.max_concurrent_runs):
+        await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))
+        return {
+            "status": "skipped",
+            "reason": "concurrency_limit",
+            "active_suite_runs": int(active_count),
+        }
+
+    # Separate daily spend pool: sum TODAY's suite_runs cost for THIS trigger
+    # only (never the org, never runs). ``daily_spend_limit`` is a per-trigger
+    # knob, so the pool must be scoped to the trigger that owns the run (id
+    # stamped onto ``suite_runs.extra`` at fire time).
+    if trigger.daily_spend_limit is not None:
+        used = await suite_run_daily_spend_used_for_trigger(session, org_id, trigger_id)
+        if suite_run_daily_spend_exceeded(used, trigger.daily_spend_limit):
+            await session.execute(
+                update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC))
+            )
+            return {
+                "status": "skipped",
+                "reason": "spend_limit",
+                "daily_spend_limit": str(trigger.daily_spend_limit),
+                "today_cost": str(used),
+            }
+    return None
+
+
+async def _suite_run_llm_judge_guard(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+    eval_suite_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Reject an ``llm_judge`` suite_run fire up front; ``skip`` when unsupported.
+
+    ``llm_judge`` suites are not yet supported on the scheduled path: the SAQ
+    ``execute_suite_run`` job does not wire a judge callable, so any
+    ``llm_judge`` definition would hard-fail the run at execution time
+    (``suite contains llm_judge definitions but no judge callable was
+    provided``). Reject the fire up front (a clear, observable skip) rather
+    than letting the run build and then fail — config must not promise a run it
+    cannot deliver. This is the fire-boundary guard that mirrors "reject
+    llm_judge suite_run triggers" (FAR-377 reviewer finding).
+    """
+    from modulo.core.eval_engine.execute_suite_run import load_suite_definitions
+
+    suite_defs = await load_suite_definitions(session, org_id, eval_suite_id)
+    if any(str(getattr(d, "eval_type", "")) == "llm_judge" for d in suite_defs):
+        _log.warning(
+            "fire_suite_run_trigger: suite %s contains llm_judge definitions which are not "
+            "supported on the scheduled path; skipping fire (run would hard-fail at execution)",
+            eval_suite_id,
+        )
+        return {
+            "status": "skipped",
+            "reason": "llm_judge_unsupported",
+            "suite_id": str(eval_suite_id),
+        }
+    return None
+
+
+async def _build_suite_run_or_skip(
+    session: AsyncSession,
+    trigger: Any,
+    org_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    model_backend_id: uuid.UUID,
+    config: dict[str, Any],
+    pipeline_id: uuid.UUID,
+) -> tuple[Any, dict[str, Any] | None]:
+    """Build the SuiteRun; ``(run, None)`` on success, ``(None, skip)`` otherwise.
+
+    A non-skip failure class is deliberately NOT swallowed: ``build_suite_run``
+    is expected to raise only the two typed errors, which map to explicit skips
+    (``empty_dataset`` / ``suite_run_config_error``) — a genuinely unexpected
+    error still propagates so the SAQ job fails and retries.
+    """
+    from modulo.core.eval_engine.execute_suite_run import (
+        SuiteRunEmptyDatasetError,
+        SuiteRunExecutionError,
+        build_suite_run,
+    )
+
+    scenario_inputs = config.get("scenario_inputs") or {}
+    try:
+        run = await build_suite_run(
+            session,
+            org_id=org_id,
+            suite_id=trigger.eval_suite_id,
+            dataset_id=dataset_id,
+            model_backend_id=model_backend_id,
+            scenario_inputs=scenario_inputs,
+            pipeline_id=pipeline_id,
+        )
+    except SuiteRunEmptyDatasetError as exc:
+        # Never a silent pass — surface the empty dataset as a missed run.
+        return None, {"status": "skipped", "reason": "empty_dataset", "detail": str(exc)}
+    except SuiteRunExecutionError as exc:
+        return None, {"status": "skipped", "reason": "suite_run_config_error", "detail": str(exc)}
+    return run, None
+
+
+def _stamp_suite_run_extra(
+    run: Any,
+    trigger_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+    dataset_id: uuid.UUID,
+    model_backend_id: uuid.UUID,
+    config: dict[str, Any],
+) -> None:
+    """Stamp the config-derived execution context + the owning trigger id onto the run.
+
+    The id stamps let the SAQ job run the suite and ensure a finished eval never
+    touches the production pool. ``str(None)`` would render as the literal
+    ``'None'`` and crash ``Decimal``, so a config key explicitly set to
+    ``null`` falls back to the default.
+    """
+    from decimal import Decimal
+
+    from modulo.core.eval_engine.execute_suite_run import _DEFAULT_COST_PER_LLM_CASE
+
+    scenario_inputs = config.get("scenario_inputs") or {}
+    cost_raw = config.get("cost_per_llm_case")
+    cost_per_case = _DEFAULT_COST_PER_LLM_CASE if cost_raw is None else Decimal(str(cost_raw))
+    suite_ceiling_raw = config.get("suite_ceiling")
+    run.extra = {
+        "trigger_id": str(trigger_id),
+        "pipeline_id": str(pipeline_id),
+        "dataset_id": str(dataset_id),
+        "model_backend_id": str(model_backend_id),
+        "scenario_inputs": scenario_inputs,
+        "entity_thresholds": config.get("entity_thresholds") or {},
+        # ``extra`` is a plain ``JSON`` column with no ``default=str``
+        # serializer, so every value written here MUST be JSON-native.
+        # Store ``cost_per_llm_case`` and ``suite_ceiling`` as ``str`` — the
+        # SAQ job coerces them back to ``Decimal`` on read. Writing a raw
+        # ``Decimal`` here raises ``TypeError`` at flush (json.dumps), which
+        # kills every fire inside ``session.begin()``.
+        "suite_ceiling": str(suite_ceiling_raw) if suite_ceiling_raw is not None else None,
+        "eval_definition_version": int(config.get("eval_definition_version", 1)),
+        "cost_per_llm_case": str(cost_per_case),
+    }
+
+
+async def fire_suite_run_trigger(
+    *,
+    trigger_id: uuid.UUID,
+    org_id: uuid.UUID,
+    pipeline_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Per-item fire job for a ``run_kind='suite_run'`` cron/event trigger (FAR-377).
+
+    Builds a ``pending`` SuiteRun instead of a pipeline ``Run``. Uses the
+    SUITE-RUN spend pool (over ``suite_runs``, never ``runs``) and its own
+    concurrency pool (non-terminal ``suite_runs`` for the trigger's suite +
+    dataset). It writes NO ``TriggerEvent`` and NO ``Run`` — a SuiteRun is the
+    audit record, and writing into the trigger-watch/dedup event set would
+    violate the loop guard (a finished eval must never re-fire an eval).
+
+    Returns ``{'status': 'fired', 'suite_run_id': <id>}`` on success, or a skip
+    dict. The caller (SAQ wrapper) enqueues the ``execute_suite_run`` job after
+    commit.
+    """
+    from sqlalchemy import update
+
+    from modulo.db.models.trigger import Trigger
+
+    factory = _open_factory()
+    async with factory() as session, session.begin():
+        await _set_rls_org(session, org_id)
+
+        trigger, skip = await _acquire_suite_run_trigger(session, trigger_id=trigger_id, org_id=org_id)
+        if skip is not None:
+            return skip
+
+        config = trigger.config_json or {}
+        dataset_id, model_backend_id, skip = _resolve_suite_run_config(config)
+        if skip is not None:
+            return skip
+        assert dataset_id is not None and model_backend_id is not None  # nosec B101 - non-None whenever skip is None (see _resolve_suite_run_config)
+
+        skip = await _suite_run_fire_gates(session, trigger, org_id, trigger_id, dataset_id)
+        if skip is not None:
+            return skip
+
+        skip = await _suite_run_llm_judge_guard(session, org_id, trigger.eval_suite_id)
+        if skip is not None:
+            return skip
+
+        run, skip = await _build_suite_run_or_skip(
+            session,
+            trigger,
+            org_id,
+            dataset_id,
+            model_backend_id,
+            config,
+            pipeline_id,
+        )
+        if skip is not None:
+            return skip
+
+        _stamp_suite_run_extra(run, trigger_id, pipeline_id, dataset_id, model_backend_id, config)
+        await session.flush()
+        await session.execute(update(Trigger).where(Trigger.id == trigger_id).values(last_fired_at=datetime.now(UTC)))
+        _log.info("suite_run trigger %s fired -> suite_run %s", trigger_id, run.id)
+        return {"status": "fired", "suite_run_id": str(run.id), "trigger_id": str(trigger_id)}
+
+
 def _suppress_aclose() -> Any:
     from contextlib import suppress
 
@@ -2200,16 +2645,26 @@ async def _enqueue_catchup_fire(
     unchanged from ``_fire_missed_cron_epochs`` (complexity bound).
     """
     try:
-        job_id = await _enqueue_fire_job_async(
-            q,
-            "modulo.core.saq_worker.fire_cron_trigger",
-            f"fire:{row.id}:{int(now.timestamp())}",
-            trigger_id=str(row.id),
-            org_id=str(org_id),
-            pipeline_id=str(row.pipeline_id),
-            cron_expression=row.cron_expression,
-            snapshot_id=str(snapshot_id) if snapshot_id else "",
-        )
+        if getattr(row, "run_kind", "run") == "suite_run":
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_suite_run_trigger",
+                f"suite_catchup:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+            )
+        else:
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_cron_trigger",
+                f"fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+                cron_expression=row.cron_expression,
+                snapshot_id=str(snapshot_id) if snapshot_id else "",
+            )
         if job_id is not None:
             summary["cron_catchup_enqueued"] += 1
         await _mark_catchup_fired(redis_client, row.id, missed_epoch)
@@ -2285,6 +2740,7 @@ async def _fire_missed_cron_epochs(
                     Trigger.cron_timezone,
                     Trigger.next_fire_at,
                     Trigger.last_fired_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "cron",
                     Trigger.active.is_(True),
@@ -2499,6 +2955,7 @@ def _new_fire_due_summary() -> dict[str, Any]:
         "polling_skipped_paused": 0,
         "report_due": 0,
         "report_enqueued": 0,
+        "report_skipped_suite_run": 0,
         "ongoing_due": 0,
         "ongoing_enqueued": 0,
         "ongoing_skipped_paused": 0,
@@ -2571,6 +3028,8 @@ async def _process_due_cron_scan(
                     Trigger.cron_expression,
                     Trigger.cron_timezone,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
+                    Trigger.eval_suite_id,
                 ).where(
                     Trigger.trigger_type == "cron",
                     Trigger.active.is_(True),
@@ -2630,6 +3089,7 @@ async def _process_due_polling_scan(
                     Trigger.pipeline_id,
                     Trigger.config_json,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "polling",
                     Trigger.active.is_(True),
@@ -2694,6 +3154,7 @@ async def _process_due_ongoing_scan(
                     Trigger.pipeline_id,
                     Trigger.config_json,
                     Trigger.next_fire_at,
+                    Trigger.run_kind,
                 ).where(
                     Trigger.trigger_type == "ongoing",
                     Trigger.active.is_(True),
@@ -2786,18 +3247,33 @@ async def _enqueue_cron_fire(
     the job (a concurrent machine already enqueued the same epoch) so the
     catch-up scan never re-fires it. Extracted unchanged from
     ``_process_due_cron_rows`` (complexity bound).
+
+    FAR-377: a ``run_kind == 'suite_run'`` cron row enqueues the
+    ``fire_suite_run_trigger`` per-item job (with NO snapshot — the suite run
+    resolves its own dataset/backend from the trigger config) instead of
+    ``fire_cron_trigger``.
     """
     try:
-        job_id = await _enqueue_fire_job_async(
-            q,
-            "modulo.core.saq_worker.fire_cron_trigger",
-            f"fire:{row.id}:{int(now.timestamp())}",
-            trigger_id=str(row.id),
-            org_id=str(org_id),
-            pipeline_id=str(row.pipeline_id),
-            cron_expression=row.cron_expression,
-            snapshot_id=str(snapshot_id) if snapshot_id else "",
-        )
+        if getattr(row, "run_kind", "run") == "suite_run":
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_suite_run_trigger",
+                f"suite_fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+            )
+        else:
+            job_id = await _enqueue_fire_job_async(
+                q,
+                "modulo.core.saq_worker.fire_cron_trigger",
+                f"fire:{row.id}:{int(now.timestamp())}",
+                trigger_id=str(row.id),
+                org_id=str(org_id),
+                pipeline_id=str(row.pipeline_id),
+                cron_expression=row.cron_expression,
+                snapshot_id=str(snapshot_id) if snapshot_id else "",
+            )
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -2922,7 +3398,7 @@ async def _enqueue_polling_fire(
     org_id: uuid.UUID,
     row: Any,
     config: dict[str, Any],
-    connector_instance_id: uuid.UUID,
+    connector_instance_id: uuid.UUID | None,
     summary: dict[str, Any],
 ) -> bool:
     """Enqueue ONE polling fire job; ``False`` when the enqueue raised.
@@ -2930,7 +3406,15 @@ async def _enqueue_polling_fire(
     No advance rollback for polling — a consumed epoch self-heals on the next
     tick — the caller ingests the error event. Extracted unchanged from
     ``_process_due_polling_rows`` (complexity bound).
+
+    FAR-377: a ``run_kind == 'suite_run'`` polling row routes to the SuiteRun
+    fire job (mirroring the cron scan) — it builds a SuiteRun, never a pipeline
+    ``Run``. The write-surface loop guard depends on this discriminator.
     """
+    if getattr(row, "run_kind", "run") == "suite_run":
+        # The suite run resolves its own dataset/backend from the trigger config;
+        # no connector instance, poll query or condition is needed.
+        return await _enqueue_suite_run_fire(q, now, org_id, row, summary, "polling_enqueued")
     try:
         job_id = await _enqueue_fire_job_async(
             q,
@@ -2951,6 +3435,42 @@ async def _enqueue_polling_fire(
         return False
     if job_id is not None:
         summary["polling_enqueued"] += 1
+    return True
+
+
+async def _enqueue_suite_run_fire(
+    q: RedisQueue,
+    now: datetime,
+    org_id: uuid.UUID,
+    row: Any,
+    summary: dict[str, Any],
+    counter_key: str,
+) -> bool:
+    """Enqueue the ``fire_suite_run_trigger`` job for a ``run_kind='suite_run'`` row.
+
+    Shared by the coupling that routes a suite_run row surfaced by the ongoing or
+    polling dispatch scans (FAR-377). Mirrors the cron scan: builds a SuiteRun,
+    never a pipeline ``Run``, and passes NO snapshot/connector args (the suite run
+    resolves its own dataset/backend from the trigger config). Returns ``False``
+    only when the enqueue raised (the caller then ingests the error event).
+    """
+    try:
+        job_id = await _enqueue_fire_job_async(
+            q,
+            "modulo.core.saq_worker.fire_suite_run_trigger",
+            f"suite_fire:{row.id}:{int(now.timestamp())}",
+            trigger_id=str(row.id),
+            org_id=str(org_id),
+            pipeline_id=str(row.pipeline_id),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        summary["enqueue_failures"] += 1
+        _log.exception("fire_due_triggers: suite_run fire enqueue failed %s", row.id)
+        return False
+    if job_id is not None:
+        summary[counter_key] += 1
     return True
 
 
@@ -2978,9 +3498,12 @@ async def _process_one_due_polling_row(
             row.id,
         )
         interval = 60
-    if connector_instance_id is None:
+    is_suite_run = getattr(row, "run_kind", "run") == "suite_run"
+    if connector_instance_id is None and not is_suite_run:
         # Missing connector instance — log poll_error and advance
-        # (mirrors the legacy beat _fetch_due_triggers behaviour).
+        # (mirrors the legacy beat _fetch_due_triggers behaviour). A suite_run
+        # polling row is exempt: it resolves its own dataset/backend from the
+        # trigger config and needs no connector instance.
         await _polling_missing_connector(session, org_id, row, interval, summary)
         return
 
@@ -3067,37 +3590,59 @@ async def _process_due_report_rows(
 ) -> None:
     """Advance + enqueue the due scheduled-report rows (one epoch each, atomic)."""
     for row in report_rows:
-        summary["report_due"] += 1
-        try:
-            if not await _advance_report_next_send(session, row.id, row.cron_expression):
-                continue
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            _log.exception("fire_due_triggers: report advance failed %s", row.id)
-            continue
-        try:
-            job_id = await _enqueue_fire_job_async(
-                q,
-                "modulo.core.saq_worker.fire_report_trigger",
-                f"fire:report:{row.id}:{int(now.timestamp())}",
-                report_id=str(row.id),
-                org_id=str(org_id),
-            )
-            if job_id is not None:
-                summary["report_enqueued"] += 1
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            summary["enqueue_failures"] += 1
-            _log.exception("fire_due_triggers: report enqueue failed %s", row.id)
-            await _ingest_saq_error(
-                session,
-                org_id,
-                function="fire_due_triggers",
-                message=f"fire_due_triggers: enqueue failed for report {row.id}",
-                context={"report_id": str(row.id), "trigger_type": "report"},
-            )
+        await _process_one_due_report_row(session, q, now, org_id, row, summary)
+
+
+async def _process_one_due_report_row(
+    session: AsyncSession,
+    q: RedisQueue,
+    now: datetime,
+    org_id: uuid.UUID,
+    row: Any,
+    summary: dict[str, Any],
+) -> None:
+    """Advance + enqueue ONE due scheduled-report row (one epoch each, atomic).
+
+    Extracted from ``_process_due_report_rows`` (complexity bound).
+    """
+    # FAR-377: never mis-dispatch a ``run_kind == 'suite_run'`` row through the
+    # report path (which drives ``fire_report_trigger``, a scheduled report
+    # delivery — not a pipeline Run). A suite_run scheduled report should not
+    # exist, but the guard keeps a mis-typed row from firing a report.
+    if getattr(row, "run_kind", "run") == "suite_run":
+        summary["report_skipped_suite_run"] += 1
+        return
+    summary["report_due"] += 1
+    try:
+        if not await _advance_report_next_send(session, row.id, row.cron_expression):
+            return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("fire_due_triggers: report advance failed %s", row.id)
+        return
+    try:
+        job_id = await _enqueue_fire_job_async(
+            q,
+            "modulo.core.saq_worker.fire_report_trigger",
+            f"fire:report:{row.id}:{int(now.timestamp())}",
+            report_id=str(row.id),
+            org_id=str(org_id),
+        )
+        if job_id is not None:
+            summary["report_enqueued"] += 1
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        summary["enqueue_failures"] += 1
+        _log.exception("fire_due_triggers: report enqueue failed %s", row.id)
+        await _ingest_saq_error(
+            session,
+            org_id,
+            function="fire_due_triggers",
+            message=f"fire_due_triggers: enqueue failed for report {row.id}",
+            context={"report_id": str(row.id), "trigger_type": "report"},
+        )
 
 
 async def _process_one_ongoing_row(
@@ -3132,6 +3677,11 @@ async def _process_one_ongoing_row(
         # Per-tick enqueue cap — defer to the next tick. The
         # advance already happened (no double-fire).
         return 0
+    if getattr(row, "run_kind", "run") == "suite_run":
+        # FAR-377: a suite_run ongoing row routes to the SuiteRun fire job
+        # (mirroring the cron scan) — it builds a SuiteRun, never a pipeline
+        # ``Run``. The suite run resolves its own dataset/backend; no snapshot id.
+        return 1 if await _enqueue_suite_run_fire(q, now, org_id, row, summary, "ongoing_enqueued") else 0
     snapshot_id = _resolve_snapshot_id(row, ongoing_latest_snapshots)
     try:
         job_id = await _enqueue_fire_job_async(
@@ -3230,6 +3780,12 @@ def _nodeless_zombie_predicate(age_minutes: int) -> Any:
     max-length first node, zero checkpoints in between) could be false-failed.
     ``SAQ_CLAIMED_NODELESS_MINUTES`` must be tuned to exceed worst-case
     compile + first-node duration.
+
+    The nodeless re-dispatch throttle (at most one re-dispatch per window per
+    run, FAR-509) is enforced ROW-level in ``_reconcile_nodeless_repair`` via
+    ``_is_nodeless_redispatch_throttled`` — a row can match multiple branches,
+    so the row-level re-check is authoritative; this predicate deliberately
+    does NOT filter on ``dispatched_at``.
     """
     from sqlalchemy import and_
     from sqlalchemy import exists as sa_exists
@@ -3260,7 +3816,8 @@ def _is_nodeless_zombie_row(row: Any, age_minutes: int) -> bool:
 
     The combined reconcile predicate can match a row via MULTIPLE branches
     (e.g. stale heartbeat AND nodeless); this discriminates the nodeless repair
-    (terminal-fail) from the stale repair (re-dispatch).
+    (budget- and throttle-bounded re-dispatch; terminal-fail on budget
+    exhaustion) from the stale repair (unconditional re-dispatch).
     """
     if row.status != "running":
         return False
@@ -3272,20 +3829,31 @@ def _is_nodeless_zombie_row(row: Any, age_minutes: int) -> bool:
 
 
 def _should_redispatch_nodeless(row: Any) -> bool:
-    """Decide whether a nodeless zombie should be RE-DISPATCHED (not terminal-failed).
+    """Decide whether a nodeless zombie's retry BUDGET allows a re-dispatch.
 
     A nodeless zombie executed ZERO nodes (no checkpoint, no node_token_usage,
     no outputs_json), so re-dispatch is SAFE — there is nothing to
     double-execute, and these pipelines only create PRs after a node runs.
 
-    Retry budgeting (FAR — nodeless safe re-dispatch):
+    This is the pure budget decision ONLY — it does NOT bound the enqueue
+    rate. The rate is throttled separately in the repair branch
+    (:func:`_is_nodeless_redispatch_throttled`): at most one re-dispatch per
+    ``SAQ_CLAIMED_NODELESS_MINUTES`` window per run. Between the two, a
+    never-re-claimable zombie is ultimately bounded by the B4 mid-graph-wedge
+    age backstop.
+
+    Retry budgeting (FAR-509) — the budget bounds successful-claim CYCLES
+    (terminal-fail once ``claim_count`` exceeds it; it does NOT bound the
+    enqueue count):
       * ``retry_policy`` present (non-empty) with ``"stall"`` in ``on``: honor the
         ``max_retries`` budget. ``claim_count`` is 1 for the initial claim, so a
         re-dispatch is allowed while ``claim_count <= max_retries`` (initial
         attempt + up to ``max_retries`` retries).
       * ``retry_policy`` absent/None OR an empty policy (the column defaults to
-        ``{}``): re-dispatch ONCE only, bounded by ``claim_count <= 1`` (the
-        original claim has not yet been re-dispatched).
+        ``{}``): re-dispatch while ``claim_count`` is within the configurable
+        budget (``SAQ_NODELESS_REDISPATCH_BUDGET``, default 2). Zero nodes have
+        executed, so every re-dispatch is safe; terminal-fail applies once the
+        budget is exhausted.
       * ``retry_policy`` present (non-empty) but WITHOUT ``"stall"`` in ``on``:
         terminal-fail — never re-dispatch a nodeless zombie for a trigger it does
         not cover.
@@ -3299,9 +3867,30 @@ def _should_redispatch_nodeless(row: Any) -> bool:
         # A non-empty policy that does not cover "stall" must NOT re-dispatch a
         # nodeless zombie — terminal-fail it.
         return False
-    # No stall retry policy (or no/empty policy): re-dispatch exactly once
-    # (only the un-re-redispatched claim).
-    return bool(row.claim_count <= 1)
+    # No stall retry policy (or no/empty policy): re-dispatch while within the
+    # configurable budget (SAQ_NODELESS_REDISPATCH_BUDGET, default 2 — FAR-509;
+    # claim_count is 1 for the un-re-dispatched initial claim). This bounds the
+    # successful-claim cycles, NOT the enqueue rate — the rate is throttled in
+    # the repair branch (one re-dispatch per nodeless window per run).
+    return bool(row.claim_count <= int(get_settings().saq_nodeless_redispatch_budget))
+
+
+def _is_nodeless_redispatch_throttled(row: Any, nodeless_window: int) -> bool:
+    """Re-dispatch throttle for the nodeless repair (FAR-509): True when the
+    run was (re-)dispatched within the last ``nodeless_window`` minutes.
+
+    Without this, a run that stays ``running`` + nodeless with budget to spare
+    would be re-enqueued on EVERY 60s tick (the fresh ``key_suffix`` defeats
+    SAQ dedupe) — one duplicate no-op job per tick for the whole degraded
+    window. ``dispatched_at`` is refreshed by every dispatch
+    (``_record_dispatched`` writes it before enqueue), so this bounds the
+    enqueue rate to at most ONE re-dispatch per nodeless window per run.
+    ``dispatched_at IS NULL`` (never dispatched) is never throttled.
+    """
+    dispatched_at = getattr(row, "dispatched_at", None)
+    if dispatched_at is None:
+        return False
+    return bool((datetime.now(UTC) - dispatched_at).total_seconds() <= nodeless_window * 60)
 
 
 async def _fail_nodeless_run(session: AsyncSession, run_id: uuid.UUID, org_id: uuid.UUID) -> None:
@@ -3711,6 +4300,16 @@ async def run_classification_reconcile() -> dict[str, int]:
 async def dispatcher_reconcile() -> dict[str, Any]:
     """System cron — re-dispatch runs whose SAQ job is missing (every 60s).
 
+    Drain note (FAR-402 P5 / design §10 O7): a run in ``unknown`` (adopted from
+    FAR-410, a NON-TERMINAL recovery status) holds a concurrency slot while its
+    outcome is indeterminate. It must be DETECTIBLE here — reconciled to a
+    terminal outcome via an operator re-run that reuses the persisted run-level
+    ``idempotency_key`` (never silently dropped, and never re-dispatched as a
+    fresh unit of work). ``unknown`` is intentionally absent from
+    ``ONGOING_ACTIVE_STATUSES`` so a stuck UNKNOWN does not trigger an ongoing
+    top-up. Retry/compensation runs compose with it by re-executing against the
+    same pinned snapshot and reusing the run-level idempotency key.
+
     Predicate (plan F3c + F6a): ``queue.job(run:{id})`` IS None AND staleness:
 
       * pending + dispatched_at IS NULL: capacity-deferred — matched on the
@@ -3743,9 +4342,16 @@ async def dispatcher_reconcile() -> dict[str, Any]:
       * running + ``dispatcher='saq'`` + FRESH heartbeat but zero node
         progress after SAQ_CLAIMED_NODELESS_MINUTES (node_token_usage/out-
         puts_json both NULL + no LangGraph checkpoint for the thread):
-        nodeless zombie - terminal-failed with ``executor_stalled``, NEVER
-        re-dispatched (a re-dispatch could double-execute a live-but-stuck
-        execute_run).
+        nodeless zombie — safe to re-dispatch (zero nodes executed, so
+        nothing can double-execute). Bounded by the retry budget
+        (``_should_redispatch_nodeless``: retry_policy or
+        SAQ_NODELESS_REDISPATCH_BUDGET), THROTTLED to at most one
+        re-dispatch per nodeless window per run
+        (``_is_nodeless_redispatch_throttled``), and CAPPED at
+        ``NODELESS_REDISPATCH_MAX_PER_TICK`` re-dispatches per tick
+        (fleet-wide, mirroring the B3 enqueue-failed cap — budget-exhausted
+        rows still terminal-fail when the cap is hit); terminal-failed with
+        ``executor_stalled`` once the budget is exhausted.
       * awaiting_human/claimed: ``dispatcher='saq'``, heartbeat stale by
         2*SAQ_JOB_HEARTBEAT, AND no SAQ job in Redis (F6a gated recovery — the
         no-job gate is applied per-row). A half-resumed run whose ``resume_run``
@@ -3844,7 +4450,12 @@ async def dispatcher_reconcile() -> dict[str, Any]:
             # The fresh heartbeat excludes it from the stale branch above
             # (that is the primary hang mechanism - a live heartbeat keeps
             # the run 'running' forever), so it gets its own predicate.
-            # Repaired by terminal-fail, NOT re-dispatch (see _fail_nodeless_run).
+            # Repaired by re-dispatch — budget-bounded (claim-cycle budget,
+            # terminal-fail on exhaustion) and rate-throttled to one
+            # re-dispatch per nodeless window per run (see
+            # _reconcile_nodeless_repair). The throttle is enforced ROW-level
+            # in the repair branch (a row can match multiple branches), so
+            # this predicate deliberately admits throttled rows.
             _nodeless_zombie_predicate(nodeless_window),
         )
         for org_id in org_ids:
@@ -3893,6 +4504,7 @@ def _dispatcher_summary() -> dict[str, Any]:
         "deduped": 0,
         "nodeless_failed": 0,
         "nodeless_redispatched": 0,
+        "nodeless_capped": 0,
         "claim_cap_terminalized": 0,
         "mid_graph_wedge_terminalized": 0,
         "age_terminalized": 0,
@@ -4304,40 +4916,93 @@ async def _reconcile_nodeless_repair(
     A nodeless zombie executed ZERO nodes (no checkpoint, no
     ``node_token_usage``, no ``outputs_json``), so re-dispatch is SAFE (no
     double-execution; these pipelines only create PRs after a node runs).
-    Re-dispatch it back to the queue (a fresh worker picks it up) instead of
-    terminal-failing, bounded by ``retry_policy`` / ``claim_count``. Only
-    terminal-fail when re-dispatch is NOT warranted (retry budget exhausted)
-    or the re-dispatch itself fails (fall back so the run is never left
-    dangling). Returns the (possibly updated) enqueue-failed counter when the
-    branch fully handled the row, ``None`` when the caller must proceed with
-    the normal repairs. Extracted from ``_reconcile_one_row`` (complexity
-    bound).
+    Four-way outcome (FAR-509):
+
+      * TERMINAL-FAIL — the retry budget is exhausted
+        (``_should_redispatch_nodeless`` False): terminal-fail exactly as
+        before, REGARDLESS of the throttle (waiting cannot help a run that can
+        no longer be re-dispatched). Checked FIRST, independent of the
+        throttle and of the per-tick cap (terminal-fail reduces load; it never
+        enqueues).
+      * THROTTLED — budget available but the run was (re-)dispatched within
+        the last ``nodeless_window`` minutes: skip silently this tick (no
+        enqueue, no terminal-fail). ``dispatched_at`` is refreshed by every
+        dispatch (``_record_dispatched`` writes it before enqueue), so this
+        bounds the enqueue rate to at most one re-dispatch per nodeless window
+        per run — without it, a healthy re-claimed run executing its first
+        long node (no checkpoint yet) would collect one duplicate no-op job
+        per 60s tick.
+      * CAPPED — budget available, window elapsed, but this tick has already
+        re-dispatched ``NODELESS_REDISPATCH_MAX_PER_TICK`` nodeless zombies
+        (per-tick fleet cap, mirroring the B3 enqueue-failed cap): skip — no
+        enqueue, no terminal-fail; the row stays running and becomes eligible
+        again next tick (budget and throttle are unaffected). Counted
+        ``nodeless_capped``; the warning logs once per tick.
+      * RE-DISPATCH — budget available, the throttle window elapsed, and
+        under the per-tick cap: enqueue a fresh ``execute_run`` (a new worker
+        claims it).
+
+    A re-dispatch that itself fails falls back to terminal-fail so the run is
+    never left dangling. Returns the (possibly updated) enqueue-failed counter
+    when the branch fully handled the row, ``None`` when the caller must
+    proceed with the normal repairs. Extracted from ``_reconcile_one_row``
+    (complexity bound).
     """
     if not _is_nodeless_zombie_row(row, nodeless_window):
         return None
-    if _should_redispatch_nodeless(row):
-        job_type = _reconcile_job_type(row.status)
-        key_suffix = uuid.uuid4().hex
-        await _redispatch_nodeless(
-            session,
-            q,
-            org_id,
-            row,
-            job_type,
-            key_suffix,
-            summary,
-            terminalized_run_ids,
+    if not _should_redispatch_nodeless(row):
+        # Budget exhausted (retry budget exhausted / policy excludes 'stall'):
+        # terminal-fail exactly as before — even when throttled, since waiting
+        # cannot help a run that can no longer be re-dispatched.
+        summary["nodeless_failed"] += 1
+        await _fail_nodeless_run(session, row.id, org_id)
+        # FAR-162 (P6'): the nodeless terminalizer writes a raw
+        # ORM UPDATE (never finalize_cost) — add the run so its
+        # compensating daily fact is recorded once the per-org
+        # transaction commits, like the other terminalizers.
+        terminalized_run_ids.append((row.id, org_id))
+        return enqueue_failed_redispatched
+    if _is_nodeless_redispatch_throttled(row, nodeless_window):
+        # Throttle (FAR-509): the run was (re-)dispatched within the last
+        # nodeless window — skip silently this tick (no duplicate enqueue, no
+        # terminal-fail). dispatched_at advances on every dispatch, so the
+        # next re-dispatch happens at the earliest one window later.
+        summary["skipped"] += 1
+        _log.info(
+            "dispatcher_reconcile: nodeless re-dispatch throttled for run %s (dispatched within the nodeless window)",
+            row.id,
         )
         return enqueue_failed_redispatched
-    # Re-dispatch not warranted (retry budget exhausted / policy excludes
-    # 'stall'): terminal-fail exactly as before.
-    summary["nodeless_failed"] += 1
-    await _fail_nodeless_run(session, row.id, org_id)
-    # FAR-162 (P6'): the nodeless terminalizer writes a raw
-    # ORM UPDATE (never finalize_cost) — add the run so its
-    # compensating daily fact is recorded once the per-org
-    # transaction commits, like the other terminalizers.
-    terminalized_run_ids.append((row.id, org_id))
+    if summary["nodeless_redispatched"] >= NODELESS_REDISPATCH_MAX_PER_TICK:
+        # Per-tick fleet cap (mirrors ENQUEUE_FAILED_REDISPATCH_MAX_PER_TICK):
+        # after a mass worker wedge every aged zombie becomes throttle-eligible
+        # in the SAME tick — defer the overflow to later ticks. No enqueue, no
+        # terminal-fail: the row stays running and becomes eligible again next
+        # tick (budget and throttle are unaffected). Budget-exhausted rows
+        # never reach this branch — the budget check above already
+        # terminal-failed them. The warning logs once per tick (first capped
+        # row), not once per row.
+        first_capped = summary["nodeless_capped"] == 0
+        summary["nodeless_capped"] += 1
+        if first_capped:
+            _log.warning(
+                "dispatcher_reconcile: nodeless re-dispatch cap hit (%d/tick); deferring run %s to a later tick",
+                NODELESS_REDISPATCH_MAX_PER_TICK,
+                row.id,
+            )
+        return enqueue_failed_redispatched
+    job_type = _reconcile_job_type(row.status)
+    key_suffix = uuid.uuid4().hex
+    await _redispatch_nodeless(
+        session,
+        q,
+        org_id,
+        row,
+        job_type,
+        key_suffix,
+        summary,
+        terminalized_run_ids,
+    )
     return enqueue_failed_redispatched
 
 

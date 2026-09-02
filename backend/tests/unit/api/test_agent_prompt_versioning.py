@@ -32,6 +32,15 @@ def _make_settings() -> Settings:
     )
 
 
+@pytest.fixture(autouse=True)
+def _stub_get_agent() -> Generator[None, None, None]:
+    """The IDOR ownership check in the prompt-version routes reads the agent via
+    ``get_agent`` before the write CRUD. Supply a same-org agent so the ownership
+    check passes for the legitimate (same-org) principal these tests use."""
+    with patch("modulo.api.routes.agents.get_agent", return_value=_make_agent()):
+        yield
+
+
 def _make_agent(history: list | None = None) -> MagicMock:
     a = MagicMock()
     a.id = _AGENT_ID
@@ -161,6 +170,7 @@ class TestGetPromptVersion:
     def test_get_version_found(self, client: TestClient) -> None:
         agent = _make_agent()
         with (
+            patch("modulo.api.routes.agents.get_agent", return_value=agent),
             patch("modulo.api.routes.agents.get_prompt_version", return_value=agent.prompt_version_history[0]),
             patch("modulo.api.routes.agents.set_rls_org"),
         ):
@@ -171,7 +181,9 @@ class TestGetPromptVersion:
         assert data["template"] == "original prompt v1"
 
     def test_get_version_not_found(self, client: TestClient) -> None:
+        agent = _make_agent()
         with (
+            patch("modulo.api.routes.agents.get_agent", return_value=agent),
             patch("modulo.api.routes.agents.get_prompt_version", return_value=None),
             patch("modulo.api.routes.agents.set_rls_org"),
         ):
@@ -189,6 +201,7 @@ class TestGetPromptVersion:
             "eval_result_ids": [],
         }
         with (
+            patch("modulo.api.routes.agents.get_agent", return_value=agent),
             patch("modulo.api.routes.agents.get_prompt_version", return_value=current_entry),
             patch("modulo.api.routes.agents.set_rls_org"),
         ):

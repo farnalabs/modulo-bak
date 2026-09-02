@@ -141,7 +141,7 @@ class AgentResponse(BaseModel):
     library_id: uuid.UUID | None
     prompt_always_visible: bool
     required_environment_capabilities: list[str]
-    template_id: str | None
+    template_id: uuid.UUID | None
     agent_command: str | None
     agent_commands: list[str] | None
     created_by: uuid.UUID = Field(validation_alias="account_id")
@@ -299,6 +299,8 @@ async def list_agents_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error listing agents")
         raise HTTPException(
@@ -374,6 +376,8 @@ async def create_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error creating agent")
         raise HTTPException(
@@ -406,13 +410,15 @@ async def get_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error getting agent")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_UNEXPECTED_ERROR_OCCURRED_PLEASE,
         ) from None
-    if agent is None:
+    if agent is None or agent.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_AGENT_NOT_FOUND)
     return AgentResponse.model_validate(agent)
 
@@ -429,6 +435,8 @@ async def update_agent_endpoint(
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             agent = await get_agent(session, agent_id)
+            if agent is None or agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     except ProgrammingError:
         _log.exception(_CODE_AGENTS_UPDATE_AGENT_ENDPOINT)
         raise HTTPException(
@@ -441,6 +449,8 @@ async def update_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error updating agent")
         raise HTTPException(
@@ -532,7 +542,7 @@ async def optimize_prompt(
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
 
-    if agent is None:
+    if agent is None or agent.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_AGENT_NOT_FOUND)
 
     source_template = _resolve_prompt_template(agent, version)
@@ -629,6 +639,8 @@ async def optimize_prompt(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Prompt optimization failed: LLM call failed after retries",
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error during prompt optimization")
         raise HTTPException(
@@ -659,6 +671,9 @@ async def apply_optimized_prompt(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             agent = await add_prompt_version(
                 session,
                 agent_id,
@@ -686,6 +701,8 @@ async def apply_optimized_prompt(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error applying optimized prompt")
         raise HTTPException(
@@ -720,13 +737,15 @@ async def list_prompt_versions(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error listing prompt versions")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_UNEXPECTED_ERROR_OCCURRED_PLEASE,
         ) from None
-    if agent is None:
+    if agent is None or agent.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_AGENT_NOT_FOUND)
 
     history = list(agent.prompt_version_history or [])
@@ -753,6 +772,9 @@ async def get_prompt_version_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            agent = await get_agent(session, agent_id)
+            if agent is None or agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_AGENT_NOT_FOUND)
             entry = await get_prompt_version(session, agent_id, version)
     except ProgrammingError:
         _log.exception("agents.get_prompt_version_endpoint")
@@ -766,6 +788,8 @@ async def get_prompt_version_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error getting prompt version")
         raise HTTPException(
@@ -795,6 +819,9 @@ async def rollback_prompt(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             agent = await rollback_prompt_version(session, agent_id, version)
     except IntegrityError:
         _log.exception("agents.rollback_prompt")
@@ -814,6 +841,8 @@ async def rollback_prompt(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error rolling back prompt")
         raise HTTPException(
@@ -855,13 +884,15 @@ async def diff_prompt_versions(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error diffing prompt versions")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=_MSG_UNEXPECTED_ERROR_OCCURRED_PLEASE,
         ) from None
-    if agent is None:
+    if agent is None or agent.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_AGENT_NOT_FOUND)
 
     template_a = _resolve_prompt_template(agent, req.version_a)
@@ -904,6 +935,9 @@ async def delete_agent_endpoint(
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            existing_agent = await get_agent(session, agent_id)
+            if existing_agent is None or existing_agent.organisation_id != principal.organisation_id:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
             deleted = await delete_agent(session, agent_id)
     except IntegrityError:
         _log.exception("agents.delete_agent_endpoint")
@@ -923,6 +957,8 @@ async def delete_agent_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=_MSG_DATABASE_OPERATION_FAILED_PLEASE,
         ) from None
+    except HTTPException:
+        raise
     except Exception:
         _log.exception("Unexpected error deleting agent")
         raise HTTPException(

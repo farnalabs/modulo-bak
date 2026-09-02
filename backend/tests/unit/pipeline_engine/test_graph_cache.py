@@ -12,14 +12,21 @@ from modulo.core.pipeline_engine.graph_cache import (
     _MAX_SIZE,
     _make_gate_kickback_router,
     build_graph_from_json,
+    compute_eval_defs_hash,
     evict,
     get_or_compile,
+    struct_hash_with_eval_defs,
 )
 
 
 @pytest.fixture(autouse=True)
 def _auto_clear_cache() -> None:
     _CACHE.clear()
+
+
+def _k(pid: uuid.UUID, sid: uuid.UUID, timeout: int, h: str = "") -> tuple:
+    """Build a cache key tuple (matches graph_cache.CacheKey arity)."""
+    return (pid, sid, timeout, h)
 
 
 # ---------------------------------------------------------------------------
@@ -59,10 +66,10 @@ def test_get_or_compile_different_pipeline_calls_factory():
 def test_evict_removes_entry():
     pid, sid = uuid.uuid4(), uuid.uuid4()
     get_or_compile(pid, sid, lambda: "cached")
-    assert (pid, sid, 300) in _CACHE
+    assert _k(pid, sid, 300) in _CACHE
 
     evict(pid, sid)
-    assert (pid, sid, 300) not in _CACHE
+    assert _k(pid, sid, 300) not in _CACHE
 
 
 def test_cache_evicts_oldest_when_full():
@@ -76,7 +83,7 @@ def test_cache_evicts_oldest_when_full():
     extra_pid = uuid.uuid4()
     get_or_compile(extra_pid, base_sid, lambda: "new")
     assert first_key not in _CACHE
-    assert (extra_pid, base_sid, 300) in _CACHE
+    assert _k(extra_pid, base_sid, 300) in _CACHE
 
 
 def test_evict_does_not_affect_other_pipelines():
@@ -85,8 +92,8 @@ def test_evict_does_not_affect_other_pipelines():
     get_or_compile(pid2, sid, lambda: "2")
 
     evict(pid1, sid)
-    assert (pid1, sid, 300) not in _CACHE
-    assert (pid2, sid, 300) in _CACHE
+    assert _k(pid1, sid, 300) not in _CACHE
+    assert _k(pid2, sid, 300) in _CACHE
 
 
 def test_lru_moves_entry_on_access():
@@ -96,7 +103,7 @@ def test_lru_moves_entry_on_access():
         get_or_compile(k, sid, lambda: "v")
     # Access the first key, making it recently used
     get_or_compile(keys[0], sid, lambda: "v")
-    assert next(iter(_CACHE)) == (keys[1], sid, 300)
+    assert next(iter(_CACHE)) == _k(keys[1], sid, 300)
 
 
 def test_get_or_compile_distinguishes_node_timeout_values():
@@ -126,12 +133,55 @@ def test_evict_removes_all_node_timeout_variants():
     pid, sid = uuid.uuid4(), uuid.uuid4()
     get_or_compile(pid, sid, lambda: "a", pipeline_node_timeout_seconds=100)
     get_or_compile(pid, sid, lambda: "b", pipeline_node_timeout_seconds=200)
-    assert (pid, sid, 100) in _CACHE
-    assert (pid, sid, 200) in _CACHE
+    assert _k(pid, sid, 100) in _CACHE
+    assert _k(pid, sid, 200) in _CACHE
 
     evict(pid, sid)
-    assert (pid, sid, 100) not in _CACHE
-    assert (pid, sid, 200) not in _CACHE
+    assert _k(pid, sid, 100) not in _CACHE
+    assert _k(pid, sid, 200) not in _CACHE
+
+
+def test_port_topology_hash_forces_recompile():
+    """FAR-416 / F1: a distinct port topology must recompile, not serve a stale graph."""
+    from modulo.core.pipeline_engine.port_resolver import compute_port_topology_hash
+
+    pid, sid = uuid.uuid4(), uuid.uuid4()
+    calls: list[str] = []
+
+    base_graph = {
+        "nodes": [
+            {"id": "a", "node_type": "agent", "outputs": [{"port": "out"}]},
+            {"id": "b", "node_type": "agent", "inputs": [{"port": "in"}]},
+        ],
+        "edges": [{"source": "a", "target": "b", "type": "normal"}],
+    }
+    mutated_graph = {
+        "nodes": [
+            {"id": "a", "node_type": "agent", "outputs": [{"port": "out"}]},
+            {"id": "b", "node_type": "agent", "inputs": [{"port": "different"}]},
+        ],
+        "edges": [{"source": "a", "target": "b", "type": "normal"}],
+    }
+    h1 = compute_port_topology_hash(base_graph)
+    h2 = compute_port_topology_hash(mutated_graph)
+    assert h1 != h2
+
+    def factory_for(h: str) -> Callable[[], str]:
+        def factory() -> str:
+            calls.append(h)
+            return f"compiled-{h}"
+
+        return factory
+
+    first = get_or_compile(pid, sid, factory_for(h1), graph_struct_hash=h1)
+    second = get_or_compile(pid, sid, factory_for(h2), graph_struct_hash=h2)
+    cached = get_or_compile(pid, sid, factory_for(h1), graph_struct_hash=h1)
+
+    assert first == f"compiled-{h1}"
+    assert second == f"compiled-{h2}"
+    assert cached == f"compiled-{h1}"
+    # Recompiled once for the new port topology; original hash served from cache.
+    assert calls == [h1, h2]
 
 
 # ---------------------------------------------------------------------------
@@ -709,3 +759,86 @@ def test_gate_with_reject_edge_type_compiles():
     }
     compiled = build_graph_from_json(graph)
     assert compiled is not None
+
+
+# ---------------------------------------------------------------------------
+# FAR-502: eval-defs cache-key folding (replay/resume eval staleness)
+# ---------------------------------------------------------------------------
+
+
+def _eval_def(
+    config: dict[str, Any] | None = None,
+    eval_id: uuid.UUID | None = None,
+    org_id: uuid.UUID | None = None,
+    pipeline_id: uuid.UUID | None = None,
+) -> Any:
+    from modulo.core.eval_engine import EvalDefinition, EvalType
+
+    return EvalDefinition(
+        id=eval_id or uuid.uuid4(),
+        org_id=org_id or uuid.uuid4(),
+        pipeline_id=pipeline_id or uuid.uuid4(),
+        node_id="A",
+        name="gate-eval",
+        eval_type=EvalType.REGEX,
+        config=config or {"pattern": "v1"},
+        failure_behaviour="warn",
+        version=1,
+    )
+
+
+def test_compute_eval_defs_hash_stable_and_sensitive():
+    shared_org, shared_pipeline, shared_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    e1 = _eval_def(eval_id=shared_id, org_id=shared_org, pipeline_id=shared_pipeline)
+    # Same content -> same hash (deterministic).
+    assert compute_eval_defs_hash({"A": [e1]}) == compute_eval_defs_hash({"A": [e1]})
+    # created_at is excluded: the DTO stamps datetime.now() on every load, so
+    # two loads of identical eval rows must hash identically.
+    e1_reloaded = _eval_def(config=dict(e1.config), eval_id=shared_id, org_id=shared_org, pipeline_id=shared_pipeline)
+    assert compute_eval_defs_hash({"A": [e1]}) == compute_eval_defs_hash({"A": [e1_reloaded]})
+    # A content change -> different hash.
+    e2 = _eval_def(config={"pattern": "v2"}, eval_id=shared_id, org_id=shared_org, pipeline_id=shared_pipeline)
+    assert compute_eval_defs_hash({"A": [e1]}) != compute_eval_defs_hash({"A": [e2]})
+    # Per-node list order (DB return order) does not affect the hash.
+    assert compute_eval_defs_hash({"A": [e1, e2]}) == compute_eval_defs_hash({"A": [e2, e1]})
+    # No eval defs -> empty hash (call site leaves the struct hash unchanged).
+    assert not compute_eval_defs_hash(None)
+    assert not compute_eval_defs_hash({})
+
+
+def test_struct_hash_with_eval_defs_folds_and_preserves_base():
+    base = "topo-hash"
+    shared_org, shared_pipeline, shared_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    defs = {"A": [_eval_def(eval_id=shared_id, org_id=shared_org, pipeline_id=shared_pipeline)]}
+    folded = struct_hash_with_eval_defs(base, defs)
+    assert folded != base
+    assert folded.startswith(f"{base}:")
+    # No eval defs -> unchanged base hash (graphs without evals share a key).
+    assert struct_hash_with_eval_defs(base, None) == base
+    assert struct_hash_with_eval_defs(base, {}) == base
+    # Changed eval definitions change the folded hash.
+    changed = struct_hash_with_eval_defs(
+        base,
+        {"A": [_eval_def(config={"pattern": "v2"}, eval_id=shared_id, org_id=shared_org, pipeline_id=shared_pipeline)]},
+    )
+    assert changed != folded
+
+
+def test_get_or_compile_recompiles_when_eval_defs_change():
+    """FAR-502 core mechanism: same (pipeline, snapshot, timeout) with CHANGED
+    eval definitions folded into struct_hash -> cache miss -> recompile, while
+    unchanged eval definitions keep hitting the cached graph."""
+    pid, sid = uuid.uuid4(), uuid.uuid4()
+    e1 = _eval_def(config={"pattern": "v1"})
+    e2 = _eval_def(config={"pattern": "v2"})
+    h1 = struct_hash_with_eval_defs("topo", {"A": [e1]})
+    h2 = struct_hash_with_eval_defs("topo", {"A": [e2]})
+    assert h1 != h2
+
+    compiled1 = get_or_compile(pid, sid, lambda: "graph-e1", graph_struct_hash=h1)
+    # Replay with CHANGED eval defs: different key -> fresh compile with E2.
+    compiled2 = get_or_compile(pid, sid, lambda: "graph-e2", graph_struct_hash=h2)
+    assert compiled2 == "graph-e2"
+    assert compiled2 != compiled1
+    # Replay with UNCHANGED eval defs: same key -> cached graph.
+    assert get_or_compile(pid, sid, lambda: "should-not-run", graph_struct_hash=h1) is compiled1

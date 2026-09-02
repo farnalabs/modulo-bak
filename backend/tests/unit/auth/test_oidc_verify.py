@@ -12,6 +12,7 @@ import pytest
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo.auth.oidc_verify import (
     OidcVerifyError,
@@ -500,10 +501,139 @@ class TestEdgeCases:
         clear_jwks_cache()
         assert not _jwks_cache
 
+    def test_cache_expires_after_ttl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import time
+
+        import modulo.auth.oidc_verify as oidc_verify
+
+        oidc_verify._cache_set("https://example.com/jwks", [{"kty": "RSA"}])
+        future = time.time() + oidc_verify._JWKS_CACHE_TTL + 1
+
+        monkeypatch.setattr(time, "time", lambda: future)
+
+        assert oidc_verify._cache_get("https://example.com/jwks") is None
+        assert "https://example.com/jwks" not in oidc_verify._jwks_cache
+
+    async def test_fails_on_discovery_http_error(self) -> None:
+        mock_client = _make_httpx_mock({_DISCOVERY_URL: _make_resp(500)})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="Failed to fetch discovery document"):
+                await verify_id_token_with_discovery("token", _DISCOVERY_URL, "cid")
+
+    async def test_fails_on_non_dict_discovery(self) -> None:
+        resp = _make_resp(json_data=["not", "a", "dict"])
+        mock_client = _make_httpx_mock({_DISCOVERY_URL: resp})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="not a JSON object"):
+                await verify_id_token_with_discovery("token", _DISCOVERY_URL, "cid")
+
+    async def test_fails_on_jwks_http_error(self) -> None:
+        mock_client = _make_httpx_mock({_JWKS_URI: _make_resp(500)})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="Failed to fetch JWKS"):
+                await verify_id_token(_ID_TOKEN, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+    async def test_fails_on_non_dict_jwks(self) -> None:
+        resp = _make_resp(json_data=["keys"])
+        mock_client = _make_httpx_mock({_JWKS_URI: resp})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="not a JSON object"):
+                await verify_id_token(_ID_TOKEN, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+    async def test_unsupported_alg_rejected(self) -> None:
+        now = int(datetime.now(UTC).timestamp())
+        payload = {"sub": "u", "iss": _ISSUER, "aud": _CLIENT_ID, "iat": now, "exp": now + 3600}
+
+        def _b64(data: bytes) -> str:
+            return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+        header = _b64(json.dumps({"alg": "none", "typ": "JWT"}).encode())
+        body = _b64(json.dumps(payload).encode())
+        token = f"{header}.{body}."
+
+        mock_client = _make_httpx_mock({_JWKS_URI: _make_resp(json_data={"keys": []})})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="Unsupported JWT algorithm"):
+                await verify_id_token(token, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+    async def test_fails_on_unparseable_header(self) -> None:
+        # First segment decodes to something that is not a JSON object.
+        malformed_header = base64.urlsafe_b64encode(b"not-json!").rstrip(b"=").decode()
+        token = f"{malformed_header}.cGF5bG9hZA.s2lnbmF0dXJl"
+
+        with pytest.raises(OidcVerifyError, match="Failed to decode JWT header"):
+            await verify_id_token(token, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+    async def test_fails_to_build_key_from_malformed_jwk(
+        self,
+        keypair: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey],
+    ) -> None:
+        private_key, _ = keypair
+        id_token = _create_id_token(private_key)
+        # An unknown ``alg`` makes PyJWK key construction fail.
+        bad_jwk = {"kty": "RSA", "kid": "test-key-1", "alg": "NOTREAL"}
+        resp = _make_resp(json_data={"keys": [bad_jwk]})
+        mock_client = _make_httpx_mock({_JWKS_URI: resp})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError, match="Failed to construct key from JWK"):
+                await verify_id_token(id_token, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+    async def test_kidless_token_falls_back_to_first_key(
+        self,
+        keypair: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey],
+    ) -> None:
+        # Providers may omit `kid`; then the first key in the set must be used.
+        private_key, _ = keypair
+        now = datetime.now(UTC)
+        token = pyjwt.encode(
+            {"sub": "kidless", "iss": _ISSUER, "aud": _CLIENT_ID, "iat": now, "exp": now + timedelta(hours=1)},
+            private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            ),
+            algorithm="RS256",
+        )
+        jwks_resp = _make_resp(json_data={"keys": [_pubkey_to_jwk(keypair[1])]})
+        mock_client = _make_httpx_mock({_JWKS_URI: jwks_resp})
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            claims = await verify_id_token(token, _JWKS_URI, _CLIENT_ID, _ISSUER)
+
+        assert claims["sub"] == "kidless"
+
 
 # ---------------------------------------------------------------------------
 # Integration with sso.py callback flow
 # ---------------------------------------------------------------------------
+
+
+def _mock_session() -> AsyncMock:
+    """Build an AsyncMock session whose DB lookups return ``None`` (no provider).
+
+    These tests exercise the OIDC verification flow with env-var providers, so
+    the DB provider resolution intentionally returns nothing (system role
+    unprovisioned -> app single-org fallback finds nothing -> env path).
+    """
+    session = AsyncMock(spec=AsyncSession)
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    result.scalars.return_value.all.return_value = []
+    session.execute.return_value = result
+    return session
 
 
 class TestOidcCallbackIntegration:
@@ -534,7 +664,7 @@ class TestOidcCallbackIntegration:
             ),
         )
 
-        session = AsyncMock()
+        session = _mock_session()
         signed = sign_state("testprovider:test-state", settings.secret_key)
 
         discovery_doc = _discovery_doc()
@@ -560,6 +690,7 @@ class TestOidcCallbackIntegration:
                 "auth-code",
                 signed,
                 settings,
+                None,
                 session,
                 "http://localhost/callback",
             )
@@ -593,7 +724,7 @@ class TestOidcCallbackIntegration:
             ),
         )
 
-        session = AsyncMock()
+        session = _mock_session()
         signed = sign_state("testprovider:state", settings.secret_key)
 
         discovery_doc = _discovery_doc()
@@ -618,6 +749,7 @@ class TestOidcCallbackIntegration:
                     "auth-code",
                     signed,
                     settings,
+                    None,
                     session,
                     "http://localhost/callback",
                 )
@@ -642,7 +774,7 @@ class TestOidcCallbackIntegration:
             ),
         )
 
-        session = AsyncMock()
+        session = _mock_session()
         signed = sign_state("testprovider:test-state", settings.secret_key)
 
         mock_client = AsyncMock()
@@ -657,6 +789,7 @@ class TestOidcCallbackIntegration:
                     "auth-code",
                     signed,
                     settings,
+                    None,
                     session,
                     "http://localhost/callback",
                 )
@@ -681,7 +814,7 @@ class TestOidcCallbackIntegration:
             ),
         )
 
-        session = AsyncMock()
+        session = _mock_session()
         signed = sign_state("testprovider:test-state", settings.secret_key)
 
         disc_resp = _make_resp(json_data=_discovery_doc())
@@ -699,6 +832,7 @@ class TestOidcCallbackIntegration:
                     "auth-code",
                     signed,
                     settings,
+                    None,
                     session,
                     "http://localhost/callback",
                 )
@@ -723,7 +857,7 @@ class TestOidcCallbackIntegration:
             ),
         )
 
-        session = AsyncMock()
+        session = _mock_session()
         signed = sign_state("testprovider:test-state", settings.secret_key)
 
         disc_resp = _make_resp(json_data=_discovery_doc())
@@ -753,6 +887,104 @@ class TestOidcCallbackIntegration:
                     "auth-code",
                     signed,
                     settings,
+                    None,
                     session,
                     "http://localhost/callback",
                 )
+
+
+# ---------------------------------------------------------------------------
+# FAR-506: derived endpoint host allowlist (SSRF + client_secret protection)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedJwksHostAllowlist:
+    """A remote discovery document must NOT be able to point ``jwks_uri`` at an
+    internal/cloud-metadata host (SSRF), but a legitimate multi-host IdP (e.g.
+    Google's ``www.googleapis.com``) IS allowed. The pinned client is the real
+    SSRF boundary; the exact-host allowlist is now a preferred-log nicety
+    (FAR-506)."""
+
+    @pytest.mark.parametrize(
+        "jwks_uri",
+        [
+            "http://169.254.169.254/latest/meta-data/keys",  # cloud-metadata, non-HTTPS
+            "http://127.0.0.1/jwks",  # loopback, non-HTTPS
+            "https://10.0.0.5/jwks",  # private RFC1918, HTTPS
+        ],
+    )
+    async def test_rejects_internal_jwks_uri_without_fetch(self, jwks_uri: str) -> None:
+        disc_resp = _make_resp(json_data={"issuer": _ISSUER, "jwks_uri": jwks_uri})
+        mock_client = AsyncMock()
+        calls: list[str] = []
+
+        async def _get(url: str, **kwargs: object) -> MagicMock:
+            calls.append(url)
+            if url == _DISCOVERY_URL:
+                return disc_resp
+            return _make_resp(404)
+
+        mock_client.get = _get
+        mock_client.post = AsyncMock()
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            with pytest.raises(OidcVerifyError):
+                await verify_id_token_with_discovery("token", _DISCOVERY_URL, _CLIENT_ID)
+
+        # Only the discovery document was fetched; the disallowed jwks_uri was
+        # rejected before any request, so no fetch to a hostile host occurred.
+        assert calls == [_DISCOVERY_URL]
+
+    async def test_accepts_cross_host_sibling_jwks_uri(self) -> None:
+        """A sibling-host ``jwks_uri`` (Google returns its JWKS on
+        www.googleapis.com rather than the accounts.google.com discovery host)
+        is NEWLY allowed: the flow proceeds past the host check to the JWKS fetch
+        instead of being rejected before any attempt."""
+        jwks_uri_sibling = "https://www.googleapis.com/oauth2/v3/certs"
+        disc_resp = _make_resp(json_data={"issuer": "https://accounts.google.com", "jwks_uri": jwks_uri_sibling})
+        mock_client = AsyncMock()
+        fetched: list[str] = []
+
+        async def _get(url: str, **kwargs: object) -> MagicMock:
+            if url == _DISCOVERY_URL:
+                return disc_resp
+            fetched.append(url)
+            return _make_resp(json_data={"keys": []})  # reaches the JWKS fetch
+
+        mock_client.get = _get
+        mock_client.post = AsyncMock()
+
+        # A well-formed JWT with a valid header so signature verification reaches
+        # the JWKS fetch (rather than failing earlier on header decoding).
+        header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(b'{"sub":"u"}').rstrip(b"=").decode()
+        token = f"{header}.{payload}.c2ln"
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            # No OIDC-provider-host-allowlist error. The flow proceeds; here the
+            # returned (empty) JWKS produces a DIFFERENT, post-fetch error.
+            with pytest.raises(OidcVerifyError, match="No keys"):
+                await verify_id_token_with_discovery(token, _DISCOVERY_URL, _CLIENT_ID)
+
+        assert fetched == [jwks_uri_sibling]
+
+    async def test_same_host_jwks_uri_accepted(
+        self,
+        keypair: tuple[rsa.RSAPrivateKey, rsa.RSAPublicKey],
+        jwks_resp: MagicMock,
+    ) -> None:
+        """The legit same-host path (discovery, jwks and issuer all on the
+        configured issuer host) still verifies end to end."""
+        private_key, _ = keypair
+        id_token = _create_id_token(private_key)
+        mock_client = _make_httpx_mock(
+            {_DISCOVERY_URL: _make_resp(json_data=_discovery_doc()), _JWKS_URI: jwks_resp},
+        )
+
+        with patch("httpx.AsyncClient") as cls:
+            cls.return_value.__aenter__.return_value = mock_client
+            claims = await verify_id_token_with_discovery(id_token, _DISCOVERY_URL, _CLIENT_ID)
+
+        assert claims["sub"] == "user123"

@@ -5,6 +5,21 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+# FAR-458 connector-write idempotency gate: the per-op ``on_unknown`` policy
+# modes and their default — the SINGLE source of truth for the mode set. Both
+# consumers import from here so the set can never drift between the REST
+# connector's config validation and the pipeline engine's gate read:
+#   - ``modulo.connectors.rest`` validates the connector's ``on_unknown`` config
+#     value against :data:`ON_UNKNOWN_MODES` and defaults to
+#     :data:`DEFAULT_ON_UNKNOWN` when absent.
+#   - ``modulo.core.pipeline_engine.node_runner`` coerces a connector's
+#     ``on_unknown_for`` read to :data:`DEFAULT_ON_UNKNOWN` for any value
+#     outside :data:`ON_UNKNOWN_MODES`.
+# This module is a stdlib-only leaf, so importing it from either side cannot
+# create a cycle.
+ON_UNKNOWN_MODES = ("fail_open", "fail_closed", "off")
+DEFAULT_ON_UNKNOWN = "fail_open"
+
 
 class Capability(StrEnum):
     """Operations a connector can perform."""
@@ -437,6 +452,15 @@ class HealthResult:
     detail: str = ""
 
 
+def health_check_failure(exc: Exception) -> HealthResult:
+    """Degrade a failed connector health check into a not-ok result.
+
+    Centralises the truncation policy applied to the error detail so every
+    connector reports a consistent, bounded failure message.
+    """
+    return HealthResult(ok=False, detail=str(exc)[:200])
+
+
 class CIRunStatus(StrEnum):
     PENDING = "pending"
     QUEUED = "queued"
@@ -489,6 +513,27 @@ class ConnectorBase(ABC):
     @abstractmethod
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         """Write data to the external tool. Returns the created/updated resource."""
+
+    def on_unknown_for(self, resource: str) -> str:
+        """Effective ``on_unknown`` mode for a connector write to *resource*
+        (FAR-458).
+
+        Governs the FAR-458 connector-write idempotency gate's AMBIGUOUS-case
+        decision (couldn't-confirm-delivery). Three values, validated at
+        config-parse time:
+
+        - ``"fail_open"`` (default): on ambiguity the gate does NOT suppress —
+          the write fires (possible duplicate, usually recoverable).
+        - ``"fail_closed"``: on ambiguity the gate SUPPRESSES — the write does
+          not fire (possible silent miss; the operator reconciles).
+        - ``"off"``: the write is never deduped (gate bypassed entirely).
+
+        A CONFIRMED-delivered write (``delivery_done is True`` + matching key)
+        is suppressed in every mode except ``off`` — that is the point of dedup.
+        The default implements the fail-open contract of every other gate
+        failure mode here; connectors override to declare a per-op policy.
+        """
+        return DEFAULT_ON_UNKNOWN
 
     async def compensate(
         self,

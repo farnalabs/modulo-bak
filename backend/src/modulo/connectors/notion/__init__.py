@@ -14,7 +14,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _NOTION_API = "https://api.notion.com/v1"
 _NOTION_VERSION = "2022-06-28"
@@ -55,7 +57,8 @@ class NotionConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        return pinned_async_client_sync(
+            _NOTION_API,
             base_url=_NOTION_API,
             headers=self._headers(),
             timeout=30,
@@ -83,7 +86,7 @@ class NotionConnector(ConnectorBase):
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Notion API connection error")
         except ValueError as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as client:

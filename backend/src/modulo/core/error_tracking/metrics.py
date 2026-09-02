@@ -31,6 +31,11 @@ _runs_oldest_running_gauge: Any = None
 _runs_stall_reason_total: Any = None
 _runs_claim_count_histogram: Any = None
 
+# FAR-410 UNKNOWN-rate instrument — a connector write cancelled mid-send whose
+# upstream side-effect state is unknowable. Distinct from generic failure so it
+# is observable independently.
+_connector_unknown_total: Any = None
+
 
 def _get_meter() -> Any:
     try:
@@ -88,16 +93,52 @@ def _runtime_instruments() -> list[tuple[str, str, str]]:
     ]
 
 
-def init_runtime_metrics() -> None:
-    """Register the run-runtime liveness instruments once (idempotent)."""
-    global _runs_running_gauge, _runs_oldest_running_gauge, _runs_stall_reason_total, _runs_claim_count_histogram
+# Maps each run-runtime instrument name to the module global that holds its handle.
+_RUNTIME_INSTRUMENT_GLOBALS: dict[str, str] = {
+    "runs_running_count": "_runs_running_gauge",
+    "runs_oldest_running_age_seconds": "_runs_oldest_running_gauge",
+    "runs_stall_reason_total": "_runs_stall_reason_total",
+    "runs_claim_count_histogram": "_runs_claim_count_histogram",
+    "runs_claim_count_total": "_runs_claim_count_histogram",
+}
 
-    if (
+
+def _runtime_metrics_registered() -> bool:
+    """True once every run-runtime instrument handle has been initialised."""
+    return (
         _runs_running_gauge is not None
         and _runs_oldest_running_gauge is not None
         and _runs_stall_reason_total is not None
         and _runs_claim_count_histogram is not None
-    ):
+    )
+
+
+def _create_runtime_instrument(meter: Any, kind: str, name: str, description: str) -> Any | None:
+    """Create a single run-runtime instrument, swallowing SDK incompatibilities.
+
+    Returns the instrument handle, or ``None`` when the OTel SDK cannot provide
+    it (unsupported API or other failure) so the remaining instruments still
+    register.
+    """
+    try:
+        if kind == "gauge":
+            return meter.create_gauge(name=name, description=description, unit="1")
+        if kind == "counter":
+            return meter.create_counter(name=name, description=description, unit="1")
+        return meter.create_histogram(name=name, description=description, unit="1")
+    except AttributeError:
+        _log.warning("metrics.runtime_instrument_unsupported — %s skipped", name)
+        return None
+    except Exception:
+        _log.warning("metrics.runtime_instrument_failed — %s skipped", name)
+        return None
+
+
+def init_runtime_metrics() -> None:
+    """Register the run-runtime liveness instruments once (idempotent)."""
+    global _runs_running_gauge, _runs_oldest_running_gauge, _runs_stall_reason_total, _runs_claim_count_histogram
+
+    if _runtime_metrics_registered():
         return
 
     meter = _get_meter()
@@ -105,27 +146,10 @@ def init_runtime_metrics() -> None:
         return
 
     for kind, name, description in _runtime_instruments():
-        try:
-            if kind == "gauge":
-                handle = meter.create_gauge(name=name, description=description, unit="1")
-            elif kind == "counter":
-                handle = meter.create_counter(name=name, description=description, unit="1")
-            else:
-                handle = meter.create_histogram(name=name, description=description, unit="1")
-        except AttributeError:
-            _log.warning("metrics.runtime_instrument_unsupported — %s skipped", name)
+        handle = _create_runtime_instrument(meter, kind, name, description)
+        if handle is None:
             continue
-        except Exception:
-            _log.warning("metrics.runtime_instrument_failed — %s skipped", name)
-            continue
-        if name == "runs_running_count":
-            _runs_running_gauge = handle
-        elif name == "runs_oldest_running_age_seconds":
-            _runs_oldest_running_gauge = handle
-        elif name == "runs_stall_reason_total":
-            _runs_stall_reason_total = handle
-        else:
-            _runs_claim_count_histogram = handle
+        globals()[_RUNTIME_INSTRUMENT_GLOBALS[name]] = handle
 
     _log.info("metrics.runtime_registered")
 
@@ -330,3 +354,72 @@ def record_alert_delivery_failed(rule_id: str, action_type: str) -> None:
         _init_delivery_failed_counter()
     if _alert_delivery_failed_total is not None:
         _alert_delivery_failed_total.add(1, attributes={"rule_id": rule_id, "action_type": action_type})
+
+
+def _init_connector_unknown_counter() -> None:
+    global _connector_unknown_total
+    if _connector_unknown_total is not None:
+        return
+    try:
+        meter = _get_meter()
+        if meter is None:
+            return
+        _connector_unknown_total = meter.create_counter(
+            name="modulo_connector_unknown_total",
+            description=(
+                "Total connector write-timeouts cancelled mid-send with unknown "
+                "upstream side-effect state (UNKNOWN rate)"
+            ),
+            unit="1",
+        )
+    except Exception:
+        _log.warning("metrics.connector_unknown_counter_failed")
+
+
+def record_connector_unknown(connector: str, node_id: str = "") -> None:
+    """Record a FAR-410 UNKNOWN terminal outcome (mid-send cancellation).
+
+    Kept distinct from generic failure metrics so an UNKNOWN rate spike is
+    observable and attributable to the connector (and node) that produced it.
+    """
+    if _connector_unknown_total is None:
+        _init_connector_unknown_counter()
+    if _connector_unknown_total is not None:
+        attrs: dict[str, Any] = {"connector": connector or "unknown"}
+        if node_id:
+            attrs["node_id"] = node_id
+        _connector_unknown_total.add(1, attributes=attrs)
+
+
+def record_connector_unknown_span(connector: str, node_id: str | None = None, detail: str | None = None) -> None:
+    """Mark the current OTel span as a FAR-410 UNKNOWN outcome and record the rate.
+
+    A connector write cancelled mid-send is a DISTINCT terminal state, never a
+    generic failure. Sets the current span's status to ``ERROR`` with the
+    ``connector.side_effect_unknown`` error-code attribute (and the
+    ``error.type`` / ``connector`` / ``node_id`` attributes) so it is observable
+    and attributable to the connector/node, then increments the UNKNOWN-rate
+    counter. Both are best-effort and swallow their own failures (tracing/
+    metrics must never break the retry path).
+    """
+    try:
+        from opentelemetry import trace as _otel_trace
+        from opentelemetry.trace import Status, StatusCode
+
+        span = _otel_trace.get_current_span()
+        if span is not None and span.is_recording():
+            attrs: dict[str, str] = {
+                "error.code": "connector.side_effect_unknown",
+                "error.type": "connector.side_effect_unknown",
+            }
+            if connector:
+                attrs["connector"] = connector
+            if node_id:
+                attrs["node_id"] = node_id
+            if detail:
+                attrs["error.message"] = detail[:256]
+            span.set_status(Status(StatusCode.ERROR, "connector.side_effect_unknown"))
+            span.set_attributes(attrs)
+    except Exception:
+        _log.warning("metrics.connector_unknown_span_failed", exc_info=True)
+    record_connector_unknown(connector, node_id or "")

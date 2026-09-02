@@ -12,7 +12,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _SHORTCUT_API = "https://api.app.shortcut.com/api/v3"
 
@@ -49,7 +51,8 @@ class ShortcutConnector(ConnectorBase):
         return ConnectorType.SHORTCUT
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        return pinned_async_client_sync(
+            _SHORTCUT_API,
             base_url=_SHORTCUT_API,
             headers={"Shortcut-Token": self._token, "Content-Type": "application/json"},
             timeout=30,
@@ -72,7 +75,7 @@ class ShortcutConnector(ConnectorBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def _get_by_resource(
         self,

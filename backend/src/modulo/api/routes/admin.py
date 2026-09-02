@@ -13,6 +13,7 @@ from sqlalchemy import Date, case, cast, delete, func, select, text
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import modulo.db.crud.account as account_crud
 from modulo.api.constants import (
     MSG_FEATURE_NOT_AVAILABLE,
     MSG_RESOURCE_ALREADY_EXISTS,
@@ -603,6 +604,117 @@ class CreateUserResponse(BaseModel):
     org_role: str
 
 
+def _assert_create_user_role(req: CreateUserRequest) -> None:
+    """Reject an unsupported role with a 422 (extracted for S3776)."""
+    if req.org_role not in ("admin", "operator", "runner", "viewer"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(f"Invalid role: {req.org_role}. Must be one of: admin, operator, runner, viewer"),
+        )
+
+
+async def _existing_account_or_conflict(
+    session: AsyncSession,
+    req: CreateUserRequest,
+    org_id: uuid.UUID,
+) -> Any | None:
+    """Return the account matching ``req.email``, raising 409 on conflict.
+
+    Mirrors the conflict rules the create-user route previously enforced
+    inline (extracted to keep the route's control flow shallow, S3776).
+    """
+    async with session.begin():
+        existing = await get_account_by_email(session, req.email)
+        if existing is not None:
+            membership = await get_membership_by_account_and_org(session, existing.id, org_id)
+            if membership is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A user with this email already exists in this organisation",
+                )
+            # SECURITY (#1185): refuse password hash overwrite when the
+            # account belongs to other orgs — prevents cross-tenant takeover.
+            # Allow adoption for SSO/SCIM accounts (no local password).
+            if existing.password_hash is not None and existing.auth_provider == "local":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "EMAIL_ACCOUNT_EXISTS: An account with this email exists"
+                        " in another organisation. Password-based adoption is not allowed."
+                    ),
+                )
+    return existing
+
+
+async def _create_or_adopt_account(
+    session: AsyncSession,
+    req: CreateUserRequest,
+    existing: Any | None,
+    pw_hash: str,
+    current_user: TenantPrincipal,
+) -> tuple[Any, Any]:
+    """Create a new account (or adopt ``existing``) and grant org membership.
+
+    Extracted from the create-user route to keep its control flow shallow
+    (SonarQube S3776). Returns ``(account, membership)``.
+    """
+    async with session.begin():
+        if existing is not None:
+            account = existing
+            # SECURITY (#1185): only allow password hash overwrite for
+            # accounts that have NO existing password (SSO/SCIM JIT).
+            if account.password_hash is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        "EMAIL_ACCOUNT_EXISTS: An account with this email exists"
+                        " in another organisation. Password-based adoption is not allowed."
+                    ),
+                )
+            account.password_hash = pw_hash
+        else:
+            account = await account_crud.create_account(
+                session,
+                email=req.email,
+                display_name=req.display_name,
+                password_hash=pw_hash,
+            )
+
+        # FAR-460: an admin-minted credential must be replaced by the user
+        # on first sign-in — this mirrors admin_reset_password and matches the
+        # migration docstring. The forced-change gate (login response + /me +
+        # frontend) enforces the rotation.
+        account.must_change_password = True
+
+        membership = await create_membership(
+            session,
+            account_id=account.id,
+            org_id=current_user.organisation_id,
+            role=req.org_role,
+        )
+
+        # Audit is fail-open-with-alert (mirrors me.change_password): the
+        # user creation ALWAYS commits; a failed audit write is loudly
+        # logged and never rolls back the change.
+        try:
+            await set_rls_org(session, current_user.organisation_id)
+            await append_audit_event(
+                session,
+                org_id=current_user.organisation_id,
+                event_type="user_created_by_admin",
+                actor_user_id=current_user.account_id,
+                resource_type="user",
+                resource_id=account.id,
+                payload_json={"target_user_id": str(account.id), "org_role": req.org_role},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("admin_create_user audit write failed")
+
+    return account, membership
+
+
 @router.post("/users", status_code=status.HTTP_201_CREATED)
 @handle_db_errors("admin.admin_create_user")
 async def admin_create_user(
@@ -611,34 +723,10 @@ async def admin_create_user(
     session: AsyncSession = Depends(get_db_session),
 ) -> CreateUserResponse:
     _require_admin(current_user, "create users")
-
-    if req.org_role not in ("admin", "operator", "runner", "viewer"):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=(f"Invalid role: {req.org_role}. Must be one of: admin, operator, runner, viewer"),
-        )
+    _assert_create_user_role(req)
 
     try:
-        async with session.begin():
-            existing = await get_account_by_email(session, req.email)
-            if existing is not None:
-                membership = await get_membership_by_account_and_org(session, existing.id, current_user.organisation_id)
-                if membership is not None:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="A user with this email already exists in this organisation",
-                    )
-                # SECURITY (#1185): refuse password hash overwrite when the
-                # account belongs to other orgs — prevents cross-tenant takeover.
-                # Allow adoption for SSO/SCIM accounts (no local password).
-                if existing.password_hash is not None and existing.auth_provider == "local":
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            "EMAIL_ACCOUNT_EXISTS: An account with this email exists"
-                            " in another organisation. Password-based adoption is not allowed."
-                        ),
-                    )
+        existing = await _existing_account_or_conflict(session, req, current_user.organisation_id)
 
         try:
             validate_password_strength(req.password)
@@ -650,36 +738,13 @@ async def admin_create_user(
 
         pw_hash = hash_password(req.password)
 
-        async with session.begin():
-            from modulo.db.crud.account import create_account
-
-            if existing is not None:
-                account = existing
-                # SECURITY (#1185): only allow password hash overwrite for
-                # accounts that have NO existing password (SSO/SCIM JIT).
-                if account.password_hash is not None:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            "EMAIL_ACCOUNT_EXISTS: An account with this email exists"
-                            " in another organisation. Password-based adoption is not allowed."
-                        ),
-                    )
-                account.password_hash = pw_hash
-            else:
-                account = await create_account(
-                    session,
-                    email=req.email,
-                    display_name=req.display_name,
-                    password_hash=pw_hash,
-                )
-
-            membership = await create_membership(
-                session,
-                account_id=account.id,
-                org_id=current_user.organisation_id,
-                role=req.org_role,
-            )
+        account, membership = await _create_or_adopt_account(
+            session,
+            req,
+            existing,
+            pw_hash,
+            current_user,
+        )
 
         return CreateUserResponse(
             id=str(account.id),
@@ -1418,12 +1483,35 @@ async def admin_reset_password(
 
             temporary_password = secrets.token_urlsafe(18)[:24]
             account.password_hash = hash_password(temporary_password)
+            # FAR-460: the temporary credential must be replaced by the user —
+            # this is what makes the reset dialog's "prompted to change it on
+            # next login" promise real (enforced by login response + /me +
+            # frontend forced-change gate).
+            account.must_change_password = True
 
             families = await list_families_for_account(session, user_id)
             for family in families:
                 await blacklist_family(session, family.family_id, user_id)
 
             await session.flush()
+
+            # Audit is fail-open-with-alert (mirrors me.change_password): the
+            # password reset ALWAYS commits; a failed audit write is loudly
+            # logged and never rolls back the change.
+            try:
+                await append_audit_event(
+                    session,
+                    org_id=current_user.organisation_id,
+                    event_type="user_password_reset_by_admin",
+                    actor_user_id=current_user.account_id,
+                    resource_type="user",
+                    resource_id=user_id,
+                    payload_json={"target_user_id": str(user_id)},
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("admin_reset_password audit write failed")
 
     except ProgrammingError:
         logger.exception(_CODE_ROUTES_ADMIN)
@@ -1779,6 +1867,7 @@ async def admin_dashboard_summary(
     current_user: TenantPrincipal = Depends(get_current_tenant_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, object]:
+    _require_admin(current_user, "view dashboard summary")
     from modulo.api.routes.dashboard import dashboard_summary as _dashboard_summary
 
     return await _dashboard_summary(session=session, principal=current_user)
@@ -1794,7 +1883,7 @@ class QueueMetricsResponse(BaseModel):
 @router.get("/queues/metrics")
 @handle_db_errors("admin.queue_metrics")
 async def admin_queue_metrics(
-    current_user: TenantPrincipal = require_permission("admin.queue_metrics"),
+    _current_user: TenantPrincipal = require_permission("admin.queue_metrics"),
 ) -> QueueMetricsResponse:
     """LLEN of both configured SAQ queues (runs + system), PREFIX-AWARE.
 
@@ -1949,7 +2038,7 @@ async def request_org_deletion(
                 result = await _request_deletion(
                     session,
                     org_id=current_user.organisation_id,
-                    actor_user_id=current_user.account_id,
+                    _actor_user_id=current_user.account_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -2148,7 +2237,7 @@ async def delete_org_immediate(
                 req = await _request_deletion(
                     session,
                     org_id=current_user.organisation_id,
-                    actor_user_id=current_user.account_id,
+                    _actor_user_id=current_user.account_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
@@ -3032,22 +3121,21 @@ class StorageInfoResponse(BaseModel):
     estimated_saved_bytes: int
 
 
-@router.get(
-    "/runs/retention",
-    dependencies=[require_feature("admin_run_retention")],
-)
-async def admin_get_retention(
-    current_user: TenantPrincipal = Depends(get_current_tenant_user),
-    session: AsyncSession = Depends(get_db_session),
-) -> RetentionConfigResponse:
-    _require_admin(current_user, "view retention")
+async def _load_org_retention_setting(
+    session: AsyncSession,
+    org_id: uuid.UUID,
+) -> Any | None:
+    """Read the organisation's ``settings_json`` retention setting.
+
+    RLS is set before the read; DB failures are mapped to the same error
+    responses the route previously raised inline. Extracted so the route's
+    control flow stays shallow (SonarQube S3776).
+    """
     try:
         async with session.begin():
-            await set_rls_org(session, current_user.organisation_id)
-            result = await session.execute(
-                select(Organisation.settings_json).where(Organisation.id == current_user.organisation_id).limit(1)
-            )
-            row = result.scalar_one_or_none()
+            await set_rls_org(session, org_id)
+            result = await session.execute(select(Organisation.settings_json).where(Organisation.id == org_id).limit(1))
+            return result.scalar_one_or_none()
     except asyncio.CancelledError:
         raise
     except IntegrityError:
@@ -3066,6 +3154,9 @@ async def admin_get_retention(
 
         _raise_unexpected(MSG_UNEXPECTED_ERROR)
 
+
+def _retention_days_from_setting(row: Any) -> int:
+    """Return the effective retention window (days) stored in ``row``, else 90."""
     retention_days = 90
     if isinstance(row, dict):
         raw = row.get("retention_days", 90)
@@ -3075,7 +3166,20 @@ async def admin_get_retention(
             retention_days = raw
         elif isinstance(raw, str) and raw.isdigit():
             retention_days = int(raw)
-    return RetentionConfigResponse(retention_days=retention_days)
+    return retention_days
+
+
+@router.get(
+    "/runs/retention",
+    dependencies=[require_feature("admin_run_retention")],
+)
+async def admin_get_retention(
+    current_user: TenantPrincipal = Depends(get_current_tenant_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> RetentionConfigResponse:
+    _require_admin(current_user, "view retention")
+    row = await _load_org_retention_setting(session, current_user.organisation_id)
+    return RetentionConfigResponse(retention_days=_retention_days_from_setting(row))
 
 
 @router.put("/runs/retention", status_code=status.HTTP_200_OK, dependencies=[require_feature("admin_run_retention")])

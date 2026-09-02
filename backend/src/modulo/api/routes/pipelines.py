@@ -35,7 +35,18 @@ from modulo.auth.dependencies import get_current_tenant_user
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.team_rbac import org_role_level
 from modulo.core.audit_logger import append_audit_event
+from modulo.core.capability_scope import (
+    ScopeViolationError,
+    agent_granted_connector_types,
+    validate_allowed_connectors_subset,
+)
 from modulo.core.graph_validator import GraphValidator
+from modulo.core.pipeline_engine.scatter_join import (
+    FanOutConfig,
+    JoinAggregateSpec,
+    JoinCollectSpec,
+)
+from modulo.core.release_channels import VALID_RELEASE_CHANNELS
 from modulo.core.reports.quality_report import (
     deliver_quality_report,
     generate_quality_report,
@@ -73,6 +84,7 @@ from modulo.db.crud.pipeline import (
     update_pipeline,
 )
 from modulo.db.crud.pipeline_folder import move_pipeline_to_folder
+from modulo.db.crud.pipeline_snapshot import create_snapshot_edit
 from modulo.db.crud.pipeline_snapshot_versioning import (
     delete_snapshot,
     diff_snapshots,
@@ -129,7 +141,7 @@ def _is_guardrail_admin(principal: TenantPrincipal) -> bool:
     """Resolve whether the caller may strip a guardrail binding from a node.
 
     Admin-level only (``org_role == "admin"``, the role the ``guardrail.manage``
-    permission requires) ÔÇö the same privilege the admin-only guardrail
+    permission requires) — the same privilege the admin-only guardrail
     definition / apply / reject endpoints enforce. Uses the flag-independent
     numeric hierarchy so enforcement stays live even when authz.enforce is
     disabled (mirrors ``_is_privileged`` for the HITL guard).
@@ -150,9 +162,9 @@ async def _set_rls_context(session: AsyncSession, principal: TenantPrincipal) ->
     await set_rls_user_context(session, principal.account_id, principal.org_role)
 
 
-def _raise_db_migration_error() -> None:
+def _raise_db_migration_error(exc: ProgrammingError) -> None:
     """Raise the 501 'feature not available' response for a ProgrammingError."""
-    logger.exception(_CODE_ROUTES_PIPELINES)
+    logger.error(_CODE_ROUTES_PIPELINES, exc_info=exc)
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail=MSG_THIS_FEATURE_NOT_AVAILABLE,
@@ -187,6 +199,8 @@ class GraphEdgeData:
     condition_expression: str | None
     hitl_gate_config: dict[str, Any] | None
     hitl_gate_config_present: bool
+    source_port: str = "out"
+    target_port: str = "in"
 
 
 def _edge_to_data(edge: PipelineGraphEdge) -> GraphEdgeData:
@@ -199,6 +213,8 @@ def _edge_to_data(edge: PipelineGraphEdge) -> GraphEdgeData:
         condition_expression=edge.condition_expression,
         hitl_gate_config=(edge.hitl_gate_config.model_dump(mode="json") if edge.hitl_gate_config is not None else None),
         hitl_gate_config_present="hitl_gate_config" in edge.model_fields_set,
+        source_port=edge.source_port,
+        target_port=edge.target_port,
     )
 
 
@@ -211,6 +227,8 @@ def _edge_data_to_dict(edge: GraphEdgeData) -> dict[str, Any]:
         "condition_expression": edge.condition_expression,
         "hitl_gate_config": edge.hitl_gate_config,
         "hitl_gate_config_present": edge.hitl_gate_config_present,
+        "source_port": edge.source_port,
+        "target_port": edge.target_port,
     }
 
 
@@ -222,6 +240,8 @@ def _edge_data_to_validator(edge: GraphEdgeData) -> dict[str, Any]:
         "type": edge.edge_type,
         "condition_expression": edge.condition_expression,
         "hitl_gate_config": edge.hitl_gate_config,
+        "source_port": edge.source_port,
+        "target_port": edge.target_port,
     }
 
 
@@ -253,11 +273,11 @@ async def _deny_hitl_gate(
     exc: HitlGateWeakeningDenied,
     request_id: str | None = None,
 ) -> None:
-    """Append the denial audit event and translate to HTTP (hitl-gate-removal-guard-plan.md v19 ┬º5).
+    """Append the denial audit event and translate to HTTP (hitl-gate-removal-guard-plan.md v19 §5).
 
     The guarded write already rolled back (guard-runs-before-delete), so the
     denial audit event is written in a fresh transaction immediately after the
-    denial ÔÇö it must never be lost with the rolled-back write.
+    denial — it must never be lost with the rolled-back write.
     """
     try:
         async with session.begin():
@@ -327,7 +347,7 @@ async def _handle_graph_write_denials(
     ) from None
 
 
-_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure"})
+_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure", "eval_failed"})
 _RETRY_POLICY_MAX_RETRIES = 5
 
 
@@ -341,16 +361,17 @@ def _validate_retry_policy(value: dict[str, Any] | None) -> dict[str, Any] | Non
         return value
     if not isinstance(value, dict):
         raise ValueError(
-            "retry_policy must be an object like {'on': ['stall','timeout','failure'], 'max_retries': 0-5}"
+            "retry_policy must be an object like "
+            "{'on': ['stall','timeout','failure','eval_failed'], 'max_retries': 0-5}"
         )
     on = value.get("on", [])
     if not isinstance(on, list) or any(not isinstance(e, str) for e in on):
-        raise ValueError("retry_policy 'on' must be a list of strings from ['stall','timeout','failure']")
+        raise ValueError("retry_policy 'on' must be a list of strings from ['stall','timeout','failure','eval_failed']")
     unknown = set(on) - _RETRY_POLICY_EVENTS
     if unknown:
         raise ValueError(
             f"retry_policy 'on' contains unknown values {sorted(unknown)}; "
-            "allowed values are ['stall','timeout','failure']"
+            "allowed values are ['stall','timeout','failure','eval_failed']"
         )
     max_retries = value.get("max_retries", 0)
     if isinstance(max_retries, bool) or not isinstance(max_retries, int):
@@ -386,7 +407,7 @@ class PipelineCreate(TeamVisibilityMixin):
     retry_policy: dict[str, Any] | None = Field(
         None,
         description=(
-            "Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. "
+            "Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. "
             "When a run ends in a configured state and retries remain, the run is "
             "re-dispatched automatically instead of terminal-failing."
         ),
@@ -432,7 +453,7 @@ class PipelineUpdate(TeamVisibilityMixin):
     )
     retry_policy: dict[str, Any] | None = Field(
         None,
-        description="Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. Set to {} to clear.",
+        description="Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.",
     )
     graph_json: PipelineGraphUpdate | None = Field(
         None,
@@ -442,7 +463,7 @@ class PipelineUpdate(TeamVisibilityMixin):
     @field_validator("retry_policy", mode="before")
     @classmethod
     def _validate_retry_policy_field(cls, value: dict[str, Any] | None) -> dict[str, Any]:
-        # None clears the policy (empty dict) ÔÇö the column is non-nullable.
+        # None clears the policy (empty dict) — the column is non-nullable.
         return _validate_retry_policy(value) or {}
 
     @field_validator("max_duration_seconds", mode="before")
@@ -486,12 +507,17 @@ class PipelineResponse(BaseModel):
     rate_limit_config: dict[str, Any] | None = None
     retry_policy: dict[str, Any] = Field(default_factory=dict, json_schema_extra={"default": {}})
     snapshot_count: int = 0
+    # Additive, backward-compatible: the pipelines list surfaces the stored
+    # graph's node count as a table column. Populated by the list endpoint's
+    # response builder (which already holds the full rows); other endpoints
+    # that reuse this model leave the additive default.
+    node_count: int = 0
     archived_at: datetime | None = None
     owner_team_id: uuid.UUID | None = None
     folder_id: uuid.UUID | None = None
     # Set on PATCH /pipelines/{id} responses when owner_team_id changed: the
     # UI warns the user to re-save the graph so connectors/model backends are
-    # rebound for the new team (PRD ┬º9.3 ownership transfer).
+    # rebound for the new team (PRD §9.3 ownership transfer).
     connector_rebind_required: bool = False
     created_by: uuid.UUID = Field(validation_alias="account_id")
     created_at: datetime
@@ -501,7 +527,7 @@ class PipelineResponse(BaseModel):
     @classmethod
     def _coerce_retry_policy(cls, value: Any) -> dict[str, Any]:
         # The column is non-nullable with a {} default, but legacy rows and
-        # partial ORM objects may expose None ÔÇö the no-policy default is {}.
+        # partial ORM objects may expose None — the no-policy default is {}.
         return value if isinstance(value, dict) else {}
 
     model_config = {"from_attributes": True, "populate_by_name": True}
@@ -543,15 +569,53 @@ class SchemaPin(BaseModel):
 _RESERVED_ENV_PREFIXES = ("MODULO_", "OPENCODE_API_KEY")
 
 
+class CapabilityScope(BaseModel):
+    """Node-level least-privilege contract (FAR-402 P4 / FAR-418).
+
+    A node may NARROW (never widen) what its referenced Agent is granted:
+
+    * ``allowed_connectors``: connector instance-ids and/or connector types the
+      node may resolve from the ConnectorHub. Each connector-TYPE entry must be
+      within the Agent's ``connector_type_refs`` (compile-time check); the
+      ConnectorHub is fetched with ONLY these connectors (deny-by-default).
+    * ``allowed_tools``: MCP/runtime tools the node's agent may invoke — an
+      additional narrowing filter wired through ``check_tool_scope``.
+    * ``context_scope``: allowlist of ``run_context`` keys the node may read
+      (need-to-know boundary).
+
+    Default is UNRESTRICTED: an absent ``capability_scope`` leaves behaviour
+    unchanged (the node may use all of its Agent's grants).
+    """
+
+    allowed_connectors: list[str] | None = Field(
+        default=None,
+        description="Connector instance-ids and/or connector types the node may "
+        "resolve. Absent/empty = UNRESTRICTED (Agent grants).",
+    )
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description="MCP/runtime tools the node's agent may invoke. Absent = NOT "
+        "narrowed (additional role check still applies).",
+    )
+    context_scope: list[str] | None = Field(
+        default=None,
+        description="Allowlist of run_context keys the node may read. Absent = UNRESTRICTED (full run_context).",
+    )
+
+
 class PipelineGraphNode(BaseModel):
     id: uuid.UUID
-    node_type: Literal["agent", "manual", "composite", "sandbox_agent"] = "agent"
+    node_type: Literal["agent", "manual", "composite", "sandbox_agent", "router", "hitl", "join"] = "agent"
     agent_id: uuid.UUID | None = None
     position: GraphPosition
     connector_binding: ConnectorBinding | None = None
     output_schema_id: uuid.UUID | None = None
     input_schema_pin: SchemaPin | None = None
     output_schema_pin: SchemaPin | None = None
+    # FAR-418: node-level capability_scope (least-privilege). A node narrows (never
+    # widens) its Agent's grants: allowed_connectors / allowed_tools / context_scope.
+    # Absent = UNRESTRICTED (behaviour unchanged). Validated in _resolve_graph_references.
+    capability_scope: CapabilityScope | None = None
     label: str | None = Field(default=None, max_length=255)
     role: str | None = None
     autonomy_recommendation: str | None = None
@@ -560,7 +624,7 @@ class PipelineGraphNode(BaseModel):
     # marked idempotent=false (e.g. one with an external side effect like
     # creating a PR or charging a card) suppresses BOTH the run-level
     # retry_policy re-dispatch and the node-level transient retry for any graph
-    # that contains it ÔÇö re-running would double-execute the side effect.
+    # that contains it — re-running would double-execute the side effect.
     idempotent: bool = Field(
         default=True,
         description="Whether the node is logically safe to re-run. When false, "
@@ -573,7 +637,7 @@ class PipelineGraphNode(BaseModel):
     parameter_set_id: uuid.UUID | None = None
     parameter_overrides: dict[str, Any] | None = None
     template_id: str | None = None
-    # FAR-296: sandbox_agent mode ÔÇö "llm" (default, dispatches an LLM agent with
+    # FAR-296: sandbox_agent mode — "llm" (default, dispatches an LLM agent with
     # agent_command + rendered prompt) or "script" (runs script_command verbatim
     # with the full run input at /home/user/input.json).
     mode: Literal["llm", "script"] = "llm"
@@ -583,7 +647,7 @@ class PipelineGraphNode(BaseModel):
     # FAR-296 Phase 3: egress control + resource-limit config surface.
     # egress_policy: "default" (internet allowed, e2b default), "deny_all"
     # (allow_internet_access=False), or "selected" (allow_internet_access=False
-    # + a host:port egress_allowlist carried as metadata ÔÇö FAR-296 Phase 3b-3).
+    # + a host:port egress_allowlist carried as metadata — FAR-296 Phase 3b-3).
     # resource_limits: a known-subset dict carried as sandbox metadata so a
     # server-side template/config can enforce them.
     egress_policy: Literal["default", "deny_all", "selected"] | None = None
@@ -591,7 +655,7 @@ class PipelineGraphNode(BaseModel):
     resource_limits: dict[str, Any] | None = None
     # FAR-212 PR B: sandbox write/egress mediation surface. ``read_only`` mounts
     # / chmods the workspace read-only at runtime (so writes are impossible for
-    # the agent's non-root user ÔÇö write_files derives False) and
+    # the agent's non-root user — write_files derives False) and
     # ``git_credentials`` scopes the provisioned git credential (``scoped`` =
     # limited to the allowlisted github.com host via an enforced helper;
     # ``unscoped`` = full access, the default; ``none`` = no git credentials are
@@ -603,7 +667,7 @@ class PipelineGraphNode(BaseModel):
     git_credentials: Literal["scoped", "unscoped", "none"] | None = None
     # FAR-296 Phase 4a: wall-clock spend budget (seconds). When set, the
     # node's sandbox is killed by the platform-side runtime killer once the
-    # wall-clock elapsed time exceeds this budget ÔÇö a tighter spend bound than
+    # wall-clock elapsed time exceeds this budget — a tighter spend bound than
     # the node timeout. Must be a positive int (validated at save-time).
     wallclock_budget_seconds: int | None = None
     # FAR-228: opt-in idempotency gate for side-effecting sandbox nodes. When
@@ -651,6 +715,48 @@ class PipelineGraphNode(BaseModel):
         default_factory=list,
         description="Filesystem detector: globs of sandbox paths whose change counts as activity.",
     )
+    # FAR-402 P1 (F2-A Router / F2-D HITL): per-node configuration carried on
+    # the node and compiled by the pipeline engine.
+    router_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Router node config: {mode, rules:[{guard (JMESPath), target|target_port}|{default, target}]}. "
+        "Required for node_type='router'.",
+    )
+    hitl_config: dict[str, Any] | None = Field(
+        default=None,
+        description="HITL node config (mode, form_schema_ref, reject_target, claim_team_id, claim_expiry_min, "
+        "human_only, eval_before_interrupt, required_team_id, overdue_threshold_minutes, eval_condition, "
+        "condition). Compiles to the existing synthetic-gate path. Required for node_type='hitl'.",
+    )
+    # FAR-402 P3 / FAR-417: scatter (fan-out). A property on an agent /
+    # sandbox_agent / composite node (NOT a new node_type). When set, the node
+    # splits its `split` source port into N parallel branches. The compile step
+    # expands this into N distinct child node identities with unique ids.
+    fan_out: FanOutConfig | None = None
+    # FAR-402 P3 / FAR-417: join (fan-in). Only valid on a `join` node_type.
+    # `collect` lists the upstream branches to gather; `aggregate` declares how
+    # to fold them.
+    collect: list[JoinCollectSpec] | None = None
+    aggregate: JoinAggregateSpec | None = None
+    # Policy when some collected branches failed (non-empty, non-timeout).
+    # "collect_and_proceed" (default) marks failed branches in the output;
+    # "fail" raises. Deadline (seconds) for waiting on slow/partial branches.
+    join_partial_policy: Literal["collect_and_proceed", "fail"] = "collect_and_proceed"
+    # FAR-416 (FAR-402 F1): ports are ADDITIVE metadata over the flat
+    # run_context/artifact dict. A port name maps 1:1 to the flat-state key the
+    # node already uses (identity mapping). When absent, the lazy backfill
+    # synthesizes a single {port:"out"} output and {port:"in"} input. Declaring
+    # ports enables compile-time fan-in safety + typed port validation.
+    inputs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Input ports. Each entry: {port: str, schema_ref?: str}. "
+        "None => backfilled with a single default 'in' port at compile time.",
+    )
+    outputs: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Output ports. Each entry: {port: str, schema_ref?: str}. "
+        "None => backfilled with a single default 'out' port at compile time.",
+    )
 
     @model_validator(mode="after")
     def validate_node_type(self) -> PipelineGraphNode:
@@ -659,10 +765,21 @@ class PipelineGraphNode(BaseModel):
             "composite": self._validate_composite_node,
             "sandbox_agent": self._validate_sandbox_agent_node,
             "agent": self._validate_agent_node,
+            "router": self._validate_router_node,
+            "hitl": self._validate_hitl_node,
+            "join": self._validate_join_node,
         }
         node_validators[self.node_type]()
+        # FAR-402 P3 / FAR-417: fan_out / collect / aggregate cross-checks.
+        if self.fan_out is not None and self.node_type == "join":
+            raise ValueError("A join node cannot also declare fan_out")
+        if self.fan_out is not None and self.node_type not in (
+            "agent",
+            "sandbox_agent",
+        ):
+            raise ValueError("fan_out is only allowed on agent / sandbox_agent nodes")
         # FAR-212 PR B: read_only / git_credentials are sandbox_agent-only fields.
-        # A non-sandbox node that sets them is rejected ÔÇö the enforcement surface
+        # A non-sandbox node that sets them is rejected — the enforcement surface
         # (read-only workspace, git-credential scope) only exists for sandbox
         # agents, and a declared-but-unenforced field on another node type would
         # be a silent no-op.
@@ -695,6 +812,26 @@ class PipelineGraphNode(BaseModel):
         if self.label is None:
             raise ValueError("Manual nodes require a label")
 
+    def _validate_router_node(self) -> None:
+        # The heavy validation (default-rule enforcement) happens at compile
+        # time in the pipeline engine; here we just require a router_config.
+        if self.router_config is None:
+            raise ValueError("Router nodes require a router_config")
+        rules = (self.router_config or {}).get("rules") or []
+        if not rules:
+            raise ValueError("Router nodes require at least one rule")
+        for rule in rules:
+            if rule.get("default"):
+                continue
+            if not (rule.get("target") or rule.get("target_port")):
+                raise ValueError("Each non-default Router rule requires a target/target_port")
+
+    def _validate_hitl_node(self) -> None:
+        # HITL nodes produce output like a normal (manual/agent) node and gate
+        # their outgoing edges. Require a hitl_config describing the gate.
+        if self.hitl_config is None:
+            raise ValueError("HITL nodes require a hitl_config")
+
     def _validate_composite_node(self) -> None:
         if self.composite_ref is None:
             raise ValueError("Composite nodes require a composite_ref")
@@ -704,7 +841,7 @@ class PipelineGraphNode(BaseModel):
             raise ValueError("Composite nodes cannot have connector bindings")
 
     def _validate_sandbox_agent_node(self) -> None:
-        # FAR-296 mode-aware validation ÔÇö ONE shared helper used by every
+        # FAR-296 mode-aware validation — ONE shared helper used by every
         # sandbox_agent gate (Pydantic model, node runner, GraphValidator,
         # MCP update_pipeline_graph, config linter) so save-time and run-time
         # agreement is guaranteed. Imported from the lightweight sandbox_mode
@@ -747,6 +884,22 @@ class PipelineGraphNode(BaseModel):
     def _validate_agent_node(self) -> None:
         if self.agent_id is None:
             raise ValueError("Agent nodes require an agent")
+
+    def _validate_join_node(self) -> None:
+        # A join node is a pure convergence node — it has no agent, no connector
+        # binding, and no manual output schema of its own.
+        if self.agent_id is not None:
+            raise ValueError("Join nodes cannot reference an agent")
+        if self.connector_binding is not None:
+            raise ValueError("Join nodes cannot have connector bindings")
+        if not self.collect:
+            raise ValueError("Join nodes require a non-empty 'collect' list")
+        if self.aggregate is None:
+            raise ValueError("Join nodes require an 'aggregate'")
+        if self.aggregate.kind == "merge_by_key" and not self.aggregate.key:
+            raise ValueError("Join aggregate merge_by_key requires an explicit 'key'")
+        if self.aggregate.kind == "map" and not self.aggregate.map_expression:
+            raise ValueError("Join aggregate map requires a 'map_expression'")
 
     def _validate_sandbox_env_vars(self) -> None:
         if not self.env_vars:
@@ -821,13 +974,23 @@ class PipelineGraphEdge(BaseModel):
     id: uuid.UUID = Field(default_factory=uuid.uuid4)
     source_node_id: uuid.UUID
     target_node_id: uuid.UUID
-    edge_type: str = Field(pattern="^(normal|reject|conditional)$")
+    edge_type: str = Field(pattern="^(normal|reject|conditional|loop)$")
     hitl_gate_config: HitlGateConfig | None = None
     condition_expression: str | None = Field(
         default=None,
         max_length=500,
         description="JMESPath expression for conditional edge routing. "
         "Evaluated against pipeline state; if truthy, routes to target.",
+    )
+    # FAR-416 (FAR-402 F1): port addressing. Defaults mirror the flat-state keys
+    # used before ports existed, so legacy edges route identically.
+    source_port: str = Field(
+        default="out",
+        description="Output port on the source node this edge originates from.",
+    )
+    target_port: str = Field(
+        default="in",
+        description="Input port on the target node this edge delivers into.",
     )
 
     model_config = {"from_attributes": True}
@@ -896,7 +1059,7 @@ async def _enforce_connector_team_bindings(
 ) -> None:
     """Block graph saves that bind a team-private connector to a different team's pipeline.
 
-    PRD ┬º9.3: a connector with ``visibility: team`` is only usable within pipelines
+    PRD §9.3: a connector with ``visibility: team`` is only usable within pipelines
     owned by the same team. Violations raise 409 ``connector_team_mismatch`` at the
     pipeline-save command layer.
     """
@@ -921,7 +1084,7 @@ async def _enforce_model_backend_team_bindings(
 ) -> None:
     """Block graph saves that pin a team-private model backend from another team.
 
-    PRD ┬º9.3: a model backend with ``visibility: team`` is only usable within
+    PRD §9.3: a model backend with ``visibility: team`` is only usable within
     pipelines owned by the same team, mirroring the connector rule. Violations
     raise 409 ``model_backend_team_mismatch`` at the pipeline-save command layer.
     """
@@ -1073,6 +1236,39 @@ def _build_schema_and_backend_pins(
     return schema_pins, model_backend_pins
 
 
+def _validate_capability_scopes(
+    nodes: list[PipelineGraphNode],
+    agents_by_id: dict[uuid.UUID, Agent],
+) -> None:
+    """Compile-time narrow-not-widen check for node capability_scope (FAR-418).
+
+    A node may NARROW its referenced Agent's connector grants, never WIDEN them.
+    For every node that declares ``capability_scope.allowed_connectors``, each
+    connector-TYPE entry must be within the Agent's ``connector_type_refs``; a
+    widen attempt raises a typed ``ScopeViolationError`` (422 at the route). A
+    node with no scope (UNRESTRICTED default) or no Agent reference is skipped.
+    Connector instance-id entries are opaque here and enforced at run time by the
+    ConnectorHub deny-by-default fetch scope.
+    """
+    for node in nodes:
+        scope = node.capability_scope
+        if scope is None or not scope.allowed_connectors:
+            continue
+        if node.agent_id is None:
+            # A connector node may not reference an Agent; its allowed_connectors
+            # are instance/type constrained only, so nothing is checked here.
+            continue
+        agent = agents_by_id.get(node.agent_id)
+        if agent is None:
+            continue
+        granted = agent_granted_connector_types(agent.connector_type_refs)
+        validate_allowed_connectors_subset(
+            node_id=str(node.id),
+            allowed_connectors=scope.allowed_connectors,
+            granted_types=granted,
+        )
+
+
 async def _resolve_graph_references(
     session: AsyncSession,
     nodes: list[PipelineGraphNode],
@@ -1084,13 +1280,22 @@ async def _resolve_graph_references(
     Whenever the graph resolves model-backend pins, they are checked against
     the pipeline's team: a team-private model backend pinned by a pipeline owned
     by a different team (or by no team at all) raises 409
-    ``model_backend_team_mismatch`` (PRD ┬º9.3), mirroring the connector rule
+    ``model_backend_team_mismatch`` (PRD §9.3), mirroring the connector rule
     which is also enforced unconditionally. The mismatch rule itself decides
     whether an org-owned pipeline (``owner_team_id=None``) may pin a team-private
     backend.
     """
     agent_ids = {node.agent_id for node in nodes if node.agent_id is not None}
     agents_by_id = await _load_agents_by_ids(session, org_id, agent_ids)
+    try:
+        _validate_capability_scopes(nodes, agents_by_id)
+    except ScopeViolationError as exc:
+        # FAR-418: a node that widens (never narrows) its Agent's connector grants
+        # is rejected — the save is refused, not silently accepted.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
     await _load_existing_schema_ids(session, org_id, _collect_schema_ids(nodes))
     schema_pins, model_backend_pins = _build_schema_and_backend_pins(nodes, agents_by_id)
     if model_backend_pins:
@@ -1103,15 +1308,28 @@ async def _resolve_graph_references(
     return schema_pins, model_backend_pins
 
 
+def _pipeline_list_item(pipeline: Pipeline) -> PipelineResponse:
+    """Build a list-item response, deriving node_count from the stored graph.
+
+    The CRUD list already loads the full rows, so ``len(graph_nodes_json)``
+    is cheap (no extra query). Defensive against partial ORM stand-ins that
+    lack the attribute (tests, internal callers).
+    """
+    response = PipelineResponse.model_validate(pipeline)
+    nodes = getattr(pipeline, "graph_nodes_json", None)
+    response.node_count = len(nodes) if isinstance(nodes, list) else 0
+    return response
+
+
 @router.get("", responses={401: {"description": "Unauthorized"}})
 @handle_db_errors("pipelines.list")
 async def list_pipelines_endpoint(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    cursor: str | None = Query(default=None),
-    include_archived: bool = Query(default=False),
-    folder_id: uuid.UUID | None = Query(default=None),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    cursor: Annotated[str | None, Query()] = None,
+    include_archived: Annotated[bool, Query()] = False,
+    folder_id: Annotated[uuid.UUID | None, Query()] = None,
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
 ) -> PipelineListResponse:
     try:
@@ -1125,11 +1343,11 @@ async def list_pipelines_endpoint(
                 include_archived=include_archived,
                 folder_id=folder_id,
             )
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     return PipelineListResponse(
-        items=[PipelineResponse.model_validate(p) for p in result.items],
+        items=[_pipeline_list_item(p) for p in result.items],
         total=result.total,
         page=result.page,
         page_size=result.page_size,
@@ -1142,7 +1360,7 @@ async def list_pipelines_endpoint(
 @handle_db_errors("pipelines.create")
 async def create_pipeline_endpoint(
     req: PipelineCreate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.create"),
 ) -> PipelineResponse:
     try:
@@ -1169,8 +1387,8 @@ async def create_pipeline_endpoint(
                 # The model default ({}) applies when omitted; an explicit value
                 # is persisted on the returned ORM row within this transaction.
                 pipeline.retry_policy = req.retry_policy
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     return PipelineResponse.model_validate(pipeline)
 
@@ -1179,7 +1397,7 @@ async def create_pipeline_endpoint(
 @handle_db_errors("pipelines.get")
 async def get_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineResponse:
@@ -1187,8 +1405,8 @@ async def get_pipeline_endpoint(
         async with session.begin():
             await _set_rls_context(session, principal)
             pipeline = await get_pipeline(session, pipeline_id, organisation_id=principal.organisation_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
@@ -1199,15 +1417,15 @@ async def get_pipeline_endpoint(
 @handle_db_errors("pipelines.get_graph")
 async def get_pipeline_graph_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.graph.read"),
 ) -> PipelineGraphResponse:
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
             graph = await get_pipeline_graph(session, pipeline_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if graph is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
@@ -1241,7 +1459,7 @@ async def _validate_graph_save(
     """Run save-time graph validation, returning the advisory issue list.
 
     Loads the pipeline's guardrail eval rows so the graph-save validation can
-    reject a per-node guardrail-cap violation (FAR-223 item 7) ÔÇö the
+    reject a per-node guardrail-cap violation (FAR-223 item 7) — the
     authoring-time rejection that the create_run fail-closed backstop also
     enforces at run start.
     """
@@ -1269,19 +1487,84 @@ async def _validate_graph_save(
     ]
 
 
+def _extract_agent_command_sync_updates(nodes: list[dict[str, Any]]) -> dict[uuid.UUID, str]:
+    """FAR-488a: first-carried ``agent_command`` per distinct bound agent.
+
+    A node WITHOUT an ``agent_id`` needs no sync (its node-level command always
+    stands at snapshot time — ``_apply_agent_fields`` only materializes bound
+    agents). A node carrying no usable ``agent_command`` value has nothing to
+    sync. When several nodes bind the SAME agent, the FIRST node's command wins
+    (deterministic; snapshot materialization applies one row value to every
+    node bound to that agent, so per-node divergence is not representable).
+    """
+    updates: dict[uuid.UUID, str] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        raw_agent_id = node.get("agent_id")
+        command = node.get("agent_command")
+        if raw_agent_id is None or not isinstance(command, str) or not command:
+            continue
+        try:
+            agent_id = uuid.UUID(str(raw_agent_id))
+        except (TypeError, ValueError):
+            continue
+        updates.setdefault(agent_id, command)
+    return updates
+
+
+async def _sync_agent_row_commands(
+    session: AsyncSession,
+    *,
+    org_id: uuid.UUID,
+    nodes: list[dict[str, Any]],
+) -> int:
+    """FAR-488a: sync a PATCHed node ``agent_command`` into the bound Agent row.
+
+    At snapshot time ``_apply_agent_fields`` overwrites a bound node's
+    ``agent_command`` with the Agent row's non-NULL value, while the graph PATCH
+    used to persist node-level commands to ``graph_nodes_json`` only — so an
+    operator's PATCH read back correctly but every run silently executed the
+    stale Agent-row command (FAR-488 incident, 2026-08-29). Syncing the row
+    inside the SAME transaction as the graph write makes "what you PATCH is
+    what runs" hold.
+
+    Deliberate skip cases: a node without ``agent_id`` (nothing bound — the
+    node value already stands); an Agent row with a NULL ``agent_command``
+    (the node value already stands at snapshot time); an incoming command
+    equal to the row value (no-op). Returns the number of Agent rows updated.
+    """
+    updates = _extract_agent_command_sync_updates(nodes)
+    if not updates:
+        return 0
+    result = await session.execute(select(Agent).where(Agent.id.in_(list(updates)), Agent.organisation_id == org_id))
+    changed = 0
+    for agent in result.scalars():
+        incoming = updates.get(agent.id)
+        if incoming is None or agent.agent_command is None or agent.agent_command == incoming:
+            continue
+        logger.info(
+            "pipeline.graph.agent_command_synced",
+            extra={"agent_id": str(agent.id), "organisation_id": str(org_id)},
+        )
+        agent.agent_command = incoming
+        changed += 1
+    return changed
+
+
 @router.patch("/{pipeline_id}/graph")
 @handle_db_errors("pipelines.replace_graph")
 async def replace_pipeline_graph_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineGraphUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineGraphResponse:
     # Route layer carries the operator baseline ("pipeline.graph.update") for
     # defense-in-depth breadth; actual gate-weakening enforcement is the
     # service-layer backstop (operator+ privileged under the row lock, non-
-    # privileged callers denied ÔÇö hitl-gate-removal-guard-plan.md v19 ┬º3 item
+    # privileged callers denied — hitl-gate-removal-guard-plan.md v19 §3 item
     # 5). There is deliberately no admin-only route gate here: operators are
     # "privileged" for weakening by design, and equivalent weakening remains
     # reachable via update_pipeline / convert_to_agent / revert_to_manual, so an
@@ -1301,7 +1584,7 @@ async def replace_pipeline_graph_endpoint(
             )
             # FAR-309 PR A review: the guardrail-binding strip guard now lives
             # in the SERVICE LAYER (replace_pipeline_graph, under the row lock)
-            # so every graph-mutation caller inherits it ÔÇö including the
+            # so every graph-mutation caller inherits it — including the
             # PATCH /{id} graph_json path and snapshot rollback. The admin flag
             # is resolved here and the service layer re-reads the live role
             # under the lock for REST callers.
@@ -1323,6 +1606,10 @@ async def replace_pipeline_graph_endpoint(
                 is_guardrail_admin=_is_guardrail_admin(principal),
             )
             if graph is not None:
+                # FAR-488a: keep the bound Agent rows in step with node-level
+                # agent_command PATCHes INSIDE the same transaction, so the
+                # next snapshot materializes the command the operator saved.
+                await _sync_agent_row_commands(session, org_id=principal.organisation_id, nodes=node_data)
                 issues = await _validate_graph_save(
                     session,
                     org_id=principal.organisation_id,
@@ -1338,8 +1625,8 @@ async def replace_pipeline_graph_endpoint(
             pipeline_id=pipeline_id,
             exc=exc,
         )
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if graph is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
@@ -1385,7 +1672,7 @@ async def _assert_team_transition_allowed(
     The endpoint's ``require_team_membership_or_admin`` dependency checks the
     CURRENT ``owner_team_id`` at request time, but the update can change
     ``visibility`` or reassign/clear ``owner_team_id`` without re-checking the
-    team gate against the NEW values ÔÇö a member could downgrade a team-private
+    team gate against the NEW values — a member could downgrade a team-private
     pipeline to org-visible or hand it to a team they don't belong to
     (task-authz-b-visibility-guard). Re-runs the RLS-parity membership-or-admin
     gate inside the same transaction (RLS context is transaction-scoped).
@@ -1502,10 +1789,13 @@ async def _apply_graph_update(
     )
     if graph is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
+    # FAR-488a: same Agent-row sync as the PATCH /graph endpoint — a graph
+    # replacement shipped inside a PATCH update payload must also run.
+    await _sync_agent_row_commands(session, org_id=org_id, nodes=node_data)
 
 
 def _raise_active_runs_conflict(exc: PipelineHasActiveRunsError) -> None:
-    """Raise the 409 for an ownership transfer blocked by active runs (PRD ┬º9.3)."""
+    """Raise the 409 for an ownership transfer blocked by active runs (PRD §9.3)."""
     raise HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail=f"pipeline_has_active_runs: {exc.active_run_count} run(s) still in progress; "
@@ -1518,7 +1808,7 @@ def _raise_active_runs_conflict(exc: PipelineHasActiveRunsError) -> None:
 async def update_pipeline_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> PipelineResponse:
@@ -1569,8 +1859,8 @@ async def update_pipeline_endpoint(
         )
     except PipelineHasActiveRunsError as exc:
         _raise_active_runs_conflict(exc)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
@@ -1583,7 +1873,7 @@ async def update_pipeline_endpoint(
 @handle_db_errors("pipelines.delete")
 async def delete_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.delete"),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> None:
@@ -1591,8 +1881,8 @@ async def delete_pipeline_endpoint(
         async with session.begin():
             await _set_rls_context(session, principal)
             deleted = await soft_delete_pipeline(session, pipeline_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
@@ -1602,15 +1892,20 @@ async def delete_pipeline_endpoint(
 @handle_db_errors("pipelines.restore")
 async def restore_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
+            existing = await get_pipeline(
+                session, pipeline_id, include_deleted=True, organisation_id=principal.organisation_id
+            )
+            if existing is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
             pipeline = await restore_pipeline(session, pipeline_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
     return PipelineResponse.model_validate(pipeline)
@@ -1620,15 +1915,18 @@ async def restore_pipeline_endpoint(
 @handle_db_errors("pipelines.archive")
 async def archive_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
+            existing = await get_pipeline(session, pipeline_id, organisation_id=principal.organisation_id)
+            if existing is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
             pipeline = await archive_pipeline(session, pipeline_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
     return PipelineResponse.model_validate(pipeline)
@@ -1638,15 +1936,18 @@ async def archive_pipeline_endpoint(
 @handle_db_errors("pipelines.unarchive")
 async def unarchive_pipeline_endpoint(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
+            existing = await get_pipeline(session, pipeline_id, organisation_id=principal.organisation_id)
+            if existing is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
             pipeline = await unarchive_pipeline(session, pipeline_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
     return PipelineResponse.model_validate(pipeline)
@@ -1735,7 +2036,7 @@ async def _clone_pipeline_into_org(
 async def clone_pipeline_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineCloneRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.create"),
 ) -> PipelineResponse:
     logger.info(
@@ -1767,8 +2068,8 @@ async def clone_pipeline_endpoint(
                 org_role=principal.org_role,
                 requested_name=req.name,
             )
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     logger.info("Copy complete: %s -> %s (%s)", pipeline_id, cloned.id, _sanitise_log_value(target_name))
     return PipelineResponse.model_validate(cloned)
@@ -1833,8 +2134,8 @@ async def _detect_parameter_ports(
 async def save_as_composite_endpoint(
     pipeline_id: uuid.UUID,
     req: SaveAsCompositeRequest,
-    session: AsyncSession = Depends(get_db_session),
-    principal: TenantPrincipal = Depends(get_current_tenant_user),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    principal: Annotated[TenantPrincipal, Depends(get_current_tenant_user)],
 ) -> dict[str, Any]:
     try:
         async with session.begin():
@@ -1890,8 +2191,8 @@ async def save_as_composite_endpoint(
                 version="0.1.0",
             )
 
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     return {
         "id": str(template.id),
@@ -1954,7 +2255,7 @@ async def _quality_report_recipient_urls(
 @handle_db_errors("pipelines.trigger_quality_report")
 async def trigger_quality_report(
     pipeline_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> QualityReportResponse:
     try:
@@ -1972,8 +2273,8 @@ async def trigger_quality_report(
             deliveries: list[dict[str, Any]] = []
             if recipient_urls:
                 deliveries = await deliver_quality_report(report, {"webhook_urls": recipient_urls})
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     return QualityReportResponse(
         period=report["period"],
@@ -1998,6 +2299,13 @@ class SnapshotResponse(BaseModel):
     notes: str | None
     created_at: datetime | None
     created_by: uuid.UUID | None = Field(default=None, validation_alias="account_id")
+    # FAR-402 P6: live-edit history + release-channel discriminator. Additive
+    # fields default to the legacy run-kind/none-channel snapshot so older
+    # clients that ignore them keep working.
+    version_kind: str = "run"
+    created_kind: str = "run"
+    draft: bool = False
+    channel: str = "none"
 
     model_config = {"from_attributes": True, "populate_by_name": True}
 
@@ -2022,6 +2330,18 @@ class SnapshotListResponse(BaseModel):
     total: int
 
 
+class SnapshotCreateEdit(BaseModel):
+    """Body for a live-edit save (FAR-402 P6).
+
+    ``draft`` marks an in-progress editor auto-save (``False`` = a committed
+    edit). ``channel`` optionally tags the edit's release channel (default
+    ``none`` — the live-edit chain is not channel-routed unless set).
+    """
+
+    draft: bool = False
+    channel: str | None = None
+
+
 class SnapshotDiffQuery(BaseModel):
     snapshot_a_id: uuid.UUID
     snapshot_b_id: uuid.UUID
@@ -2036,6 +2356,9 @@ class SnapshotDiffResponse(BaseModel):
     edges_added: list[dict[str, Any]]
     edges_removed: list[dict[str, Any]]
     edges_modified: list[dict[str, Any]]
+    # FAR-402 P6: semantic-diff + impact layer (port-signature deltas,
+    # downstream-impact oracle, save-time breaking-change warnings).
+    semantic: dict[str, Any] = Field(default_factory=dict)
 
 
 def _snapshot_to_response(s: Any) -> SnapshotResponse:
@@ -2047,6 +2370,10 @@ def _snapshot_to_response(s: Any) -> SnapshotResponse:
         notes=s.notes,
         created_at=s.created_at,
         created_by=s.account_id,
+        version_kind=s.version_kind,
+        created_kind=s.created_kind,
+        draft=s.draft,
+        channel=s.channel,
     )
 
 
@@ -2059,6 +2386,10 @@ def _snapshot_to_detail_response(s: Any) -> SnapshotDetailResponse:
         notes=s.notes,
         created_at=s.created_at,
         created_by=s.account_id,
+        version_kind=s.version_kind,
+        created_kind=s.created_kind,
+        draft=s.draft,
+        channel=s.channel,
         graph_json=s.graph_json,
         connector_bindings_json=s.connector_bindings_json,
         schema_pins_json=s.schema_pins_json,
@@ -2073,9 +2404,9 @@ def _snapshot_to_detail_response(s: Any) -> SnapshotDetailResponse:
 @handle_db_errors("pipelines.list_snapshots")
 async def list_snapshot_endpoint(
     pipeline_id: uuid.UUID,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotListResponse:
@@ -2086,8 +2417,8 @@ async def list_snapshot_endpoint(
             if pipeline is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pipeline not found")
             snapshots, total = await list_snapshots(session, pipeline_id, page=page, page_size=page_size)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     return SnapshotListResponse(
         items=[_snapshot_to_response(s) for s in snapshots],
@@ -2095,12 +2426,60 @@ async def list_snapshot_endpoint(
     )
 
 
+@router.post(
+    "/{pipeline_id}/snapshots",
+    dependencies=[require_feature("pipeline_diff_rollback")],
+)
+@handle_db_errors("pipelines.save_edit_snapshot")
+async def save_edit_snapshot_endpoint(
+    pipeline_id: uuid.UUID,
+    req: SnapshotCreateEdit,
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
+    _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
+) -> SnapshotResponse:
+    """Save a LIVE-EDIT snapshot of the current graph (FAR-402 P6).
+
+    Creates a new snapshot row tagged ``version_kind='edit'`` so the editor's
+    save history is distinct from run-frozen snapshots; the prior snapshot row
+    stays immutable, so rollback remains a pointer swap to a prior version. A
+    ``draft`` save marks an in-progress editor auto-save; ``channel`` optionally
+    tags the edit's release channel.
+    """
+    channel = str(req.channel or "none").strip().lower()
+    if channel not in VALID_RELEASE_CHANNELS:
+        valid = ", ".join(sorted(VALID_RELEASE_CHANNELS))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid release channel: {req.channel!r}. Must be one of {valid}.",
+        )
+    try:
+        async with session.begin():
+            await _set_rls_context(session, principal)
+            pipeline = await get_pipeline(session, pipeline_id)
+            if pipeline is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
+            snapshot = await create_snapshot_edit(
+                session,
+                pipeline_id=pipeline_id,
+                account_id=principal.account_id,
+                draft=req.draft,
+                channel=channel,
+            )
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
+
+    if snapshot is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save edit snapshot")
+    return _snapshot_to_response(snapshot)
+
+
 @router.get("/{pipeline_id}/snapshots/{snapshot_id}")
 @handle_db_errors("pipelines.get_snapshot_detail")
 async def get_snapshot_detail_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotDetailResponse:
@@ -2113,8 +2492,8 @@ async def get_snapshot_detail_endpoint(
                 organisation_id=principal.organisation_id,
                 pipeline_id=pipeline_id,
             )
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if snapshot is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SNAPSHOT_NOT_FOUND)
@@ -2127,7 +2506,7 @@ async def tag_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
     req: SnapshotTagUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotResponse:
@@ -2135,8 +2514,8 @@ async def tag_snapshot_endpoint(
         async with session.begin():
             await _set_rls_context(session, principal)
             snapshot = await tag_snapshot(session, snapshot_id, tag=req.tag, notes=req.notes)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if snapshot is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SNAPSHOT_NOT_FOUND)
@@ -2151,14 +2530,14 @@ async def tag_snapshot_endpoint(
 async def rollback_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotResponse:
     # Route layer carries the operator baseline ("pipeline.graph.update") for
     # defense-in-depth breadth; actual gate-weakening enforcement is the
     # service-layer backstop (operator+ privileged under the row lock, non-
-    # privileged callers denied ÔÇö hitl-gate-removal-guard-plan.md v19 ┬º3 item
+    # privileged callers denied — hitl-gate-removal-guard-plan.md v19 §3 item
     # 5). There is deliberately no admin-only route gate here, matching the
     # graph-replace endpoint: operators are "privileged" for weakening by
     # design (equivalent weakening stays reachable via update_pipeline).
@@ -2181,8 +2560,8 @@ async def rollback_snapshot_endpoint(
             pipeline_id=pipeline_id,
             exc=exc,
         )
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if new_snapshot is None:
         raise HTTPException(
@@ -2197,7 +2576,7 @@ async def rollback_snapshot_endpoint(
 async def delete_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     snapshot_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission("pipeline.delete"),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> None:
@@ -2218,8 +2597,8 @@ async def delete_snapshot_endpoint(
             if snapshot is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Snapshot not found")
             deleted = await delete_snapshot(session, snapshot_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if not deleted:
         raise HTTPException(
@@ -2236,7 +2615,7 @@ async def delete_snapshot_endpoint(
 async def diff_snapshot_endpoint(
     pipeline_id: uuid.UUID,
     req: SnapshotDiffQuery,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_LIST),
     _: TenantPrincipal = require_team_membership_or_admin(resolve_pipeline_team_scope),
 ) -> SnapshotDiffResponse:
@@ -2244,8 +2623,8 @@ async def diff_snapshot_endpoint(
         async with session.begin():
             await _set_rls_context(session, principal)
             result = await diff_snapshots(session, req.snapshot_a_id, req.snapshot_b_id)
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
 
     if result is None:
         raise HTTPException(
@@ -2269,7 +2648,7 @@ class PipelineFolderMoveRequest(BaseModel):
 async def move_pipeline_to_folder_endpoint(
     pipeline_id: uuid.UUID,
     req: PipelineFolderMoveRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_UPDATE),
 ) -> PipelineResponse:
     try:
@@ -2281,8 +2660,8 @@ async def move_pipeline_to_folder_endpoint(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(e),
         ) from None
-    except ProgrammingError:
-        _raise_db_migration_error()
+    except ProgrammingError as exc:
+        _raise_db_migration_error(exc)
     if pipeline is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_PIPELINE_NOT_FOUND)
     return PipelineResponse.model_validate(pipeline)
@@ -2371,7 +2750,7 @@ async def _finalize_locked_graph_save(
             detail=exc.detail,
         ) from exc
     if isinstance(exc, ProgrammingError):
-        logger.exception(_CODE_ROUTES_PIPELINES)
+        logger.error(_CODE_ROUTES_PIPELINES, exc_info=exc)
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail=MSG_THIS_FEATURE_NOT_AVAILABLE,
@@ -2387,7 +2766,7 @@ async def convert_node_to_agent_endpoint(
     pipeline_id: uuid.UUID,
     node_id: uuid.UUID,
     req: ConvertToAgentRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
 ) -> PipelineGraphResponse:
     try:
@@ -2488,8 +2867,8 @@ async def convert_node_to_agent_endpoint(
 async def revert_node_to_manual_endpoint(
     pipeline_id: uuid.UUID,
     node_id: uuid.UUID,
-    snapshot_id: uuid.UUID = Query(...),
-    session: AsyncSession = Depends(get_db_session),
+    snapshot_id: Annotated[uuid.UUID, Query()],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_PIPELINE_GRAPH_UPDATE),
 ) -> PipelineGraphResponse:
     try:
@@ -2595,6 +2974,8 @@ def _edge_to_dict(e: Any) -> dict[str, Any]:
         "condition_expression": getattr(e, "condition_expression", None),
         "hitl_gate_config": dict(e.hitl_gate_config) if isinstance(e.hitl_gate_config, dict) else e.hitl_gate_config,
         "hitl_gate_config_present": True,
+        "source_port": getattr(e, "source_port", "out"),
+        "target_port": getattr(e, "target_port", "in"),
     }
 
 
@@ -2617,7 +2998,7 @@ async def _save_graph(
     hitl-gate-removal-guard-plan.md v19 / FAR-309 PR A review).
     """
     edge_dicts = [_edge_to_dict(e) if hasattr(e, "source_node_id") else dict(e) for e in edges]
-    return await replace_pipeline_graph(
+    graph = await replace_pipeline_graph(
         session,
         pipeline_id=pipeline_id,
         org_id=org_id,
@@ -2628,3 +3009,9 @@ async def _save_graph(
         account_id=account_id,
         is_guardrail_admin=is_guardrail_admin,
     )
+    if graph is not None:
+        # FAR-488a: node-conversion saves go through here too — keep the same
+        # "what you save is what runs" Agent-row sync (a no-op when the node
+        # commands already mirror the bound Agent rows).
+        await _sync_agent_row_commands(session, org_id=org_id, nodes=nodes)
+    return graph

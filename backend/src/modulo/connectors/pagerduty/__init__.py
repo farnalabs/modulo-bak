@@ -17,7 +17,10 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
+from modulo.core.ssrf import pinned_async_client_sync
 
 _BASE = "https://api.pagerduty.com"
 
@@ -52,13 +55,15 @@ def _next_offset_cursor(offset: object, records: list[Any], more: object) -> str
 class PagerDutyConnector(ConnectorBase):
     def __init__(self, token: str) -> None:
         self._token = token
+        self._redactor = CredentialRedactor([token])
 
     @property
     def connector_type(self) -> ConnectorType:
         return ConnectorType.PAGERDUTY
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        return pinned_async_client_sync(
+            _BASE,
             base_url=_BASE,
             headers={
                 "Authorization": f"Token token={self._token}",
@@ -75,12 +80,15 @@ class PagerDutyConnector(ConnectorBase):
                     return HealthResult(ok=True, detail="PagerDuty API token validated")
                 if resp.status_code == 401:
                     return HealthResult(ok=False, detail="Invalid PagerDuty API token")
-                return HealthResult(ok=False, detail=f"HTTP {resp.status_code}: {resp.text[:200]}")
+                return HealthResult(
+                    ok=False, detail=self._redactor.redact(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(self._redactor.redact_exc(exc))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:
             match q.resource:
@@ -101,6 +109,7 @@ class PagerDutyConnector(ConnectorBase):
                 case _:
                     raise ValueError(f"Unsupported PagerDuty resource: {q.resource!r}")
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         async with self._client() as c:
             match payload.resource:

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -51,6 +52,44 @@ CAPACITY_MARKERS = frozenset({ERROR_CODE_ORG_CAPACITY_LIMITED, ERROR_CODE_PIPELI
 # Day-key format used for run-usage bucketing and the --older-than parser.
 _DAY_FORMAT = "%Y-%m-%d"
 
+# FAR-438 run-record idempotency-key persistence. The run record stores its STABLE
+# logical idempotency identity ``<pipeline_id>:<run_number>`` (NOT a per-replay
+# ``run_id`` — a fresh UUID fork would mint a new key on every re-run and
+# silently defeat dedupe). These helpers live HERE (the DB layer owns the run
+# record) because import-linter forbids ``modulo.db`` importing ``modulo.core``;
+# the derivation + dedupe that CONSUME the persisted value live in
+# ``modulo.core.pipeline_engine.idempotency``. The ``<id>:<number>`` shape regex
+# mirrors ``_RUN_REF_RE`` there; the two copies are a deliberate layering
+# trade-off (DB cannot import core, so they cannot share one definition).
+_RUN_IDEMPOTENCY_REF_RE = re.compile(r"^[A-Za-z0-9_-]+:\d+$")
+
+
+def run_idempotency_ref(pipeline_id: uuid.UUID, run_number: int) -> str:
+    """Build the stable logical run identity ``<pipeline_id>:<run_number>`` (FAR-438).
+
+    This is the run-scoped value persisted on the run record. A re-run that
+    restores the SAME run reuses the same ``run_number`` (allocated once per
+    org), so the reference — and every per-node key derived from it — is stable
+    across the re-run. It is deliberately NOT the per-replay ``run_id``.
+    """
+    return f"{pipeline_id}:{run_number}"
+
+
+def run_idempotency_key(run_ref: str) -> str:
+    """Validate *run_ref* and return the value to persist on the run record (FAR-438).
+
+    Enforces the ``<id>:<number>`` contract at the persist boundary so a naive
+    per-replay ``run_id`` fails loudly instead of silently persisting a value
+    that mints a fresh key every re-run.
+    """
+    if not isinstance(run_ref, str) or not _RUN_IDEMPOTENCY_REF_RE.match(run_ref):
+        raise ValueError(
+            "run_ref must be the stable logical run identity '<pipeline_id>:<run_number>' "
+            f"(recomputed on a re-run), NOT the per-replay run_id; got {run_ref!r}"
+        )
+    return run_ref
+
+
 # Legacy underscore alias for the neutral helper (see modulo.db.unique_violation).
 _is_unique_violation = is_unique_violation
 
@@ -66,12 +105,16 @@ RUN_STATUS_WHITELIST: frozenset[str] = frozenset(
         "running",
         "awaiting_human",
         "claimed",
+        "unknown",
         "complete",
         "failed",
         "cancelled",
         "eval_failed",
         "stalled",
         "budget_exceeded",
+        "router_no_match",
+        "cost_ceiling_exceeded",
+        "compensation_failed",
     }
 )
 
@@ -85,8 +128,12 @@ PAUSE_EXEMPT_TRIGGER_TYPES = frozenset({"manual", "correction"})
 # per-day "failed" bucket also counts the legacy ``expired`` spelling (a run
 # demoted before the status-set cleanup), while the failure-reason breakdown
 # only attributes genuinely failed executions (a cancelled run has no reason).
-_FAILURE_BUCKET_STATUSES: frozenset[str] = frozenset({"failed", "cancelled", "eval_failed", "expired", "stalled"})
-_FAILURE_REASON_STATUSES: frozenset[str] = frozenset({"failed", "eval_failed", "stalled"})
+_FAILURE_BUCKET_STATUSES: frozenset[str] = frozenset(
+    {"failed", "cancelled", "eval_failed", "expired", "stalled", "compensation_failed", "router_no_match"}
+)
+_FAILURE_REASON_STATUSES: frozenset[str] = frozenset(
+    {"failed", "eval_failed", "stalled", "compensation_failed", "router_no_match"}
+)
 
 _SANDBOX_CONCURRENCY_KEY = "sandbox_concurrency_limit"
 _SANDBOX_CONCURRENCY_MIN = 1
@@ -625,7 +672,7 @@ def _downgrade_guardrails_to_observe(guardrail_defs: list[Any]) -> list[Any]:
 async def _run_guardrail_interception_pass(
     *,
     org_id: uuid.UUID,
-    run_id: uuid.UUID,
+    _run_id: uuid.UUID,
     guardrail_defs: list[Any],
     payload: dict[str, Any],
     is_replay: bool | None,
@@ -925,7 +972,7 @@ async def _intercept_guardrails(
                     guardrail_blocking_eval_name,
                 ) = await _run_guardrail_interception_pass(
                     org_id=org_id,
-                    run_id=run_id,
+                    _run_id=run_id,
                     guardrail_defs=guardrail_defs,
                     payload=payload,
                     is_replay=is_replay,
@@ -1009,6 +1056,17 @@ async def create_run(
     # deletion flow has set status='deleted' (or in a hard-deleted org).
     await _ensure_org_not_deleted(session, org_id)
 
+    # DB capacity hard-stop (FAR-426): refuse a NEW run when a *fixed* DB is
+    # at/over the 98% threshold. This is the boundary where a run is created —
+    # a resume, retention sweep or admin operation never reaches it. Fail-open:
+    # a broken capacity probe can never block run creation (it allows the run).
+    # Raises ``StorageExhaustedError`` (modulo.db.capacity); the API layer maps
+    # it to HTTP 503 ``urn:problem:modulo:storage_exhausted`` so the transaction
+    # here rolls back and no phantom run is persisted.
+    from modulo.db.capacity import enforce_capacity_gate
+
+    await enforce_capacity_gate()
+
     # Guardrails kill-switch (FAR-223 item 9) — pinned at run start alongside
     # the guardrail rows, never re-read mid-run. Defaults to OFF on read
     # failure (the fail-closed direction for a data-safety control).
@@ -1073,6 +1131,18 @@ async def create_run(
     # which races under concurrent trigger dispatches.
     run_number = await _allocate_run_number(session, org_id)
 
+    # FAR-438 idempotency-key persistence: the run's STABLE logical identity
+    # (<pipeline_id>:<run_number>) is written once at create so a re-run that
+    # restores THIS run can READ it back and reuse the identical derived per-node
+    # keys (UNKNOWN-recovery dedupe). It is NEVER a per-replay run_id (a fresh
+    # UUID fork would mint a new key every re-run). run_idempotency_key validates
+    # the <id>:<number> shape so a buggy identity fails loudly at the persist
+    # boundary rather than silently storing a value that mints fresh keys. These
+    # helpers are local (DB layer) — the derivation that CONSUMES the stored value
+    # lives in modulo.core.pipeline_engine.idempotency (a module the DB layer
+    # must not import, per import-linter).
+    idempotency_key = run_idempotency_key(run_idempotency_ref(pipeline_id, run_number))
+
     # Create-time journey stamping (FAR-142): resolve the chain anchor
     # (explicit > adopted-from-parent > deterministic floor), canonicalise the
     # work-item refs, and carry is_replay / variant_group_id verbatim. None of
@@ -1111,6 +1181,7 @@ async def create_run(
         parent_run_id=parent_run_id,
         run_number=run_number,
         rate_limit_key=rate_limit_key,
+        idempotency_key=idempotency_key,
         work_item_id=resolved_work_item_id,
         work_item_refs=canonical_refs,
         is_replay=is_replay,
@@ -1584,7 +1655,8 @@ _UPDATE_STATUS_FENCED_SQL = text(
     "started_at = CASE WHEN :status = 'running' AND started_at IS NULL THEN now() ELSE started_at END, "
     "completed_at = CASE "
     "  WHEN cancellation_requested AND :status IN ('awaiting_human', 'complete') THEN now() "
-    "  WHEN :status IN ('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded') THEN now() "
+    "  WHEN :status IN ('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', "
+    "'budget_exceeded', 'router_no_match', 'cost_ceiling_exceeded', 'compensation_failed') THEN now() "
     "  ELSE completed_at END, "
     "claimed_by = CASE WHEN CAST(:claimed_by AS text) IS NOT NULL THEN CAST(:claimed_by AS text) ELSE claimed_by END, "
     "error_code = CASE WHEN :clear_error_code THEN NULL "
@@ -1593,14 +1665,14 @@ _UPDATE_STATUS_FENCED_SQL = text(
     "  WHEN CAST(:error_code AS text) IS NOT NULL THEN CAST(:error_detail AS text) ELSE error_detail END, "
     "total_tokens = COALESCE(:total_tokens, total_tokens), "
     "total_cost_usd = COALESCE(:total_cost_usd, total_cost_usd), "
-    "cost_breakdown = CASE WHEN :cost_breakdown_sentinel THEN cost_breakdown "
-    "  ELSE CAST(:cost_breakdown AS jsonb) END, "
-    "node_token_usage = CASE WHEN CAST(:node_token_usage AS jsonb) IS NOT NULL "
-    "  THEN CAST(:node_token_usage AS jsonb) ELSE node_token_usage END, "
-    "outputs_json = CASE WHEN CAST(:outputs_json AS jsonb) IS NOT NULL "
-    "  THEN CAST(:outputs_json AS jsonb) ELSE outputs_json END, "
-    "node_telemetry_json = CASE WHEN CAST(:node_telemetry_json AS jsonb) IS NOT NULL "
-    "  THEN CAST(:node_telemetry_json AS jsonb) ELSE node_telemetry_json END "
+    "cost_breakdown = CASE WHEN :cost_breakdown_sentinel THEN CAST(cost_breakdown AS json) "
+    "  ELSE CAST(:cost_breakdown AS json) END, "
+    "node_token_usage = CASE WHEN CAST(:node_token_usage AS json) IS NOT NULL "
+    "  THEN CAST(:node_token_usage AS json) ELSE CAST(node_token_usage AS json) END, "
+    "outputs_json = CASE WHEN CAST(:outputs_json AS json) IS NOT NULL "
+    "  THEN CAST(:outputs_json AS json) ELSE CAST(outputs_json AS json) END, "
+    "node_telemetry_json = CASE WHEN CAST(:node_telemetry_json AS json) IS NOT NULL "
+    "  THEN CAST(:node_telemetry_json AS json) ELSE CAST(node_telemetry_json AS json) END "
     "WHERE id=:rid "
     "AND (CAST(:tok AS text) IS NULL OR claim_token = CAST(:tok AS text)) "
     "AND (CAST(:from_status AS text) IS NULL OR status = CAST(:from_status AS text)) "
@@ -1672,7 +1744,8 @@ async def _update_run_status_fenced(
 _TRANSITION_SQL = text(
     "UPDATE runs SET status=CAST(:target AS text), "
     "completed_at = CASE WHEN CAST(:target AS text) IN "
-    "('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded') "
+    "('complete', 'failed', 'cancelled', 'eval_failed', 'stalled', 'budget_exceeded', 'router_no_match', "
+    "'cost_ceiling_exceeded', 'compensation_failed') "
     "THEN now() ELSE completed_at END, "
     "error_code = COALESCE(CAST(:error_code AS text), error_code), "
     "error_detail = CASE WHEN CAST(:error_code AS text) IS NOT NULL "

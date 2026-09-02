@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -111,10 +112,13 @@ async def _cron_heartbeat_fresh(redis: aioredis.Redis) -> bool:
     Fleet-wide semantics (matches the ``app``-machine health gate): the
     system cron runs on worker machines only, so a stale fleet-wide reading
     means no worker's cron scheduler has fired within 2x its 60s cadence.
+
+    The heartbeat keys are discovered with ``SCAN`` — never ``KEYS`` — so a
+    Redis instance already under load cannot be blocked by an O(N) full-key
+    scan exactly when a fleet-wide death needs to be detected.
     """
-    heartbeat_keys = await redis.keys("saq:cron:heartbeat:fire_due_triggers:*")
     now = time.time()
-    for key in heartbeat_keys:
+    async for key in redis.scan_iter(match="saq:cron:heartbeat:fire_due_triggers:*"):
         raw = await redis.get(key)
         if raw is None:
             continue
@@ -216,12 +220,38 @@ def _recovery_text(state: dict[str, Any]) -> str:
     duration = f" for {(time.time() - float(started_at)):.0f}s" if started_at else ""
     return (
         "\u2705 *Modulo watchdog: worker-liveness recovered*\n"
-        + "The following conditions have cleared"
+        "The following conditions have cleared"
         + duration
         + ":\n"
         + "\n".join(f"\u2022 {condition}" for condition in prior_conditions)
         + f"\nResolved at {datetime.now(UTC).isoformat()} on {_hostname()}"
     )
+
+
+async def _post_webhook_payload(url: str, payload: bytes, channel: str) -> None:
+    """Best-effort JSON webhook POST. Never raises out of the task.
+
+    ``channel`` demultiplexes the failure log keys (``webhook`` for the generic
+    Slack-compatible webhook, ``teams_webhook`` for the Microsoft Teams
+    MessageCard webhook) so a failure stays attributable to its channel. The
+    two webhook channels are otherwise byte-identical in their HTTP posting —
+    one implementation avoids drift between the copies.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                url,
+                content=payload,
+                headers={"Content-Type": "application/json", "User-Agent": "Modulo-Watchdog/1.0"},
+            )
+        if not resp.is_success:
+            _log.warning("watchdog.%s_http_error status=%s", channel, resp.status_code)
+    except asyncio.CancelledError:
+        raise
+    except httpx.RequestError as exc:
+        _log.warning("watchdog.%s_request_failed: %s", channel, exc)
+    except Exception as exc:
+        _log.warning("watchdog.%s_unknown_failure: %s", channel, exc)
 
 
 async def _post_generic_webhook(settings: Settings, text: str) -> None:
@@ -230,23 +260,7 @@ async def _post_generic_webhook(settings: Settings, text: str) -> None:
     if not webhook_url:
         _log.warning("watchdog.webhook_no_url")
         return
-
-    payload = json.dumps({"text": text}).encode()
-    try:
-        async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                webhook_url,
-                content=payload,
-                headers={"Content-Type": "application/json", "User-Agent": "Modulo-Watchdog/1.0"},
-            )
-        if not resp.is_success:
-            _log.warning("watchdog.webhook_http_error status=%s", resp.status_code)
-    except asyncio.CancelledError:
-        raise
-    except httpx.RequestError as exc:
-        _log.warning("watchdog.webhook_request_failed: %s", exc)
-    except Exception as exc:
-        _log.warning("watchdog.webhook_unknown_failure: %s", exc)
+    await _post_webhook_payload(webhook_url, json.dumps({"text": text}).encode(), "webhook")
 
 
 async def _post_teams_webhook(settings: Settings, text: str) -> None:
@@ -255,7 +269,6 @@ async def _post_teams_webhook(settings: Settings, text: str) -> None:
     if not webhook_url:
         _log.warning("watchdog.teams_webhook_no_url")
         return
-
     payload = json.dumps(
         {
             "@type": "MessageCard",
@@ -265,21 +278,7 @@ async def _post_teams_webhook(settings: Settings, text: str) -> None:
             "text": text,
         }
     ).encode()
-    try:
-        async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                webhook_url,
-                content=payload,
-                headers={"Content-Type": "application/json", "User-Agent": "Modulo-Watchdog/1.0"},
-            )
-        if not resp.is_success:
-            _log.warning("watchdog.teams_webhook_http_error status=%s", resp.status_code)
-    except asyncio.CancelledError:
-        raise
-    except httpx.RequestError as exc:
-        _log.warning("watchdog.teams_webhook_request_failed: %s", exc)
-    except Exception as exc:
-        _log.warning("watchdog.teams_webhook_unknown_failure: %s", exc)
+    await _post_webhook_payload(webhook_url, payload, "teams_webhook")
 
 
 def _parse_alert_email_to(alert_email_to: str | None) -> list[str]:
@@ -350,6 +349,23 @@ async def _send_email_alert(
         _log.warning("watchdog.email_unknown_failure: %s", exc)
 
 
+async def _dispatch_channel(coro_factory: Callable[[], Awaitable[None]], log_key: str) -> None:
+    """Run one alert channel, isolating its failure from the others.
+
+    Each channel is wrapped in its own try/except so one channel's failure
+    never prevents the others from delivering (mirrors the error-forwarder
+    isolation lesson). ``asyncio.CancelledError`` is re-raised (the watchdog
+    task is being torn down) while any other exception is logged with the
+    channel-specific *log_key* and swallowed so the caller never raises.
+    """
+    try:
+        await coro_factory()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log.warning("watchdog.%s: %s", log_key, exc)
+
+
 async def _send_alerts(
     settings: Settings,
     conditions: list[str],
@@ -364,26 +380,14 @@ async def _send_alerts(
     """
     text = _recovery_text(recovery_state) if recovery_state is not None else _alert_text(conditions)
     if settings.alert_webhook_url:
-        try:
-            await _post_generic_webhook(settings, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _log.warning("watchdog.channel_generic_failed: %s", exc)
+        await _dispatch_channel(lambda: _post_generic_webhook(settings, text), "channel_generic_failed")
     if settings.alert_teams_webhook_url:
-        try:
-            await _post_teams_webhook(settings, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _log.warning("watchdog.channel_teams_failed: %s", exc)
+        await _dispatch_channel(lambda: _post_teams_webhook(settings, text), "channel_teams_failed")
     if settings.alert_email_to and settings.smtp_host:
-        try:
-            await _send_email_alert(settings, conditions, recovery_state=recovery_state)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            _log.warning("watchdog.channel_email_failed: %s", exc)
+        await _dispatch_channel(
+            lambda: _send_email_alert(settings, conditions, recovery_state=recovery_state),
+            "channel_email_failed",
+        )
 
 
 async def _maybe_alert(settings: Settings, redis: aioredis.Redis, conditions: list[str]) -> None:

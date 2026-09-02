@@ -782,7 +782,7 @@ class TestExecuteResumeWrappers:
                 run_id="7b2f2e7e-3a0a-4f5c-9a0e-1a2b3c4d5e6f",
                 org_id="8c3f3f8f-4b0b-4f6d-9b1f-2b3c4d5e6f70",
                 resume_data={"action": "approved"},
-                claim_token="stale-token-from-previous-attempt",
+                _claim_token="stale-token-from-previous-attempt",
             )
         assert result == {"status": "complete"}
         core.assert_awaited_once()
@@ -1730,33 +1730,145 @@ class TestGetSystemAsyncEngine:
         finally:
             sw._SYSTEM_ASYNC_ENGINE = None
 
-    def test_falls_back_to_regular_engine_when_url_empty(self) -> None:
-        regular_engine = MagicMock()
+    def test_fails_closed_when_url_empty(self) -> None:
         mock_settings = _settings(modulo_system_database_url="")
         sw._SYSTEM_ASYNC_ENGINE = None  # reset singleton
+        errors: list[tuple[object, object]] = []
         try:
             with (
                 patch.object(sw, "get_settings", return_value=mock_settings),
-                patch.object(sw, "_get_async_engine", return_value=regular_engine),
+                patch.object(sw._log, "error", lambda msg, extra=None: errors.append((msg, extra))),
+                pytest.raises(RuntimeError, match="MODULO_SYSTEM_DATABASE_URL"),
             ):
-                result = sw._get_system_async_engine()
+                sw._get_system_async_engine()
 
-            assert result is regular_engine
+            assert len(errors) == 1
+            msg, extra = errors[0]
+            assert msg == "saq_worker.system_engine_misconfigured"
+            assert "MODULO_SYSTEM_DATABASE_URL not set" in extra["reason"]
+            # Fail-closed leaves no engine cached — the next invocation raises again.
+            assert sw._SYSTEM_ASYNC_ENGINE is None
         finally:
             sw._SYSTEM_ASYNC_ENGINE = None
 
     def test_caches_engine_singleton(self) -> None:
-        regular_engine = MagicMock()
-        mock_settings = _settings(modulo_system_database_url="")
+        system_engine = MagicMock()
+        mock_settings = _settings(modulo_system_database_url="postgresql+asyncpg://sys:pass@db:5432/modulo")
         sw._SYSTEM_ASYNC_ENGINE = None  # reset singleton
         try:
             with (
                 patch.object(sw, "get_settings", return_value=mock_settings),
-                patch.object(sw, "_get_async_engine", return_value=regular_engine),
+                patch("sqlalchemy.ext.asyncio.create_async_engine", return_value=system_engine),
             ):
                 first = sw._get_system_async_engine()
                 second = sw._get_system_async_engine()
 
             assert first is second
+            assert first is system_engine
         finally:
             sw._SYSTEM_ASYNC_ENGINE = None
+
+
+class TestFireSuiteRunTriggerEnqueueFailure:
+    """``fire_suite_run_trigger`` must not strand a ``pending`` SuiteRun when the
+    ``execute_suite_run`` job cannot be enqueued (Redis/SAQ down).
+
+    The run is already committed ``pending`` by ``cron_helpers.fire_suite_run_trigger``
+    before enqueue; if enqueue fails and we swallow it, the run sits ``pending``
+    forever (nothing reconciles stuck ``pending`` suite_runs). The fix terminalises
+    it to ``failed`` via ``_fail_run`` (FAR-377 reviewer finding).
+    """
+
+    @pytest.mark.asyncio
+    async def test_enqueue_failure_terminalises_pending_suite_run(self) -> None:
+        suite_run_id = _UUID_1
+        org_id = _UUID_ORG
+        trigger_id = _UUID_2
+        pipeline_id = _UUID_3
+
+        fired = {"status": "fired", "suite_run_id": suite_run_id, "trigger_id": trigger_id}
+
+        enqueue_calls: list[tuple[str, str]] = []
+
+        async def fake_enqueue(sid: str, oid: str) -> None:
+            enqueue_calls.append((sid, oid))
+            raise RuntimeError("redis down")
+
+        # Session double for the terminalise path (the run is found + failed).
+        run = MagicMock()
+        run.organisation_id = UUID(org_id)
+        term_session = MagicMock()
+        term_session.get = AsyncMock(return_value=run)
+        # ``session.begin()`` must return an async context manager (not a bare
+        # coroutine) for ``async with session.begin():`` to work under mock.
+        # ``MagicMock(return_value=...)`` (not ``AsyncMock``) so calling it
+        # returns the inner async-CM directly instead of wrapping it in a
+        # coroutine.
+        term_session.begin = MagicMock(return_value=AsyncMock())
+        term_cm = AsyncMock()
+        term_cm.__aenter__.return_value = term_session
+        term_cm.__aexit__.return_value = False
+        factory = MagicMock(return_value=term_cm)
+
+        fail_calls: list[tuple[object, str]] = []
+
+        async def fake_fail_run(session: object, r: object, detail: str) -> None:
+            fail_calls.append((r, detail))
+
+        with (
+            patch(
+                "modulo.core.cron_helpers.fire_suite_run_trigger",
+                new_callable=AsyncMock,
+                return_value=fired,
+            ),
+            patch.object(sw, "_enqueue_suite_run_execution", side_effect=fake_enqueue),
+            patch.object(sw, "_make_session_factory", return_value=factory),
+            patch("modulo.core.eval_engine.execute_suite_run._fail_run", side_effect=fake_fail_run),
+            patch("modulo.db.rls.set_rls_org", new_callable=AsyncMock),
+        ):
+            result = await sw.fire_suite_run_trigger(
+                {},
+                trigger_id=trigger_id,
+                org_id=org_id,
+                pipeline_id=pipeline_id,
+            )
+
+        assert result["status"] == "fired"
+        assert result["dispatched"] == "enqueue_failed"
+        assert enqueue_calls == [(suite_run_id, org_id)]
+        # The committed ``pending`` run must be terminalised (never stranded).
+        assert fail_calls, "pending SuiteRun must be terminalised on enqueue failure"
+        assert fail_calls[0][0] is run
+        assert "enqueue" in fail_calls[0][1].lower()
+
+    @pytest.mark.asyncio
+    async def test_enqueue_success_marks_dispatched(self) -> None:
+        """Happy path: a successful enqueue is recorded as ``enqueued``."""
+        suite_run_id = _UUID_1
+        org_id = _UUID_ORG
+        trigger_id = _UUID_2
+        pipeline_id = _UUID_3
+
+        fired = {"status": "fired", "suite_run_id": suite_run_id, "trigger_id": trigger_id}
+        enqueue_calls = []
+
+        async def fake_enqueue(sid: str, oid: str) -> None:
+            enqueue_calls.append((sid, oid))
+
+        with (
+            patch(
+                "modulo.core.cron_helpers.fire_suite_run_trigger",
+                new_callable=AsyncMock,
+                return_value=fired,
+            ),
+            patch.object(sw, "_enqueue_suite_run_execution", side_effect=fake_enqueue),
+        ):
+            result = await sw.fire_suite_run_trigger(
+                {},
+                trigger_id=trigger_id,
+                org_id=org_id,
+                pipeline_id=pipeline_id,
+            )
+
+        assert result["dispatched"] == "enqueued"
+        assert enqueue_calls == [(suite_run_id, org_id)]

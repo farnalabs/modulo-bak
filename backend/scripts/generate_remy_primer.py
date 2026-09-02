@@ -42,7 +42,7 @@ _log = logging.getLogger(__name__)
 def _safe_output_path(path: Path) -> Path:
     """Resolve *path* and require it to stay within the working directory."""
     resolved = os.path.realpath(str(path))
-    base = os.path.realpath(os.getcwd())
+    base = os.path.realpath(Path.cwd())
     if resolved != base and not resolved.startswith(base + os.sep):
         raise ValueError(f"output path {str(path)!r} resolves outside the working directory")
     return Path(resolved)
@@ -106,8 +106,8 @@ def _load_prd_glossary(prd_path: Path) -> dict[str, str]:
 
     section = m.group(1)
     terms: dict[str, str] = {}
-    for line in section.splitlines():
-        line = line.strip()
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
         if not line.startswith("| **"):
             continue
         parts = [p.strip() for p in line.split("|") if p.strip()]

@@ -25,7 +25,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from modulo.api.constants import MSG_DB_OPERATION_FAILED, MSG_FEATURE_NOT_AVAILABLE, MSG_INTERNAL_SERVER_ERROR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import deny_break_glass_mint, get_db_session, require_permission
-from modulo.api.middleware.sensitive_mask import SENSITIVE_VALUE_MASK, mask_config_json
+from modulo.api.middleware.sensitive_mask import (
+    SENSITIVE_VALUE_MASK,
+    mask_config_json,
+    merge_masked_config_json,
+)
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.secret_storage import _is_encrypted_token, encrypt_stored_secret
 from modulo.core.cron_helpers import (
@@ -34,7 +38,6 @@ from modulo.core.cron_helpers import (
     validate_cron_expression,
 )
 from modulo.core.exceptions import OrgDeletedError
-from modulo.core.sanitize_log import sanitise_log_value
 from modulo.core.trigger_engine import TriggerEngine
 from modulo.core.trigger_streak import (
     _streak_config,
@@ -43,8 +46,10 @@ from modulo.core.trigger_streak import (
     get_trigger_streak_status,
 )
 from modulo.core.trigger_validation import validate_ongoing_config
+from modulo.db.capacity import StorageExhaustedError
 from modulo.db.crud.pipeline_snapshot import create_snapshot_from_live_graph
 from modulo.db.crud.run import create_run
+from modulo.db.crud.trigger import apply_trigger_event_cursor
 from modulo.db.models.organisation import Organisation
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.trigger import Trigger
@@ -198,17 +203,12 @@ def _merge_trigger_config(current: dict[str, Any] | None, update: dict[str, Any]
 
     A masked placeholder must never clobber the stored secret (read-modify-write
     round-trip guard); an explicit ``None`` clears the key; a missing key leaves
-    it intact.
+    it intact. Delegates to :func:`merge_masked_config_json` so nested masked
+    values (``headers.Authorization``, list elements, ``operations`` params) are
+    skipped at every depth — the trigger GET emits a recursive mask, so the
+    PATCH merge must be recursive too (previously top-level exact-equality only).
     """
-    merged_cfg = dict(current or {})
-    for k, v in update.items():
-        if isinstance(v, str) and v == SENSITIVE_VALUE_MASK:
-            continue
-        if v is None:
-            merged_cfg.pop(k, None)
-        else:
-            merged_cfg[k] = v
-    return merged_cfg
+    return merge_masked_config_json(current or {}, update)
 
 
 _SECRET_CONFIG_KEYS = frozenset({"hmac_secret", "signing_secret"})
@@ -659,7 +659,7 @@ async def update_polling_config(
             ):
                 trigger_engine = TriggerEngine()
                 await trigger_engine.schedule_polling_trigger(
-                    session, trigger=trigger, org_id=principal.organisation_id
+                    session, trigger=trigger, _org_id=principal.organisation_id
                 )
 
             await session.flush()
@@ -856,7 +856,7 @@ async def test_polling_condition(
     trigger_engine = TriggerEngine()
     return await trigger_engine.evaluate_condition(
         session,
-        trigger=trigger,
+        _trigger=trigger,
         org_id=principal.organisation_id,
         connector_instance_id=uuid.UUID(req.connector_instance_id),
         poll_query=req.poll_query,
@@ -1346,6 +1346,8 @@ async def test_trigger(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Cannot create run: organisation {exc.org_id} not found",
         ) from None
+    except StorageExhaustedError:
+        raise
     except HTTPException:
         raise
     except Exception:
@@ -1399,16 +1401,7 @@ async def list_trigger_events(
                 q = q.where(TriggerEvent.validation_result == event_status)
 
             if cursor:
-                try:
-                    cursor_created_at_str, cursor_id = cursor.split("_", 1)
-                    cursor_dt = datetime.datetime.fromisoformat(cursor_created_at_str)
-                    cursor_uuid = uuid.UUID(cursor_id)
-                    q = q.where(
-                        (TriggerEvent.created_at < cursor_dt)
-                        | ((TriggerEvent.created_at == cursor_dt) & (TriggerEvent.id < cursor_uuid))
-                    )
-                except (ValueError, AttributeError):
-                    _log.warning("Malformed cursor ignored: %s", sanitise_log_value(cursor), exc_info=True)
+                q = apply_trigger_event_cursor(q, cursor)
 
             q = q.order_by(TriggerEvent.created_at.desc(), TriggerEvent.id.desc()).limit(limit + 1)
             rows = (await session.execute(q)).scalars().all()

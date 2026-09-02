@@ -109,13 +109,16 @@ def put_observability_settings(client, ctx, request):
 @when("I POST /api/v1/settings/observability/test")
 def step_otel_connection(client, ctx, request):
     endpoint = ctx.get("otlp_endpoint", "http://otel-collector:4318")
-    with patch("modulo.api.routes.observability.httpx.AsyncClient") as mock_client_cls:
+    with patch(
+        "modulo.api.routes.observability.pinned_async_client",
+        new_callable=AsyncMock,
+    ) as mock_pinned:
         mock_client = MagicMock()
-        mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+        mock_client.aclose = AsyncMock()
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_pinned.return_value = mock_client
 
         resp = client.post(
             "/api/v1/settings/observability/test",
@@ -470,14 +473,16 @@ def run_detail_includes_capacity(request):
 def run_detail_includes_work_item_refs(request):
     data = request.node._resp.json()
     refs = data.get("work_item_refs")
-    assert isinstance(refs, list) and len(refs) > 0, "work_item_refs missing"
+    assert isinstance(refs, list), "work_item_refs missing"
+    assert len(refs) > 0, "work_item_refs missing"
 
 
 @then("the run detail response includes child_runs")
 def run_detail_includes_child_runs(request):
     data = request.node._resp.json()
     children = data.get("child_runs")
-    assert isinstance(children, list) and len(children) > 0, "child_runs missing"
+    assert isinstance(children, list), "child_runs missing"
+    assert len(children) > 0, "child_runs missing"
 
 
 @then("the event stream includes node_started events")

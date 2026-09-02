@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -94,15 +95,13 @@ def _resolve_license_key(raw_key: str) -> LicenseStatusResponse | None:
 
 
 def _resolve_effective_license(settings: Settings, org: Organisation | None = None) -> LicenseStatusResponse:
-    """Resolve the effective license, checking org-level, then system-level (env var), then in-memory."""
-    # 1. Org-level license key
+    """Resolve the effective license, checking org-level, then in-memory, then system-level (env var)."""
     if org is not None:
         org_key = org.settings_json.get("license_key") if org.settings_json else None
         resolved = _resolve_license_key(str(org_key) if org_key else "")
         if resolved is not None:
             return resolved
 
-    # 2. In-memory store (from POST /admin/license)
     lic = get_license()
     if lic is not None:
         return _license_status(lic)
@@ -115,22 +114,14 @@ def _resolve_effective_license(settings: Settings, org: Organisation | None = No
     return LicenseStatusResponse(has_license=False, tier="community")
 
 
-@router.get("")
-@handle_db_errors("admin.license.get_license_status")
-async def get_license_status(
-    settings: Settings = Depends(get_settings),
-    current_user: TenantPrincipal = require_permission(_CODE_ORG_LICENSE_MANAGE),
-    session: AsyncSession = Depends(get_db_session),
-) -> LicenseStatusResponse:
-
-    # Attempt Redis cache read
+async def _read_license_cache(settings: Settings, org_id: str) -> LicenseStatusResponse | None:
+    """Best-effort Redis cache read for an org's license status."""
     redis: Redis | None = None
     try:
         redis = Redis.from_url(
             settings.redis_url, decode_responses=True, socket_connect_timeout=2.0, socket_timeout=2.0
         )
-        cache_key = f"license:{current_user.organisation_id}"
-        cached = await redis.get(cache_key)
+        cached = await redis.get(f"license:{org_id}")
         if cached:
             return LicenseStatusResponse(**json.loads(cached))
     except Exception:
@@ -138,28 +129,46 @@ async def get_license_status(
     finally:
         if redis is not None:
             await redis.aclose()
+    return None
+
+
+async def _write_license_cache(settings: Settings, org_id: str, response: LicenseStatusResponse) -> None:
+    """Best-effort Redis cache write (60s TTL) for an org's license status."""
+    redis: Redis | None = None
+    try:
+        redis = Redis.from_url(
+            settings.redis_url, decode_responses=True, socket_connect_timeout=2.0, socket_timeout=2.0
+        )
+        await redis.setex(f"license:{org_id}", 60, response.model_dump_json())
+    except Exception:
+        logger.warning("license.cache_write_failed", exc_info=True)
+    finally:
+        if redis is not None:
+            await redis.aclose()
+
+
+@router.get("")
+@handle_db_errors("admin.license.get_license_status")
+async def get_license_status(
+    settings: Annotated[Settings, Depends(get_settings)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    current_user: TenantPrincipal = require_permission(_CODE_ORG_LICENSE_MANAGE),
+) -> LicenseStatusResponse:
+
+    org_id = current_user.organisation_id
+    if org_id is not None:
+        cached = await _read_license_cache(settings, str(org_id))
+        if cached is not None:
+            return cached
 
     try:
         org = None
-        if current_user.organisation_id is not None:
+        if org_id is not None:
             async with session.begin():
-                org = await get_organisation(session, current_user.organisation_id)
+                org = await get_organisation(session, org_id)
 
         response = _resolve_effective_license(settings, org=org)
-
-        # Write to Redis cache (best-effort, 60s TTL)
-        try:
-            redis = Redis.from_url(
-                settings.redis_url, decode_responses=True, socket_connect_timeout=2.0, socket_timeout=2.0
-            )
-            cache_key = f"license:{current_user.organisation_id}"
-            await redis.setex(cache_key, 60, response.model_dump_json())
-        except Exception:
-            logger.warning("license.cache_write_failed", exc_info=True)
-        finally:
-            if redis is not None:
-                await redis.aclose()
-
+        await _write_license_cache(settings, str(org_id), response)
         return response
     except ProgrammingError:
         logger.exception(_CODE_LICENSE_GET_FAILED)
@@ -221,7 +230,7 @@ async def upload_license(
 async def issue_license(
     req: LicenseIssueRequest,
     background_tasks: BackgroundTasks,
-    settings: Settings = Depends(get_settings),
+    settings: Annotated[Settings, Depends(get_settings)],
     _: TenantPrincipal = require_system_permission("system.config.manage"),  # type: ignore[assignment]
 ) -> LicenseIssueResponse:
     """Manually issue (sign) a team license key for a customer.
@@ -230,19 +239,12 @@ async def issue_license(
     When ``email`` is provided, the license key is also emailed to the customer
     via a background task so this request stays fast.
     """
-    try:
-        license_key = generate_team_license(
-            req.org_name,
-            term_months=req.term_months,
-            features=req.features if req.features is not None else TEAM_FEATURES,
-            private_key_hex=settings.modulo_license_private_key or None,
-        )
-    except ValueError as exc:
-        logger.exception("license.issue_generation_failed")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(exc),
-        ) from exc
+    license_key = generate_team_license(
+        req.org_name,
+        term_months=req.term_months,
+        features=req.features if req.features is not None else TEAM_FEATURES,
+        private_key_hex=settings.modulo_license_private_key or None,
+    )
 
     validation = parse_and_verify(license_key)
     if not validation.valid or validation.license_data is None:

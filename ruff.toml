@@ -15,10 +15,184 @@ select = [
     "RUF",
     "SIM",
     "C4",
+    "ISC",
     "T20",
     "RET",
     "PYI",
     "FURB",
+    "PIE",
+    "RSE",
+    # Defensive gate-strengthening: every rule below was verified to have zero
+    # current violations (run `ruff check . --extend-select <codes> --statistics`),
+    # so enabling them tightens the lint gate against future regressions without
+    # touching existing code.
+    "G001", "G002", "G003", "G004", "G201",
+    "PERF101", "PERF203", "PERF402", "PERF403",
+    "PT020", "PT021",
+    "Q000", "Q003",
+    "ICN",
+    "FA",
+    "NPY",
+    "RUF100",
+    # Second wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.15.20: run `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the backend/pyproject.toml gate.
+    "PLC3002", "PLR0206", "PLR1711", "PLR1722", "PLR5501",
+    "PLW0120", "PLW0127", "PLW0131", "PLW0211", "PLW0642",
+    "PLW2901",
+    "PYI025",
+    "UP032",
+    # Third wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the repo-root ruff.toml gate. Combines the two
+    # independent third-wave additions from this branch and origin/main.
+    "B017",
+    "B019",
+    "B025",
+    "B905",
+    "SIM105",
+    "SIM107",
+    "SIM108",
+    "SIM115",
+    "SIM118",
+    "SIM201",
+    "SIM202",
+    "SIM210",
+    "SIM211",
+    "SIM212",
+    "SIM220",
+    "SIM221",
+    "SIM222",
+    "SIM223",
+    "SIM300",
+    "SIM910",
+    "C401",
+    "C408",
+    "C409",
+    "C410",
+    "C411",
+    "C413",
+    "C414",
+    "C415",
+    "C416",
+    "C417",
+    "C418",
+    "C419",
+    "C420",
+    "PGH",
+    "RUF005",
+    "RUF010",
+    "RUF015",
+    "RUF016",
+    "RUF018",
+    "RUF019",
+    "RUF022",
+    "RUF026",
+    "RUF051",
+    "TRY400",
+    "RSE102",
+    "PLW0406",
+    "PLR0124",
+    "PLR1714",
+    "PLR0133",
+    "PLW1508",
+    "PLC0414",
+    "PLC0205",
+    "PLR1730",
+    "PLR1733",
+    "PLR1736",
+    "PLC2401",
+    # Fourth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the backend/pyproject.toml gate.
+    "PLC0105",
+    "PLC0131",
+    "PLC0206",
+    "PLC2403",
+    "PLR1716",
+    "PLW0129",
+    "PLW0133",
+    "PLW0245",
+    "PLW0604",
+    "PERF401",
+    # Fifth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the backend/pyproject.toml gate. Includes PT027
+    # (already enforced by the backend gate) to close the existing drift.
+    "PT027",
+    "YTT101", "YTT102", "YTT103",
+    "YTT201", "YTT202", "YTT203", "YTT204",
+    "YTT301", "YTT302", "YTT303",
+    "SLOT002",
+    # flake8-use-pathlib: every member of the family now has zero current call
+    # sites across the whole tree (incl. scripts/, which were migrated to match)
+    # — the PTH118/PTH120/PTH123 backlog was cleared in a scan-by-scan migration.
+    "PTH100", "PTH101", "PTH102", "PTH103", "PTH104", "PTH105", "PTH106", "PTH107",
+    "PTH108", "PTH109", "PTH110", "PTH111", "PTH112", "PTH113", "PTH114", "PTH115",
+    "PTH116", "PTH117", "PTH118", "PTH119", "PTH120", "PTH121", "PTH122", "PTH123",
+    "PTH124", "PTH201", "PTH202", "PTH203", "PTH204", "PTH205", "PTH206", "PTH207",
+    "PTH208", "PTH210", "PTH211",
+    # flake8-logging hygiene: logger must be obtained via getLogger() with
+    # __name__ (LOG001/LOG002), never the deprecated WARN constant (LOG009),
+    # never a root-logger call (LOG015).
+    "LOG001", "LOG002", "LOG009", "LOG015",
+    # Sixth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5: `ruff check . --extend-select <codes>
+    # --statistics`). Mirrors the backend/pyproject.toml gate. These families
+    # close drift and block future regressions: B007 (unused loop variable),
+    # B904 (raise without `from` — chain exceptions), RUF009/RUF012/RUF013
+    # (mutable defaults / typed-class hygiene), the TODO-comment TD family
+    # (author/link/capitalization hygiene), and FIX001 (no stray FIXME).
+    "B007", "B904",
+    "RUF009", "RUF012", "RUF013",
+    "TD004", "TD006", "TD007",
+    "FIX001",
+    # flake8-datetimez: production time handling must be timezone-aware;
+    # remaining violations are intentional naive datetime fixtures in tests/,
+    # covered by the tests/** per-file-ignore.
+    "DTZ",
+    # Seventh wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5 under both this gate and the
+    # backend/pyproject.toml gate: `ruff check . --select PT023,PT026`).
+    # Mirrors the backend/pyproject.toml gate. Upon any future regression the
+    # newly-flagged decorators must be normalized rather than re-ignored.
+    "PT023",  # consistent @pytest.mark.<marker>() parentheses style
+    "PT026",  # reject useless arg-free @pytest.mark.usefixtures()
+    # Eighth wave of defensive gate-strengthening (verified zero current
+    # violations with ruff==0.16.5 under both this gate and the
+    # backend/pyproject.toml gate: `ruff check . --select PT001,PT002,PT003,
+    # PT007,PT008,PT009,PT010,PT014,PT015,PT016,PT017,PT022,PT024,PT025,PT030,
+    # PT031 --statistics`). Mirrors the backend/pyproject.toml gate. These
+    # pytest-style rules are all pass-to-enable (zero current violations across
+    # the whole tree), so enabling them tightens the test-quality gate against
+    # future regressions without touching existing tests.
+    "PT001",  # consistent @pytest.fixture() parentheses style
+    "PT002",  # no positional arguments to @pytest.fixture()/@pytest.mark.parametrize()
+    "PT003",  # @pytest.fixture(scope=...) should not be spelled with scope="function"
+    "PT007",  # @pytest.mark.parametrize() values must be a collection, not a bare dict/list
+    "PT008",  # no lambda argument to mocker.patch()
+    "PT009",  # use plain asserts rather than unittest-style assertEquals() etc.
+    "PT010",  # pytest.raises()/pytest.warns() must name at least one exception/warning
+    "PT014",  # no duplicated test cases in @pytest.mark.parametrize()
+    "PT015",  # no assert that is always False
+    "PT016",  # no pytest.fail() without a message
+    "PT017",  # no assert inside an except block
+    "PT022",  # no unused-yield fixture (use plain return instead)
+    "PT024",  # no redundant @pytest.mark.asyncio on an already-coroutine fixture
+    "PT025",  # no erroneous use_fixtures() marker on a fixture
+    "PT030",  # pytest.warns() too broad (bare Exception) — narrow to the concrete warning
+    "PT031",  # pytest.warns() with multiple statements — assert inside the block
+    # Ninth wave of defensive gate-strengthening: unlike the pass-to-enable waves
+    # above, these rules had a small existing backlog that this PR FIXED, so the
+    # gate now also locks the fixes in against future regressions (verified zero
+    # remaining violations with ruff==0.16.5 under both the backend and repo-root
+    # gates: `ruff check . --select LOG004,LOG014,PLW1510,ARG003,ARG004
+    # --statistics`). Mirrors the backend/pyproject.toml gate.
+    "LOG004",  # logger.exception() must not be used outside an exception handler
+    "LOG014",  # exc_info= must carry the real exception, not rely on ambient state
+    "PLW1510", # subprocess.run() needs an explicit `check=` argument
+    "ARG003",  # unused class-method argument
+    "ARG004",  # unused static-method argument
 ]
 ignore = [
     "S101",
@@ -31,7 +205,7 @@ ignore = [
 "backend/scripts/*" = ["T20"]
 ".github/scripts/*" = ["T20"]
 "deploy/*" = ["T20", "S108"]
-"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008"]
+"tests/**" = ["S101", "S105", "S106", "S107", "S108", "S112", "S311", "B007", "B008", "DTZ"]
 "docs/**" = ["T20"]
 ".semgrep/**" = ["F821"]
 "docs/api/examples/**" = ["T20", "S108"]

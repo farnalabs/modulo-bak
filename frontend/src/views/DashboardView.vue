@@ -4,7 +4,7 @@
     <PageHeader :title="$t('views.DashboardView.dashboard')" :subtitle="$t('views.DashboardView.overview_of_your_organisations_pipelines_and_runs')" data-testid="dashboard-title">
       <template #right>
         <div class="flex flex-wrap justify-end gap-1">
-          <button
+          <button type="button"
             v-for="w in trendWindows"
             :key="w.value ?? 'all'"
             :data-testid="'trend-toggle-' + (w.value ?? 'all')"
@@ -178,7 +178,7 @@
             </div>
             <div class="flex items-center gap-2 ml-3">
               <span :class="runStatusBadgeClass(run.status)" class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium capitalize">
-                {{ run.status }}
+                {{ runStatusLabel(run.status) }}
               </span>
               <span class="text-xs text-muted-foreground hidden sm:inline">{{ run.trigger_type }}</span>
             </div>
@@ -204,7 +204,7 @@ import StatCard from '../components/StatCard.vue'
 import { ChevronUp, ChevronDown } from '@lucide/vue'
 import { RUN_STATUS } from '../constants/filters'
 import { formatMoney } from '../lib/money'
-import { runStatusBadgeClass, formatRunDate } from '../utils/runUtils'
+import { runStatusBadgeClass, runStatusLabel, formatRunDate } from '../utils/runUtils'
 import { useOrgCurrency } from '../composables/useOrgCurrency'
 
 const { t } = useI18n()

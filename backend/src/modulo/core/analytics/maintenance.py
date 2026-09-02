@@ -193,17 +193,21 @@ async def backfill_facts(session: Any, day: date) -> int:
         ),
         else_=None,
     )
-    # Graph-derived fields from the snapshot's ``graph_json`` (the serialised
-    # pipeline graph: a dict with a ``nodes`` list). ``graph_json`` is the
-    # native Postgres ``json`` type, so the ``json_*`` functions apply; all
-    # three degrade to defaults when the graph is malformed/absent — backfilled
-    # rows must NEVER carry NULL here (NULL facts on backfilled rows are a bug).
-    graph_nodes_json = PipelineSnapshot.graph_json.op("->")("nodes")
+    # ``graph_json`` is ``json`` on SQLite/MariaDB and promoted to ``jsonb`` on
+    # Postgres by migration 0147 — but the promotion is non-blocking and the ORM
+    # model keeps the generic ``JSON`` type, so the column type is not guaranteed
+    # to be ``jsonb`` in every environment. ``json_array_length`` / ``json_array_elements``
+    # only accept ``json``, not ``jsonb`` (and ``jsonb_array_length`` only accepts
+    # ``jsonb``), so cast the extracted ``nodes`` array to ``json`` explicitly to
+    # stay type-agnostic across both column types.
+    graph_nodes_json = sa.cast(PipelineSnapshot.graph_json.op("->")("nodes"), sa.JSON)
+    _json_array_length = sa.func.json_array_length
+    _json_array_elements = sa.func.json_array_elements
     node_count_expr = sa.case(
-        (graph_nodes_json.is_not(None), sa.func.coalesce(sa.func.json_array_length(graph_nodes_json), 0)),
+        (graph_nodes_json.is_not(None), sa.func.coalesce(_json_array_length(graph_nodes_json), 0)),
         else_=0,
     )
-    _node_arr = sa.func.json_array_elements(graph_nodes_json).table_valued("value")
+    _node_arr = _json_array_elements(graph_nodes_json).table_valued("value")
     _node_value = _node_arr.c.value
     sandbox_count_subq = (
         sa.select(sa.func.count())
@@ -459,8 +463,8 @@ async def reconcile_facts(session: Any, *, today: date | None = None) -> dict[st
         )
     ).all()
 
-    for org_id, run_date, ledger_total in ledger_rows:
-        ledger_total = ledger_total or Decimal(0)
+    for org_id, run_date, raw_ledger_total in ledger_rows:
+        ledger_total = raw_ledger_total or Decimal(0)
         facts_total = (
             await session.execute(
                 sa.select(func.coalesce(func.sum(RunDailyFact.total_cost_usd), 0)).where(

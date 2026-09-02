@@ -145,6 +145,174 @@ def test_infer_schema_returns_200(client: TestClient) -> None:
     assert "Inferred from" in data["suggestion_name"]
 
 
+def test_infer_schema_threads_session_into_secrets_backend(client: TestClient) -> None:
+    """Regression (FAR-519): connector sampling must decrypt credentials with a
+    secrets backend carrying the DB session, or the connector is silently
+    skipped and schema sampling 502s ("Failed to sample connector data")."""
+    ci = _make_mock_connector_instance()
+    mb = _make_mock_model_backend()
+    page_result = MagicMock(items=[mb], total=1, page=1, page_size=1)
+    backend_id = uuid.uuid4()
+    captured_sessions: list[object] = []
+
+    def fake_create_backend(*args: object, **kwargs: object) -> object:
+        captured_sessions.append(kwargs.get("session"))
+        return MagicMock()
+
+    with (
+        patch("modulo.api.routes.schemas.get_connector_instance", return_value=ci),
+        patch("modulo.api.routes.schemas.list_model_backends", return_value=page_result),
+        patch("modulo.api.routes.schemas.set_rls_org"),
+        patch("modulo.api.routes.schemas.ConnectorHub.sample", return_value=[{"id": "1", "title": "Test"}]),
+        patch("modulo.api.routes.schemas.SchemaInferenceService.infer", return_value={"type": "object"}),
+        patch("modulo.api.routes.schemas.ConnectorHub.initialise"),
+        patch("modulo.api.routes.schemas.ModelBackendHub.initialise"),
+        patch(
+            "modulo.api.routes.schemas.ModelBackendHub.backend_ids",
+            new_callable=PropertyMock(return_value=frozenset({backend_id})),
+        ),
+        patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
+        patch("modulo.api.routes.schemas.create_secrets_backend", fake_create_backend),
+    ):
+        resp = client.post(
+            "/api/v1/schemas/infer",
+            json={
+                "connector_instance_id": str(_CONNECTOR_ID),
+                "sample_query": {"resource": "issues", "filters": {}, "limit": 5},
+            },
+        )
+
+    assert resp.status_code == 200
+    # The connector-sampling path (``_sample_connector_records``) must build the
+    # secrets backend with the DB session, or credentials never decrypt and the
+    # sample 502s.
+    assert any(s is not None for s in captured_sessions), "connector sampling secrets backend must carry the DB session"
+
+
+def test_infer_schema_threads_session_into_model_backend(client: TestClient) -> None:
+    """Regression (FAR-519): the model-backend path (``_infer_definition`` ->
+
+    ``_resolve_model_backend``) must build the secrets backend with the DB
+    session. The default FernetSecretsBackend raises
+    ``RuntimeError('no DB session')`` inside ``get_secret`` before the
+    ``credentials_ciphertext`` fallback applies, and ``ModelBackendHub.initialise``
+    only catches ``TimeoutError``/``KeyError`` — so without a session every model
+    backend init becomes a blanket 502 ("Failed to initialise model backend for
+    inference") and ``POST /api/v1/schemas/infer`` cannot complete end-to-end."""
+    ci = _make_mock_connector_instance()
+    mb = _make_mock_model_backend()
+    page_result = MagicMock(items=[mb], total=1, page=1, page_size=1)
+    backend_id = uuid.uuid4()
+    captured_backends: list[object] = []
+
+    def fake_create_backend(*args: object, **kwargs: object) -> MagicMock:
+        obj = MagicMock()
+        obj._session = kwargs.get("session")
+        return obj
+
+    async def spy_initialise(*args: object, **kwargs: object) -> None:
+        captured_backends.append(kwargs.get("secrets_backend"))
+
+    with (
+        patch("modulo.api.routes.schemas.get_connector_instance", return_value=ci),
+        patch("modulo.api.routes.schemas.list_model_backends", return_value=page_result),
+        patch("modulo.api.routes.schemas.set_rls_org"),
+        patch("modulo.api.routes.schemas.ConnectorHub.sample", return_value=[{"id": "1", "title": "Test"}]),
+        patch("modulo.api.routes.schemas.SchemaInferenceService.infer", return_value={"type": "object"}),
+        patch("modulo.api.routes.schemas.ConnectorHub.initialise"),
+        patch("modulo.api.routes.schemas.ModelBackendHub.initialise", side_effect=spy_initialise),
+        patch(
+            "modulo.api.routes.schemas.ModelBackendHub.backend_ids",
+            new_callable=PropertyMock(return_value=frozenset({backend_id})),
+        ),
+        patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
+        patch("modulo.api.routes.schemas.create_secrets_backend", fake_create_backend),
+    ):
+        resp = client.post(
+            "/api/v1/schemas/infer",
+            json={
+                "connector_instance_id": str(_CONNECTOR_ID),
+                "sample_query": {"resource": "issues", "filters": {}, "limit": 5},
+            },
+        )
+
+    assert resp.status_code == 200
+    # The model-backend path (``_infer_definition`` -> ``_resolve_model_backend``)
+    # must build the secrets backend with the DB session — this is the exact
+    # regression the PR-Reviewer MAJOR flagged for schemas.py:916.
+    assert captured_backends, "ModelBackendHub.initialise was never called"
+    assert all(b is not None and getattr(b, "_session", None) is not None for b in captured_backends), (
+        "model-backend secrets backend must carry the DB session"
+    )
+
+
+def test_infer_schema_threads_session_into_model_backend_decrypt(client: TestClient) -> None:
+    """Regression (FAR-522): the ModelBackendHub decrypt path in
+    ``_infer_definition`` must build its secrets backend with the session and
+    re-assert the org scope in the SAME transaction, or model-backend
+    credentials never decrypt and inference 502s (silent skip / degraded)."""
+    ci = _make_mock_connector_instance()
+    mb = _make_mock_model_backend()
+    page_result = MagicMock(items=[mb], total=1, page=1, page_size=1)
+    backend_id = uuid.uuid4()
+    backend_sessions: list[object] = []
+    events: list[tuple[str, object]] = []
+
+    def fake_create_backend(*args: object, **kwargs: object) -> object:
+        backend = MagicMock()
+        backend._session = kwargs.get("session")
+        events.append(("create_backend", backend._session))  # type: ignore[arg-type]
+        return backend
+
+    async def fake_hub_init(self: object, instances: object, secrets_backend: object) -> None:
+        backend_sessions.append(secrets_backend._session)  # type: ignore[attr-defined]
+
+    def spy_set_rls_org(session: object, org_id: object) -> object:
+        events.append(("rls", org_id))
+
+    with (
+        patch("modulo.api.routes.schemas.get_connector_instance", return_value=ci),
+        patch("modulo.api.routes.schemas.list_model_backends", return_value=page_result),
+        patch("modulo.api.routes.schemas.set_rls_org", side_effect=spy_set_rls_org) as mock_rls,
+        patch("modulo.api.routes.schemas.ConnectorHub.sample", return_value=[{"id": "1", "title": "Test"}]),
+        patch("modulo.api.routes.schemas.ConnectorHub.initialise"),
+        patch("modulo.api.routes.schemas.SchemaInferenceService.infer", return_value={"type": "object"}),
+        patch("modulo.api.routes.schemas.ModelBackendHub.initialise", fake_hub_init),
+        patch(
+            "modulo.api.routes.schemas.ModelBackendHub.backend_ids",
+            new_callable=PropertyMock(return_value=frozenset({backend_id})),
+        ),
+        patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
+        patch("modulo.api.routes.schemas.create_secrets_backend", fake_create_backend),
+    ):
+        resp = client.post(
+            "/api/v1/schemas/infer",
+            json={
+                "connector_instance_id": str(_CONNECTOR_ID),
+                "sample_query": {"resource": "issues", "filters": {}, "limit": 5},
+            },
+        )
+
+    assert resp.status_code == 200
+    assert backend_sessions, "ModelBackendHub must receive a secrets backend for the model-backend decrypt"
+    assert all(s is not None for s in backend_sessions), (
+        "model-backend decrypt secrets backend must carry the DB session, or credentials never decrypt"
+    )
+    # ORG-SCOPE AT DECRYPT (MAJOR regression): the model-backend decrypt is the
+    # LAST secrets backend built (the context loader and connector sampling each
+    # build their own earlier). The decrypt must re-assert the org scope in its
+    # own transaction AFTER building that backend — set_config(..., true) is
+    # transaction-local, so the loader's org scope is gone once it commits. A
+    # missing re-assert leaves no set_rls_org call after the final backend build.
+    last_backend_build = next(i for i, (kind, _) in reversed(list(enumerate(events))) if kind == "create_backend")
+    assert any(kind == "rls" and org == _ORG_ID for i, (kind, org) in enumerate(events) if i > last_backend_build), (
+        "model-backend decrypt must re-assert the org scope (set_rls_org) in the same "
+        "transaction as the credential decrypt"
+    )
+    # Sanity: the loader + sampling re-asserts happen before the final build.
+    assert mock_rls.call_count >= 2
+
+
 def test_infer_schema_forwards_filters_to_sampling(client: TestClient) -> None:
     """The request ``sample_query.filters`` must reach the connector sampling call."""
     ci = _make_mock_connector_instance()
@@ -497,7 +665,7 @@ def test_infer_schema_emits_audit_event_with_tool_source_and_model(client: TestC
         ),
         patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
         patch("modulo.api.routes.schemas.create_secrets_backend"),
-        patch("modulo.api.routes.schemas.append_audit_event", new_callable=AsyncMock) as mock_append,
+        patch("modulo.api.routes.schemas.append_audit_event_isolated", new_callable=AsyncMock) as mock_append,
     ):
         resp = client.post(
             "/api/v1/schemas/infer",
@@ -510,9 +678,10 @@ def test_infer_schema_emits_audit_event_with_tool_source_and_model(client: TestC
     assert resp.status_code == 200
     mock_append.assert_awaited_once()
     call = mock_append.await_args
-    assert call.kwargs["org_id"] == _ORG_ID
     assert call.kwargs["event_type"] == "schema_inference_completed"
-    payload = call.kwargs["payload_json"]
+    assert call.kwargs["resource_type"] == "connector_instance"
+    assert call.kwargs["resource_id"] == _CONNECTOR_ID
+    payload = call.kwargs["payload"]
     assert payload["connector_name"] == "Test Connector"
     assert payload["connector_type"] == "github"
     assert payload["resource"] == "issues"
@@ -545,7 +714,7 @@ def test_infer_schema_response_does_not_contain_or_persist_sample_records(client
         ),
         patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
         patch("modulo.api.routes.schemas.create_secrets_backend"),
-        patch("modulo.api.routes.schemas.append_audit_event", new_callable=AsyncMock),
+        patch("modulo.api.routes.schemas.append_audit_event_isolated", new_callable=AsyncMock),
     ):
         resp = client.post(
             "/api/v1/schemas/infer",
@@ -594,7 +763,7 @@ def test_infer_schema_flags_rare_fields_in_response(client: TestClient) -> None:
         ),
         patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
         patch("modulo.api.routes.schemas.create_secrets_backend"),
-        patch("modulo.api.routes.schemas.append_audit_event", new_callable=AsyncMock),
+        patch("modulo.api.routes.schemas.append_audit_event_isolated", new_callable=AsyncMock),
     ):
         resp = client.post(
             "/api/v1/schemas/infer",
@@ -633,7 +802,7 @@ def test_infer_schema_rare_fields_empty_when_all_fields_common(client: TestClien
         ),
         patch("modulo.api.routes.schemas.ModelBackendHub.get", return_value=MagicMock()),
         patch("modulo.api.routes.schemas.create_secrets_backend"),
-        patch("modulo.api.routes.schemas.append_audit_event", new_callable=AsyncMock),
+        patch("modulo.api.routes.schemas.append_audit_event_isolated", new_callable=AsyncMock),
     ):
         resp = client.post(
             "/api/v1/schemas/infer",

@@ -79,6 +79,14 @@ TELEMETRY_FIELDS = frozenset(
         "model_cost_clamped",
         "model_cost_out_of_band_high",
         "model_cost_display_usd",
+        # FAR-491 agent-reported token usage (display-only — never an input to
+        # the system's built-in money math; operator formulas may reference
+        # them).
+        "model_tokens_input",
+        "model_tokens_output",
+        "model_tokens_total",
+        "model_tokens_cache_read",
+        "model_tokens_cache_write",
         "agent_stdout",
         "agent_stderr",
         "stdout_length",
@@ -197,7 +205,7 @@ def resolve_node_contract_output(
 # ---------------------------------------------------------------------------
 
 
-def node_return(outputs_json: Any, telemetry_json: Any, node_id: str) -> Any:
+def node_return(outputs_json: Any, _telemetry_json: Any, node_id: str) -> Any:
     """The PURE agent return for *node_id* -- legacy-safe.
 
     When a telemetry entry exists for the node (a P1+ row) the value in
@@ -408,6 +416,62 @@ def _looks_like_gate(envelope: dict[str, Any]) -> bool:
     return a0.get("status") in {"interrupted", "condition_skipped", "auto_approved"}
 
 
+def _is_recovery_marker(envelope: dict[str, Any]) -> bool:
+    """True when *envelope* is a recovery marker.
+
+    A recovery marker carries a ``recovered`` / ``skipped`` key but was NOT
+    written with a structured ``artifacts`` list (in which case it is treated
+    as a normal envelope instead).
+    """
+    has_marker = "recovered" in envelope or "skipped" in envelope
+    return has_marker and not isinstance(envelope.get("artifacts"), list)
+
+
+def _split_by_known_type(envelope: dict[str, Any], resolved_type: str) -> tuple[Any, dict[str, Any]] | None:
+    """Dispatch a splittable node type to its dedicated per-type splitter.
+
+    Returns the ``(return_value, telemetry)`` tuple, or ``None`` when
+    *resolved_type* is not a splittable type so the caller can fall through to
+    shape-based detection / unknown handling.
+    """
+    if resolved_type not in SPLITTABLE_NODE_TYPES:
+        return None
+    if resolved_type == "sandbox_agent":
+        return _split_sandbox_agent(envelope)
+    if resolved_type == "agent":
+        return _split_agent(envelope)
+    if resolved_type == "connector":
+        return _split_connector(envelope)
+    if resolved_type == "manual":
+        return _split_manual(envelope)
+    return _split_gate(envelope)
+
+
+def _split_unknown(
+    envelope: dict[str, Any],
+    resolved_type: str,
+    run_id: str | None,
+    node_id: str | None,
+) -> tuple[Any, dict[str, Any]]:
+    """Best-effort split for a recognized-but-unhandled envelope shape.
+
+    Warns with ``run_id`` / ``node_id`` / ``reason`` and returns the
+    best-effort ``(envelope.get("output"), {unknown fields})``. All envelope
+    fields land in telemetry (lossless).
+    """
+    _log.warning(
+        "node_output_split.unknown",
+        extra={
+            "run_id": run_id,
+            "node_id": node_id,
+            "reason": f"unknown_node_type:{resolved_type!r}",
+        },
+    )
+    return_value = envelope.get("output")
+    telemetry = {key: value for key, value in envelope.items() if key != "output"}
+    return return_value, telemetry
+
+
 def split_node_output(
     outer_dict: Any,
     node_type: str | None,
@@ -446,25 +510,12 @@ def split_node_output(
             extra={"run_id": run_id, "node_id": node_id, "reason": "not_a_dict"},
         )
         return None, {}
-    if ("recovered" in outer_dict or "skipped" in outer_dict) and not isinstance(outer_dict.get("artifacts"), list):
+    if _is_recovery_marker(outer_dict):
         return _split_recovery(outer_dict)
     resolved_type = node_type or ""
-    if resolved_type in SPLITTABLE_NODE_TYPES:
-        if resolved_type == "sandbox_agent":
-            return _split_sandbox_agent(outer_dict)
-        if resolved_type == "agent":
-            return _split_agent(outer_dict)
-        if resolved_type == "connector":
-            return _split_connector(outer_dict)
-        if resolved_type == "manual":
-            return _split_manual(outer_dict)
-        return _split_gate(outer_dict)
+    known = _split_by_known_type(outer_dict, resolved_type)
+    if known is not None:
+        return known
     if _looks_like_gate(outer_dict):
         return _split_gate(outer_dict)
-    _log.warning(
-        "node_output_split.unknown",
-        extra={"run_id": run_id, "node_id": node_id, "reason": f"unknown_node_type:{resolved_type!r}"},
-    )
-    return_value = outer_dict.get("output")
-    telemetry = {key: value for key, value in outer_dict.items() if key != "output"}
-    return return_value, telemetry
+    return _split_unknown(outer_dict, resolved_type, run_id, node_id)

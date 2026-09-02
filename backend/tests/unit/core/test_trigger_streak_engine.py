@@ -264,8 +264,12 @@ class TestDeactivateSQL:
         drained (never counted, never breaking the walk; never cancelled). The
         status set is derived from TERMINAL_STATUSES (single source of truth)."""
         sql = ts._NO_DELIVERY_DEACTIVATE_SQL
-        assert "r.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
-        assert "r3.status IN ('budget_exceeded','cancelled','complete','eval_failed','failed','stalled')" in sql
+        _terminal = (
+            "'budget_exceeded','cancelled','compensation_failed','complete','cost_ceiling_exceeded',"
+            "'eval_failed','failed','router_no_match','stalled'"
+        )
+        assert f"r.status IN ({_terminal})" in sql
+        assert f"r3.status IN ({_terminal})" in sql
         assert "pending" not in sql
 
     def test_guarded_atomic_update(self) -> None:
@@ -302,7 +306,7 @@ class TestMigrationBackfillGrace:
         assert 'ADD COLUMN IF NOT EXISTS "streak_epoch" timestamp with time zone DEFAULT CURRENT_TIMESTAMP' in source
         assert "ix_runs_unclassified_terminal" in source
         heads = ScriptDirectory(str(versions_dir.parent)).get_heads()
-        assert heads == ["0140_eval_regression_alert"], f"expected a single head, got {heads}"
+        assert heads == ["0170_add_residual_foreign_keys"], f"expected a single head, got {heads}"
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +664,7 @@ class TestEnforceSweep:
             patch.object(ts, "_record_streak_mass_cascade", new_callable=AsyncMock) as record,
             patch.object(ch, "_ingest_saq_error", new_callable=AsyncMock) as ingest,
         ):
-            alerted = await ts._maybe_alert_mass_cascade(factory, ORG, redis_client=None)
+            alerted = await ts._maybe_alert_mass_cascade(factory, ORG)
         assert alerted is True
         record.assert_awaited_once_with(ORG, 5)
         ingest.assert_awaited_once()

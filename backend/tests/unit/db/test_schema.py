@@ -11,6 +11,7 @@ def test_initial_schema_contains_required_tables() -> None:
         "chat_sessions",
         "composite_templates",
         "connector_instances",
+        "connector_profiles",
         "cost_components",
         "deleted_defaults",
         "dismissals",
@@ -98,11 +99,9 @@ def test_all_resource_tables_are_organisation_scoped() -> None:
         if name not in (
             "organisations",
             "accounts",
-            "dismissals",
             "system_config",
             "tier_catalog",
             "feature_flag_catalog",
-            "run_evidence",
             "library_sync_state",
         ):
             assert "organisation_id" in table.c, f"{name} is missing organisation_id"

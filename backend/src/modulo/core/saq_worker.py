@@ -56,6 +56,7 @@ import time
 import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any, cast
 
 from redis import asyncio as aioredis
@@ -253,7 +254,7 @@ def _build_queue(queue_name: str) -> RedisQueue:
     return RedisQueue(redis_client, name=queue_name, max_concurrent_ops=max_ops)
 
 
-def _check_redis_connection(redis_client: aioredis.Redis, max_retries: int = 3) -> None:
+def _check_redis_connection(_redis_client: aioredis.Redis, max_retries: int = 3) -> None:
     """Validate Redis connectivity on worker startup with exponential backoff.
 
     Synchronous — called from the settings factory before the event loop is
@@ -496,15 +497,18 @@ async def resume_run(
     run_id: str,
     org_id: str,
     resume_data: dict[str, Any] | None = None,
-    claim_token: str | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """SAQ ``resume_run`` job — claim (awaiting_human/claimed or stale-running) + resume.
 
     The ``claim_token`` kwarg is the stale token stamped into this job's kwargs
     by a previous attempt (PR #1003). SAQ retries re-invoke this function with
-    ``**job.kwargs``, so the kwarg is accepted and intentionally IGNORED here —
-    the core claim (``claim_resume_run_async``) generates its own fresh token.
+    ``**job.kwargs``, so the kwarg must be accepted here — it is intentionally
+    IGNORED (the core claim ``claim_resume_run_async`` generates its own fresh
+    token). Popping it from ``kwargs`` keeps the SAQ re-invocation contract
+    intact while avoiding an unused-parameter lint.
     """
+    kwargs.pop("claim_token", None)
     from modulo.core.pipeline_execution import resume_run as resume_run_core
 
     aeng = _get_async_engine()
@@ -544,7 +548,7 @@ async def _dispatch_created_run(result: dict[str, Any], *, org_id: str, log_cont
 
 
 async def fire_cron_trigger(
-    ctx: dict[str, Any],
+    _ctx: dict[str, Any],
     *,
     trigger_id: str,
     org_id: str,
@@ -566,7 +570,7 @@ async def fire_cron_trigger(
 
 
 async def fire_polling_trigger(
-    ctx: dict[str, Any],
+    _ctx: dict[str, Any],
     *,
     trigger_id: str,
     org_id: str,
@@ -589,7 +593,7 @@ async def fire_polling_trigger(
     return await _dispatch_created_run(result, org_id=org_id, log_context="fire_polling_trigger")
 
 
-async def fire_report_trigger(ctx: dict[str, Any], *, report_id: str, org_id: str) -> dict[str, Any]:
+async def fire_report_trigger(_ctx: dict[str, Any], *, report_id: str, org_id: str) -> dict[str, Any]:
     """Per-item report fire job — generate + deliver (SAQ bounded job)."""
     from modulo.core import cron_helpers as _ch
 
@@ -597,7 +601,7 @@ async def fire_report_trigger(ctx: dict[str, Any], *, report_id: str, org_id: st
 
 
 async def fire_ongoing_trigger(
-    ctx: dict[str, Any],
+    _ctx: dict[str, Any],
     *,
     trigger_id: str,
     org_id: str,
@@ -622,26 +626,278 @@ async def fire_ongoing_trigger(
     )
 
 
+async def fire_suite_run_trigger(
+    ctx: dict[str, Any],
+    *,
+    trigger_id: str,
+    org_id: str,
+    pipeline_id: str,
+    cron_expression: str = "",
+    snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Per-item fire job for a ``run_kind='suite_run'`` trigger (SAQ, FAR-377).
+
+    Builds a ``pending`` SuiteRun via ``cron_helpers.fire_suite_run_trigger``
+    (which enforces the suite-run concurrency + spend pools and writes NO
+    trigger-watch event), then — post-commit — enqueues the
+    ``execute_suite_run`` job. A fired run is dispatched exactly like a fired
+    pipeline run, but runs through the ``execute_suite_run`` SAQ job instead of
+    ``execute_run``.
+    """
+    from modulo.core import cron_helpers as _ch
+
+    result = await _ch.fire_suite_run_trigger(
+        trigger_id=uuid.UUID(trigger_id),
+        org_id=uuid.UUID(org_id),
+        pipeline_id=uuid.UUID(pipeline_id),
+    )
+    if result.get("status") == "fired" and result.get("suite_run_id"):
+        try:
+            await _enqueue_suite_run_execution(result["suite_run_id"], org_id)
+            result["dispatched"] = "enqueued"
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("fire_suite_run_trigger: enqueue failed for suite_run %s", result.get("suite_run_id"))
+            # Terminalise the freshly-committed (``pending``) SuiteRun in its OWN
+            # transaction so it is never stranded ``pending`` forever. Re-raising
+            # would only retry the fire job and create a *duplicate* pending run
+            # (the fire is not idempotent in run creation), re-introducing the
+            # exact stranded-``pending`` state the transaction-boundary fix
+            # eliminated. Mirrors the production path: a run that cannot be
+            # dispatched must land ``failed`` with an error_detail + Error
+            # Dashboard ingest (FAR-377 reviewer finding).
+            await _fail_suite_run_on_enqueue_error(result["suite_run_id"], org_id)
+            result["dispatched"] = "enqueue_failed"
+    return result
+
+
+async def _fail_suite_run_on_enqueue_error(suite_run_id: str, org_id: str) -> None:
+    """Terminalise a ``pending`` SuiteRun whose ``execute_suite_run`` job could not be enqueued.
+
+    Called from ``fire_suite_run_trigger`` when ``_enqueue_suite_run_execution``
+    raises (Redis down / SAQ unavailable). The SuiteRun was already committed as
+    ``pending`` by ``cron_helpers.fire_suite_run_trigger``; without this it would
+    sit ``pending`` forever (nothing reconciles stuck ``pending`` suite_runs).
+    Promotes ``pending -> running -> failed`` (the legal edge) via ``_fail_run``
+    and ingests the failure to the Error Dashboard, isolated in its own
+    committed transaction so the fire job itself can still return cleanly.
+    """
+    from modulo.core.eval_engine.execute_suite_run import _fail_run
+    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.rls import set_rls_org as _set_rls
+
+    rid = uuid.UUID(suite_run_id)
+    oid = uuid.UUID(org_id)
+    factory = _make_session_factory()
+    try:
+        async with factory() as session, session.begin():
+            await _set_rls(session, oid)
+            run = await session.get(SuiteRun, rid)
+            if run is None or run.organisation_id != oid:
+                _log.warning("fire_suite_run_trigger: cannot terminalise missing/cross-org suite_run %s", rid)
+                return
+            await _fail_run(
+                session,
+                run,
+                "SuiteRun could not be dispatched (SAQ/Redis enqueue failed); the run was never executed.",
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("fire_suite_run_trigger: failed to terminalise suite_run %s after enqueue error", rid)
+
+
+async def _enqueue_suite_run_execution(suite_run_id: str, org_id: str) -> str | None:
+    """Enqueue the ``execute_suite_run`` job on the runs queue (no Run capacity gate).
+
+    A SuiteRun is not a pipeline ``Run``, so ``dispatch_run`` (which loads a
+    ``Run`` and checks pipeline/org capacity) does not apply. The job key is
+    deterministic so SAQ dedupe never double-runs a suite, and a re-fire uses a
+    fresh suite_run anyway (each fire is a distinct SuiteRun row).
+    """
+    from saq.queue.redis import RedisQueue
+
+    settings = get_settings()
+    redis_client = aioredis.from_url(  # type: ignore[no-untyped-call]
+        settings.redis_url,
+        socket_connect_timeout=10,
+        socket_keepalive=True,
+        max_connections=settings.saq_redis_pool_size,
+    )
+    queue = RedisQueue(redis_client, name=settings.saq_runs_queue)
+    try:
+        job = await queue.enqueue(
+            "modulo.core.saq_worker.execute_suite_run",
+            key=f"suite_run:{suite_run_id}",
+            timeout=300,
+            heartbeat=30,
+            retries=2,
+            ttl=300,
+            suite_run_id=suite_run_id,
+            org_id=org_id,
+        )
+        return job.id if job is not None else None
+    finally:
+        with contextlib.suppress(Exception):
+            await redis_client.aclose()
+
+
+async def execute_suite_run(ctx: dict[str, Any], *, suite_run_id: str, org_id: str) -> dict[str, Any]:
+    """SAQ ``execute_suite_run`` job — run a scheduled SuiteRun to terminal (FAR-377).
+
+    Called for a ``run_kind='suite_run'`` trigger that a fire job (or the
+    ``fire_suite_run`` dispatch path) enqueued. Loads the persisted SuiteRun
+    (carrying the immutable baseline tuple + any config-derived ceiling from
+    ``extra``), executes it end-to-end (pending -> terminal) via the
+    ``execute_suite_run`` runner, and returns the terminal stats. On an
+    orchestration failure (typed OR raw DB error) the runner transitions the run
+    to ``failed``, but that write happens INSIDE ``session.begin()`` and is
+    ROLLED BACK when the runner re-raises — so the failure is re-persisted in its
+    OWN committed transaction (``_persist_suite_run_execution_failure``) before the
+    job re-raises for the SAQ ``after_process`` hook (the monitored failure sink).
+    A persistent failure therefore leaves the run ``failed`` with
+    ``error_detail`` populated, never stranded ``pending``.
+    """
+    from modulo.core.eval_engine.execute_suite_run import execute_suite_run as _run_exec
+    from modulo.db.models.eval_suite_run import SuiteRun, is_terminal
+    from modulo.db.rls import set_rls_org
+
+    rid = uuid.UUID(suite_run_id)
+    oid = uuid.UUID(org_id)
+    factory = _make_session_factory()
+    try:
+        async with factory() as session, session.begin():
+            await set_rls_org(session, oid)
+            run = await session.get(SuiteRun, rid)
+            if run is None:
+                _log.warning("SAQ execute_suite_run: suite_run %s not found", rid)
+                return {"status": "missing"}
+            # modulo_app is BYPASSRLS, so ``session.get`` is NOT org-scoped — the
+            # explicit predicate is the isolation control. Verify the loaded run
+            # belongs to the job's org before executing it (defense-in-depth):
+            # a cross-org suite_run_id must never be executed.
+            if run.organisation_id != oid:
+                _log.warning("SAQ execute_suite_run: suite_run %s belongs to a different org", rid)
+                return {"status": "missing"}
+            # Terminal short-circuit (FAR-377 reviewer minor): the enqueued job uses
+            # ``retries=2``, so a run that already reached a terminal state can be
+            # re-invoked on retry. Re-evaluating the whole dataset only to fail the
+            # illegal ``failed -> completed`` transition is wasted work + a noisy
+            # error path — close it cheaply instead.
+            if is_terminal(run.state):
+                _log.info(
+                    "SAQ execute_suite_run: suite_run %s already terminal (%s) - skipping re-execution",
+                    rid,
+                    run.state,
+                )
+                return {"status": "already_terminal", "state": run.state}
+            extra = run.extra or {}
+            suite_ceiling_raw = extra.get("suite_ceiling")
+            run_kwargs: dict[str, Any] = {
+                "entity_thresholds": extra.get("entity_thresholds"),
+                "scenario_inputs": extra.get("scenario_inputs"),
+                "eval_definition_version": int(extra.get("eval_definition_version", 1)),
+            }
+            # ``cost_per_llm_case`` is JSON-decoded from ``extra`` (may be a
+            # str/int/float). Coerce to ``Decimal`` (the ledger arithmetic needs
+            # it); when absent, leave it to the runner's default rather than
+            # passing ``None`` (which would override the default AND feed ``None``
+            # into the ledger).
+            cost_per = extra.get("cost_per_llm_case")
+            if cost_per is not None:
+                run_kwargs["cost_per_llm_case"] = Decimal(str(cost_per))
+            # ``suite_ceiling`` is ALSO JSON-decoded (a str/int/float). The
+            # runner only coerces it when the kwarg is ``None`` (it falls back to
+            # ``run.extra``), so a raw str passed here would bypass that coercion
+            # and raise ``Decimal >= str`` mid-evaluation. Coerce it the same way
+            # as ``cost_per_llm_case``; when absent, omit it so the runner reads
+            # the (already-``None``) value from ``run.extra``.
+            if suite_ceiling_raw is not None:
+                run_kwargs["suite_ceiling"] = Decimal(str(suite_ceiling_raw))
+            stats = await _run_exec(session, run, **run_kwargs)
+            run.extra = {**extra, "execution": stats}
+            await session.flush()
+        _log.info(
+            "saq.execute_suite_run.done",
+            extra={"suite_run_id": str(rid), "state": stats.get("state"), "org": str(oid)},
+        )
+        return stats
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log.exception("SAQ execute_suite_run failed for suite_run %s", rid)
+        # Transaction-boundary fix (FAR-377): ``execute_suite_run`` (the runner)
+        # transitions the run to ``failed`` + populates ``error_detail`` + ingests
+        # the Error-Ingestion event, but it runs INSIDE ``session.begin()`` above.
+        # When the runner re-raises (an orchestration failure — typed OR a raw DB
+        # error), the async context manager ROLLS BACK that transaction, discarding
+        # the ``failed`` transition + ``error_detail`` + event. The run would be
+        # stranded ``pending`` forever — never terminal, never surfaced. Persist
+        # the failure in a FRESH session/transaction here so it survives the
+        # rollback, then re-raise for the after_process sink.
+        await _persist_suite_run_execution_failure(factory, rid, oid, exc)
+        raise
+
+
+async def _persist_suite_run_execution_failure(
+    factory: Any, suite_run_id: uuid.UUID, org_id: uuid.UUID, exc: Exception
+) -> None:
+    """Persist a SuiteRun orchestration failure in its OWN committed transaction.
+
+    Called from ``execute_suite_run``'s outer handler AFTER the runner's execution
+    transaction rolled back. Re-loads the freshly-persisted run (now ``pending``
+    again — the rolled-back transaction also discarded the ``pending -> running``
+    transition) and terminalises it to ``failed`` with ``error_detail`` + the
+    Error-Ingestion event, then commits. ``_fail_run`` promotes a ``pending`` run
+    to ``running`` first so the ``failed`` edge is legal, and isolates the ingest
+    sink in a savepoint so it can never roll back the terminal transition.
+
+    Best-effort: if this itself fails (e.g. the DB is down), it is logged and the
+    caller still re-raises so SAQ's after_process sink sees the original error.
+    """
+    from modulo.core.eval_engine.execute_suite_run import _fail_run, _failure_detail
+    from modulo.db.models.eval_suite_run import SuiteRun
+    from modulo.db.rls import set_rls_org as _set_rls
+
+    detail = _failure_detail(exc)
+    try:
+        async with factory() as session, session.begin():
+            await _set_rls(session, org_id)
+            run = await session.get(SuiteRun, suite_run_id)
+            if run is None or run.organisation_id != org_id:
+                _log.warning(
+                    "SAQ execute_suite_run: cannot persist failure, suite_run %s missing or cross-org",
+                    suite_run_id,
+                )
+                return
+            await _fail_run(session, run, detail)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _log.exception("SAQ execute_suite_run: failed to persist suite_run failure %s", suite_run_id)
+
+
 # ---------------------------------------------------------------------------
 # Job functions — system worker (plan F1 / F3c / PR B step 6)
 # ---------------------------------------------------------------------------
 
 
-async def fire_due_triggers(ctx: dict[str, Any]) -> dict[str, Any]:
+async def fire_due_triggers(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — read due rows, atomic next_fire_at advance, enqueue fire jobs."""
     from modulo.core import cron_helpers as _ch
 
     return await _ch.fire_due_triggers()
 
 
-async def dispatcher_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
+async def dispatcher_reconcile(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — re-dispatch runs whose SAQ job is missing (every 60s)."""
     from modulo.core import cron_helpers as _ch
 
     return await _ch.dispatcher_reconcile()
 
 
-async def claim_expiry(ctx: dict[str, Any]) -> dict[str, Any]:
+async def claim_expiry(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — expire stale HITL claims (SAQ SOLE writer/notifier, F1)."""
     from modulo.core.hitl_manager.expiry_job import expire_stale_claims
     from modulo.core.notifier import Notifier
@@ -657,7 +913,7 @@ async def claim_expiry(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"expired": len(expired)}
 
 
-async def hitl_overdue(ctx: dict[str, Any]) -> dict[str, Any]:
+async def hitl_overdue(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — dispatch ``hitl_overdue`` notifications for HITL gates that
     have been waiting past the overdue threshold (idempotent per claim).
     """
@@ -675,7 +931,7 @@ async def hitl_overdue(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"dispatched": len(dispatched)}
 
 
-async def retention_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
+async def retention_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — batch-delete terminal runs and old LangGraph checkpoint rows.
 
     Deletes terminal ``runs`` rows older than the retention window (via
@@ -723,7 +979,7 @@ async def retention_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": deleted, "checkpoints_deleted": checkpoints_deleted}
 
 
-async def webhook_dedup_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
+async def webhook_dedup_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — purge old webhook trigger events (30-day retention).
 
     The system session factory is ``autobegin=False`` (the codebase DI
@@ -746,7 +1002,7 @@ async def webhook_dedup_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"deleted": total}
 
 
-async def trigger_events_cleanup(ctx: dict[str, Any]) -> dict[str, Any]:
+async def trigger_events_cleanup(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — age-based retention for trigger_events (90-day default).
 
     Deletes ``trigger_events`` rows whose ``received_at`` is older than the
@@ -785,7 +1041,7 @@ STALE_RUN_RECOVERY_STATS_KEY = "saq:cron:stats:stale_run_recovery"
 STALE_RUN_RECOVERY_STALE_SECONDS = 15 * 60
 
 
-async def stale_run_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
+async def stale_run_recovery(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — legacy stale-run sweep, scoped to non-SAQ rows (F1).
 
     The sweep itself (``pipeline_execution.stale_run_recovery_sweep``) returns a
@@ -816,8 +1072,8 @@ async def stale_run_recovery(ctx: dict[str, Any]) -> dict[str, Any]:
     return recovered
 
 
-async def cost_probe(ctx: dict[str, Any]) -> dict[str, Any]:
-    """System cron — the cost-tracking probe (spec Â§4.7, every 5 min, retries=0).
+async def cost_probe(_ctx: dict[str, Any]) -> dict[str, Any]:
+    """System cron — the cost-tracking probe (spec §4.7, every 5 min, retries=0).
 
     The verification canary for the ledger/report system: samples the N=50 most
     recent terminal runs per org, checks ``total == sum``, asserts the org-row
@@ -830,7 +1086,7 @@ async def cost_probe(ctx: dict[str, Any]) -> dict[str, Any]:
     return await run_probe(_make_session_factory())
 
 
-async def analytics_facts_maintenance(ctx: dict[str, Any]) -> dict[str, Any]:
+async def analytics_facts_maintenance(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — daily run-facts backfill + reconcile + retention (ADR 020).
 
     System cron: uses modulo_system role (LOGIN, BYPASSRLS) for cross-org access.
@@ -841,7 +1097,7 @@ async def analytics_facts_maintenance(ctx: dict[str, Any]) -> dict[str, Any]:
     return await run_maintenance(_make_system_session_factory())
 
 
-async def journey_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
+async def journey_reconcile(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — hourly bounded journey reconciliation sweep (FAR-143).
 
     Re-derives ``journeys`` evidence from terminal runs whose journey rows are
@@ -859,7 +1115,7 @@ async def journey_reconcile(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"advanced": advanced}
 
 
-async def check_missed_fire_alerts_cron(ctx: dict[str, Any]) -> dict[str, Any]:
+async def check_missed_fire_alerts_cron(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — hourly missed-fire probe for silent low-cadence triggers.
 
     Delegates to :func:`modulo.core.error_tracking.check_missed_fire_alerts`,
@@ -878,7 +1134,7 @@ async def check_missed_fire_alerts_cron(ctx: dict[str, Any]) -> dict[str, Any]:
     return {"emitted": emitted}
 
 
-async def library_sync(ctx: dict[str, Any]) -> dict[str, Any]:
+async def library_sync(_ctx: dict[str, Any]) -> dict[str, Any]:
     """System cron — periodic community-library sync (FAR-363).
 
     No-op when ``modulo_library_endpoint`` is empty (library not configured).
@@ -986,12 +1242,15 @@ _SYSTEM_ASYNC_ENGINE: AsyncEngine | None = None
 def _get_system_async_engine() -> AsyncEngine:
     """Engine for cross-org system crons using the modulo_system role.
 
-    Falls back to the regular engine when MODULO_SYSTEM_DATABASE_URL is not set,
-    so deployments that haven't provisioned the system role still work. The
-    fallback runs system crons as modulo_app, which is NOBYPASSRLS (see
+    FAIL CLOSED when MODULO_SYSTEM_DATABASE_URL is not set: cross-org system
+    crons require the modulo_system role (LOGIN, BYPASSRLS). Falling back to the
+    regular engine would run them as modulo_app, which is NOBYPASSRLS (see
     bootstrap_role.py: the app role asserts ``rolbypassrls = false``), so any
-    RLS-scoped reads silently return zero rows — a warning is emitted to surface
-    that the system role is unprovisioned.
+    RLS-scoped read silently returns zero rows — a silent no-op that masks a
+    misconfigured deployment. Instead, a clear ``RuntimeError`` is raised. The
+    engine is created LAZILY on first use inside a cron invocation (never at
+    worker startup), so this raise fails only the specific system cron — which
+    SAQ logs — while the worker stays up to serve every other job.
     """
     global _SYSTEM_ASYNC_ENGINE
     if _SYSTEM_ASYNC_ENGINE is None:
@@ -1017,16 +1276,21 @@ def _get_system_async_engine() -> AsyncEngine:
                 connect_args={"ssl": False, "statement_cache_size": 0},
             )
         else:
-            _log.warning(
-                "saq_worker.system_engine_fallback",
+            _log.error(
+                "saq_worker.system_engine_misconfigured",
                 extra={
                     "reason": (
-                        "MODULO_SYSTEM_DATABASE_URL not set — system crons run as modulo_app "
-                        "(NOBYPASSRLS); RLS-scoped reads return zero rows"
+                        "MODULO_SYSTEM_DATABASE_URL not set — refusing to run cross-org "
+                        "system crons as modulo_app (NOBYPASSRLS); RLS-scoped reads would "
+                        "silently return zero rows. Set the modulo_system role URL."
                     )
                 },
             )
-            _SYSTEM_ASYNC_ENGINE = _get_async_engine()
+            raise RuntimeError(
+                "MODULO_SYSTEM_DATABASE_URL is not set: cross-org system crons require "
+                "the modulo_system role (LOGIN, BYPASSRLS). Refusing to fail open to "
+                "modulo_app (NOBYPASSRLS), which would silently return zero rows."
+            )
     return _SYSTEM_ASYNC_ENGINE
 
 
@@ -1049,10 +1313,12 @@ def _runs_functions() -> list[tuple[str, Any]]:
     return [
         ("modulo.core.saq_worker.execute_run", execute_run),
         ("modulo.core.saq_worker.resume_run", resume_run),
+        ("modulo.core.saq_worker.execute_suite_run", execute_suite_run),
         ("modulo.core.saq_worker.fire_cron_trigger", fire_cron_trigger),
         ("modulo.core.saq_worker.fire_polling_trigger", fire_polling_trigger),
         ("modulo.core.saq_worker.fire_report_trigger", fire_report_trigger),
         ("modulo.core.saq_worker.fire_ongoing_trigger", fire_ongoing_trigger),
+        ("modulo.core.saq_worker.fire_suite_run_trigger", fire_suite_run_trigger),
     ]
 
 
@@ -1170,7 +1436,7 @@ def _system_cron_jobs() -> list[CronJob[Any]]:
         ),
         # cost_probe: every 5 min, retries=0 (pinned — a dead probe is caught
         # separately by the heartbeat/staleness alert), unique=True so a second
-        # overlapping instance cannot double-advance probe_state (Â§4.7).
+        # overlapping instance cannot double-advance probe_state (§4.7).
         # NOTE: must be the 5-field form "*/5 * * * *" — croniter parses a
         # 6-field expression ("0 */5 * * * *") differently and the probe fires
         # per-5-hours instead of per-5-minutes (bug class #680).

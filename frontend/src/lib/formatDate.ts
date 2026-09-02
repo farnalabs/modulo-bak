@@ -1,4 +1,4 @@
-import { format } from 'date-fns'
+import { format, formatDistanceToNow } from 'date-fns'
 
 /**
  * Safely parses a date-like value, returning null for invalid input.
@@ -7,7 +7,7 @@ import { format } from 'date-fns'
 export function toDate(date: Date | string | number | null | undefined): Date | null {
   if (date == null) return null
   const d = date instanceof Date ? date : new Date(date) // nosemgrep: new-date-without-guard
-  return isNaN(d.getTime()) ? null : d
+  return Number.isNaN(d.getTime()) ? null : d
 }
 
 export function formatDateShort(date: Date | string | number | null | undefined): string {
@@ -26,4 +26,10 @@ export function formatDateFilename(date: Date | string | number | null | undefin
   const d = toDate(date)
   if (!d) return '—'
   return format(d, 'yyyy-MM-dd')
+}
+
+export function formatRelativeTime(date: Date | string | number | null | undefined): string {
+  const d = toDate(date)
+  if (!d) return '—'
+  return formatDistanceToNow(d, { addSuffix: true })
 }

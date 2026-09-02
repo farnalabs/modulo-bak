@@ -37,7 +37,7 @@ from modulo.api.dependencies import (
 )
 from modulo.auth.jwt import TenantPrincipal
 from modulo.auth.permissions import PermissionDenied, assert_org_role
-from modulo.auth.secret_storage import decode_stored_secret
+from modulo.auth.secret_storage import decode_stored_secret_scoped
 from modulo.core.dispatch import dispatch_run
 from modulo.core.error_tracking import ErrorIngestionService
 from modulo.core.exceptions import SnapshotLockNotAvailableError, TriggersPausedError
@@ -167,7 +167,7 @@ async def receive_webhook(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal | None = Depends(get_current_tenant_user_optional),
-    engine: AsyncEngine = Depends(_get_engine),
+    _engine: AsyncEngine = Depends(_get_engine),
 ) -> dict[str, Any]:
     """Receive an incoming webhook and enqueue a pipeline run.
 
@@ -236,14 +236,16 @@ async def receive_webhook(
             hmac_secret: str | None = None
             if hmac_secret_raw is not None:
                 try:
-                    hmac_secret = decode_stored_secret(hmac_secret_raw, get_settings().fernet_key)
+                    hmac_secret = await decode_stored_secret_scoped(
+                        session, hmac_secret_raw, get_settings().fernet_key, org_id=org_id
+                    )
                 except Exception:
                     _log.exception("webhooks.hmac_secret_decrypt_failed trigger=%s", trigger_id)
                     hmac_secret = hmac_secret_raw
             if hmac_secret is not None:
                 ts = verify_timestamp(modulo_timestamp)
                 if not verify_hmac(raw_body, hmac_secret, hmac_signature, timestamp=ts):
-                    raise HmacValidationError()
+                    raise HmacValidationError
             else:
                 _log.warning(
                     "webhooks.receive_webhook: unauthenticated delivery accepted "
@@ -338,13 +340,22 @@ async def receive_webhook(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(exc),
         ) from exc
-    except SnapshotLockNotAvailableError:
-        _log.info(
-            "webhooks.receive_webhook.snapshot_lock_busy trigger=%s pipeline=%s",
+    except SnapshotLockNotAvailableError as exc:
+        from modulo.db.crud.pipeline_snapshot import SNAPSHOT_LOCK_ATTEMPTS
+
+        _log.warning(
+            "webhooks.receive_webhook.snapshot_lock_busy trigger=%s pipeline=%s attempts=%s (FAR-527)",
             trigger_id,
             trigger.pipeline_id if trigger is not None else None,
+            SNAPSHOT_LOCK_ATTEMPTS,
         )
-        return {"run_id": None, "status": "queued", "detail": "Pipeline busy — queued for retry"}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Pipeline snapshot lock unavailable after {SNAPSHOT_LOCK_ATTEMPTS} attempts — "
+                "retry the webhook delivery"
+            ),
+        ) from exc
     except ProgrammingError:
         _log.exception(_CODE_WEBHOOKS_RECEIVE_WEBHOOK)
         raise HTTPException(
@@ -418,7 +429,7 @@ async def replay_webhook(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     principal: TenantPrincipal | None = Depends(get_current_tenant_user_optional),
-    engine: AsyncEngine = Depends(_get_engine),
+    _engine: AsyncEngine = Depends(_get_engine),
 ) -> dict[str, Any]:
     """Re-fire a webhook run from a previous TriggerEvent log entry.
 
@@ -482,9 +493,11 @@ async def replay_webhook(
                 cfg = trigger.config_json or {}
                 hmac_secret_raw: str | None = cfg.get("hmac_secret")
                 if hmac_secret_raw is None:
-                    raise HmacValidationError()
+                    raise HmacValidationError
                 try:
-                    hmac_secret = decode_stored_secret(hmac_secret_raw, get_settings().fernet_key)
+                    hmac_secret = await decode_stored_secret_scoped(
+                        session, hmac_secret_raw, get_settings().fernet_key, org_id=org_id
+                    )
                 except Exception:
                     _log.exception("webhooks.hmac_secret_decrypt_failed trigger=%s", trigger_id)
                     hmac_secret = hmac_secret_raw
@@ -498,7 +511,7 @@ async def replay_webhook(
                 if stored is None:
                     raise ReplayNotFoundError(event_id)
                 if not verify_hmac(stored.raw_body, hmac_secret, hmac_signature, timestamp=ts):
-                    raise HmacValidationError()
+                    raise HmacValidationError
 
             try:
                 # Pause pre-check AFTER principal auth / trigger load, BEFORE the
@@ -581,13 +594,22 @@ async def replay_webhook(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Concurrent run limit of {exc.limit} reached",
         ) from exc
-    except SnapshotLockNotAvailableError:
-        _log.info(
-            "webhooks.replay_webhook.snapshot_lock_busy trigger=%s pipeline=%s",
+    except SnapshotLockNotAvailableError as exc:
+        from modulo.db.crud.pipeline_snapshot import SNAPSHOT_LOCK_ATTEMPTS
+
+        _log.warning(
+            "webhooks.replay_webhook.snapshot_lock_busy trigger=%s pipeline=%s attempts=%s (FAR-527)",
             trigger_id,
             trigger.pipeline_id if trigger is not None else None,
+            SNAPSHOT_LOCK_ATTEMPTS,
         )
-        return {"run_id": None, "status": "queued", "detail": "Pipeline busy — queued for retry"}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"Pipeline snapshot lock unavailable after {SNAPSHOT_LOCK_ATTEMPTS} attempts — "
+                "retry the webhook delivery"
+            ),
+        ) from exc
     except ProgrammingError:
         _log.exception("webhooks.replay_webhook")
         raise HTTPException(

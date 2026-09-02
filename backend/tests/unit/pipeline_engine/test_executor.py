@@ -3,8 +3,8 @@
 import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Any, TypedDict
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Any, Self, TypedDict
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -13,6 +13,8 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
+from modulo.core.node_output_split import split_node_output
 from modulo.core.pipeline_engine.executor import (
     PipelineExecutor,
     RunNotFoundError,
@@ -26,8 +28,17 @@ from modulo.core.pipeline_engine.executor import (
     _seed_state,
     _terminal_failure,
 )
-from modulo.core.pipeline_engine.node_runner import SandboxNodeFailedError
+from modulo.core.pipeline_engine.node_runner import (
+    SANDBOX_AGENT_FAILED_SUMMARY,
+    SandboxNodeFailedError,
+    _build_sandbox_node_envelope,
+    _SandboxNodeOutput,
+)
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
+from modulo.core.pipeline_engine.runtime_retry import (
+    COMPENSATION_FAILED_CODE,
+    CompensationFailedError,
+)
 from modulo.otel_bridge import trace_id_for_thread
 
 
@@ -371,6 +382,188 @@ async def test_resume_wires_reclassify_after_work_intact():
     assert order == ["apply_work_intact", "reclassify_after_work_intact"]
 
 
+async def test_resume_wires_retry_policy_into_graph_hash_and_compile():
+    """FAR-402 P5: resume() folds the pipeline retry_policy into the compile-cache
+    hash and threads ``pipeline_retry_policy`` + ``node_idempotency_key`` into
+    ``build_graph_from_json`` — so a checkpoint-resumed run executes with the
+    SAME per-node retry / per-edge retry / compensation as a fresh run.
+
+    This is the prove-the-fix test for the reviewer's CHANGES_REQUESTED finding 1:
+    without the change, ``get_or_compile`` would be called with the base hash and
+    ``build_graph_from_json`` would NOT receive ``pipeline_retry_policy`` — so this
+    test FAILS on the unpatched code.
+    """
+    from modulo.core.pipeline_engine.executor import compute_retry_aware_topology_hash
+
+    policy = {"on": ["failure"], "max_retries": 2}
+    run = _make_run()
+    final_run = _make_run(run_id=run.id, status="complete")
+    snapshot = _make_snapshot()
+    session = _make_resume_session(snapshot, retry_policy=policy)
+    factory = _make_session_factory(session)
+    registry = _mock_registry()
+    events = [
+        {
+            "event": "on_chain_end",
+            "name": "node-a",
+            "data": {"output": {"output": {"status": "completed", "cost_estimate_usd": 0.0}}},
+        }
+    ]
+    compiled = _mock_compiled(events)
+    compiled.aupdate_state = AsyncMock()
+
+    checkpointer_mock = MagicMock()
+    checkpointer_mock.__aenter__ = AsyncMock(return_value=checkpointer_mock)
+    checkpointer_mock.__aexit__ = AsyncMock(return_value=False)
+
+    settings_mock = MagicMock()
+    settings_mock.fernet_key = "test-fernet-key-not-for-production="
+
+    goc_calls: list[tuple[Any, Any, str | None]] = []
+
+    def _spy_get_or_compile(pipeline_id, snapshot_id, compile_fn, *, graph_struct_hash=None, **_kwargs):
+        goc_calls.append((pipeline_id, snapshot_id, graph_struct_hash))
+        # Invoke the captured compile_fn so the build_graph_from_json spy records it.
+        compile_fn()
+        return compiled
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
+        patch("modulo.core.pipeline_engine.executor.get_run", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.update_run_status", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org"),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context"),
+        patch(
+            "modulo.core.pipeline_engine.executor.get_or_compile",
+            side_effect=_spy_get_or_compile,
+        ),
+        patch("modulo.core.pipeline_engine.executor.build_graph_from_json") as spy_build,
+        patch("modulo.core.pipeline_engine.executor.get_registry", return_value=registry),
+        patch("modulo.core.pipeline_engine.executor.GraphValidator", new=_mock_graph_validator()),
+        patch("modulo.core.pipeline_engine.executor._checkpointer_scope", return_value=checkpointer_mock),
+        patch("modulo.settings.get_settings", return_value=settings_mock),
+        patch("modulo.core.pipeline_engine.executor.RunawayGuard", return_value=MagicMock()),
+    ):
+        executor = PipelineExecutor(MagicMock())
+        executor._checkpointer_conn_string = "sqlite:///test.db"
+        await executor.resume(run_id=run.id, org_id=uuid.uuid4(), resume_data={"action": "approved"})
+
+    # (a) graph_struct_hash equals compute_retry_aware_topology_hash(graph_json, policy)
+    assert len(goc_calls) == 1
+    observed_hash = goc_calls[0][2]
+    expected_hash = compute_retry_aware_topology_hash(snapshot.graph_json, policy)
+    assert observed_hash == expected_hash
+
+    # (b) build_graph_from_json received pipeline_retry_policy + node_idempotency_key
+    spy_build.assert_called_once()
+    build_kwargs = spy_build.call_args.kwargs
+    assert build_kwargs.get("pipeline_retry_policy") == policy
+    assert callable(build_kwargs.get("node_idempotency_key"))
+
+    # (c) the retry-aware hash differs from the no-policy base hash, so a policy
+    # PATCH forces a recompile rather than serving a stale (policy-less) graph.
+    base_hash = compute_retry_aware_topology_hash(snapshot.graph_json, None)
+    assert observed_hash != base_hash
+
+
+async def test_resume_fails_open_when_retry_policy_access_raises():
+    """CHANGES_REQUESTED finding 2 (MINOR): the resume path must mirror the
+    execute() path and fail OPEN to no-retry when the pipeline retry_policy
+    raises on access (malformed/legacy value). A bare getattr that raises must
+    NOT crash resume where execute degrades to no-retry."""
+    run = _make_run()
+    final_run = _make_run(run_id=run.id, status="complete")
+    snapshot = _make_snapshot()
+    # Make pipeline.retry_policy RAISE on attribute access (legacy/malformed value).
+    from unittest.mock import PropertyMock
+
+    from modulo.core.pipeline_engine.executor import compute_retry_aware_topology_hash
+
+    pipe = _make_pipeline()
+    type(pipe).retry_policy = PropertyMock(side_effect=ValueError("legacy blob"))
+
+    # Build a resume session whose pipeline query returns our raising pipeline.
+    pipeline_result = MagicMock()
+    pipeline_result.scalar_one_or_none.return_value = pipe
+    eval_result = MagicMock()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = []
+    eval_result.scalars.return_value = scalars_mock
+    eval_result.scalar_one_or_none.return_value = pipe
+    graph_json_result = MagicMock()
+    graph_json_result.scalar_one_or_none.return_value = snapshot.graph_json
+    snapshot_result = MagicMock()
+    snapshot_result.scalar_one.return_value = snapshot
+    count_result = MagicMock()
+    count_result.scalar.return_value = 0
+    execute_results = iter([graph_json_result, snapshot_result, pipeline_result, eval_result, count_result])
+
+    async def _execute(*_a: Any, **_k: Any) -> Any:
+        try:
+            return next(execute_results)
+        except StopIteration:
+            return count_result
+
+    session = AsyncMock(spec=AsyncSession)
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=None)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin = MagicMock(return_value=begin_cm)
+    session.execute = _execute
+
+    factory = _make_session_factory(session)
+    registry = _mock_registry()
+    events = [
+        {
+            "event": "on_chain_end",
+            "name": "node-a",
+            "data": {"output": {"output": {"status": "completed", "cost_estimate_usd": 0.0}}},
+        }
+    ]
+    compiled = _mock_compiled(events)
+    compiled.aupdate_state = AsyncMock()
+
+    checkpointer_mock = MagicMock()
+    checkpointer_mock.__aenter__ = AsyncMock(return_value=checkpointer_mock)
+    checkpointer_mock.__aexit__ = AsyncMock(return_value=False)
+
+    settings_mock = MagicMock()
+    settings_mock.fernet_key = "test-fernet-key-not-for-production="
+
+    goc_calls: list[str | None] = []
+
+    def _spy_get_or_compile(pipeline_id, snapshot_id, compile_fn, *, graph_struct_hash=None, **_kwargs):
+        goc_calls.append(graph_struct_hash)
+        compile_fn()
+        return compiled
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
+        patch("modulo.core.pipeline_engine.executor.get_run", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.update_run_status", return_value=final_run),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org"),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context"),
+        patch("modulo.core.pipeline_engine.executor.get_or_compile", side_effect=_spy_get_or_compile),
+        patch("modulo.core.pipeline_engine.executor.build_graph_from_json") as spy_build,
+        patch("modulo.core.pipeline_engine.executor.get_registry", return_value=registry),
+        patch("modulo.core.pipeline_engine.executor.GraphValidator", new=_mock_graph_validator()),
+        patch("modulo.core.pipeline_engine.executor._checkpointer_scope", return_value=checkpointer_mock),
+        patch("modulo.settings.get_settings", return_value=settings_mock),
+        patch("modulo.core.pipeline_engine.executor.RunawayGuard", return_value=MagicMock()),
+    ):
+        executor = PipelineExecutor(MagicMock())
+        executor._checkpointer_conn_string = "sqlite:///test.db"
+        # Must NOT raise — fails open to no-retry (empty policy).
+        await executor.resume(run_id=run.id, org_id=uuid.uuid4(), resume_data={"action": "approved"})
+
+    # No policy threaded through -> base hash (legacy value ignored safely).
+    assert goc_calls == [compute_retry_aware_topology_hash(snapshot.graph_json, None)]
+    spy_build.assert_called_once()
+    assert not spy_build.call_args.kwargs.get("pipeline_retry_policy")
+
+
 # ---------------------------------------------------------------------------
 # FAR-198 — deterministic OTel trace context seeding + per-node span stamps
 # ---------------------------------------------------------------------------
@@ -491,6 +684,52 @@ async def test_stream_graph_maps_output_schema_validation_error_to_domain_code()
     detach.assert_called_once()
 
 
+async def test_stream_graph_maps_compensation_failed_error_to_terminal_status():
+    """FAR-402 P5 (§E): when a watched node's compensation edge itself fails, the
+    node wrapper raises ``CompensationFailedError`` and the executor must
+    terminalize the run as ``compensation_failed`` (never retry, never
+    ``failed``) with the canonical ``compensation_failed`` error code. The
+    runtime suite only asserts the exception type — this exercises the executor
+    terminalization branch (executor.py:4467) end to end through ``_stream_graph``.
+    """
+    compiled = _mock_compiled_raising(
+        CompensationFailedError(
+            node_id="node-a",
+            compensation_target="comp-n",
+            cause=RuntimeError("compensation boom"),
+        )
+    )
+
+    broker = _mock_registry().get_or_create.return_value
+
+    executor = PipelineExecutor(MagicMock())
+    executor._otel_bridge = MagicMock()
+    executor._otel_bridge.start_run_root.return_value = MagicMock()
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.context_api.attach", return_value="tok"),
+        patch("modulo.core.pipeline_engine.executor.context_api.detach") as detach,
+    ):
+        status, error_code, detail, _ntu = await executor._stream_graph(
+            compiled,
+            None,
+            {"configurable": {"thread_id": "org:run"}},
+            {"node-a"},
+            broker,
+            uuid.uuid4(),
+        )
+
+    assert status == "compensation_failed"
+    assert error_code == COMPENSATION_FAILED_CODE
+    assert "compensation boom" in detail
+
+    published = [call.args for call in broker.publish.call_args_list if call.args[0] == "run_failed"]
+    assert len(published) == 1
+    assert published[0][1]["error"] == COMPENSATION_FAILED_CODE
+    executor._otel_bridge.end_run_root.assert_called_once()
+    detach.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -580,7 +819,7 @@ def _make_session_factory(session: AsyncMock) -> MagicMock:
     return MagicMock(side_effect=lambda: _ctx())
 
 
-def _make_resume_session(snapshot: MagicMock) -> AsyncMock:
+def _make_resume_session(snapshot: MagicMock, retry_policy: dict[str, Any] | None = None) -> AsyncMock:
     """Session mock whose execute() order matches resume()'s query sequence.
 
     resume() queries the snapshot's graph_json FIRST (the atomic sandbox-capacity
@@ -588,6 +827,8 @@ def _make_resume_session(snapshot: MagicMock) -> AsyncMock:
     of execute(), so the shared _make_session iterator is not reusable here.
     """
     pipeline = _make_pipeline()
+    if retry_policy is not None:
+        pipeline.retry_policy = retry_policy
 
     pipeline_result = MagicMock()
     pipeline_result.scalar_one_or_none.return_value = pipeline
@@ -602,6 +843,10 @@ def _make_resume_session(snapshot: MagicMock) -> AsyncMock:
     scalars_mock = MagicMock()
     scalars_mock.all.return_value = []
     eval_result.scalars.return_value = scalars_mock
+    # The pipeline query (select(Pipeline)) resolves to this mock's
+    # scalar_one_or_none(); ensure it returns the pipeline (with any configured
+    # retry_policy) regardless of which iterator slot resume() consumes it from.
+    eval_result.scalar_one_or_none.return_value = pipeline
 
     count_result = MagicMock()
     count_result.scalar.return_value = 0
@@ -1410,13 +1655,6 @@ async def test_execute_passes_hash_to_cache():
 # ---------------------------------------------------------------------------
 
 
-def _make_pipeline_with_capacity(max_concurrent_runs: int = 5) -> MagicMock:
-    p = MagicMock()
-    p.max_concurrent_runs = max_concurrent_runs
-    p.lock_wait_timeout_seconds = 1
-    return p
-
-
 async def test_execute_times_out_when_at_capacity():
     """When max_concurrent_runs is exceeded, run times out with lock_timeout error."""
     run = _make_run()
@@ -1465,7 +1703,9 @@ async def test_execute_proceeds_when_under_capacity():
         patch("modulo.core.pipeline_engine.executor.async_sessionmaker", return_value=factory),
         patch(
             "modulo.core.pipeline_engine.executor.get_run",
-            side_effect=[run, running_run, running_run, running_run],
+            # One result per get_run call — the FAR-510 stored-outputs read on
+            # the complete path adds a fifth call to this sequence.
+            side_effect=[run, running_run, running_run, running_run, running_run],
         ),
         patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
         patch("modulo.core.pipeline_engine.executor.set_rls_org"),
@@ -2749,6 +2989,444 @@ async def test_finalize_run_after_stream_revocation_failure_is_isolated():
 
 
 # ---------------------------------------------------------------------------
+# FAR-510 — masked sandbox-agent failure downgrade at finalization
+# ---------------------------------------------------------------------------
+
+
+def _finalize_executor_with_session() -> tuple[PipelineExecutor, MagicMock]:
+    executor = PipelineExecutor(MagicMock())
+    session = AsyncMock(spec=AsyncSession)
+    session.begin = MagicMock(return_value=_begin_cm())
+    executor._session_factory = _make_session_factory(session)  # type: ignore[assignment]
+    return executor, session
+
+
+async def _finalize_with_patched_tail(
+    executor: PipelineExecutor,
+    args: dict[str, Any],
+) -> tuple[AsyncMock, Any]:
+    """Drive ``_finalize_run_after_stream`` with its DB-facing tail patched out.
+
+    Returns the ``finalize_cost`` mock (the assertion seam for the terminal
+    status/error fields) and the final run row.
+    """
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=MagicMock())),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+    return mock_finalize, final_run
+
+
+def _generic_exception_envelope(node_id: str = "node-x") -> dict[str, Any]:
+    """The REAL generic-exception failure envelope, stamped exactly as the
+    runner's ``except Exception`` path builds it (FAR-510)."""
+    return _build_sandbox_node_envelope(
+        node_id=node_id,
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary=SANDBOX_AGENT_FAILED_SUMMARY,
+            exit_code=-1,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            attempt_key="attempt-1",
+            error_type="RuntimeError",
+            error_message="boom",
+            sandbox_id="sb-1",
+            modulo_synthetic_failure=True,
+        ),
+        exclude_from_output=frozenset({"error_type", "error_message"}),
+    )
+
+
+def _schema_validation_envelope(node_id: str = "node-x", business_json: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The REAL schema-validation failure envelope, stamped exactly as the
+    runner's schema-rejection path builds it (FAR-510)."""
+    rejected = business_json if business_json is not None else {"summary": "done"}
+    return _build_sandbox_node_envelope(
+        node_id=node_id,
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary="Output failed schema validation: 'status' is a required property",
+            exit_code=0,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            cost_source=rejected,
+            output_json=rejected,
+            attempt_key="attempt-1",
+            modulo_synthetic_failure=True,
+        ),
+    )
+
+
+def _split_stored_columns(envelope: dict[str, Any], node_id: str = "node-x") -> tuple[Any, dict[str, Any]]:
+    """The ``(outputs_json, node_telemetry_json)`` pair the P1b writer
+    persists for *envelope* — driven through the production splitter."""
+    return split_node_output(envelope, "sandbox_agent", None)
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_masked_sandbox_agent_failure():
+    """A ``complete`` run whose completed sandbox-agent output is the stamped
+    generic-exception failure envelope finalizes ``failed`` with the
+    ``sandbox.agent_failed`` code."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
+
+    mock_finalize, final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_stamped_schema_validation_envelope():
+    """The schema-validation synthetic failure path is stamped too — its live
+    envelope downgrades on the marker, independent of the summary text."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {"node-x": _schema_validation_envelope()}
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_clean_sandbox_output():
+    """A normal successful sandbox output finalizes ``complete`` unchanged."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": _build_sandbox_node_envelope(
+            node_id="node-x",
+            output=_SandboxNodeOutput(
+                status="completed",
+                summary="all good",
+                exit_code=0,
+                wall_clock_time_ms=100,
+                cost_estimate_usd=0.0,
+                output_json={"summary": "all good"},
+                attempt_key="attempt-1",
+            ),
+        ),
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_ignores_failed_envelope_on_non_sandbox_node():
+    """A stamped failed envelope on a non-sandbox node type is NOT downgraded."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "llm"}
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_leaves_already_failed_run_unchanged():
+    """A run already finalizing ``failed`` passes through untouched (no-op)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["final_status"] = "failed"
+    args["error_code"] = "agent.failed"
+    args["error_detail"] = "agent self-reported failure"
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {
+        "node-x": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "agent.failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "agent self-reported failure"
+
+
+def test_work_intact_false_for_downgraded_sandbox_agent_failure():
+    """FAR-510 — a downgraded run (``failed`` + ``sandbox.agent_failed``) is
+    forced work_intact=False. The synthetic failure envelope has a summary
+    string, so without the forced-False rule ``compute_work_intact`` would
+    count it as a valid artifact and return True for an agent that died."""
+    executor, _session = _finalize_executor_with_session()
+    synthetic = {
+        "status": "failed",
+        "summary": SANDBOX_AGENT_FAILED_SUMMARY,
+        "exit_code": -1,
+        "modulo_synthetic_failure": True,
+    }
+    # The completed set equals the full DAG node set and every output has a
+    # summary — exactly the shape that would compute work_intact=True.
+    assert (
+        executor._compute_run_work_intact("failed", "sandbox.agent_failed", {"node-x": synthetic}, {"node-x"}) is False
+    )
+    assert executor._compute_run_work_intact("failed", "sandbox.agent_failed", {}, set()) is False
+
+
+def _stored_run_with_outputs(outputs_json: Any, node_telemetry_json: Any | None = None) -> MagicMock:
+    run = MagicMock()
+    run.outputs_json = outputs_json
+    run.node_telemetry_json = node_telemetry_json
+    return run
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_stored_telemetry_failure_from_prior_segment_on_resume():
+    """Resume parity (REAL post-P1b shape) — the live segment emits nothing
+    (a HITL resume re-emits only the resumed segment), and the stored columns
+    hold the SPLIT shapes: ``outputs_json[node]`` is ``None`` (the
+    generic-exception path has no agent return) and the envelope fields
+    (``status``/``summary`` + the synthetic-failure marker) live ONLY in
+    ``node_telemetry_json``. The stored telemetry view drives the downgrade."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    return_value, telemetry = _split_stored_columns(_generic_exception_envelope())
+    assert return_value is None
+    assert telemetry["status"] == "failed"
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrades_stored_schema_validation_failure():
+    """FAR-510 — the schema-validation synthetic failure path is stamped on the
+    STORED shape too: the rejected business JSON lands in ``outputs_json`` (the
+    pure return) while the stamped envelope fields land in telemetry, and the
+    telemetry view drives the downgrade."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    rejected = {"summary": "done", "pr_url": "https://example.com/pr/1"}
+    return_value, telemetry = _split_stored_columns(_schema_validation_envelope(business_json=rejected))
+    assert return_value == rejected
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_failed_status_without_synthetic_marker():
+    """Precision boundary — a sandbox node output self-reporting ``failed``
+    WITHOUT the runner's synthetic-failure marker is an honest failure shape
+    (real exit-code failure / agent-authored business JSON), not the masked
+    dispatch-failure marker: no downgrade."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    honest = _build_sandbox_node_envelope(
+        node_id="node-x",
+        output=_SandboxNodeOutput(
+            status="failed",
+            summary="genuinely failed differently",
+            exit_code=1,
+            wall_clock_time_ms=1234,
+            cost_estimate_usd=0.0,
+            output_json={"status": "failed", "summary": "genuinely failed differently"},
+            attempt_key="attempt-1",
+        ),
+    )
+    return_value, telemetry = _split_stored_columns(honest)
+    stored_run = _stored_run_with_outputs({"node-x": return_value}, {"node-x": telemetry})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrade_checks_live_and_stored_views_without_clobbering():
+    """Dedup premise — stored ``outputs_json`` and the live envelope hold
+    DIFFERENT shapes for the same node by design, so no view clobbers another:
+    a clean stored business JSON must not mask a stamped live envelope."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
+    stored_run = _stored_run_with_outputs({"node-x": {"summary": "clean business json"}})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-x"
+
+
+@pytest.mark.asyncio
+async def test_finalize_keeps_complete_for_pre_p1b_legacy_row_without_marker():
+    """Legacy (pre-P1b) stored rows — the mixed envelope self-reports
+    status/summary but never carries the synthetic-failure marker, so a legacy
+    row never downgrades (the marker-based predicate is the contract, and the
+    legacy-safe telemetry accessor still resolves the view)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {}
+    legacy = {
+        "artifacts": [
+            {
+                "node_id": "node-x",
+                "status": "failed",
+                "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY, "exit_code": -1},
+            }
+        ],
+        "output": {"status": "failed", "summary": SANDBOX_AGENT_FAILED_SUMMARY},
+    }
+    stored_run = _stored_run_with_outputs({"node-x": legacy})
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=stored_run)),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "complete"
+    assert mock_finalize.await_args.kwargs["error_code"] is None
+    assert mock_finalize.await_args.kwargs["error_detail"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_downgrade_lists_all_matching_nodes_sorted():
+    """Multi-node — every matching node is listed, sorted, in error_detail."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-b": "sandbox_agent", "node-a": "sandbox_agent", "node-c": "llm"}
+    args["completed_node_outputs"] = {
+        "node-b": _generic_exception_envelope("node-b"),
+        "node-a": _generic_exception_envelope("node-a"),
+        "node-c": _generic_exception_envelope("node-c"),
+    }
+
+    mock_finalize, _final_run = await _finalize_with_patched_tail(executor, args)
+
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+    assert mock_finalize.await_args.kwargs["error_detail"] == "Sandbox agent node(s) failed: node-a, node-b"
+
+
+@pytest.mark.asyncio
+async def test_finalize_stored_output_read_failure_falls_back_to_live_scan():
+    """Failure isolation — a stored-outputs read failure is swallowed (warn +
+    empty dict) and the downgrade still scans the live dict; finalization
+    never crashes."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["node_type_map"] = {"node-x": "sandbox_agent"}
+    args["completed_node_outputs"] = {"node-x": _generic_exception_envelope()}
+    # First get_run (stored read) explodes; the second (final fetch) succeeds.
+    get_run_mock = AsyncMock(side_effect=[RuntimeError("stored read boom"), MagicMock()])
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()) as mock_finalize,
+        patch("modulo.core.pipeline_engine.executor.get_run", new=get_run_mock),
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert mock_finalize.await_args.kwargs["status"] == "failed"
+    assert mock_finalize.await_args.kwargs["error_code"] == "sandbox.agent_failed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_skips_stored_output_read_when_not_complete():
+    """Performance contract — the extra stored-outputs run-row read happens on
+    the complete path only; a failed run issues exactly one get_run (the
+    final-row fetch)."""
+    executor, _session = _finalize_executor_with_session()
+    args = _finalize_args(uuid.uuid4(), uuid.uuid4())
+    args["final_status"] = "failed"
+    args["error_code"] = "agent.failed"
+    args["error_detail"] = "agent self-reported failure"
+
+    with (
+        patch.object(executor, "_compute_run_work_intact", return_value=None),
+        patch.object(executor, "_run_post_terminal_evidence_probes", new=AsyncMock()),
+        patch.object(executor, "_revoke_run_api_key", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.finalize_cost", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.get_run", new=AsyncMock(return_value=MagicMock())) as get_run_mock,
+    ):
+        final_run = await executor._finalize_run_after_stream(**args)
+
+    assert final_run is not None
+    assert get_run_mock.await_count == 1
+
+
+# ---------------------------------------------------------------------------
 # S3776 decomposition helpers (FAR-310) — direct coverage for extracted helpers
 # ---------------------------------------------------------------------------
 
@@ -2928,3 +3606,355 @@ class TestTransientFailureDetail:
         assert code == "node_cancelled"
         assert "retry suppressed because a node in the graph is non-idempotent" in detail
         assert "idempotent=false" in detail
+
+
+def _make_connector_init_session(rows: list[Any]) -> AsyncMock:
+    """Session whose execute() yields non-empty ConnectorInstance rows for _init_connector_hub."""
+    result = MagicMock()
+    scalars_mock = MagicMock()
+    scalars_mock.all.return_value = rows
+    result.scalars.return_value = scalars_mock
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.return_value = result
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=None)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin = MagicMock(return_value=begin_cm)
+    return session
+
+
+class _FakeConnectorHub:
+    """Stand-in ConnectorHub whose initialise fails closed with a shared-budget error."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def initialise(self, _rows: list[Any], allowed_connectors: list[Any] | None = None) -> None:
+        raise self._exc
+
+
+async def test_init_connector_hub_propagates_shared_budget_error():
+    """FAR-439: _init_connector_hub must FAIL CLOSED (re-raise) on SharedBudgetUnavailableError.
+
+    A configured-but-unconstructable shared Redis budget — or a settings-read failure on
+    the executor path — raises SharedBudgetUnavailableError from ``hub.initialise``.
+    Swallowing it and returning None would let the connector node vacuously "succeed"
+    with the ``no connector hub`` fallback, silently no-op'ing the remote integration and
+    finalising the run GREEN. The raise must propagate so the run fails loudly at startup.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([MagicMock()])
+    )
+    hub = _FakeConnectorHub(
+        SharedBudgetUnavailableError("shared rate-limit Redis client is configured but could not be constructed")
+    )
+
+    with (
+        patch("modulo.core.connector_hub.ConnectorHub", return_value=hub),
+        patch("modulo.core.runtime_provider.create_default_hub", return_value=MagicMock()),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="key")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        pytest.raises(SharedBudgetUnavailableError),
+    ):
+        await executor._init_connector_hub(org_id)
+
+
+async def test_init_connector_hub_raises_when_configured_but_build_fails():
+    """FAR-439 root cause: a run WITH connectors configured must fail loudly.
+
+    A construction/settings failure (here ``get_settings`` raising) on a run that
+    HAS active connector rows must RAISE out of ``_init_connector_hub`` — never
+    return None. Returning None would let the node_runner vacuously "succeed"
+    with the ``no connector hub`` fallback, silently no-op'ing the configured
+    remote integration and finalising the run GREEN.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([MagicMock()])
+    )
+
+    with (
+        patch("modulo.settings.get_settings", side_effect=RuntimeError("settings unavailable")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        pytest.raises(RuntimeError),
+    ):
+        await executor._init_connector_hub(org_id)
+
+
+async def test_init_connector_hub_returns_none_when_no_connectors_configured():
+    """FAR-439: a run with NO active connector bindings returns None (vacuous success).
+
+    Vacuous success is only correct when no connector work is expected — the
+    ``hub=None`` fallback must never be reached for a configured run (see the
+    sibling fail-loudly tests). With zero rows the hub is never constructed so
+    the None return is the safe, correct result.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_init_session([])
+    )
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+    ):
+        result = await executor._init_connector_hub(org_id)
+
+    assert result is None
+
+
+def _make_connector_read_failing_session(exc: Exception) -> AsyncMock:
+    """Session whose execute() raises for a _init_connector_hub connector-row read."""
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.side_effect = exc
+    begin_cm = AsyncMock()
+    begin_cm.__aenter__ = AsyncMock(return_value=None)
+    begin_cm.__aexit__ = AsyncMock(return_value=False)
+    session.begin = MagicMock(return_value=begin_cm)
+    return session
+
+
+async def test_init_connector_hub_fails_closed_on_read_error():
+    """FAR-439: a connector-row READ failure must re-raise (fail closed), not return None.
+
+    A session / set_rls / ``session.execute`` failure while reading the
+    ConnectorInstance rows means we CANNOT determine whether connectors are
+    configured. Failing open (returning None) would let the connector node
+    vacuously "succeed" with the ``no connector hub`` fallback, silently no-op'ing
+    a possibly-configured remote integration and finalising the run GREEN. The
+    read error must propagate so the run fails loudly at startup — it is NOT
+    evidence that no connectors are configured.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._session_factory = _make_session_factory(  # type: ignore[assignment]
+        _make_connector_read_failing_session(RuntimeError("db read failed"))
+    )
+
+    with (
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        pytest.raises(RuntimeError, match="db read failed"),
+    ):
+        await executor._init_connector_hub(org_id)
+
+
+class _FakeConnectorHubWithMarkers:
+    """Stand-in ConnectorHub whose initialise populates skipped/healthy like the real hub."""
+
+    def __init__(
+        self,
+        skipped: dict[uuid.UUID, str] | None = None,
+        healthy: set[uuid.UUID] | None = None,
+    ) -> None:
+        self._skipped = skipped or {}
+        self._healthy = healthy or set()
+        self.skipped: dict[uuid.UUID, str] = {}
+        self.healthy: set[uuid.UUID] = set()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def initialise(self, _rows: list[Any], allowed_connectors: list[Any] | None = None) -> None:
+        self.skipped = dict(self._skipped)
+        self.healthy = set(self._healthy)
+
+
+def _make_nested_savepoint_cm() -> AsyncMock:
+    """begin_nested() savepoint stand-in whose __aexit__ records the rollback path."""
+    nested_cm = AsyncMock()
+    nested_cm.__aenter__ = AsyncMock(return_value=None)
+    nested_cm.__aexit__ = AsyncMock(return_value=False)
+    return nested_cm
+
+
+async def test_init_connector_hub_persists_degraded_markers():
+    """FAR-495: skipped instances get a degraded marker, healthy ones get cleared.
+
+    After ``hub.initialise`` populates ``skipped``/``healthy``, the executor must
+    persist the marker writes inside a ``begin_nested()`` savepoint:
+    ``mark_instances_degraded`` for the skipped instance ids and
+    ``clear_degraded_markers`` for the healthy ones, then still register the hub.
+    """
+    org_id = uuid.uuid4()
+    skipped_id = uuid.uuid4()
+    healthy_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    session = _make_connector_init_session([MagicMock()])
+    nested_cm = _make_nested_savepoint_cm()
+    session.begin_nested = MagicMock(return_value=nested_cm)
+    executor._session_factory = _make_session_factory(session)  # type: ignore[assignment]
+    hub = _FakeConnectorHubWithMarkers(skipped={skipped_id: "stub backend unavailable"}, healthy={healthy_id})
+    mark_mock = AsyncMock()
+    clear_mock = AsyncMock()
+
+    with (
+        patch("modulo.core.connector_hub.ConnectorHub", return_value=hub),
+        patch("modulo.core.runtime_provider.create_default_hub", return_value=MagicMock()),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="key")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.decorator.set_connector_hub") as set_hub_mock,
+        patch("modulo.db.crud.connector_instance.mark_instances_degraded", mark_mock),
+        patch("modulo.db.crud.connector_instance.clear_degraded_markers", clear_mock),
+    ):
+        result = await executor._init_connector_hub(org_id)
+
+    assert result is hub
+    mark_mock.assert_awaited_once_with(session, {skipped_id: "stub backend unavailable"})
+    clear_mock.assert_awaited_once_with(session, {healthy_id})
+    nested_cm.__aenter__.assert_awaited_once()
+    set_hub_mock.assert_called_once_with(hub)
+
+
+async def test_init_connector_hub_marker_failure_is_swallowed():
+    """FAR-495: a degraded-marker write failure must never fail the run start.
+
+    ``mark_instances_degraded`` raising inside the savepoint must be swallowed
+    (best-effort wiring): the savepoint's ``__aexit__`` is exercised with the
+    exception (the rollback path), the sibling clear is never attempted, and
+    ``_init_connector_hub`` still completes successfully and registers the hub.
+    """
+    org_id = uuid.uuid4()
+    skipped_id = uuid.uuid4()
+    healthy_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    session = _make_connector_init_session([MagicMock()])
+    nested_cm = _make_nested_savepoint_cm()
+    session.begin_nested = MagicMock(return_value=nested_cm)
+    executor._session_factory = _make_session_factory(session)  # type: ignore[assignment]
+    hub = _FakeConnectorHubWithMarkers(skipped={skipped_id: "secrets unavailable"}, healthy={healthy_id})
+    clear_mock = AsyncMock()
+
+    with (
+        patch("modulo.core.connector_hub.ConnectorHub", return_value=hub),
+        patch("modulo.core.runtime_provider.create_default_hub", return_value=MagicMock()),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="key")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.decorator.set_connector_hub") as set_hub_mock,
+        patch(
+            "modulo.db.crud.connector_instance.mark_instances_degraded",
+            AsyncMock(side_effect=RuntimeError("marker write failed")),
+        ),
+        patch("modulo.db.crud.connector_instance.clear_degraded_markers", clear_mock),
+    ):
+        result = await executor._init_connector_hub(org_id)
+
+    assert result is hub
+    nested_cm.__aenter__.assert_awaited_once()
+    nested_cm.__aexit__.assert_awaited_once()
+    exc_type, _exc, _tb = nested_cm.__aexit__.await_args.args
+    assert exc_type is RuntimeError
+    clear_mock.assert_not_awaited()
+    set_hub_mock.assert_called_once_with(hub)
+
+
+async def test_init_connector_hub_no_marker_calls_when_clean():
+    """FAR-495: with nothing skipped and nothing healthy, marker wiring is a no-op.
+
+    An empty ``skipped``/``healthy`` outcome must not open a savepoint or invoke
+    either crud function — the guard skips the whole marker block.
+    """
+    org_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    session = _make_connector_init_session([MagicMock()])
+    session.begin_nested = MagicMock()
+    executor._session_factory = _make_session_factory(session)  # type: ignore[assignment]
+    hub = _FakeConnectorHubWithMarkers()
+    mark_mock = AsyncMock()
+    clear_mock = AsyncMock()
+
+    with (
+        patch("modulo.core.connector_hub.ConnectorHub", return_value=hub),
+        patch("modulo.core.runtime_provider.create_default_hub", return_value=MagicMock()),
+        patch("modulo.core.secrets_backend.create_secrets_backend", return_value=MagicMock()),
+        patch("modulo.settings.get_settings", return_value=MagicMock(fernet_key="key")),
+        patch("modulo.core.pipeline_engine.executor.set_rls_org", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.executor.set_rls_execution_context", new=AsyncMock()),
+        patch("modulo.core.pipeline_engine.decorator.set_connector_hub"),
+        patch("modulo.db.crud.connector_instance.mark_instances_degraded", mark_mock),
+        patch("modulo.db.crud.connector_instance.clear_degraded_markers", clear_mock),
+    ):
+        result = await executor._init_connector_hub(org_id)
+
+    assert result is hub
+    mark_mock.assert_not_awaited()
+    clear_mock.assert_not_awaited()
+    session.begin_nested.assert_not_called()
+
+
+class _FakeModelBackendHub:
+    """Stand-in ModelBackendHub whose __aexit__ is awaited by ``_teardown_hub``."""
+
+    def __init__(self) -> None:
+        self.exited = False
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.exited = True
+
+
+async def test_teardown_model_backend_hub_when_connector_hub_init_raises_pre_stream():
+    """FAR-439: a pre-stream connector-hub raise must tear down the model-backend hub.
+
+    ``_init_run_environment`` acquires model_backend_hub (via ``__aenter__`` +
+    ``set_model_backend_hub``) BEFORE ``_init_connector_hub``. On a configured-path
+    raise that propagates out of execute() before the post-stream try/finally runs,
+    the hub would be leaked (ContextVar dangling, async client never awaited). The
+    raise must await the hub's ``__aexit__`` and clear the ContextVars before
+    propagating so no async client is left dangling.
+    """
+    org_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    pipeline_id = uuid.uuid4()
+    executor = PipelineExecutor(MagicMock())
+    executor._otel_bridge = MagicMock()
+
+    model_hub = _FakeModelBackendHub()
+    with (
+        patch.object(executor, "_init_model_backend_hub", new=AsyncMock(return_value=model_hub)),
+        patch.object(
+            executor,
+            "_init_connector_hub",
+            new=AsyncMock(side_effect=RuntimeError("connector hub init failed")),
+        ),
+        patch("modulo.core.pipeline_engine.executor.set_model_backend_hub", new=MagicMock()) as set_mb,
+        patch("modulo.core.pipeline_engine.executor.set_connector_hub", new=MagicMock()) as set_ch,
+        patch("modulo.core.pipeline_engine.executor.set_cancellation_check", new=MagicMock()) as set_cc,
+        patch("modulo.core.pipeline_engine.executor.set_audit_hook", new=MagicMock()) as set_ah,
+        patch("modulo.core.pipeline_engine.executor.get_registry") as get_registry_mock,
+        pytest.raises(RuntimeError, match="connector hub init failed"),
+    ):
+        registry = MagicMock()
+        get_registry_mock.return_value = registry
+        await executor._init_run_environment(
+            org_id=org_id,
+            run_id=run_id,
+            pipeline_id=pipeline_id,
+            graph_json={"nodes": []},
+        )
+
+    assert model_hub.exited is True
+    set_mb.assert_called_once_with(None)
+    set_ch.assert_called_once_with(None)
+    assert set_cc.call_args_list[-1] == call(None)
+    assert set_ah.call_args_list[-1] == call(None)
+    registry.close.assert_called_once_with(run_id)

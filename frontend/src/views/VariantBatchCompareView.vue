@@ -16,20 +16,22 @@
           <div class="space-y-1">
             <h2 class="text-lg font-semibold">{{ batch.name }}</h2>
             <div class="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
-              <span
-                role="status"
+              <span class="sr-only" id="variant-batch-status-label">{{ $t('views.variantBatch.statusHeader') }}</span>
+              <output
                 data-testid="variant-batch-status"
+                aria-labelledby="variant-batch-status-label"
                 class="inline-flex items-center gap-1.5"
               >
                 <span class="h-2 w-2 rounded-full" :class="statusDotClass"></span>
                 {{ $t(batchStatusKey) }}
-              </span>
+              </output>
               <span v-if="batch.pipeline_name">{{ batch.pipeline_name }}</span>
               <span class="tabular-nums">{{ batch.runs.length }} {{ $t('views.variantBatch.runs') }}</span>
             </div>
           </div>
           <div class="flex flex-wrap gap-3">
             <Button
+              type="button"
               data-testid="variant-batch-refire"
               :disabled="refiring"
               @click="handleReFire"
@@ -38,6 +40,7 @@
               {{ refiring ? $t('views.variantBatch.refiring') : $t('views.variantBatch.reFire') }}
             </Button>
             <Button
+              type="button"
               data-testid="variant-batch-back"
               variant="outlined"
               class="border border-input bg-background text-sm font-medium hover:bg-muted/50"
@@ -48,12 +51,14 @@
           </div>
         </div>
 
-        <div v-if="hasPartialResults" role="status" data-testid="variant-batch-partial" class="rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning">
+        <output v-if="hasPartialResults" data-testid="variant-batch-partial" aria-labelledby="variant-batch-partial-label" class="rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning">
+          <span class="sr-only" id="variant-batch-partial-label">{{ $t('views.variantBatch.aria_partial_results') }}</span>
           {{ $t('views.variantBatch.partialResults') }}
-        </div>
-        <div v-if="batchFailed" role="status" data-testid="variant-batch-failed" class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+        </output>
+        <output v-if="batchFailed" data-testid="variant-batch-failed" aria-labelledby="variant-batch-failed-label" class="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          <span class="sr-only" id="variant-batch-failed-label">{{ $t('views.variantBatch.aria_batch_failed') }}</span>
           {{ $t('views.variantBatch.batchFailed') }}
-        </div>
+        </output>
 
         <div class="overflow-x-auto rounded-lg border bg-card">
           <table class="w-full text-left text-sm">
@@ -94,6 +99,7 @@
                 </td>
                 <td class="px-4 py-3 text-right">
                   <button
+                    type="button"
                     class="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                     :aria-label="$t(expandedRunIds.has(run.run_id) ? 'views.variantBatch.collapseDetail' : 'views.variantBatch.expandDetail', { label: run.variant_name })"
                     :aria-expanded="expandedRunIds.has(run.run_id)"
@@ -191,6 +197,7 @@
               <td class="px-4 py-3 tabular-nums text-muted-foreground">{{ cmp.run_count }}</td>
               <td class="px-4 py-3 text-right">
                 <button
+                  type="button"
                   class="text-xs text-destructive hover:underline disabled:opacity-50"
                   :disabled="deletingId === cmp.batch_id"
                   :data-testid="`variant-batch-delete-${cmp.batch_id}`"

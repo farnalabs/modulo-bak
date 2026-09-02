@@ -89,7 +89,7 @@ routes:
         name: pipeline-list
         breadcrumb: Pipelines
         parent: /
-        product_map: [feat-pipelines]
+        product_map: [feat-pipelines, feat-router]
         sidebar_group: build
         sidebar_order: 2
         type: list_page
@@ -455,7 +455,8 @@ routes:
         sidebar_group: admin
         sidebar_order: 1
         type: list_page
-        <<: *team
+        <<: *community
+        required_roles: [admin]
         deprecated: false
 
     /admin/org:
@@ -609,7 +610,7 @@ routes:
         product_map: [feat-runtime]
         sidebar_group: system
         sidebar_order: 5
-        type: form_page
+        type: page
         deprecated: false
 
         <<: *team
@@ -1141,6 +1142,27 @@ elements:
       - testid: hk-delete-selected
         type: button
         dynamic_testid: false
+      - testid: hk-checkpoint-retention
+        type: element
+        dynamic_testid: false
+      - testid: hk-ckpt-max-age
+        type: input
+        dynamic_testid: false
+      - testid: hk-ckpt-purge
+        type: button
+        dynamic_testid: false
+      - testid: hk-ckpt-purge-confirm
+        type: button
+        dynamic_testid: false
+      - testid: hk-ckpt-purge-cancel
+        type: button
+        dynamic_testid: false
+      - testid: hk-ckpt-result
+        type: element
+        dynamic_testid: false
+      - testid: hk-ckpt-error
+        type: element
+        dynamic_testid: false
     /admin/model-backends:
       - testid: admin-model-backends-add
         type: button
@@ -1212,16 +1234,19 @@ elements:
       - testid: my-profile-my-team
         type: element
         dynamic_testid: false
-      - testid: my-profile-current-password
+      - testid: change-password-current
         type: input
         dynamic_testid: false
-      - testid: my-profile-new-password
+      - testid: change-password-new
         type: input
         dynamic_testid: false
-      - testid: my-profile-confirm-password
+      - testid: change-password-confirm
         type: input
         dynamic_testid: false
-      - testid: my-profile-update-password
+      - testid: change-password-submit
+        type: button
+        dynamic_testid: false
+      - testid: force-change-password-sign-out
         type: button
         dynamic_testid: false
     /admin/node-categories:
@@ -1444,23 +1469,41 @@ elements:
         type: input
         dynamic_testid: false
     /admin/run-retention:
-      - testid: admin-run-retention-save
+      - testid: admin-run-retention-refresh
         type: button
         dynamic_testid: false
-      - testid: admin-run-retention-purge-now
+      - testid: admin-run-retention-export
         type: button
+        dynamic_testid: false
+      - testid: admin-run-retention-purge
+        type: button
+        dynamic_testid: false
+      - testid: admin-run-retention-apply
+        type: button
+        dynamic_testid: false
+      - testid: admin-run-retention-date-from
+        type: input
+        dynamic_testid: false
+      - testid: admin-run-retention-date-to
+        type: input
+        dynamic_testid: false
+      - testid: admin-run-retention-pipeline
+        type: select
+        dynamic_testid: false
+      - testid: admin-run-retention-status
+        type: select
         dynamic_testid: false
       - testid: admin-run-retention-total-runs
         type: element
         dynamic_testid: false
-      - testid: admin-run-retention-estimated-saved
+      - testid: admin-run-retention-total-bytes
         type: element
         dynamic_testid: false
-      - testid: admin-run-retention-days
-        type: input
+      - testid: admin-run-retention-terminal-runs
+        type: element
         dynamic_testid: false
-      - testid: admin-run-retention-purge-age
-        type: input
+      - testid: admin-run-retention-purge-confirm
+        type: button
         dynamic_testid: false
     /admin/sandbox-concurrency:
       - testid: admin-sandbox-concurrency-save
@@ -1487,6 +1530,9 @@ elements:
         dynamic_testid: false
       - testid: admin-users-create-role
         type: select
+        dynamic_testid: false
+      - testid: admin-users-generate-password
+        type: button
         dynamic_testid: false
       - testid: admin-users-copy-password
         type: button
@@ -2968,14 +3014,148 @@ elements:
 features:
     feat-auth:
         description: OAuth authorization, sessions, and user profile
+        status: covered
+        behaviours:
+            # Admin-initiated credential lifecycle (FAR-460)
+            - "[x] Admin password reset sets accounts.must_change_password=true and emits a user_password_reset_by_admin audit event; admin user creation emits user_created_by_admin -- both fail-open (a failed audit write never rolls back the change)"
+            - "[x] The login response and /me (both /api/v1/auth/me and /api/v1/viewmodel/me) carry must_change_password so the frontend can force the change flow on fresh logins and restored sessions"
+            - "[x] When must_change_password is true, App.vue renders ONLY the forced change-password view (all navigation blocked by construction); PUT /api/v1/me/password clears the flag in the same transaction as the hash swap and refresh-token families are blacklisted"
+            - "[x] Admin create-user shows the shared credential dialog (email + password + copy) after success and offers a client-side strong-password generator meeting the form's displayed rules (8+ chars, upper+lower+digit)"
     feat-analytics:
         description: Reporting and analytics over runs, costs, and facts
     feat-audit:
         description: Audit trail and audit log
+        status: covered
+        behaviours:
+            # Cryptographic chain (SHA-256 linked events per org)
+            - "[x] Every AuditEvent records the SHA-256 of its canonical, compact JSON (sort_keys, separators=(',',':')) over event_type / actor / resource_type+id / payload / request_id / previous_hash / event_id / org / created_at, chaining each event to the prior one in the same organisation and forming a tamper-evident per-org chain with an AuditChainHead row tracking last_event_hash / last_event_id / event_count"
+            - "[x] Appends lock the chain head with SELECT ... FOR UPDATE so concurrent transactions cannot fork the chain; a race that creates the head between the lock check and the insert retries up to APPEND_MAX_RETRIES=3 with exponential backoff before re-raising (test_integrity_error_retries_then_succeeds / test_integrity_error_exhausts_retries)"
+            - "[x] The first event in an org has a NULL previous_hash; every subsequent event carries the hash of its immediate predecessor (test_first_event_creates_chain_head / test_second_event_links_to_first)"
+            - "[x] Append failure handling is typed and retry-scoped: a retryable IntegrityError backs off and retries, while a ProgrammingError (missing table) and SQLAlchemyError propagate immediately without retry"
+            - "[x] append_audit_event_isolated emits an event from a fresh post-commit transaction, re-establishing the RLS org + user context lost when SET LOCAL reverts on COMMIT; it fails open (a broken append is logged under log_key and never rolls back the completed operation) and always propagates CancelledError"
+            - "[x] Append-only enforcement is defense-in-depth: application-layer SQLAlchemy ORM listeners block UPDATE/DELETE on BOTH AuditEvent and ErrorEvent rows with AppendOnlyViolationError (idempotent, thread-safe, never double-registered), complementing the DB-level Postgres triggers (test_append_only.py)"
+            - "[x] Sanitised logging: invalid listing cursors are logged sanitised (never raw CR/LF control characters)"
+
+            # Chain verification
+            - "[x] GET /api/v1/admin/audit/verify recomputes the whole chain and returns {valid, total_events, checked_events, truncated, first_gap_index, first_tampered_id, chain_head_match, chain_count_mismatch, detail}; a missing chain head, a chain-head event_count mismatch, truncation, or a degenerate zero-fetch result all fail CLOSED as not valid"
+            - "[x] Tamper evidence is actionable: on a break the response reports the expected vs stored previous_hash at the first gap in a human-readable detail string (test_verify_chain_break_detail_first_event / test_verify_chain_break_detail_reports_expected_vs_actual_hash)"
+            - "[x] Verification is bounded to the most recent 10,000 events (truncated=true beyond that, reported not valid rather than silently partial)"
+
+            # Browse / export API (all under /api/v1/admin/audit, permission audit.manage)
+            - "[x] GET '' lists events with forward-only composite-cursor pagination (JSON {'c':created_at,'i':id} over created_at DESC, id DESC), clamps limit (API default 50) into 1..1000 at the core, filters by event_type / user_id / entity_type / from_date / to_date, always returns total, and an invalid user_id format is 422 while an invalid cursor falls back to the first page"
+            - "[x] POST /batch-detail returns full details for up to 100 event ids (BATCH_MAX_SIZE), skipping silently only invalid-UUID entries, so cross-page bulk selection works"
+            - "[x] GET /export returns paginated JSON (page / page_size clamped to 1..1000, ordered created_at ASC) with the same filters and a total, driving the admin CSV/JSONL export"
+            - "[x] /batch-detail and /export additionally require the audit_viewer feature (no view without the flag); every audit endpoint needs audit.manage"
+
+            # Frontend (AdminAuditLogView, /admin/audit)
+            - "[x] The team-tier audit log view verifies chain integrity, exports CSV and JSONL (client-side pagination over /export into audit-log-<date>.csv / .jsonl), and filters by actor user / date range / target entity type with previous/next pagination and filter reset"
+        deferrals:
+            - Verification is bounded to VERIFY_MAX_EVENTS=10,000 most-recent events — there is no incremental from-chain-head verify for very long chains
+            - The export surface is paginated JSON only (no server-side streaming / scan export for the whole org in one response)
     feat-connectors:
         description: External tool connectors
+        status: covered
+        behaviours:
+            # Generic REST integration connector (FAR-408 / FAR-411 / FAR-412).
+
+            # Happy Path
+            - "[x] A REST connector instance is creatable with a declarative endpoint (base_url + path + method) and an auth credential profile (bearer / api_key / basic)"
+            - "[x] query() is the read surface and write() is the write surface; a mutating verb (PUT/DELETE/PATCH) is intended to be declared on the write surface — the connector does not infer semantics, the author declares the method, and the query/write surface fixes the ACL gate"
+            - "[x] A JSON response with a configured records_path JMESPath expression yields a list of dicts that feeds the downstream JMESPath consumer; a top-level JSON array and a whole-object single-record fallback also stay list-of-dicts"
+            - "[x] When no records_path is configured, raw / passthrough content-types yield a single uniform {body, content_type, status_code, headers} record, so the result always stays a list-of-dicts (XML covered by test_query_xml_passthrough_yields_uniform_record)"
+            - "[x] Templated fields (headers, params, body, path) render from runtime variables via the sandboxed Jinja environment"
+            - "[x] Pagination is response-driven: the response's next_cursor (via next_cursor_path JMESPath) is surfaced on the result, while a caller-supplied start cursor is rejected with an actionable error (cursor surfacing covered by test_query_surfaces_next_cursor_from_response)"
+
+            # Config Validation
+            - "[x] Config validation rejects an unsupported HTTP method against the allowlist (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS) with an actionable ValueError"
+            - "[x] JMESPath paths using legacy dot-index syntax (data.items.0) are rejected with an actionable ValueError directing to bracket notation (data.items[0]); a numeric key like data.2024 is never silently rewritten"
+            - "[x] verify_tls is configurable (default true) and controls the httpx TLS certificate verify on the connector client"
+
+            # Auth & Credentials
+            - "[x] Credentials are stored encrypted as a multi-field JSON dict (auth_mode bearer / api_key / basic) and round-trip through the secrets backend; the credential never reaches LangGraph state, logs, or error detail, and error detail redacts secret values"
+            - "[x] api_key auth runs in BOTH header mode (default X-API-Key, or a custom header_name) and query mode (default api_key, or a custom query_param_name)"
+            - "[x] api_key-in-query credentials are applied right before the wire, after the injection guard, so the secret is never screened; a rendered/context query param that collides with the credential param name is a hard error, never a silent override"
+            - "[x] health_check issues the configured request with the credentials applied and reports the endpoint OK only for a sub-400 status"
+
+            # Security — SSRF / egress / injection
+            - "[x] An allowed_hosts allowlist plus core SSRF validation (validate_outbound_url_async wired at the composition root) prevent private / loopback / metadata / off-allowlist targets; a non-http/https scheme is rejected"
+            - "[x] Injection guard: rendered header names/values are rejected on CR/LF or C0 control chars, rendered headers may not override the protected set (authorization, proxy-authorization, host, content-length, plus the api_key header name), and query params are URL-encoded by httpx"
+            - "[x] On the WRITE surface the rendered URL, header values, params and body are screened by the core output-injection filter (filter_output_for_injection); the READ surface deliberately does NOT run the text classifier to avoid false positives on legitimate search terms"
+            - "[x] The api_key credential value is never fed through the injection filter (applied post-screening)"
+
+            # Error Handling
+            - "[x] Non-2xx/3xx responses surface a typed RESTStatusError carrying status_code, location and Retry-After metadata instead of silently passing through — redirects are never followed (metadata fields asserted in test_three_xx_carries_status_location_and_retry_after_metadata)"
+            - "[x] The response body is capped at max_response_size (default 10 MiB): a Content-Length or streaming body exceeding the cap raises RESTResponseTooLargeError so an unbounded body never stalls a run"
+            - "[x] Transport failures (connect / timeout / read) surface as a typed RESTConnectError"
+            - "[x] A fan-out source whose cardinality exceeds max_cardinality fails CLOSED before any request is emitted — a Sized source is len()-checked, a lazy generator is buffered to cap+1 then fails — raising RESTCardinalityExceededError with source_cardinality and the cardinality_over_cap flag"
+            - "[x] An empty or unresolved fan-out items path succeeds vacuously (0 items, no outbound calls — not a failure)"
+            - "[x] A mid-fan-out per-item failure fails the node, raising RESTFanOutFailureError carrying the per-item outcomes and success/failure counts so an operator can reconcile exactly which items were written"
+            - "[x] A mid-fan-out cancellation surfaces as RESTFanOutCancelledError carrying partial outcome state"
+            - "[x] A saturated per-destination token bucket never spins past the per-item budget — the rate-limit wait is bounded and raises RESTRateLimitTimeoutError"
+
+            # Retry / Idempotency / Concurrency
+            - "[x] Idempotent verbs (GET/HEAD) retry on 429/5xx and transient transport failures with exponential backoff + jitter, honouring a Retry-After capped at 30s; mutating verbs retry only when the operation declares an idempotency_header, and never retry otherwise (idempotency key reuse across retries asserted in test_mutating_verb_with_idempotency_header_retries)"
+            - "[x] Fan-out emits items SEQUENTIALLY (one request per item, no concurrent or bounded-concurrency fork in v1); each item consumes a token from a per-destination rate bucket — a local per-process TokenBucket keyed by canonical rate key (base_url + path) with no Redis wired, or a SHARED Redis-atomic bucket keyed <tenant_id>:<destination> when a redis_client is provided (FAR-439)"
+            - "[x] The connector shares a single lazily-created, connection-pooled httpx.AsyncClient (max_connections / max_keepalive_connections) closed via close() — the shared client is not Redis-backed (only the per-destination rate limiter may be, via the composition-root redis_client)"
+            - "[x] The fan-out budget (max_cardinality x per_item_timeout x (max_retries + 1)) is reconciled against the node's timeout_seconds budget by the graph validator at save/run time (validator tests assert the multiplier in test_node_send_budget_*)"
+            - "[x] A per-request timeout (default 30s, override via timeout_seconds) applies to both the read and write surfaces; the fan-out path uses its own per_item_timeout (default = connector timeout) (write-timeout surfacing a RESTConnectError asserted in test_write_timeout_is_typed_rest_connect_error_not_crash)"
+
+            # Redaction
+            - "[x] Fan-out outcome records persist only a bounded, redacted item_summary / result_summary — never the raw item payload — so a credential-bearing item is not echoed into logs or the persisted run result"
+
+            # Shared per-destination rate limiting (FAR-439) + per-connector OTel metrics (FAR-413)
+            - "[x] A shared, Redis-atomic per-destination rate limiter (PerDestinationRateLimiter + RedisTokenBucket, Lua CTL with server-side redis.call('TIME') refill) enforces ONE budget per <tenant_id>:<destination> across a fleet of uvicorn/SAQ workers; a configured shared limiter FAILS CLOSED on Redis outage (SharedBudgetUnavailableError) — it never falls back to a per-process bucket that would multiply the effective cap by N workers (covered by tests/integration/test_rate_bucket_redis.py)"
+            - "[x] Shared vs local limiting composes safely: no redis_client wired => the per-process TokenBucket is authoritative (single-worker/dev parity); a shared limiter without a real tenant_id is rejected at the composition root (never a cross-tenant 'default' budget)"
+            - "[x] Per-connector OpenTelemetry METRICS are emitted (modulo.connectors.rest.rest_metrics, lazy-initialised + exception-swallowed so metrics never surface as a connector failure): modulo_rest_request_duration_seconds histogram (host/method/outcome, one sample per logical operation), modulo_rest_outcome_total counter (closed cause-code taxonomy, labelled host), modulo_rest_retry_total, modulo_rest_ssrf_blocked_total and modulo_rest_redaction_events_total"
+            - "[x] AdminConnectorsView renders a schema-driven structured form for the Generic REST connector type: flat operational config fields (base_url, method, timeout_seconds, verify_tls, on_unknown, records_path, allowed_hosts) are first-class controls, credentials (auth_mode bearer/api_key/basic + per-mode secrets) is a separate never-conflated section, and advanced/templated fields (headers, body, operations, fan_out, rate_limit) remain a JSON editor (FAR-466)"
+            - "[x] Invalid method/auth_mode/on_unknown/timeout/advanced-JSON is a loud inline error, never silently accepted; the form submits operational config as config_json and auth as credentials, and leaves empty fields reset to defaults"
+        deferrals:
+            - Per-tenant weighted concurrency semaphore / bounded-concurrency fan-out fork — fan-out emits sequentially in v1 (no concurrent fork); throughput relies on pipeline-level concurrency limits and the connector's single connection-pooled client
+            - "Per-ITEM fan-out outcome trace SPANS — operation-level OTel trace spans (from _TracedConnector: connector.<type>.query/write/health_check emitting connector.type/operation/resource/limit/result_total/error_type + duration) and per-destination outcome/latency METRICS are emitted in v1; only per-item trace spans are deferred"
+            - DISTINCT classification layer (request-to-response ingestion classification runs as one opaque hop; a separate deduplicate/classify layer is deferred to FAR-404)
+
     feat-costs:
         description: Cost tracking, spend limits, cost controls, and cost components
+        status: covered
+        behaviours:
+            # Cost report + run-cost aggregation (GET /api/v1/admin/costs)
+            - "[x] The cost report aggregates org spend for the selected period (day/week/month/year) and groups by team or org; each item carries total_spend_usd, total_runs, a summed per-component breakdown (cost components resolved per environment) and per-org annotations, and the response surfaces org_total / org_run_count / legacy_total / has_more plus org_unassigned_components"
+            - "[x] An invalid group_by or period query param is rejected with 422 (pattern-constrained, no silent fallback)"
+            - "[x] The cost endpoints are admin-only: operators/viewers are refused 403 and an unauthenticated caller 401 (require_permission cost.manage)"
+
+            # CSV export
+            - "[x] GET /api/v1/admin/costs/export streams a CSV attachment (entity_id, entity_name, total_spend_usd, total_runs) with a Content-Disposition attachment; only CSV is supported and the period aliases (this_month / last_month / 7d / 30d / 90d) map onto the month/week/year report periods"
+
+            # Spend limits
+            - "[x] GET /api/v1/admin/costs/limits returns the org daily spend limit plus one entry per team with its own daily limit (None when unset)"
+            - "[x] PUT /api/v1/admin/costs/limits/org sets or clears (explicit null = unlimited) the org daily spend limit; a negative limit is rejected 422"
+            - "[x] PUT /api/v1/admin/costs/limits/teams/{team_id} sets or clears a team daily spend limit strictly scoped to the caller's org — a team id from another org is 404 with no mutation, a missing team is 404, and an invalid id or negative limit is 422"
+
+            # Spend-limit / token-budget / circuit-breaker enforcement at run finalize
+            - "[x] Org and team daily spend limits are enforced at run finalization: an over-budget run is permanently refused with reason daily_limit_exceeded:organisation / daily_limit_exceeded:team and the run count is not incremented (BDD cost_controls.feature)"
+            - "[x] A per-agent token budget is a hard stop: exceeding an agent's budget terminalizes the run as 'budget_exceeded' with the message 'This run exceeded its token budget.'; within budget no override applies and a budget-check failure is fail-open (test_cost_token_budget.py)"
+            - "[x] A pipeline circuit breaker trips when the pipeline's rolling monthly spend crosses its threshold, permanently pausing the pipeline trigger until an admin re-enables it; an already-tripped pipeline fails closed (test_circuit_breaker.py)"
+
+            # Cost controls + hard spend ceilings (FAR-391)
+            - "[x] GET /api/v1/admin/costs/controls returns teams with daily limits, the org budget, max_run_cost / spend_ceiling (USD at the API boundary, stored as integer cents), org_cumulative_spend_usd, alert thresholds, the circuit-breaker toggle, currency (USD/EUR/GBP) and billing period (monthly/quarterly/annual)"
+            - "[x] PUT /api/v1/admin/costs/controls updates cost-control fields; alert_thresholds must be a non-empty list of integers in 1..100 (422 otherwise) and omitted fields are preserved"
+            - "[x] The dedicated /ceiling surface manages max_run_cost (per-run) and spend_ceiling (per-org) independently: explicit null clears one ceiling back to unlimited, omitting a field leaves it unchanged, and 0 is a kill-switch; remaining_budget_usd is derived from the org ceiling (test_spend_ceiling_endpoints.py)"
+            - "[x] Ceiling enforcement runs before the daily-ledger write: a run exceeding its per-run ceiling or the org cumulative ceiling has its ledger refused (never billed beyond the ceiling) and terminalizes as 'cost_ceiling_exceeded' — except an explicit cancelled status, which is preserved; within ceilings the org cumulative spend is incremented (test_cost_finalize_ceiling.py)"
+            - "[x] POST /api/v1/admin/costs/circuit-breaker/{pipeline_id}/reset re-enables a tripped pipeline and re-activates its non-deleted triggers; a missing pipeline is 404"
+
+            # Cost components + formula engine (ADR 019)
+            - "[x] Cost-component CRUD lives under /api/v1/admin/costs/components (list / create / update / delete) with an org-level component cap and 409 on a duplicate name"
+            - "[x] Component authoring is cross-field validated: self_reported components require a null formula, calculated components require a formula, a rate component requires a source or a registered rate fallback (only e2b_rate), and reserved component names / report keys are rejected (test_cost_components_crud.py)"
+            - "[x] The cost formula engine is a hand-rolled tokenizer + recursive-descent parser supporting only + - * /, unary minus and parentheses over a whitelisted identifier registry — no eval; unknown identifiers, division by zero, nesting-depth / length cap breaches and attack strings are rejected (ADR 019, test_cost_formula.py)"
+
+            # Scheduled cost reports
+            - "[x] Scheduled cost reports (/reports) are create/list/delete: a report is created (201) with period daily|weekly|monthly, group_by team|org, format csv|json, at least one recipient and a one_time/recurring schedule; missing recipients or an unsupported grouping is 422; delete is 204 and a missing report is 404"
+
+            # Spend anomaly detection
+            - "[x] Cost anomalies are surfaced from the org daily-spend ledger: a day whose spend exceeds 2x the rolling 7-day average is reported (fresh detections merge with stored rows so dismissals survive), and dismissing an anomaly is a 204 POST with 404 for a missing one"
+        deferrals:
+            - "No pre-flight / predictive run-cost ESTIMATE — spend limits and ceilings are enforced reactively at run finalization; there is no 'this run will cost ≈X' projection before dispatch"
+            - "Cost-probe ledger self-healing (core/cost_controller/probe.py) tracks run-total vs breakdown consistency as an operational probe, not a surfaced admin report"
     feat-dashboard:
         description: Home dashboard, metrics overview, and saved views
     feat-environments:
@@ -2988,6 +3168,8 @@ features:
         description: Guardrail policies
     feat-hitl:
         description: Human-in-the-loop approval gates and review
+    feat-router:
+        description: Router decision nodes and branching in the execution graph (FAR-402 P1 / F2-A)
     feat-library:
         description: Reusable pipeline templates and the template library
     feat-license:
@@ -3000,6 +3182,37 @@ features:
         description: Model backend management and setup
     feat-notifications:
         description: Notifications, email delivery, and notification logs
+        status: covered
+        behaviours:
+            # Endpoint (webhook) CRUD — /api/v1/notifications
+            - "[x] Webhook endpoints are org-scoped CRUD (list endpoints with notification.view; create/get/update/delete/restore with notification.manage); create requires an http:// or https:// URL that ALSO passes SSRF validation (is_valid_http_url + validate_outbound_url at create, async revalidation on update — test_create_endpoint_rejects_relative_url)"
+            - "[x] Endpoint secrets are Fernet-encrypted at rest and never exposed in responses; the events subscription is a JSON list matched per event type"
+            - "[x] Endpoints soft-delete (DELETE -> 204) and restore; a missing or soft-deleted endpoint is 404 on every read/update/delete/restore path"
+            - "[x] Team-scoped endpoints (team_id) may only be created/assigned by admins (403 otherwise), and dispatch prefers team-specific endpoints for a run's team, falling back to org-wide (team_id IS NULL) endpoints when none are subscribed"
+            - "[x] Break-glass hardening: create/update/delete are denied for break-glass-minted principals (deny_break_glass_mint), and at dispatch time endpoints owned by denied/inactive/deprecated break-glass accounts are re-checked and skipped fail-closed with per-endpoint isolation — a DB blip resolving owners is treated as denied and counted by the modulo_notifier_break_glass_owner_read_failures_total metric (test_break_glass_webhook_deny.py)"
+
+            # Dispatch / retry / dead-letter (modulo.core.notifier)
+            - "[x] A dispatched event POSTs a single {event, timestamp, payload} JSON body per subscribed endpoint with Content-Type application/json, X-Modulo-Signature sha256=<HMAC-SHA256 over the body> (empty string when the endpoint has no secret, or when the stored secret cannot be decrypted), X-Modulo-Timestamp and User-Agent Modulo-Notifier/1.0"
+            - "[x] Delivery retries up to MAX_ATTEMPTS=4 (1 initial + 3 retries) on non-2xx or transport errors with exponential delays [1s, 5s, 30s], and a 429 honours Retry-After capped at 60s, falling back to the default backoff for invalid/missing values"
+            - "[x] A delivery that exhausts its retries is dead-lettered: the endpoint's consecutive_dead_letter_count increments and the endpoint auto-disables (auto_disabled + disabled_at) at MAX_DEAD_LETTERS=10; a successful delivery resets the counter (only when non-zero); the bookkeeping survives DB errors and re-raises CancelledError"
+            - "[x] Every attempt is written to the delivery log (status delivered/dead_lettered, attempt_count, response_code, last_error, run_id), and the payload is retained ONLY when the caller opts in and is then Fernet-encrypted at rest — never stored plaintext"
+            - "[x] In-app notification creation runs ALONGSIDE webhook dispatch as an independent always-executed step: an org with zero webhook endpoints still receives its in-app notification, an in-app failure never aborts webhook delivery, and webhook dispatch never silently skips in-app creation (guards the historical early-return silent-loss bug)"
+
+            # Event surface
+            - "[x] 17 named event types drive the pipeline: hitl_awaiting, run_failed, run_stalled, budget_exceeded, claim_expired, hitl_overdue, hitl_gate_removed, hitl_gate_removal_denied, eval_regression, eval_blocked, feedback_pending, system_announcement, trigger_deactivated, guardrail_enforcement_gap, guardrail_kill_switch, guardrail_unexpected_skip and circuit_breaker_tripped"
+            - "[x] The NotificationEventMapper turns each dispatched event into a typed in-app notification with per-event config (level, scope, category, dismiss strategy, TTL) rendered from sanitised payload fields, and GET /api/v1/admin/notifications/available-events drives the endpoint editor's event picker"
+
+            # In-app notifications — /api/v1/notifications/in-app
+            - "[x] GET /dashboard returns the dashboard feed, GET /unread-count the badge count, GET '' the paginated inbox, GET/PUT /preferences the per-user notification preferences, GET /{id} the detail, and POST /{id}/review-later + POST /{id}/dismiss action the record"
+
+            # Admin delivery log + webhooks + email
+            - "[x] GET /api/v1/admin/notifications/deliveries is the cursor-paginated org-wide delivery log (filter by status / event_type / endpoint_id / from / to), and POST /deliveries/retry-all-failed re-dispatches every failed + dead-lettered delivery"
+            - "[x] Admin webhook management lives under /api/v1/admin/notifications (list/create/get/update) with the same secret-handling and break-glass deny rules as the user surface"
+            - "[x] Email delivery: GET/PUT /api/v1/admin/org/{org_id}/email-settings (feature email_config; org.email.view / org.email.manage) configures SMTP with a clear_password flag and smtp_timeout, and a POST test endpoint verifies the configuration"
+            - "[x] Frontend surfaces: team-tier notification centre (/notifications) with preferences, review-later and dismiss actions; team-tier email settings (/settings/email); admin delivery-log UI (/admin/notification-delivery) with status/event-type/date filters, a retry control, retry-all and an empty state"
+        deferrals:
+            - A realtime/push transport is not part of the notifier — webhook (+ HMAC) and in-app notification are the only delivery channels; email settings exist but the notifier does not fan out to SMTP subscribers
+            - Dead-letter retry is manual-and-bulk only (retry-all-failed); there is no per-endpoint dead-letter replay of retained payloads in the API surface
     feat-observability:
         description: Error dashboard, monitoring, and observability exports
     feat-onboarding:
@@ -3030,6 +3243,65 @@ features:
         description: Users, teams, and role-based access
     feat-triggers:
         description: Manual, webhook, and scheduled triggers
+        status: covered
+        behaviours:
+            # Trigger types + CRUD surface
+            - "[x] A trigger is creatable on a pipeline (POST /api/v1/pipelines/{id}/triggers, 201) for each supported type — manual / webhook / cron / polling / agent_signal / ongoing / slack_app_mention — with a validated cron expression/timezone, max_concurrent_runs, a daily spend limit, and an org-scoped config_json"
+            - "[x] Triggers are listed (GET /api/v1/triggers, paginated, created_at desc) filterable by pipeline_id and trigger_type; the response surfaces the org-wide triggers_paused state and paused_at, plus per-trigger daily_spend_limit, in_flight (ongoing), and the uniform 6-key streak_status"
+            - "[x] Trigger list/streak state is serialized INSIDE the RLS transaction so the transaction-scoped SET LOCAL org context is never lost to a post-commit read"
+            - "[x] A pipeline-scoped listing exists (GET /api/v1/pipelines/{id}/triggers) with optional trigger_type filter"
+            - "[x] General update (PUT /api/v1/triggers/{id}) MERGES config_json (a masked secret placeholder never clobbers the stored secret; an explicit null clears the key; a missing key leaves it intact), then re-encrypts secret fields"
+            - "[x] Triggers soft-delete (DELETE, 204) and restore (POST /triggers/{id}/restore); a restored active ongoing trigger re-anchors its streak epoch and fires on the next tick (next_fire_at = now)"
+            - "[x] Active state toggles (POST /triggers/{id}/toggle) re-anchor the no-delivery streak epoch on any active=True transition, and clear the config-failure Redis counter only AFTER commit (under-clearing safe, over-clearing not)"
+            - "[x] Type-specific config endpoints (cron / polling / ongoing) reject the wrong trigger type with 400 and a named 'Only X triggers can have ...' message"
+            - "[x] Trigger test (POST /triggers/{id}/test) records a `test` TriggerEvent and creates a real run for manual triggers; deleted-org conflicts surface 409 and storage exhaustion 503"
+            - "[x] Missing or soft-deleted triggers resolve 404 on every read/update/delete/toggle/test/events path; invalid cron resolves 422; DB ProgrammingError -> 501 and SQLAlchemyError -> 503 on the trigger route handlers"
+
+            # Secret handling
+            - "[x] Secret config keys (hmac_secret, signing_secret) are encrypted at rest with Fernet (idempotent — never double-wrapped; masked/empty values untouched), and sensitive config keys are masked in every API response (mask_config_json)"
+            - "[x] An update that round-trips the masked placeholder preserves the stored secret; supplying a new value replaces it; an explicit null clears the key"
+
+            # Cron
+            - "[x] Cron update validates the expression + timezone (422 on an invalid expression/missing expression) and recomputes next_fire_at; only cron triggers accept cron config (400 otherwise)"
+            - "[x] Cron schedule preview (GET /triggers/{id}/cron/preview) returns the next N fire times (max 50; 404 missing trigger, 400 when no cron expression is configured)"
+            - "[x] The cron scheduler fires an active due trigger, creating a run with trigger_type 'cron' that references the trigger, updates last_fired_at, and advances next_fire_at"
+            - "[x] A cron trigger whose org/pipeline exceeds its daily spend limit is skipped with reason 'spend_limit' and records a spend_limit_reached TriggerEvent"
+            - "[x] A cron trigger's input_template populates the run input payload on fire; snapshot_id pins the fired graph"
+
+            # Webhook
+            - "[x] Webhook delivery is HMAC-SHA256 verified via X-Modulo-Webhook-Secret with an X-Modulo-Timestamp validated within the ±300s replay window; invalid/missing signature -> 401, missing trigger -> 404, expired timestamp -> 400"
+            - "[x] HMAC-less triggers accept unauthenticated deliveries by design, with a log warning"
+            - "[x] A valid delivery returns 202 {'run_id', status: 'accepted'}; the run is dispatched in the background via fail-fast SAQ enqueue, and dispatch failures are ingested as error events without blocking the 202 (capacity-deferred runs are left to dispatcher_reconcile)"
+            - "[x] Duplicate payloads are rejected 400 'Duplicate webhook payload'; concurrent-run-limit and pipeline rate-limit rejections are 429; a busy pipeline snapshot lock retries acquisition briefly, then surfaces an honest 503 'snapshot lock unavailable — retry the delivery' (never a fabricated 'queued' ack with no run behind it)"
+            - "[x] Every webhook delivery outcome is recorded as a TriggerEvent row (accepted, paused, guardrail_blocked, ...), and the stored raw payload supports replay"
+            - "[x] Replay (POST /triggers/{id}/webhook/replay/{event_id}) re-fires a stored payload, reusing the original hash and preserving dedup + flood protection; an authenticated principal needs the 'run.trigger' runner permission, and an unauthenticated replay must present a valid HMAC over the stored payload"
+            - "[x] Guardrail-blocked webhook deliveries are ack'd with a non-success 422 (never a false 'accepted'); the run + TriggerEvent rows stay committed for visibility"
+            - "[x] cleanup-expired sweeps stale dedup hashes and expired WebhookPayload rows under a Postgres advisory lock (safe to call from cron with a runner credential)"
+
+            # Kill-switch (org-wide pause)
+            - "[x] An org-wide trigger pause kill-switch exists (PUT /api/v1/admin/orgs/{org_id}/triggers/pause, admin-only -> 403 otherwise); toggling to the current state is an idempotent no-op, changes write an audit event"
+            - "[x] A webhook delivered to a paused org is accepted (202) but dropped with a 'paused' response and no run/dedup/snapshot work; unpausing restores acceptance; a hard-deleted org fails closed with no event write and no crash"
+
+            # Ongoing
+            - "[x] An ongoing trigger tops-up the pipeline to its target when below it, and fires no run at/above target; pending runs count toward the target; the daily spend limit and org pause both stop the top-up"
+            - "[x] Ongoing triggers REQUIRE daily_spend_limit — clearing it via update is rejected 422; creation and updates re-run the shared validator against the merged values and the pipeline max_concurrent_runs cap"
+            - "[x] Ongoing config updates (scan_interval_seconds >= 60, target_runs 1-20) bump next_fire_at to now when the pool/cadence/active state actually changes so the new config fires on the next scheduler tick"
+
+            # Polling
+            - "[x] Polling config update (connector_instance_id, poll_query, condition_expression, poll_interval_seconds >= 60, snapshot_id, daily_spend_limit) recomputes next_fire_at when the interval/connector/query changes"
+            - "[x] Polling test (POST /triggers/{id}/polling/test) evaluates the connector query + JMESPath condition without creating a run or TriggerEvent"
+            - "[x] The polling scheduler fires only when the condition matches (TriggerEvent condition_met) and records no_match otherwise; a poll respects max_concurrent_runs (concurrency_limit_reached) and the daily spend limit (spend_limit_reached); with no limit it always fires; invalid JMESPath or connector failure records poll_error; inactive triggers are skipped"
+
+            # Agent signal
+            - "[x] An agent_signal trigger fires a child pipeline run when its watched node completes, passing node_output and source_run_id into the child input payload, and records a TriggerEvent for every attempt"
+            - "[x] agent_signal respects max_concurrent_runs (skip + concurrency_limit_reached event), ignores inactive triggers and invalid snapshot_id configs (skip), and is org-isolated (a watched node in one org never fires another org)"
+
+            # Trigger event log
+            - "[x] Per-trigger event logs (GET /triggers/{id}/events) are cursor-paginated, filterable by validation_result, and 404 on a missing trigger; an admin org-wide log surface (GET /api/v1/admin/trigger-events) is cursor-paginated by trigger_type / validation_result"
+            - "[x] The frontend SettingsTriggersView covers create for every trigger type (incl. webhook URL/method/headers, cron expression/timezone/input, polling connector/query/condition, agent-signal source, ongoing target/interval/spend) plus the pause-all kill-switch, streak/outcomes UI, and the trigger event-log view"
+        deferrals:
+            - Slack app-mention triggers register as a trigger type and are endpoint-tested, but are an alpha/community surface without a BDD feature file
+            - Route-level webhook validation failures (HMAC/timestamp) roll back with the request and do not persist a TriggerEvent for those typed errors in that path (documented pre-existing limitation)
     feat-variants:
         description: Variant comparison and AB test models
 sidebar_groups:

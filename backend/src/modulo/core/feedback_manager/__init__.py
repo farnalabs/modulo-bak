@@ -24,6 +24,7 @@ from modulo.db.crud.run import create_run, get_run
 from modulo.db.models.feedback_record import FeedbackRecord
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.run import Run
+from modulo.utils.uuid import coerce_uuid
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +225,7 @@ async def _get_or_create_feedback_record(
         account_id=account_id,
         rejection_reason=rejection_reason,
         rejected_output=rejected_output,
-        producing_node_id=node_id,
+        producing_node_id=coerce_uuid(node_id),
         feedback_status="correcting",
         feedback_handler_type="human",
     )
@@ -397,7 +398,7 @@ class FeedbackManager:
             account_id=account_id,
             rejection_reason=stripped_reason,
             rejected_output=rejected_output,
-            producing_node_id=producing_node_id,
+            producing_node_id=coerce_uuid(producing_node_id),
             producing_agent_id=producing_agent_id,
             feedback_status="pending",
             feedback_handler_type=feedback_handler_type,
@@ -858,7 +859,7 @@ class FeedbackManager:
         idem_key = build_idempotency_key(
             org_id=self._org_id,
             run_id=record.run_id,
-            node_id=record.producing_node_id,
+            node_id=str(record.producing_node_id),
             correction_id=correction.id,
             redacted_input=redacted_input,
         )
@@ -934,8 +935,8 @@ class FeedbackManager:
             return None
         outcome = await resume_interrupted_correction(
             correction=ctx.correction,
-            guardrail=ctx.guardrail,
-            backend=ctx.backend,
+            _guardrail=ctx.guardrail,
+            _backend=ctx.backend,
             state=persisted_state,
             revalidation_config=ctx.revalidation_config,
             judge_callable=ctx.judge_callable,

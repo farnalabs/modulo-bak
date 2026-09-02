@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.26
 # Global build-arg declarations — required for --build-arg from fly deploy to
 # be accepted without warnings.  Re-declared inside each stage that needs them.
 ARG GIT_SHA
@@ -33,7 +33,7 @@ RUN pnpm run build
 # =============================================================================
 # Stage 2: Backend + nginx for static serving
 # =============================================================================
-FROM python:3.12-slim
+FROM python:3.14-slim
 ENV PATH="/app/.venv/bin:$PATH" \
     UV_LINK_MODE=copy \
     HOME=/tmp
@@ -41,8 +41,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # Install nginx + uv (libcap2-bin provides setcap for non-root port binding)
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
-apt-get update && apt-get install -y --no-install-recommends nginx libcap2-bin
-RUN --mount=type=cache,target=/root/.cache/pip pip install --only-binary :all: uv==0.11.13
+apt-get update && apt-get install -y --no-install-recommends libcap2-bin nginx
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --only-binary :all: uv==0.11.13
 
 WORKDIR /app
 

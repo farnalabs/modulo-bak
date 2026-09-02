@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Final, Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -53,6 +53,60 @@ def _trend_point(period: str, total: int, passed: int) -> OkrTrendPoint:
     return OkrTrendPoint(period=period, pass_rate=_rate(total, passed), total_evals=total, passed_evals=passed)
 
 
+# (period, total-field, passed-field) orderings that mirror the aggregate query
+# aliases in ``track_okr_progress``. Keeps the trend assembly and the row read
+# in a single, ordered source of truth.
+_TREND_PERIODS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("7d", "total_7d", "passed_7d"),
+    ("14d", "total_14d", "passed_14d"),
+    ("30d", "total_30d", "passed_30d"),
+    ("overall", "total_all", "passed_all"),
+)
+
+
+def _extract_trend_counts(trend_row: object) -> dict[str, int]:
+    """Read the aggregate row into zero-defaulted per-window counts.
+
+    The trend query's ``SUM`` aliases are ``NULL`` (and ``SQLAlchemy Row`` may
+    expose them as ``None``) whenever a window has no rows, so every count is
+    normalised to ``0`` before building the trend points.
+    """
+    if trend_row is None:
+        return {field: 0 for _, total_field, passed_field in _TREND_PERIODS for field in (total_field, passed_field)}
+    return {
+        field: int(getattr(trend_row, field) or 0)
+        for _, total_field, passed_field in _TREND_PERIODS
+        for field in (total_field, passed_field)
+    }
+
+
+def _comparison_points(trend: list[OkrTrendPoint]) -> tuple[float, float] | None:
+    """Return ``(previous, latest)`` pass rates for trend comparison.
+
+    Prefers the two most recent non-empty, non-overlapping discrete windows
+    (excluding ``overall``). When fewer than two discrete windows carry data,
+    falls back to any two data-carrying points (which may include ``overall``).
+    Returns ``None`` when there is not enough data to compare.
+    """
+    discrete = _discrete_windows(trend)
+    if len(discrete) >= 2:
+        return discrete[-2].pass_rate, discrete[-1].pass_rate
+    points_with_data = _data_carrying_points(trend)
+    if len(points_with_data) >= 2:
+        return points_with_data[-2].pass_rate, points_with_data[-1].pass_rate
+    return None
+
+
+def _discrete_windows(trend: list[OkrTrendPoint]) -> list[OkrTrendPoint]:
+    """Non-empty, non-overlapping trend windows (everything but ``overall``)."""
+    return [p for p in trend if p.total_evals > 0 and p.period != "overall"]
+
+
+def _data_carrying_points(trend: list[OkrTrendPoint]) -> list[OkrTrendPoint]:
+    """All trend windows that carry at least one eval."""
+    return [p for p in trend if p.total_evals > 0]
+
+
 def _compute_trend_direction(trend: list[OkrTrendPoint], threshold: float = 0.05) -> TrendDirection:
     """Determine trend direction from sequential trend points.
 
@@ -60,16 +114,10 @@ def _compute_trend_direction(trend: list[OkrTrendPoint], threshold: float = 0.05
     Excludes ``overall`` (which overlaps with all windows). A change of
     less than *threshold* (default 0.05) is considered stable.
     """
-    discrete = [p for p in trend if p.total_evals > 0 and p.period != "overall"]
-    if len(discrete) >= 2:
-        latest = discrete[-1].pass_rate
-        previous = discrete[-2].pass_rate
-    else:
-        points_with_data = [p for p in trend if p.total_evals > 0]
-        if len(points_with_data) < 2:
-            return "stable"
-        latest = points_with_data[-1].pass_rate
-        previous = points_with_data[-2].pass_rate
+    comparison = _comparison_points(trend)
+    if comparison is None:
+        return "stable"
+    previous, latest = comparison
     delta = latest - previous
 
     if delta <= -threshold:
@@ -90,6 +138,94 @@ def _days_between(from_date: datetime, target_date_str: str | None) -> int | Non
     except ValueError:
         _log.warning("Invalid target date for OKR days calculation: %s", target_date_str)
         return None
+
+
+_INFO_QUERY: Final = text("""
+    SELECT
+        COUNT(*) AS def_count,
+        MAX(pass_threshold) AS pass_threshold
+    FROM eval_definitions
+    WHERE suite_id = :suite_id AND organisation_id = :org_id
+""")
+
+_TREND_QUERY: Final = text("""
+    WITH suite_eval_ids AS (
+        SELECT id FROM eval_definitions
+        WHERE suite_id = :suite_id AND organisation_id = :org_id
+          AND eval_type != 'guardrail'
+    )
+    SELECT
+        SUM(CASE WHEN er.evaluated_at >= :window_7 THEN 1 ELSE 0 END)
+            AS total_7d,
+        SUM(CASE WHEN er.evaluated_at >= :window_7 AND er.passed THEN 1 ELSE 0 END)
+            AS passed_7d,
+        SUM(
+            CASE WHEN er.evaluated_at >= :window_14 AND er.evaluated_at < :window_7 THEN 1 ELSE 0 END
+        ) AS total_14d,
+        SUM(
+            CASE
+                WHEN er.evaluated_at >= :window_14 AND er.evaluated_at < :window_7 AND er.passed THEN 1 ELSE 0
+            END
+        ) AS passed_14d,
+        SUM(CASE WHEN er.evaluated_at >= :window_30 AND er.evaluated_at < :window_14 THEN 1 ELSE 0 END)
+            AS total_30d,
+        SUM(
+            CASE
+                WHEN er.evaluated_at >= :window_30 AND er.evaluated_at < :window_14 AND er.passed THEN 1 ELSE 0
+            END
+        ) AS passed_30d,
+        COUNT(*) AS total_all,
+        SUM(CASE WHEN er.passed THEN 1 ELSE 0 END) AS passed_all
+    FROM eval_results er
+    WHERE er.eval_id IN (SELECT id FROM suite_eval_ids)
+      AND er.organisation_id = :org_id
+""")
+
+
+async def _load_okr_data(
+    session: AsyncSession,
+    org_id: UUID,
+    suite_id: str,
+    window_7: datetime,
+    window_14: datetime,
+    window_30: datetime,
+) -> tuple[float | None, object]:
+    """Run the info + trend aggregate queries and return ``(pass_threshold, trend_row)``.
+
+    Raises ``ValueError`` when no eval definitions exist for *suite_id*, and
+    re-raises ``TimeoutError``/``SQLAlchemyError`` after logging.
+    """
+    try:
+        info_row = (await session.execute(_INFO_QUERY, {"suite_id": suite_id, "org_id": org_id})).first()
+        if info_row is None or info_row.def_count == 0:
+            raise ValueError(f"Suite {suite_id!r} not found for organisation {org_id}")
+
+        pass_threshold = info_row.pass_threshold
+
+        trend_params = {
+            "suite_id": suite_id,
+            "org_id": org_id,
+            "window_7": window_7,
+            "window_14": window_14,
+            "window_30": window_30,
+        }
+        trend_row = (await session.execute(_TREND_QUERY, trend_params)).first()
+    except TimeoutError:
+        _log.exception(
+            "OKR progress query timed out for suite %s (org %s)",
+            _sanitise_log_value(suite_id),
+            _sanitise_log_value(org_id),
+        )
+        raise
+    except SQLAlchemyError:
+        _log.exception(
+            "OKR progress DB error for suite %s (org %s)",
+            _sanitise_log_value(suite_id),
+            _sanitise_log_value(org_id),
+        )
+        raise
+
+    return pass_threshold, trend_row
 
 
 async def track_okr_progress(
@@ -124,95 +260,16 @@ async def track_okr_progress(
         raise ValueError("suite_id must not be empty")
 
     as_of = datetime.now(UTC)
+    window_7 = as_of - timedelta(days=7)
+    window_14 = as_of - timedelta(days=14)
+    window_30 = as_of - timedelta(days=30)
 
-    try:
-        info_q = text("""
-            SELECT
-                COUNT(*) AS def_count,
-                MAX(pass_threshold) AS pass_threshold
-            FROM eval_definitions
-            WHERE suite_id = :suite_id AND organisation_id = :org_id
-        """)
-        info_row = (await session.execute(info_q, {"suite_id": suite_id, "org_id": org_id})).first()
-        if info_row is None or info_row.def_count == 0:
-            raise ValueError(f"Suite {suite_id!r} not found for organisation {org_id}")
+    pass_threshold, trend_row = await _load_okr_data(session, org_id, suite_id, window_7, window_14, window_30)
 
-        pass_threshold = info_row.pass_threshold
-
-        window_7 = as_of - timedelta(days=7)
-        window_14 = as_of - timedelta(days=14)
-        window_30 = as_of - timedelta(days=30)
-
-        trend_q = text("""
-            WITH suite_eval_ids AS (
-                SELECT id FROM eval_definitions
-                WHERE suite_id = :suite_id AND organisation_id = :org_id
-                  AND eval_type != 'guardrail'
-            )
-            SELECT
-                SUM(CASE WHEN er.evaluated_at >= :window_7 THEN 1 ELSE 0 END)
-                    AS total_7d,
-                SUM(CASE WHEN er.evaluated_at >= :window_7 AND er.passed THEN 1 ELSE 0 END)
-                    AS passed_7d,
-                SUM(
-                    CASE WHEN er.evaluated_at >= :window_14 AND er.evaluated_at < :window_7 THEN 1 ELSE 0 END
-                ) AS total_14d,
-                SUM(
-                    CASE
-                        WHEN er.evaluated_at >= :window_14 AND er.evaluated_at < :window_7 AND er.passed THEN 1 ELSE 0
-                    END
-                ) AS passed_14d,
-                SUM(CASE WHEN er.evaluated_at >= :window_30 AND er.evaluated_at < :window_14 THEN 1 ELSE 0 END)
-                    AS total_30d,
-                SUM(
-                    CASE
-                        WHEN er.evaluated_at >= :window_30 AND er.evaluated_at < :window_14 AND er.passed THEN 1 ELSE 0
-                    END
-                ) AS passed_30d,
-                COUNT(*) AS total_all,
-                SUM(CASE WHEN er.passed THEN 1 ELSE 0 END) AS passed_all
-            FROM eval_results er
-            WHERE er.eval_id IN (SELECT id FROM suite_eval_ids)
-              AND er.organisation_id = :org_id
-        """)
-
-        trend_params = {
-            "suite_id": suite_id,
-            "org_id": org_id,
-            "window_7": window_7,
-            "window_14": window_14,
-            "window_30": window_30,
-        }
-        trend_row = (await session.execute(trend_q, trend_params)).first()
-    except TimeoutError:
-        _log.error(
-            "OKR progress query timed out for suite %s (org %s)",
-            _sanitise_log_value(suite_id),
-            _sanitise_log_value(org_id),
-        )
-        raise
-    except SQLAlchemyError:
-        _log.exception(
-            "OKR progress DB error for suite %s (org %s)",
-            _sanitise_log_value(suite_id),
-            _sanitise_log_value(org_id),
-        )
-        raise
-
-    total_7d = trend_row.total_7d or 0 if trend_row else 0
-    passed_7d = trend_row.passed_7d or 0 if trend_row else 0
-    total_14d = trend_row.total_14d or 0 if trend_row else 0
-    passed_14d = trend_row.passed_14d or 0 if trend_row else 0
-    total_30d = trend_row.total_30d or 0 if trend_row else 0
-    passed_30d = trend_row.passed_30d or 0 if trend_row else 0
-    total_all = trend_row.total_all or 0 if trend_row else 0
-    passed_all = trend_row.passed_all or 0 if trend_row else 0
-
+    counts = _extract_trend_counts(trend_row)
     trend = [
-        _trend_point("7d", total_7d, passed_7d),
-        _trend_point("14d", total_14d, passed_14d),
-        _trend_point("30d", total_30d, passed_30d),
-        _trend_point("overall", total_all, passed_all),
+        _trend_point(period, counts[total_field], counts[passed_field])
+        for period, total_field, passed_field in _TREND_PERIODS
     ]
 
     # Use the most recent non-empty discrete window; fall back to overall

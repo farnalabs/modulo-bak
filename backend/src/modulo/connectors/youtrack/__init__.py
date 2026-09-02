@@ -13,7 +13,9 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 def _safe_top_level_records(body: Any) -> list[dict[str, Any]]:
@@ -59,7 +61,13 @@ class YouTrackConnector(ConnectorBase):
         return ConnectorType.YOUTRACK
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
             base_url=self._base_url,
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
             timeout=30,
@@ -82,70 +90,80 @@ class YouTrackConnector(ConnectorBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         match q.resource:
             case "issues":
-                params: dict[str, Any] = {}
-                if "query" in q.filters:
-                    params["query"] = q.filters["query"]
-                if "fields" in q.filters:
-                    params["fields"] = q.filters["fields"]
-                if "skip" in q.filters:
-                    params["$skip"] = q.filters["skip"]
-                if "top" in q.filters:
-                    params["$top"] = q.filters["top"]
-                if q.limit:
-                    params.setdefault("$top", q.limit)
-                async with self._client() as client:
-                    r = await client.get("/issues", params=params)
-                    r.raise_for_status()
-                    records = _safe_top_level_records(r.json())
-                return ConnectorResult(records=records, total=len(records))
-
+                return await self._query_issues(q)
             case "issue":
-                issue_id = q.filters.get("issue_id")
-                if not issue_id:
-                    raise ValueError("YouTrack issue query requires 'issue_id' filter")
-                params = {}
-                if "fields" in q.filters:
-                    params["fields"] = q.filters["fields"]
-                async with self._client() as client:
-                    r = await client.get(f"/issues/{issue_id}", params=params)
-                    r.raise_for_status()
-                    record: dict[str, Any] = r.json()
-                return ConnectorResult(records=[record])
-
+                return await self._query_issue(q)
             case "projects":
-                async with self._client() as client:
-                    r = await client.get("/admin/projects")
-                    r.raise_for_status()
-                    records = _safe_top_level_records(r.json())
-                return ConnectorResult(records=records, total=len(records))
-
+                return await self._query_projects()
             case "project":
-                project_id = q.filters.get("project_id")
-                if not project_id:
-                    raise ValueError("YouTrack project query requires 'project_id' filter")
-                async with self._client() as client:
-                    r = await client.get(f"/admin/projects/{project_id}")
-                    r.raise_for_status()
-                    record = r.json()
-                return ConnectorResult(records=[record])
-
+                return await self._query_project(q)
             case "users":
-                params = {}
-                if "query" in q.filters:
-                    params["query"] = q.filters["query"]
-                async with self._client() as client:
-                    r = await client.get("/users", params=params)
-                    r.raise_for_status()
-                    records = _safe_top_level_records(r.json())
-                return ConnectorResult(records=records, total=len(records))
-
+                return await self._query_users(q)
             case _:
                 raise ValueError(f"Unsupported YouTrack query resource: {q.resource!r}")
+
+    async def _query_issues(self, q: ConnectorQuery) -> ConnectorResult:
+        params: dict[str, Any] = {}
+        if "query" in q.filters:
+            params["query"] = q.filters["query"]
+        if "fields" in q.filters:
+            params["fields"] = q.filters["fields"]
+        if "skip" in q.filters:
+            params["$skip"] = q.filters["skip"]
+        if "top" in q.filters:
+            params["$top"] = q.filters["top"]
+        if q.limit:
+            params.setdefault("$top", q.limit)
+        async with self._client() as client:
+            r = await client.get("/issues", params=params)
+            r.raise_for_status()
+            records = _safe_top_level_records(r.json())
+        return ConnectorResult(records=records, total=len(records))
+
+    async def _query_issue(self, q: ConnectorQuery) -> ConnectorResult:
+        issue_id = q.filters.get("issue_id")
+        if not issue_id:
+            raise ValueError("YouTrack issue query requires 'issue_id' filter")
+        params: dict[str, Any] = {}
+        if "fields" in q.filters:
+            params["fields"] = q.filters["fields"]
+        async with self._client() as client:
+            r = await client.get(f"/issues/{issue_id}", params=params)
+            r.raise_for_status()
+            record: dict[str, Any] = r.json()
+        return ConnectorResult(records=[record])
+
+    async def _query_projects(self) -> ConnectorResult:
+        async with self._client() as client:
+            r = await client.get("/admin/projects")
+            r.raise_for_status()
+            records = _safe_top_level_records(r.json())
+        return ConnectorResult(records=records, total=len(records))
+
+    async def _query_project(self, q: ConnectorQuery) -> ConnectorResult:
+        project_id = q.filters.get("project_id")
+        if not project_id:
+            raise ValueError("YouTrack project query requires 'project_id' filter")
+        async with self._client() as client:
+            r = await client.get(f"/admin/projects/{project_id}")
+            r.raise_for_status()
+            record = r.json()
+        return ConnectorResult(records=[record])
+
+    async def _query_users(self, q: ConnectorQuery) -> ConnectorResult:
+        params: dict[str, Any] = {}
+        if "query" in q.filters:
+            params["query"] = q.filters["query"]
+        async with self._client() as client:
+            r = await client.get("/users", params=params)
+            r.raise_for_status()
+            records = _safe_top_level_records(r.json())
+        return ConnectorResult(records=records, total=len(records))
 
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         match payload.resource:

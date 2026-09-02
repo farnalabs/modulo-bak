@@ -15,9 +15,9 @@
     <main
       class="flex-1 min-w-0 overflow-auto bg-background relative"
       :class="mainPaddingClass"
-      :style="remyDockedStyle"
     >
       <div class="relative z-10 space-y-2">
+        <DbCapacityBanner v-if="isAdminUser" />
         <OnboardingBanner />
         <div class="px-6">
           <ProductAnalyticsConsentPrompt />
@@ -34,7 +34,7 @@
     <div v-if="planStore.devMode && remyStore.isExecutingUi" class="remy-execution-overlay">
       <div class="remy-execution-banner">
         <span>{{ $t('components.AppLayout.remy_performing_actions') }}</span>
-        <button class="remy-stop-btn" @click="abortUiCommands">{{ $t('components.AppLayout.remy_stop') }}</button>
+        <button type="button" class="remy-stop-btn" @click="abortUiCommands">{{ $t('components.AppLayout.remy_stop') }}</button>
       </div>
     </div>
 
@@ -58,6 +58,7 @@ import { useOnboardingStore } from "../composables/useOnboarding";
 import { abortUiCommands } from "../composables/useUiCommandExecutor";
 import { applyPrimeVueTokenBridge } from "../lib/primevue-theme";
 import OnboardingBanner from "./onboarding/OnboardingBanner.vue";
+import DbCapacityBanner from "./DbCapacityBanner.vue";
 import CommandPalette from "./CommandPalette.vue";
 import SpotlightOverlay from "./onboarding/SpotlightOverlay.vue";
 import ProductAnalyticsConsentPrompt from "./product-analytics/ProductAnalyticsConsentPrompt.vue";
@@ -95,9 +96,11 @@ const mainPaddingClass = computed(() => {
   return showMobileHeader.value ? 'pt-14 md:pt-0' : ''
 });
 
-const remyDockedStyle = computed(() =>
-  remyStore.panelState === "docked" ? { paddingRight: `${remyStore.panelSize.width}px` } : undefined,
-);
+// The Remy panel is a position:fixed overlay (RemyPanel .remy-panel) in every
+// open state, including "docked" — it floats above the page on the right with
+// an elevation shadow and never reserves layout space. Main content therefore
+// always spans the full available width (no padding-right reservation, no
+// max-width cap: Duncan explicitly wants pages to use the full screen width).
 
 function toggleTheme() {
   const root = document.documentElement;
@@ -154,6 +157,14 @@ const userPermissions = computed<string[]>(() => {
   const perms = jwtPayload.value?.permissions;
   return Array.isArray(perms) ? (perms as string[]) : [];
 });
+
+// Mirrors the backend guard on GET /api/v1/admin/db-capacity
+// (require_system_or_org_admin): system admin OR org role "admin". Non-admins
+// never mount DbCapacityBanner, so its poll request is never made and the
+// browser console stays free of 401/403 erroring-request noise.
+const isAdminUser = computed(
+  () => isSystemAdmin.value || userRole.value === "admin",
+);
 
 onMounted(() => {
   planStore.fetchPlan().catch(() => {});

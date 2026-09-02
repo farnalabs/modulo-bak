@@ -47,6 +47,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from modulo._types import _DICT_STR_ANY
+from modulo.utils.uuid import coerce_uuid
 
 _log = logging.getLogger(__name__)
 
@@ -376,8 +377,24 @@ async def write_evidence_row(
     node_id: str,
     evidence_state: str,
     evidence_detail: str | None,
+    organisation_id: UUID | None = None,
 ) -> None:
     """Persist one run_evidence row.
+
+    ``organisation_id`` is the tenant anchor required by the ``run_evidence``
+    NOT NULL FK -> ``organisations`` and its org-scoped RLS policy (migration
+    0133). Callers that already hold the parent run's org (the probe, the sweep)
+    SHOULD pass it; when omitted it is resolved from the parent run.
+
+    When the parent run cannot be resolved (orphaned, or already purged) the
+    write is SKIPPED rather than anchored to a synthesised tenant. A fabricated
+    org can never persist on the deployment target: ``organisation_id`` is a FK
+    to ``organisations(id)`` and ``run_id`` a FK to ``runs(id)``, so the INSERT
+    is rejected by the FK — and the 0133 ``rls_org_isolation`` WITH CHECK
+    rejection is NOT an ``IntegrityError`` subclass, so it would escape the
+    duplicate-key guard below and break the reconciliation sweep. An
+    unresolvable parent is therefore treated as unverifiable and left unwritten
+    (logged), which is the same fail-open direction as a failed probe.
 
     ``UNIQUE(run_id, node_id)`` is handled with a nested-savepoint insert that
     swallows a duplicate-key race (the async probe and the reconciliation sweep
@@ -385,14 +402,38 @@ async def write_evidence_row(
     transaction. Raises on non-duplicate DB failures — callers decide how to
     fail.
     """
+    from modulo.db.models.run import Run
     from modulo.db.models.run_evidence import RunEvidence
+
+    if organisation_id is None:
+        organisation_id = await session.scalar(select(Run.organisation_id).where(Run.id == run_id))
+        if organisation_id is None:
+            _log.warning(
+                "heuristic.evidence_write_skipped_no_tenant",
+                extra={"run_id": str(run_id), "node_id": node_id, "evidence_state": evidence_state},
+            )
+            return
+
+    # ``node_id`` arrives as a ``str`` from stored ``outputs_json``/
+    # ``telemetry_json`` keys, which for legacy runs can hold non-UUID values.
+    # Cast leniently (matching every other boundary in this PR) and skip rather
+    # than raise inside the write path - a throwing ``UUID(node_id)`` would drop
+    # the evidence row and only log a metric (the advertised no-crash behaviour).
+    node_uuid = coerce_uuid(node_id)
+    if node_uuid is None:
+        _log.warning(
+            "heuristic.evidence_write_skipped_unparseable_node_id",
+            extra={"run_id": str(run_id), "node_id": node_id, "evidence_state": evidence_state},
+        )
+        return
 
     try:
         async with session.begin_nested():
             session.add(
                 RunEvidence(
+                    organisation_id=organisation_id,
                     run_id=run_id,
-                    node_id=node_id,
+                    node_id=node_uuid,
                     evidence_state=evidence_state,
                     evidence_detail=evidence_detail,
                 )
@@ -462,7 +503,7 @@ def build_default_evidence_provider(
     output_json loading, E2B-SDK command/files probing.
     """
 
-    async def _resolve_sandbox_id(run_id: UUID, node_id: str) -> str | None:
+    async def _resolve_sandbox_id(run_id: UUID, _node_id: str) -> str | None:
         from modulo.db.crud.run import get_run
         from modulo.db.rls import set_rls_org
 
@@ -619,9 +660,14 @@ async def run_evidence_probe(
     session_factory: Callable[[], AsyncSession],
     run_id: UUID,
     node_id: str,
+    organisation_id: UUID,
 ) -> EvidenceResult:
     """Run the bounded (≤3s) async evidence probe for one node and persist the
     run_evidence row. Runs POST-commit, off the run's critical path (§15.3).
+
+    ``organisation_id`` is the parent run's org — the run_evidence table is
+    org-scoped (0133), so the write sets RLS to that org and threads it onto
+    the row.
 
     Fail-open: any probe/write error records the §15.14 metrics and degrades to
     an 'unverifiable' row — the run's terminalization is never affected. The
@@ -630,6 +676,8 @@ async def run_evidence_probe(
     """
     if not evidence_enabled():
         return EvidenceResult.unverifiable
+    from modulo.db.rls import set_rls_org
+
     started = time.monotonic()
     state: EvidenceResult = EvidenceResult.unverifiable
     detail: str = "evidence could not be verified"
@@ -660,12 +708,14 @@ async def run_evidence_probe(
         record_heuristic_unverifiable(detail)
     try:
         async with session_factory() as session, session.begin():
+            await set_rls_org(session, organisation_id)
             await write_evidence_row(
                 session,
                 run_id=run_id,
                 node_id=node_id,
                 evidence_state=str(state.value),
                 evidence_detail=detail,
+                organisation_id=organisation_id,
             )
     except asyncio.CancelledError:
         raise
@@ -727,7 +777,7 @@ async def reconcile_noop_evidence(
             evidence_rows = await session.execute(
                 select(RunEvidence.run_id, RunEvidence.node_id).where(RunEvidence.run_id.in_([run.id for run in runs]))
             )
-            existing = {(row.run_id, row.node_id) for row in evidence_rows.all()}
+            existing = {(row.run_id, str(row.node_id)) for row in evidence_rows.all()}
 
     for run in runs:
         summary["scanned"] += 1
@@ -743,6 +793,7 @@ async def reconcile_noop_evidence(
                     session_factory=session_factory,
                     run_id=run.id,
                     node_id=node_id,
+                    organisation_id=run.organisation_id,
                 )
                 summary[str(state.value)] += 1
             except asyncio.CancelledError:

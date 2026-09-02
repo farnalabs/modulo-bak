@@ -14,13 +14,33 @@ from typing import Any
 import httpx
 
 from modulo.connectors._safe_datetime import safe_datetime as _safe_datetime
-from modulo.connectors.base import ConnectorPayload, ConnectorQuery, ConnectorResult, ConnectorType, HealthResult
+from modulo.connectors.base import (
+    ConnectorPayload,
+    ConnectorQuery,
+    ConnectorResult,
+    ConnectorType,
+    HealthResult,
+    health_check_failure,
+)
+from modulo.connectors.security import CredentialRedactor
 from modulo.connectors.ticket_tracker.base import Ticket, TicketFilter, TicketTrackerBase
+from modulo.core.ssrf import pinned_async_client_sync
 
 logger = logging.getLogger(__name__)
 
 TRELLO_CARD_FIELDS = "id,name,desc,dateLastActivity,closed,due,url,idList,labels"
 DEFAULT_TIMEOUT = 10
+
+
+class _RedactedTrelloError(Exception):
+    """Internal wrapper carrying a credential-redacted message.
+
+    Health failures surface the error detail via ``health_check_failure``
+    (``detail=str(exc)[:200]``). The Trello client puts ``key``/``token`` in the
+    query string of every request, so a raw ``httpx.HTTPStatusError``/transport
+    message embeds the LIVE credentials in its URL. This wrapper carries an
+    already-redacted message so the detail can never contain them.
+    """
 
 
 class TrelloTicketTracker(TicketTrackerBase):
@@ -33,6 +53,10 @@ class TrelloTicketTracker(TicketTrackerBase):
         self._base_url = "https://api.trello.com/1"
         if not self._api_key or not self._token:
             raise ValueError("Trello connector requires api_key and token credentials")
+        # Credential redaction now lives in the shared ``CredentialRedactor``
+        # (FAR-507) instead of a per-connector fork — Trello's ``key``/``token``
+        # are the secret values, and the same scrubbing covers every entry point.
+        self._redactor = CredentialRedactor([self._api_key, self._token])
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -41,9 +65,27 @@ class TrelloTicketTracker(TicketTrackerBase):
     def _auth(self) -> dict[str, str]:
         return {"key": self._api_key, "token": self._token}
 
+    def _redact(self, text: str) -> str:
+        """Strip the live api_key + token from *text* via the shared redactor."""
+        return self._redactor.redact(text)
+
+    def _health_failure_detail(self, exc: Exception) -> str:
+        """Produce a credential-redacted detail string for a health failure."""
+        if isinstance(exc, httpx.HTTPStatusError):
+            return f"Trello API error: {exc.response.status_code} - {self._redact(exc.response.text)}"
+        return self._redact(str(exc))
+
+    def _client(self) -> httpx.AsyncClient:
+        # PINNED TRANSPORT (FAR-526B): build the client through the pinned
+        # transport so the validated api.trello.com address is pinned onto the
+        # connection (never re-resolved at connect time — closes DNS rebinding).
+        # key/token are passed as query parameters per request (never headers),
+        # and error redaction is preserved by the existing _redact wrappers.
+        return pinned_async_client_sync(self._base_url)
+
     async def health_check(self) -> HealthResult:
         try:
-            async with httpx.AsyncClient() as client:
+            async with self._client() as client:
                 resp = await client.get(
                     f"{self._base_url}/boards/{self._board_id}",
                     params=self._auth(),
@@ -54,7 +96,7 @@ class TrelloTicketTracker(TicketTrackerBase):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            return HealthResult(ok=False, detail=str(e)[:200])
+            return health_check_failure(_RedactedTrelloError(self._health_failure_detail(e)))
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         filters = q.filters or {}
@@ -86,7 +128,7 @@ class TrelloTicketTracker(TicketTrackerBase):
         if ticket_filter and ticket_filter.offset:
             logger.warning("offset is not supported by Trello's API; ignoring offset=%s", ticket_filter.offset)
 
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             params: dict[str, Any] = self._auth()
             params["fields"] = TRELLO_CARD_FIELDS
             if ticket_filter and ticket_filter.limit:
@@ -100,9 +142,11 @@ class TrelloTicketTracker(TicketTrackerBase):
                 resp.raise_for_status()
                 raw_cards = resp.json()
             except httpx.HTTPStatusError as e:
-                raise ValueError(f"Trello API error: {e.response.status_code} - {e.response.text}") from None
+                raise ValueError(
+                    f"Trello API error: {e.response.status_code} - {self._redact(e.response.text)}"
+                ) from None
             except httpx.RequestError as e:
-                raise ValueError(f"Trello network error: {e}") from None
+                raise ValueError(f"Trello network error: {self._redact(str(e))}") from None
 
         if ticket_filter and ticket_filter.search:
             raw_cards = [
@@ -119,7 +163,7 @@ class TrelloTicketTracker(TicketTrackerBase):
         return tickets
 
     async def get_ticket(self, ticket_id: str) -> Ticket:
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             try:
                 resp = await client.get(
                     f"{self._base_url}/cards/{ticket_id}",
@@ -132,9 +176,11 @@ class TrelloTicketTracker(TicketTrackerBase):
                 resp.raise_for_status()
                 return self._to_ticket(resp.json())
             except httpx.HTTPStatusError as e:
-                raise ValueError(f"Trello API error: {e.response.status_code} - {e.response.text}") from None
+                raise ValueError(
+                    f"Trello API error: {e.response.status_code} - {self._redact(e.response.text)}"
+                ) from None
             except httpx.RequestError as e:
-                raise ValueError(f"Trello network error: {e}") from None
+                raise ValueError(f"Trello network error: {self._redact(str(e))}") from None
 
     async def create_ticket(self, title: str, description: str | None = None, **kwargs: Any) -> Ticket:
         if not kwargs.get("idList"):
@@ -146,7 +192,7 @@ class TrelloTicketTracker(TicketTrackerBase):
         if "labels" in kwargs:
             raw_labels = kwargs["labels"]
             body["labels"] = ",".join(raw_labels) if isinstance(raw_labels, list) else raw_labels
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             try:
                 resp = await client.post(
                     f"{self._base_url}/cards",
@@ -157,9 +203,11 @@ class TrelloTicketTracker(TicketTrackerBase):
                 resp.raise_for_status()
                 return self._to_ticket(resp.json())
             except httpx.HTTPStatusError as e:
-                raise ValueError(f"Trello API error: {e.response.status_code} - {e.response.text}") from None
+                raise ValueError(
+                    f"Trello API error: {e.response.status_code} - {self._redact(e.response.text)}"
+                ) from None
             except httpx.RequestError as e:
-                raise ValueError(f"Trello network error: {e}") from None
+                raise ValueError(f"Trello network error: {self._redact(str(e))}") from None
 
     async def update_ticket(self, ticket_id: str, **kwargs: Any) -> Ticket:
         body: dict[str, Any] = {}
@@ -167,7 +215,7 @@ class TrelloTicketTracker(TicketTrackerBase):
             body["idList"] = kwargs["idList"]
         if "due" in kwargs:
             body["due"] = kwargs["due"]
-        async with httpx.AsyncClient() as client:
+        async with self._client() as client:
             try:
                 resp = await client.put(
                     f"{self._base_url}/cards/{ticket_id}",
@@ -178,9 +226,11 @@ class TrelloTicketTracker(TicketTrackerBase):
                 resp.raise_for_status()
                 return self._to_ticket(resp.json())
             except httpx.HTTPStatusError as e:
-                raise ValueError(f"Trello API error: {e.response.status_code} - {e.response.text}") from None
+                raise ValueError(
+                    f"Trello API error: {e.response.status_code} - {self._redact(e.response.text)}"
+                ) from None
             except httpx.RequestError as e:
-                raise ValueError(f"Trello network error: {e}") from None
+                raise ValueError(f"Trello network error: {self._redact(str(e))}") from None
 
     def _to_ticket(self, raw: dict[str, Any]) -> Ticket:
         labels = raw.get("labels")

@@ -47,7 +47,7 @@
       <SectionCard title="Data Export" description="Export all organisation data including runs, pipelines, schemas, connectors, and settings.">
 
         <div v-if="exportStatus === 'idle'" class="flex items-center gap-3">
-          <Button class="h-8 px-2.5" @click="startExport">
+          <Button type="button" class="h-8 px-2.5" @click="startExport">
             Export All Data
           </Button>
         </div>
@@ -60,6 +60,7 @@
         <div v-else-if="exportStatus === 'error'" class="flex items-center gap-3">
           <span class="text-sm text-destructive">Export failed: {{ exportError }}</span>
           <button
+            type="button"
             class="text-sm font-medium text-primary underline underline-offset-2 hover:no-underline"
             @click="startExport"
           >
@@ -73,12 +74,14 @@
             Exported at {{ formatDate(exportData.exportedAt) }}
           </span>
           <button
+            type="button"
             class="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-input bg-background px-2.5 text-sm font-medium hover:bg-muted transition-all"
             @click="downloadExport"
           >
             Download
           </button>
           <button
+            type="button"
             class="text-sm font-medium text-primary underline underline-offset-2 hover:no-underline"
             @click="resetExport"
           >
@@ -92,7 +95,7 @@
 
       <!-- Delete Organization -->
       <SectionCard title="Delete Organisation" description="Permanently delete this organisation and all associated data. This action cannot be undone." class="border-destructive/30" title-class="text-destructive" description-class="text-destructive/80">
-        <Button severity="danger" class="h-8 px-2.5" @click="deleteDialogOpen = true">
+        <Button type="button" severity="danger" class="h-8 px-2.5" @click="deleteDialogOpen = true">
           Delete Organisation
         </Button>
       </SectionCard>
@@ -245,7 +248,7 @@ function downloadExport() {
   a.download = `org-export-${orgInfo.value.slug || orgInfo.value.id}-${formatDateFilename(new Date())}.json`
   document.body.appendChild(a)
   a.click()
-  document.body.removeChild(a)
+  a.remove()
   URL.revokeObjectURL(url)
 }
 

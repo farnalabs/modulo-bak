@@ -310,8 +310,8 @@ async def test_write_issue_operations(
     keys = assert_key.split(".")
     val = result
     for k in keys:
-        k = int(k.strip("[]")) if k.strip("[]").isdigit() else k
-        val = val[k]
+        key = int(k.strip("[]")) if k.strip("[]").isdigit() else k
+        val = val[key]
     assert val == assert_value
 
 
@@ -348,6 +348,16 @@ async def test_query_missing_filters(connector, resource, filters, match_text):
         ("pr_merge", {"repo": "owner/repo"}, "requires 'pull_number' in data"),
         ("pr_label", {"repo": "owner/repo", "pull_number": "1"}, "requires 'labels' in data"),
         ("issue_assign", {"repo": "owner/repo", "issue_number": "42"}, "requires 'assignees' in data"),
+    ],
+    ids=[
+        "issue_missing_title",
+        "file_missing_content",
+        "pr_missing_base",
+        "pr_missing_head",
+        "pr_comment_missing_body",
+        "pr_merge_missing_pull_number",
+        "pr_label_missing_labels",
+        "issue_assign_missing_assignees",
     ],
 )
 async def test_write_missing_data(connector, resource, data, match_text):

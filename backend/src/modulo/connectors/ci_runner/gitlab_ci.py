@@ -8,6 +8,7 @@ import httpx
 from modulo.connectors._safe_int import safe_int as _safe_int
 from modulo.connectors.base import CIRun, CIRunLog, CIRunStatus, HealthResult
 from modulo.connectors.ci_runner.base import CIRunnerBase
+from modulo.core.ssrf import pinned_async_client_sync
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,19 @@ class GitLabCIRunner(CIRunnerBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(base_url=self._base_url, headers=self._headers(), timeout=30)
+        # PINNED TRANSPORT (FAR-520): the GitLab CI runner takes its base_url from
+        # tenant connector config (self-hosted GitLab is supported), so it is on
+        # the same external trust boundary as the other base_url-bearing
+        # connectors. Validate + resolve the host synchronously and pin the
+        # validated IP onto the transport so the connection never re-resolves at
+        # connect time (closes the DNS-rebinding window). ``trust_env=False``
+        # stops a proxy from re-resolving the destination and defeating the pin.
+        return pinned_async_client_sync(
+            self._base_url,
+            base_url=self._base_url,
+            headers=self._headers(),
+            timeout=30,
+        )
 
     def _parse_run(self, raw: dict[str, Any]) -> CIRun:
         raw_status = raw.get("status", "")
@@ -76,6 +89,11 @@ class GitLabCIRunner(CIRunnerBase):
                 return HealthResult(ok=False, detail=f"HTTP {r.status_code}: {r.text[:200]}")
         except httpx.HTTPError as exc:
             return HealthResult(ok=False, detail=f"HTTP error: {exc}")
+        except ValueError as exc:
+            # The outbound SSRF guard in _client() rejects a private/internal
+            # base_url. Report unhealthy with the remediation text instead of
+            # raising, matching the base_url-bearing connectors.
+            return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(
         self,

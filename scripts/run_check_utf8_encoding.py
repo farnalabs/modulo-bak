@@ -10,11 +10,11 @@ BOM. Exit 0 clean, 1 blocking issue.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
+from pathlib import Path
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
 _EXTENSIONS = {
     ".py",
@@ -42,6 +42,7 @@ def _tracked_files() -> list[str]:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         return []
@@ -50,9 +51,9 @@ def _tracked_files() -> list[str]:
 
 def _write_utf8_no_bom(path: str) -> None:
     # Read as UTF-8, tolerating the BOM, then rewrite without it.
-    with open(path, encoding="utf-8-sig", newline="") as fh:
+    with Path(path).open(encoding="utf-8-sig", newline="") as fh:
         content = fh.read()
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+    with Path(path).open("w", encoding="utf-8", newline="\n") as fh:
         fh.write(content)
 
 
@@ -66,14 +67,14 @@ def main() -> int:
         return 0
 
     for rel in tracked:
-        ext = os.path.splitext(rel)[1].lower()
+        ext = Path(rel).suffix.lower()
         if ext not in _EXTENSIONS:
             continue
-        full = os.path.join(REPO_ROOT, rel)
-        if not os.path.isfile(full):
+        full = str(Path(REPO_ROOT) / rel)
+        if not Path(full).is_file():
             continue
         try:
-            with open(full, "rb") as fh:
+            with Path(full).open("rb") as fh:
                 data = fh.read()
         except OSError:
             # Skip files we can't read.
@@ -92,7 +93,7 @@ def main() -> int:
                 print("  Fixed: removed UTF-8 BOM", file=sys.stderr)
             continue
 
-        if data.startswith(_UTF16_LE_BOM) or data.startswith(_UTF16_BE_BOM):
+        if data.startswith((_UTF16_LE_BOM, _UTF16_BE_BOM)):
             print(f"UTF-16 BOM found: {rel}", file=sys.stderr)
             found = True
             if fix:

@@ -22,6 +22,7 @@ Does NOT handle WebSocket fan-out, HITL claim/approve/reject, or webhook trigger
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -43,6 +44,7 @@ from opentelemetry.trace import set_span_in_context
 from sqlalchemy import Boolean, Uuid, bindparam, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.core.audit_logger import append_audit_event
 from modulo.core.connector_hub.locking import _uuid_to_lock_keys
 from modulo.core.cost_controller.finalize import derive_node_type_map, finalize_cost
@@ -66,9 +68,11 @@ from modulo.core.model_backend_hub import ModelBackendHub
 from modulo.core.node_output_split import (
     DEFAULT_NODE_TYPE,
     SPLITTABLE_NODE_TYPES,
+    node_telemetry,
     resolve_node_contract_output,
 )
 from modulo.core.notifier import EVENT_HITL_AWAITING
+from modulo.core.pipeline_engine import retry_compensation as rc
 from modulo.core.pipeline_engine.decorator import (
     RunCancelledError,
     set_audit_hook,
@@ -76,7 +80,12 @@ from modulo.core.pipeline_engine.decorator import (
     set_connector_hub,
     set_model_backend_hub,
 )
-from modulo.core.pipeline_engine.error_codes import map_legacy_code, sanitize_error_text
+from modulo.core.pipeline_engine.error_codes import (
+    _CODE_SANDBOX_AGENT_FAILED,
+    map_legacy_code,
+    sanitize_error_text,
+)
+from modulo.core.pipeline_engine.errors import RouterNoMatchError
 from modulo.core.pipeline_engine.event_broker import RunEventBroker, get_registry
 from modulo.core.pipeline_engine.evidence import (
     EvidenceProvider,
@@ -86,9 +95,11 @@ from modulo.core.pipeline_engine.evidence import (
     node_declared_success,
     run_evidence_probe,
 )
-from modulo.core.pipeline_engine.graph_cache import build_graph_from_json, get_or_compile
+from modulo.core.pipeline_engine.graph_cache import build_graph_from_json, get_or_compile, struct_hash_with_eval_defs
+from modulo.core.pipeline_engine.idempotency import read_before_write_suppression
 from modulo.core.pipeline_engine.modulo_saver import ModuloPostgresSaver
 from modulo.core.pipeline_engine.node_runner import (
+    MODULO_SYNTHETIC_FAILURE_MARKER,
     OutputSchemaValidationError,
     SandboxNodeFailedError,
     SupersededNodeError,
@@ -97,7 +108,10 @@ from modulo.core.pipeline_engine.node_runner import (
     set_conformance_ctx,
 )
 from modulo.core.pipeline_engine.output_filter import OutputRejectedError
+from modulo.core.pipeline_engine.port_resolver import compute_port_topology_hash
 from modulo.core.pipeline_engine.runaway_protection import RunawayGuard, RunawayRunError
+from modulo.core.pipeline_engine.runtime_retry import COMPENSATION_FAILED_CODE, CompensationFailedError
+from modulo.core.spend_ceiling import ORG_CEILING_EXCEEDED, evaluate_org_spend_ceiling
 from modulo.core.trigger_engine.agent_signal import fire_agent_signal
 from modulo.db.crud.pipeline import get_pipeline
 from modulo.db.crud.run import (
@@ -115,6 +129,7 @@ from modulo.db.crud.run import (
 from modulo.db.models.eval_definition import EvalDefinition
 from modulo.db.models.eval_result import EvalResult
 from modulo.db.models.model_backend import ModelBackend
+from modulo.db.models.organisation import Organisation
 from modulo.db.models.pipeline import Pipeline
 from modulo.db.models.pipeline_snapshot import PipelineSnapshot
 from modulo.db.models.run import ACTIVE_RUN_STATUSES, TERMINAL_STATUSES, Run
@@ -144,11 +159,17 @@ _log = logging.getLogger(__name__)
 # Pipeline retry_policy events (must stay in sync with the API schema in
 # api/routes/pipelines.py and the graph validator). A policy can retry on:
 #   - "stall":    run ended "stalled" / error_code "executor_stalled"
-#   - "timeout":  error_code "node_timeout" / "TimeoutError"
+#   - "timeout":  error_code "node_timeout" / "TimeoutError" / the FAR-369
+#                 absolute node-deadline code ("node_deadline_exceeded" —
+#                 raw watchdog spelling or dotted registry code)
 #   - "failure":  any other "failed" terminal status (excluding sandbox-agent
 #                 hang deaths — error_code "node_cancelled" + "likely hung" in
 #                 error_detail — see ``_retry_after_policy``, FAR-136)
-_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure"})
+#   - "eval_failed": run terminalized "eval_failed" / error_code "eval.blocked"
+#                 (legacy raw "eval_blocked" included) — safe to re-dispatch
+#                 because the FAR-228 idempotency gate (guard A) skips an
+#                 already-delivered node on re-execution.
+_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure", "eval_failed"})
 _RETRY_POLICY_MAX_RETRIES = 5
 
 # Canonical dotted error codes written at terminalization (agent-failure UX) and
@@ -156,6 +177,8 @@ _RETRY_POLICY_MAX_RETRIES = 5
 # the failure write, and log names cannot drift (S1192).
 _ERROR_CODE_AGENT_FAILED = "agent.failed"
 _ERROR_CODE_NODE_TIMEOUT = "node.timeout"
+_ERROR_CODE_NODE_DEADLINE_EXCEEDED = "node.deadline_exceeded"
+_ERROR_CODE_EVAL_BLOCKED = "eval.blocked"
 _ERROR_CODE_SCRIPT_SIDE_EFFECT_UNKNOWN = "script.side_effect_unknown"
 _ERROR_CODE_HARNESS_IDEMPOTENCY_GATE = "harness.idempotency_gate"
 
@@ -253,8 +276,17 @@ def _retry_after_policy(
       - ``"stall"``:    ``final_status == "stalled"`` or the code resolves to
                         ``agent.stall`` (legacy ``executor_stalled`` included)
       - ``"timeout"``:  the code resolves to ``node.timeout`` / ``node.runaway``
-                        (legacy ``node_timeout`` / ``TimeoutError`` included)
+                        / ``node.deadline_exceeded`` (legacy ``node_timeout`` /
+                        ``TimeoutError`` included; the FAR-369 absolute
+                        node-deadline watchdog code ``node_deadline_exceeded``
+                        and its dotted registry spelling both resolve to
+                        ``node.deadline_exceeded``)
       - ``"failure"``:  ``final_status == "failed"`` and not a stall/timeout outcome
+      - ``"eval_failed"``: ``final_status == "eval_failed"`` or the code resolves
+                        to ``eval.blocked`` (legacy ``eval_blocked`` included).
+                        Re-dispatch is safe for delivery nodes: the FAR-228
+                        idempotency gate (guard A) returns the skipped envelope
+                        when a delivery_done-marked node re-executes.
 
     Codes are matched BOTH literally (legacy codes stay backward compatible) and
     through the shared ``map_legacy_code`` alias table, so dotted registry codes
@@ -273,8 +305,18 @@ def _retry_after_policy(
     ``_stream_graph``, which reaches this decision. The **executor-level
     zombie-watchdog stall** (``execute_run`` watchdog terminal-fails the run and
     cancels ``execute()``; the ``CancelledError`` is re-raised at the top of the
-    stream block before this decision runs) is NOT retried. See ``docs/prd.md``
-    §8.9.
+    stream block before this decision runs) is NOT retried. See
+    ``docs/troubleshooting.md`` (``executor_stalled`` row) — the zombie watchdog's
+    terminal fail is documented as "never re-dispatched".
+
+    Same-shaped limitation for the FAR-369 deadline alias above: the absolute
+    node-deadline watchdog terminal-fails the run DIRECTLY (``fail_run_terminal``
+    with ``node_deadline_exceeded``) and cancels ``execute()``, so a watchdog
+    kill currently bypasses this decision exactly like the zombie stall. The
+    ``"timeout"`` alias still matters: any deadline outcome that DOES reach this
+    decision (raw watchdog spelling via the generic catch, dotted registry
+    spelling, or a future wiring of watchdog-killed runs into the retry
+    decision) now matches the ``"timeout"`` event instead of falling through.
 
     An absent/malformed policy or a 0 budget yields None (no retry) — the
     current behaviour is unchanged for pipelines without a policy.
@@ -298,6 +340,8 @@ def _retry_after_policy(
         return max_retries
     if _timeout_event_matches(event_set, code, mapped):
         return max_retries
+    if _eval_failed_event_matches(event_set, final_status, code, mapped):
+        return max_retries
     if _failure_event_matches(event_set, final_status, code, mapped, error_detail):
         return max_retries
     return None
@@ -309,9 +353,29 @@ def _stall_event_matches(event_set: set[Any], final_status: str, code: str, mapp
 
 
 def _timeout_event_matches(event_set: set[Any], code: str, mapped: str) -> bool:
-    """``timeout`` event matches a node.timeout / node.runaway code."""
+    """``timeout`` event matches a node.timeout / node.runaway / node.deadline_exceeded code.
+
+    FAR-369: the absolute node-deadline watchdog terminalizes with
+    ``node_deadline_exceeded`` (raw) / ``node.deadline_exceeded`` (dotted) —
+    both resolve to ``node.deadline_exceeded`` through ``map_legacy_code``, so a
+    ``{on: ["timeout"]}`` policy re-dispatches a deadline death exactly like a
+    per-node timeout.
+    """
     return "timeout" in event_set and (
-        code in ("node_timeout", "TimeoutError") or mapped in (_ERROR_CODE_NODE_TIMEOUT, "node.runaway")
+        code in ("node_timeout", "TimeoutError")
+        or mapped in (_ERROR_CODE_NODE_TIMEOUT, "node.runaway", _ERROR_CODE_NODE_DEADLINE_EXCEEDED)
+    )
+
+
+def _eval_failed_event_matches(event_set: set[Any], final_status: str, code: str, mapped: str) -> bool:
+    """``eval_failed`` event matches a guardrail/eval-blocked outcome.
+
+    The executor terminalizes an ``EvalBlockedError`` as final_status
+    ``"eval_failed"`` with raw error_code ``"eval_blocked"`` (which maps to the
+    canonical ``eval.blocked``), so all three spellings match the event.
+    """
+    return "eval_failed" in event_set and (
+        final_status == "eval_failed" or code == "eval_blocked" or mapped == _ERROR_CODE_EVAL_BLOCKED
     )
 
 
@@ -568,6 +632,28 @@ def _graph_is_idempotent(graph_json: dict[str, Any] | None) -> bool:
         if node.get("idempotent") is False:
             return False
     return True
+
+
+def compute_retry_aware_topology_hash(
+    graph_json: dict[str, Any] | None,
+    pipeline_retry_policy: dict[str, Any] | None,
+) -> str:
+    """Structural compile-cache hash that folds the pipeline retry policy in.
+
+    FAR-402 P5 wires a per-node retry/compensation wrapper into the compiled
+    graph that reads the pipeline ``retry_policy`` as the node default. The
+    graph_cache key is ``(pipeline_id, snapshot_id, node_timeout, struct_hash)``;
+    folding the policy into ``struct_hash`` means a PATCH to ``retry_policy``
+    recompiles the wrapped nodes instead of serving a stale graph (the same
+    reason ``pipeline_node_timeout_seconds`` is part of the key). The per-node
+    ``retry`` blocks live in ``graph_json`` (already part of the topology hash),
+    so only the pipeline-level default needs folding here.
+    """
+    base = compute_port_topology_hash(graph_json if isinstance(graph_json, dict) else {})
+    if not isinstance(pipeline_retry_policy, dict) or not pipeline_retry_policy:
+        return base
+    policy_payload = json.dumps(pipeline_retry_policy, sort_keys=True, default=str).encode("utf-8")
+    return base + ":" + hashlib.sha256(policy_payload).hexdigest()[:16]
 
 
 def _graph_has_script_mode(graph_json: dict[str, Any] | None) -> bool:
@@ -1274,6 +1360,23 @@ def _retry_policy_applies(
     return retry_budget is not None and not is_correction_run and graph_idempotent
 
 
+@dataclass(frozen=True)
+class _RunScope:
+    """Immutable per-run identity scalars for ``_prepare_and_stream``.
+
+    Bundles the fixed run-scoped values the stream preparation path needs so
+    the method takes a single bundle instead of many loose parameters
+    (SonarQube S107: too many parameters). An annotation-only public attribute
+    set; a pure refactor — no behaviour, ordering, or state-transition change.
+    """
+
+    run_id: uuid.UUID
+    org_id: uuid.UUID
+    pipeline_id: uuid.UUID
+    snapshot_id: uuid.UUID
+    thread_id: str
+
+
 class PipelineExecutor:
     """Execute a single pipeline run (HITL-aware, supports parallel fan-out).
 
@@ -1340,6 +1443,11 @@ class PipelineExecutor:
         # write out from under a successor. Seeded into LangGraph state as
         # ``_claim_lease`` for the sandbox dispatch marker.
         self._claim_token: str | None = None
+        # FAR-435: the run-level connector fetch scope (``allowed_connectors``),
+        # computed once at run start from the graph (node capability_scope union
+        # Agent connector_type_refs grants) and reused by the compensation hub
+        # so both run paths apply the same deny-by-default fetch gate.
+        self._run_connector_scope: list[str] | None = None
         # Cancellation-intent signals wired by run_executor_with_watchdog so the
         # NodeCancelledError retry handler can tell a watchdog stall / supersession
         # from a genuine transient node cancellation and skip the pending-reset.
@@ -1440,7 +1548,7 @@ class PipelineExecutor:
             decline_code, decline_detail = self._capacity_decline(
                 max_concurrent=max_concurrent,
                 active_count=active_count,
-                pipeline_capacity_ok=pipeline_capacity_ok,
+                _pipeline_capacity_ok=pipeline_capacity_ok,
                 org_sandbox_cap=org_sandbox_cap,
                 org_count=org_sandbox_count,
                 org_capacity_ok=org_sandbox_cap_ok,
@@ -1466,6 +1574,79 @@ class PipelineExecutor:
             if pending_run is None:
                 raise RunNotFoundError(run_id)
             return pending_run
+
+    async def _check_spend_ceiling_gate(
+        self,
+        *,
+        run_id: uuid.UUID,
+        org_id: uuid.UUID,
+        claim_token: str | None,
+    ) -> Run | None:
+        """Halt a run BEFORE any billable step when the org budget is exhausted.
+
+        Reads the org's FAR-391 lifetime spend ceiling and its consumed total. If
+        the org is already at/over its ceiling (no remaining budget for ANY new
+        run), the run is terminalized as ``cost_ceiling_exceeded`` and returned so
+        ``execute()`` never spawns an LLM / E2B call. Returns ``None`` when the
+        run may proceed (no ceiling, budget remaining, or any read error).
+
+        FAIL-OPEN by design (mirrors ``_check_capacity``): a settings/DB read
+        failure must NEVER block the run — the terminal ledger block in
+        ``finalize.py`` is the authoritative hard ceiling that refuses billing
+        beyond the limit regardless of this pre-gate.
+
+        Only the org ceiling is checked here (the per-run ceiling is enforced
+        after the run has incurred cost, at the terminal ledger block, because a
+        run's cost is only known once nodes have executed).
+        """
+        try:
+            async with self._session_factory() as session, session.begin():
+                await set_rls_org(session, org_id)
+                await set_rls_execution_context(session)
+                org = (
+                    await session.execute(select(Organisation).where(Organisation.id == org_id))
+                ).scalar_one_or_none()
+                if org is None:
+                    return None
+                # Pass a minimal 1-cent charge as the "next run" so the gate
+                # honours the documented at-ceiling / kill-switch semantics: with
+                # zero remaining budget (cumulative >= ceiling, or ceiling == 0)
+                # the run must be terminalized BEFORE any billable work, not left
+                # to the finalize ledger block. A ceiling of 0 therefore blocks
+                # every new run, and an org exactly at its ceiling (1 cent would
+                # exceed it) is halted. A genuinely non-empty remaining budget
+                # (>= 1 cent) still passes so the run can execute.
+                decision = evaluate_org_spend_ceiling(
+                    org_cumulative_spend_cents=org.org_cumulative_spend_cents or 0,
+                    additional_cents=1,
+                    spend_ceiling_cents=org.spend_ceiling_cents,
+                )
+                if decision.allowed:
+                    return None
+                await update_run_status(
+                    session,
+                    run_id,
+                    "cost_ceiling_exceeded",
+                    error_code=ORG_CEILING_EXCEEDED,
+                    error_detail=decision.message,
+                    claim_token=claim_token,
+                )
+                halted_run = await get_run(session, run_id)
+                if halted_run is None:
+                    raise RunNotFoundError(run_id)
+                _log.info(
+                    "pipeline.spend_ceiling_gate_halt",
+                    extra={"run_id": str(run_id), "org_id": str(org_id)},
+                )
+                return halted_run
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception(
+                "pipeline.spend_ceiling_gate_failed",
+                extra={"run_id": str(run_id), "org_id": str(org_id)},
+            )
+            return None
 
     async def _claim_run_and_audit(
         self,
@@ -1606,7 +1787,7 @@ class PipelineExecutor:
         *,
         max_concurrent: int,
         active_count: int,
-        pipeline_capacity_ok: bool,
+        _pipeline_capacity_ok: bool,
         org_sandbox_cap: int | None,
         org_count: int,
         org_capacity_ok: bool,
@@ -1668,7 +1849,7 @@ class PipelineExecutor:
     def _build_eval_defs_by_node(
         eval_rows: list[EvalDefinition],
         org_id: uuid.UUID,
-        pipeline_id: uuid.UUID,
+        _pipeline_id: uuid.UUID,
     ) -> dict[str, list[EvalDefDTO]]:
         """Convert eval definition ORM rows to a dict keyed by node id."""
         eval_defs_by_node: dict[str, list[EvalDefDTO]] = {}
@@ -1818,20 +1999,97 @@ class PipelineExecutor:
             hub = None
         return hub
 
-    async def _init_connector_hub(self, org_id: uuid.UUID) -> Any | None:
+    async def _init_connector_hub(
+        self,
+        org_id: uuid.UUID,
+        *,
+        graph_json: dict[str, Any] | None = None,
+        request_visibility: str | None = None,
+    ) -> Any | None:
         """Load active ConnectorInstance rows for the org and initialise ConnectorHub.
+
+        *request_visibility* (FAR-516) is the run's scoping axis: ``"team"`` when
+        the run belongs to a team, ``"org"`` when it is org-scoped. It is threaded
+        into every ACL check so an org-only connector (``visibility == "org"``) is
+        fail-closed rejected for a team-scoped invocation at the connector gate.
 
         Sets the hub on the current ContextVar so make_connector_fn can access it.
         Returns the hub (or None if no connectors are configured).
+
+        When *graph_json* is provided (the run-start path), the hub applies a
+        run-level fetch scope (deny-by-default, FAR-435 building on FAR-418): the
+        union of every node's ``capability_scope.allowed_connectors`` and the
+        referenced Agents' ``connector_type_refs`` grants. The hub decrypts ONLY
+        those connectors, so out-of-scope credentials are never disclosed. The scope
+        is cached on the executor and reused by the compensation path (which has no
+        graph) so both apply the same deny-by-default fetch gate.
+
+        Contract (fail-closed on the configured path):
+          - If NO active connectors are configured for this run, returns None —
+            the node_runner treats a None hub as vacuous success, which is correct
+            only when no connector work is expected.
+          - If connectors ARE configured, any failure to build the hub (settings
+            read, secrets_backend construction, ConnectorHub construction,
+            ``__aenter__``, or ``initialise``) RAISES, so the run terminalises as
+            FAILED rather than silently completing green with no connector work.
         """
         hub: Any | None = None
+        # Fail-closed default (FAR-439): ``connectors_configured`` starts True so
+        # that ANY failure that prevents us from determining whether connectors
+        # exist — a failed session / RLS / ``session.execute`` read, a settings
+        # read, secrets_backend construction, ConnectorHub construction,
+        # ``__aenter__``, or ``initialise`` — takes the re-raise path below. It is
+        # set False ONLY when the reader query returns a confirmed-EMPTY result
+        # (no error): the single case where ``hub=None`` (vacuous success) is
+        # correct. A read/query error is NOT swallowed into the None path —
+        # "couldn't determine whether connectors exist" is a fatal hub-build
+        # failure (fail closed), not evidence that none are configured.
+        connectors_configured = True
         try:
             async with self._session_factory() as session, session.begin():
                 await set_rls_org(session, org_id)
                 await set_rls_execution_context(session)
                 from sqlalchemy import select
 
+                from modulo.core.capability_scope import (
+                    agent_granted_connector_types,
+                    compute_run_fetch_scope,
+                )
+                from modulo.db.models.agent import Agent
                 from modulo.db.models.connector_instance import ConnectorInstance
+
+                allowed_connectors: list[str] | None = None
+                if graph_json is not None:
+                    agent_ids: list[uuid.UUID] = []
+                    for node in graph_json.get("nodes", []) or []:
+                        if not isinstance(node, dict):
+                            continue
+                        agent_id = node.get("agent_id")
+                        if agent_id:
+                            try:
+                                agent_ids.append(uuid.UUID(str(agent_id)))
+                            except (TypeError, ValueError):
+                                continue
+                    grants: dict[str, set[str]] = {}
+                    if agent_ids:
+                        agent_rows = (
+                            (
+                                await session.execute(
+                                    select(Agent).where(
+                                        Agent.id.in_(agent_ids),
+                                        Agent.organisation_id == org_id,
+                                    )
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                        for agent in agent_rows:
+                            grants[str(agent.id)] = agent_granted_connector_types(agent.connector_type_refs)
+                    allowed_connectors = compute_run_fetch_scope(graph_json, grants)
+                    self._run_connector_scope = allowed_connectors
+                else:
+                    allowed_connectors = self._run_connector_scope
 
                 rows = (
                     (
@@ -1846,10 +2104,16 @@ class PipelineExecutor:
                     .all()
                 )
                 if isinstance(rows, list) and rows:
+                    # Connectors confirmed configured: build the hub. Any failure
+                    # below re-raises (fail closed) via the configured path.
                     from modulo.core.connector_hub import ConnectorHub
                     from modulo.core.pipeline_engine.decorator import set_connector_hub
                     from modulo.core.runtime_provider import create_default_hub
                     from modulo.core.secrets_backend import create_secrets_backend
+                    from modulo.db.crud.connector_instance import (
+                        clear_degraded_markers,
+                        mark_instances_degraded,
+                    )
                     from modulo.settings import get_settings
 
                     _settings = get_settings()
@@ -1861,13 +2125,73 @@ class PipelineExecutor:
                     hub = ConnectorHub(
                         secrets_backend=secrets_backend,
                         runtime_provider=runtime_hub,
+                        org_id=str(org_id),
+                        request_visibility=request_visibility,
                     )
                     await hub.__aenter__()
-                    await hub.initialise(rows)
+                    await hub.initialise(rows, allowed_connectors=allowed_connectors)
+                    if hub.skipped or hub.healthy:
+                        # FAR-495: persist a degraded marker for the skipped
+                        # instances and clear stale markers for instances that
+                        # initialised successfully (a connector fixed via a
+                        # config/plugin change stops being flagged degraded),
+                        # best-effort inside its own savepoint so a failure here
+                        # can NEVER fail or roll back the run-start transaction
+                        # (the hub itself already logged the skips). Only
+                        # instances actually attempted this run appear in
+                        # ``hub.skipped``/``hub.healthy``, so out-of-scope
+                        # instances are never touched.
+                        try:
+                            async with session.begin_nested():
+                                if hub.skipped:
+                                    await mark_instances_degraded(session, hub.skipped)
+                                if hub.healthy:
+                                    await clear_degraded_markers(session, hub.healthy)
+                        except Exception:
+                            # No run id in scope here (_init_connector_hub is
+                            # org-scoped); the instance ids are the correlatable
+                            # identifiers.
+                            _log.warning(
+                                "pipeline.connector_degraded_marker_failed skipped=%s healthy=%s",
+                                sorted(str(i) for i in hub.skipped),
+                                sorted(str(i) for i in hub.healthy),
+                                exc_info=True,
+                            )
                     set_connector_hub(hub)
+                else:
+                    # Confirmed-EMPTY result (no error): the ONE genuine "no
+                    # connectors configured" case. ``connectors_configured`` False
+                    # -> ``hub=None`` (vacuous success). Unreachable from a read
+                    # error — the fail-closed default above re-raises instead.
+                    connectors_configured = False
         except asyncio.CancelledError:
             raise
+        except SharedBudgetUnavailableError:
+            # Configured-but-unconstructable shared Redis budget / settings-read
+            # failure on the executor path (FAR-439). Swallowing it and returning
+            # None would make the connector node vacuously "succeed" with the
+            # "no connector hub" fallback, silently no-op'ing the remote
+            # integration and finalising the run GREEN. Fail closed, loudly.
+            _log.exception("pipeline.connector_hub_init_failed_shared_budget")
+            if hub is not None:
+                await _teardown_hub(hub)
+            raise
         except Exception:
+            if connectors_configured:
+                # Fail closed, loudly: connectors ARE configured, OR we could NOT
+                # establish that they are NOT (a read/query error with the
+                # fail-closed default). A run that may require connector work must
+                # never fall through to ``hub=None`` — the node_runner would treat
+                # it as vacuous success, silently no-op'ing a configured remote
+                # integration and finalising the run GREEN. Re-raise so the run
+                # terminalises as FAILED.
+                _log.exception("pipeline.connector_hub_init_failed_configured")
+                if hub is not None:
+                    await _teardown_hub(hub)
+                raise
+            # Defensive: ``connectors_configured`` is False ONLY on a confirmed
+            # empty result, which never raises — this branch is otherwise
+            # unreachable. Keep the vacuous-success return for safety.
             _log.exception("pipeline.connector_hub_init_failed")
             if hub is not None:
                 await _teardown_hub(hub)
@@ -2118,11 +2442,17 @@ class PipelineExecutor:
         honest work verdict is False (§15.4), so the zero-work elevation banner
         is what renders. Same for a ``sandbox.no_output_json`` session-lost run
         (FAR-227): the agent produced no output at all, so it can never be
-        "work intact".
+        "work intact". Same for a FAR-510 downgraded run
+        (``failed`` + ``sandbox.agent_failed``): the synthetic failure envelope
+        is not a work artifact — the agent died.
         """
         if final_status not in _TERMINAL_STATUSES:
             return None
-        if final_status == "failed" and error_code in ("agent.failed", "sandbox.no_output_json"):
+        if final_status == "failed" and error_code in (
+            "agent.failed",
+            "sandbox.no_output_json",
+            _CODE_SANDBOX_AGENT_FAILED,
+        ):
             return False
         return compute_work_intact(completed_node_outputs, node_ids)
 
@@ -2153,6 +2483,7 @@ class PipelineExecutor:
                     session_factory=self._session_factory,
                     run_id=run_id,
                     node_id=node_id,
+                    organisation_id=org_id,
                 )
                 for node_id in evidence_nodes
             ],
@@ -2277,25 +2608,58 @@ class PipelineExecutor:
             if pipeline is None:
                 raise RunNotFoundError(run_id)
 
-            guard = RunawayGuard(
-                max_duration_seconds=pipeline.max_duration_seconds,
-                max_steps=pipeline.max_steps,
-                token_budget=pipeline.token_budget,
-            )
+            # FAR-505: capture the run/pipeline scalars through the SAME helper
+            # the execute path uses (_capture_execution_scalars) so the resume
+            # compile wiring (retry policy, idempotency identity, guard) is
+            # derived from one place and cannot drift from execute() again.
+            scalars = self._capture_execution_scalars(pipeline, run)
+            guard = scalars["guard"]
 
         if not self._checkpointer_conn_string:
             raise RuntimeError("Cannot resume without a checkpointer configured")
+
+        # FAR-505: thread the SAME retry/idempotency wiring into the resume
+        # compile as the execute path (_prepare_and_stream). The graph cache is
+        # keyed by (pipeline_id, snapshot_id, node_timeout, struct_hash); folding
+        # the pipeline retry policy into the struct hash
+        # (compute_retry_aware_topology_hash) means an execute-then-resume on the
+        # same snapshot reuses the SAME compiled graph instead of cold-compiling
+        # a second, unwired entry. The idempotency key is deliberately
+        # runtime-derived from the run's stable logical identity
+        # (``<pipeline_id>:<run_number>``) — identical on resume because a resume
+        # is the SAME run, so a side-effecting node re-executed after the HITL
+        # pause dedupes exactly as it would on a same-run retry (FAR-402 P5).
+        # The retry policy + run_number are sourced from the SAME
+        # _capture_execution_scalars helper the execute path uses, so the resume
+        # wiring cannot drift from execute() again (FAR-505). The helper already
+        # fails open on a malformed/legacy retry_policy.
+        pipeline_retry_policy = scalars["pipeline_retry_policy"]
+        run_ref = rc.build_run_ref(str(pipeline_id), scalars["run_number"])
+
+        def _node_idempotency_key(node_id: str, _state: dict[str, Any]) -> str | None:
+            return rc.node_idempotency_key(run_ref=run_ref, node_ref=node_id)
 
         compiled = get_or_compile(
             pipeline_id,
             snapshot_id,
             lambda: build_graph_from_json(
                 graph_json,
+                eval_definitions_by_node=eval_defs_by_node,
                 session_factory=self._session_factory,
                 org_id=org_id,
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+                pipeline_retry_policy=pipeline_retry_policy,
+                node_idempotency_key=_node_idempotency_key,
             ),
             pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
+            # Both the retry-aware topology hash (FAR-505) and the eval-def
+            # content hash (FAR-502) must be part of the cache key so an
+            # execute-then-resume on the same snapshot reuses the SAME compiled
+            # graph as the execute path — matching _prepare_and_stream below.
+            graph_struct_hash=struct_hash_with_eval_defs(
+                compute_retry_aware_topology_hash(graph_json, pipeline_retry_policy),
+                eval_defs_by_node,
+            ),
         )
 
         config = {"configurable": {"thread_id": thread_id}}
@@ -2435,6 +2799,146 @@ class PipelineExecutor:
             except Exception:
                 _log.exception("audit.eval_blocked_failed", extra={"run_id": str(run_id)})
 
+    @staticmethod
+    def _sandbox_failure_scan_views(value: Any) -> list[dict[str, Any]]:
+        """FAR-510 — the dict views of one per-node output value that may carry
+        the sandbox envelope fields (``status`` / the synthetic-failure marker).
+
+        A full runner envelope ``{artifacts, output}`` yields the value itself
+        (flat / legacy mixed bodies), the outer ``output`` telemetry view, and
+        the first artifact's inner ``output``. A post-P1b stored
+        ``outputs_json`` value is the PURE agent return (``None`` or
+        agent-authored business JSON) — scanned top-level only; the marker
+        requirement in the predicate keeps agent-authored JSON collision-free.
+        """
+        views: list[dict[str, Any]] = []
+        if not isinstance(value, dict):
+            return views
+        views.append(value)
+        outer = value.get("output")
+        if isinstance(outer, dict):
+            views.append(outer)
+        artifacts = value.get("artifacts")
+        if isinstance(artifacts, list) and artifacts and isinstance(artifacts[0], dict):
+            inner = artifacts[0].get("output")
+            if isinstance(inner, dict):
+                views.append(inner)
+        return views
+
+    @staticmethod
+    def _is_sandbox_synthetic_failure_view(view: dict[str, Any]) -> bool:
+        """FAR-510 — the marker-based downgrade predicate.
+
+        Requires ``status == "failed"`` AND the runner's machine marker
+        (``MODULO_SYNTHETIC_FAILURE_MARKER``) True — never summary text — so an
+        agent-authored failure shape (honest exit-code failure, business JSON
+        self-reporting failure) is never downgraded.
+        """
+        return view.get("status") == "failed" and view.get(MODULO_SYNTHETIC_FAILURE_MARKER) is True
+
+    def _downgrade_masked_sandbox_failures(
+        self,
+        *,
+        run_id: uuid.UUID,
+        final_status: str,
+        error_code: str | None,
+        error_detail: str | None,
+        completed_node_outputs: dict[str, Any],
+        node_type_map: dict[str, str],
+        stored_node_outputs: dict[str, Any] | None = None,
+        stored_node_telemetry: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None, str | None]:
+        """FAR-510 — downgrade a masked sandbox-agent failure to an honest fail.
+
+        The sandbox_agent runner's synthetic failure paths (generic exception,
+        schema validation) do NOT raise — they RETURN a failure envelope
+        stamped with the ``MODULO_SYNTHETIC_FAILURE_MARKER`` machine marker.
+        Node completion is output-presence-based, so that node counts as
+        completed and the run would finalize ``complete`` — a failed dispatch
+        masked as success.
+
+        Only a ``complete`` final_status is inspected (failed/eval_failed/etc.
+        are already honest). A match is a completed output on a node the
+        ``node_type_map`` says is ``sandbox_agent`` for which ANY scanned view
+        shows ``status == "failed"`` AND the synthetic-failure marker (see
+        :meth:`_is_sandbox_synthetic_failure_view`). Returns the inputs
+        unchanged when nothing matches.
+
+        The scan checks the per-node UNION of three views — the live
+        ``completed_node_outputs`` envelope, the run's STORED cumulative
+        ``outputs_json`` value, and the STORED ``node_telemetry_json`` view
+        (via the legacy-safe ``node_output_split.node_telemetry`` accessor,
+        which falls back to the legacy mixed-envelope inner output for pre-P1b
+        rows). A HITL resume only re-emits the resumed segment's node events,
+        so a masked failure from a PRIOR segment is only visible in the stored
+        columns — and those hold the POST-split shapes (``outputs_json`` =
+        pure return or ``None``; telemetry = the envelope fields), which are
+        DIFFERENT shapes from the live envelope by design. No view clobbers
+        another: a match in ANY view downgrades.
+        """
+        if final_status != "complete":
+            return final_status, error_code, error_detail
+        stored_outputs = stored_node_outputs or {}
+        stored_telemetry = stored_node_telemetry or {}
+        node_ids = set(completed_node_outputs) | set(stored_outputs) | set(stored_telemetry)
+        found: list[str] = []
+        for node_id in node_ids:
+            if node_type_map.get(node_id) != "sandbox_agent":
+                continue
+            views = self._sandbox_failure_scan_views(completed_node_outputs.get(node_id))
+            views.extend(self._sandbox_failure_scan_views(stored_outputs.get(node_id)))
+            views.extend(self._sandbox_failure_scan_views(node_telemetry(stored_telemetry, stored_outputs, node_id)))
+            if any(self._is_sandbox_synthetic_failure_view(view) for view in views):
+                found.append(node_id)
+        if not found:
+            return final_status, error_code, error_detail
+        _log.warning(
+            "pipeline.masked_sandbox_failure_downgraded",
+            extra={"run_id": str(run_id), "node_ids": sorted(found)},
+        )
+        return "failed", _CODE_SANDBOX_AGENT_FAILED, "Sandbox agent node(s) failed: " + ", ".join(sorted(found))
+
+    async def _load_stored_node_columns(
+        self, *, run_id: uuid.UUID, org_id: uuid.UUID
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """FAR-510 — the run's STORED cumulative per-node columns.
+
+        Returns ``(outputs_json, node_telemetry_json)``. A HITL resume only
+        re-emits the resumed segment's node events, so the live
+        ``completed_node_outputs`` can miss a masked sandbox failure from a
+        prior segment; the stored row is the cumulative truth. Since the P1b
+        write-flip the two columns hold DIFFERENT shapes (pure return vs
+        telemetry envelope), so BOTH are loaded and the downgrade scans a
+        per-node view of each. Best-effort (guard-the-guard): any failure —
+        including a missing row or a non-dict column — yields empty dicts so
+        the downgrade falls back to scanning the live dict only. It must never
+        crash finalization.
+        """
+        if self._session_factory is None:
+            return {}, {}
+        try:
+            async with self._session_factory() as session, session.begin():
+                await set_rls_org(session, org_id)
+                await set_rls_execution_context(session)
+                run = await get_run(session, run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.warning(
+                "pipeline.masked_sandbox_failure_stored_scan_unavailable",
+                extra={"run_id": str(run_id)},
+                exc_info=True,
+            )
+            return {}, {}
+        if run is None:
+            return {}, {}
+        outputs_json = getattr(run, "outputs_json", None)
+        telemetry_json = getattr(run, "node_telemetry_json", None)
+        return (
+            dict(outputs_json) if isinstance(outputs_json, dict) else {},
+            dict(telemetry_json) if isinstance(telemetry_json, dict) else {},
+        )
+
     async def _finalize_run_after_stream(
         self,
         *,
@@ -2454,8 +2958,36 @@ class PipelineExecutor:
         Computes ``work_intact``, runs ``finalize_cost``, records the
         compensating daily fact when needed, fetches the final row, and fires
         the post-terminal evidence probes. ``final_status`` reflects the
-        terminal/awaiting_human outcome of the stream.
+        terminal/awaiting_human outcome of the stream, after the FAR-510
+        masked-sandbox-failure downgrade.
         """
+        # FAR-510: a sandbox_agent node whose dispatch died to a generic
+        # exception RETURNS a failed envelope instead of raising, and node
+        # completion is output-presence-based — so a failed dispatch would
+        # otherwise finalize the run ``complete``. Downgrade BEFORE the
+        # eval_blocked audit, work_intact, and finalize_cost so every
+        # downstream consumer sees the honest status. The scan also covers the
+        # run's STORED cumulative outputs (resume parity: a HITL resume only
+        # re-emits the resumed segment, so a masked failure from a prior
+        # segment is only visible in the stored row). The extra run-row read
+        # happens on the complete path ONLY — failed/awaiting_human skip it.
+        stored_node_outputs: dict[str, Any] = {}
+        stored_node_telemetry: dict[str, Any] = {}
+        if final_status == "complete":
+            stored_node_outputs, stored_node_telemetry = await self._load_stored_node_columns(
+                run_id=run_id, org_id=org_id
+            )
+        final_status, error_code, error_detail = self._downgrade_masked_sandbox_failures(
+            run_id=run_id,
+            final_status=final_status,
+            error_code=error_code,
+            error_detail=error_detail,
+            completed_node_outputs=completed_node_outputs,
+            node_type_map=node_type_map,
+            stored_node_outputs=stored_node_outputs,
+            stored_node_telemetry=stored_node_telemetry,
+        )
+
         # Record audit events for block failures on resume.
         eval_blocked = final_status == "eval_failed" and error_code == "eval_blocked"
         if eval_blocked:
@@ -2605,6 +3137,17 @@ class PipelineExecutor:
         snapshot_id = scalars["snapshot_id"]
         thread_id = scalars["thread_id"]
         is_correction_run = scalars["is_correction_run"]
+        run_number = scalars["run_number"]
+        # FAR-402 P5 / FAR-410: the runtime node-scoped idempotency-key provider.
+        # The compiled graph is cached across runs, so the key must be derived at
+        # RUNTIME from the run's stable logical identity (``<pipeline_id>:<run_number>``)
+        # plus the node id — NOT baked at compile time. A fresh per-replay
+        # ``run_id`` is never part of the derivation (a re-run recomputes the
+        # same key, so a retry of a side-effecting node dedupes its write).
+        run_ref = rc.build_run_ref(str(pipeline_id), run_number)
+
+        def _node_idempotency_key(node_id: str, _state: dict[str, Any]) -> str | None:
+            return rc.node_idempotency_key(run_ref=run_ref, node_ref=node_id)
 
         # Load eval definitions for conditional HITL gating (eval-before-interrupt).
         eval_defs_by_node: dict[str, list[EvalDefDTO]] = {}
@@ -2635,6 +3178,17 @@ class PipelineExecutor:
             # capacity check ran) is never resurrected.
             return capacity_run
 
+        # FAR-391 — hard spend-ceiling gate. Runs BEFORE any billable step is
+        # spawned (no LLM / E2B call happens until ``_prepare_and_stream`` below).
+        # If the org's lifetime budget is already exhausted, the run is halted
+        # immediately as ``cost_ceiling_exceeded`` so no billable work starts.
+        # FAIL-OPEN: any error reading the ceilings must never block the run —
+        # the terminal ledger block (finalize.py) is the authoritative hard
+        # ceiling that refuses billing beyond the limit regardless.
+        ceiling_run = await self._check_spend_ceiling_gate(run_id=run_id, org_id=org_id, claim_token=claim_token)
+        if ceiling_run is not None:
+            return ceiling_run
+
         final_status: str = "failed"
         error_code: str | None = None
         error_detail: str | None = None
@@ -2644,11 +3198,18 @@ class PipelineExecutor:
         # when the stream never started (compile/pre-stream failure) — a run with
         # no executed nodes is never work-intact.
         node_ids: set[str] = set()
+        # FAR-516: the run's scoping axis determines whether an org-only connector
+        # is permitted. A run that belongs to a team (owner_team_id set) is
+        # team-scoped: any org-visibility connector it invokes is fail-closed
+        # rejected at the connector gate. Org-scoped runs (no team) may use
+        # org-only connectors.
+        request_visibility = "team" if getattr(run, "owner_team_id", None) is not None else "org"
         model_backend_hub, connector_hub, broker, single_sandbox_node = await self._init_run_environment(
             org_id=org_id,
             run_id=run_id,
             pipeline_id=pipeline_id,
             graph_json=graph_json,
+            request_visibility=request_visibility,
         )
         # FAR-295: computed ONCE per run — a graph containing ANY node declared
         # non-idempotent (idempotent=false) suppresses every retry path below
@@ -2661,26 +3222,39 @@ class PipelineExecutor:
         gate_suppressed = False
 
         try:
-            final_status, error_code, error_detail, node_token_usage = await self._prepare_and_stream(
+            scope = _RunScope(
                 run_id=run_id,
                 org_id=org_id,
                 pipeline_id=pipeline_id,
                 snapshot_id=snapshot_id,
+                thread_id=thread_id,
+            )
+            final_status, error_code, error_detail, node_token_usage = await self._prepare_and_stream(
+                scope=scope,
                 snapshot=snapshot,
                 input_payload=input_payload,
                 variant_config_snapshot=variant_config_snapshot,
                 graph_json=graph_json,
                 eval_defs_by_node=eval_defs_by_node,
-                thread_id=thread_id,
                 node_ids=node_ids,
                 completed_node_outputs=completed_node_outputs,
                 guard=guard,
                 node_type_map=node_type_map,
                 pipeline_node_timeout_seconds=pipeline.node_timeout_seconds,
                 broker=broker,
+                pipeline_retry_policy=pipeline_retry_policy,
+                idempotency_key=_node_idempotency_key,
             )
         except asyncio.CancelledError:
             raise
+        except RouterNoMatchError as exc:
+            # FAR-402 P1 (F2-A): a Router node had no matching rule and no
+            # default — terminalize the run with the dedicated router_no_match
+            # status (terminal, non-failure; classified as excluded/notify).
+            _log.info("pipeline.router_no_match", extra={"run_id": str(run_id), "detail": str(exc)})
+            final_status = "router_no_match"
+            error_code = "router.no_match"
+            error_detail = _sanitize_detail(str(exc), limit=5000)
         except (NodeCancelledError, SandboxNodeFailedError) as exc:
             # Transient node cancellation / sandbox-infra failure (e.g. an E2B
             # sandbox command wait cancelled from outside, a stall, or a command
@@ -2847,9 +3421,13 @@ class PipelineExecutor:
         from modulo.settings import get_settings
 
         retries = int(get_settings().saq_run_retries)
-        node_attempt_count, current_token, run_markers, cancellation_requested = await self._load_transient_state(
-            run_id=run_id, org_id=org_id
-        )
+        (
+            node_attempt_count,
+            current_token,
+            run_markers,
+            cancellation_requested,
+            idempotency_key,
+        ) = await self._load_transient_state(run_id=run_id, org_id=org_id)
 
         superseded = self._claim_token is not None and current_token is not None and current_token != self._claim_token
         stalled = bool(stall_requested is not None and stall_requested.is_set())
@@ -2868,10 +3446,17 @@ class PipelineExecutor:
             exc=exc,
             run_markers=run_markers,
             run_id=run_id,
+            idempotency_key=idempotency_key,
             superseded=superseded,
             stalled=stalled,
             cancellation_requested=cancellation_requested,
             single_sandbox_node=single_sandbox_node,
+            # FAR-438: the transient path has no separate fan-out / content-edit
+            # context (exc.node_id already encodes parent+index for fan-out
+            # children; there is no connector payload to fold), so index/payload
+            # are None here — consistent with the marker-write side's defaults.
+            index=None,
+            payload=None,
         )
         # Only SandboxNodeFailedError carries a node_id — the gate is
         # keyed on it, so a None node_id (plain NodeCancelledError) can
@@ -3078,6 +3663,7 @@ class PipelineExecutor:
             "snapshot_id": snapshot_id,
             "thread_id": thread_id,
             "is_correction_run": is_correction_run,
+            "run_number": int(getattr(run, "run_number", 0) or 0),
         }
 
     async def _init_run_environment(
@@ -3087,10 +3673,15 @@ class PipelineExecutor:
         run_id: uuid.UUID,
         pipeline_id: uuid.UUID,
         graph_json: dict[str, Any],
+        request_visibility: str | None = None,
     ) -> tuple[ModelBackendHub | None, Any | None, RunEventBroker, bool]:
         """Set up the run-scoped execution environment (broker + hubs + otel).
 
         Returns ``(model_backend_hub, connector_hub, broker, single_sandbox_node)``.
+
+        *request_visibility* (FAR-516) is the run's scoping axis — ``"team"`` or
+        ``"org"`` — threaded into the connector hub so an org-only connector is
+        fail-closed rejected for a team-scoped invocation.
         """
         broker = get_registry().get_or_create(run_id)
         set_cancellation_check(self._check_db_cancellation(org_id, run_id))
@@ -3100,8 +3691,40 @@ class PipelineExecutor:
         # Load model backends for this run's org — provides LLM access to agent nodes.
         model_backend_hub = await self._init_model_backend_hub(org_id)
         # Load connector hub for this run's org — provides connector access to connector nodes.
-        connector_hub = await self._init_connector_hub(org_id)
-
+        # FAR-418/FAR-435: wire fetch-time capability scoping — the run-level
+        # allowed_connectors (node capability_scope union Agent
+        # connector_type_refs grants) is computed from the graph at run start so
+        # the hub decrypts ONLY those connectors; out-of-scope credentials are
+        # never disclosed. The scope is computed by
+        # ``modulo.core.capability_scope.compute_run_fetch_scope``. CONTRACT
+        # CHANGE (FAR-435 tightening vs the old fall-back behaviour): a run that
+        # MIXES connector-scoped and connector-unrestricted nodes no longer falls
+        # back to fetch-everything — it fetches only the scoped union. The legacy
+        # fetch-everything behaviour survives ONLY for fully-unrestricted runs
+        # (no node contributes any connector), where the union is empty → None.
+        try:
+            connector_hub = await self._init_connector_hub(
+                org_id, graph_json=graph_json, request_visibility=request_visibility
+            )
+        except (Exception, asyncio.CancelledError):
+            # FAR-439: a configured-path connector-hub failure RAISES (fail closed).
+            # Catch the run-abort paths (Exception + asyncio.CancelledError) but not
+            # KeyboardInterrupt/SystemExit — those terminate the process and must not
+            # be swallowed into a teardown-and-reraise.
+            # That raise propagates out of execute() BEFORE the post-stream
+            # try/finally runs, so the resources acquired above (the model-backend
+            # hub and its ContextVar, the run's cancellation-check / audit-hook
+            # ContextVars, and the broker) would leak. Tear them down before
+            # re-raising so no async client is left dangling and the re-entry gets
+            # a fresh broker — mirroring _cleanup_run_resources.
+            if model_backend_hub is not None:
+                await _teardown_hub(model_backend_hub)
+            set_model_backend_hub(None)
+            set_connector_hub(None)
+            set_cancellation_check(None)
+            set_audit_hook(None)
+            get_registry().close(run_id)
+            raise
         # FAR-228: the idempotency gate is inert on multi-node graphs — it only
         # fires for a SINGLE sandbox_agent node (guard A in the node body and
         # guard B below both require this).
@@ -3113,22 +3736,20 @@ class PipelineExecutor:
     async def _prepare_and_stream(
         self,
         *,
-        run_id: uuid.UUID,
-        org_id: uuid.UUID,
-        pipeline_id: uuid.UUID,
-        snapshot_id: uuid.UUID,
+        scope: _RunScope,
         snapshot: PipelineSnapshot,
         input_payload: dict[str, Any],
         variant_config_snapshot: dict[str, Any] | None,
         graph_json: dict[str, Any],
         eval_defs_by_node: dict[str, list[EvalDefDTO]],
-        thread_id: str,
         node_ids: set[str],
         completed_node_outputs: dict[str, Any],
         guard: RunawayGuard,
         node_type_map: dict[str, str],
         pipeline_node_timeout_seconds: int,
         broker: RunEventBroker,
+        pipeline_retry_policy: dict[str, Any] | None = None,
+        idempotency_key: Callable[[str, dict[str, Any]], str | None] | None = None,
     ) -> tuple[str, str | None, str | None, dict[str, Any] | None]:
         """Compile (or retrieve) the StateGraph and stream it to completion.
 
@@ -3137,29 +3758,44 @@ class PipelineExecutor:
         finalization path sees the same ids the original inline rebinding
         produced.
         """
-        # Compile (or retrieve from cache) the StateGraph.
+        # Compile (or retrieve from cache) the StateGraph. ``pipeline_retry_policy``
+        # and ``idempotency_key`` are threaded into the per-node retry/compensation
+        # wrapper (FAR-402 P5) — the latter is runtime-derived so a cached graph
+        # still dedupes against the run's stable identity.
+        # FAR-502: the eval defs loaded fresh above (execute()) are baked into
+        # HITL gate closures by the factory below. Folding their content hash
+        # into the cache key means a replay / variant run whose eval
+        # definitions changed since the cached compile misses the cache and
+        # recompiles with the fresh definitions instead of silently reusing
+        # the first run's closures.
         compiled = get_or_compile(
-            pipeline_id,
-            snapshot_id,
+            scope.pipeline_id,
+            scope.snapshot_id,
             lambda: build_graph_from_json(
                 graph_json,
                 eval_definitions_by_node=eval_defs_by_node,
                 session_factory=self._session_factory,
-                org_id=org_id,
+                org_id=scope.org_id,
                 pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
+                pipeline_retry_policy=pipeline_retry_policy,
+                node_idempotency_key=idempotency_key,
             ),
             pipeline_node_timeout_seconds=pipeline_node_timeout_seconds,
+            graph_struct_hash=struct_hash_with_eval_defs(
+                compute_retry_aware_topology_hash(graph_json, pipeline_retry_policy),
+                eval_defs_by_node,
+            ),
         )
 
         initial_state = _seed_state(snapshot, input_payload, variant_config_snapshot)
         initial_state.update(
             {
-                "_run_id": run_id,
-                "_org_id": org_id,
+                "_run_id": scope.run_id,
+                "_org_id": scope.org_id,
                 "_claim_lease": self._claim_token,
             }
         )
-        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        config: dict[str, Any] = {"configurable": {"thread_id": scope.thread_id}}
         node_ids.clear()
         node_ids.update({str(n["id"]) for n in graph_json.get("nodes", [])})
         # FAR-369: expose each node's configured ``timeout_seconds`` so the
@@ -3183,12 +3819,12 @@ class PipelineExecutor:
         # re-validates its bound guardrail conformance at node start. The
         # claimed guardrail list is hoisted ONCE per run (one query); the
         # live capability manifest is still read per node at node start.
-        claimed, claims_load_failed = await self._load_claimed_conformance_guardrails(org_id, pipeline_id)
+        claimed, claims_load_failed = await self._load_claimed_conformance_guardrails(scope.org_id, scope.pipeline_id)
         set_conformance_ctx(
             self._session_factory,
-            org_id,
+            scope.org_id,
             snapshot.environment_profile_id,
-            pipeline_id,
+            scope.pipeline_id,
             claimed,
             claims_load_failed,
         )
@@ -3201,11 +3837,11 @@ class PipelineExecutor:
         # consume the retry budget before any real execution attempt
         # (postmortem FAR-121).
         async with self._session_factory() as session, session.begin():
-            await set_rls_org(session, org_id)
+            await set_rls_org(session, scope.org_id)
             await set_rls_execution_context(session)
             await session.execute(
                 text("UPDATE runs SET node_attempt_count = node_attempt_count + 1 WHERE id = :rid"),
-                {"rid": str(run_id)},
+                {"rid": str(scope.run_id)},
             )
 
         # FAR-432 (item 4a): a checkpointer is ONLY attached when the pipeline
@@ -3222,7 +3858,7 @@ class PipelineExecutor:
             _settings = get_settings()
             async with _checkpointer_scope(
                 self._checkpointer_conn_string,
-                organisation_id=org_id,
+                organisation_id=scope.org_id,
                 fernet_key=_settings.fernet_key,
             ) as saver:
                 compiled.checkpointer = saver
@@ -3232,9 +3868,9 @@ class PipelineExecutor:
                     config,
                     node_ids,
                     broker,
-                    run_id,
-                    pipeline_id=pipeline_id,
-                    org_id=org_id,
+                    scope.run_id,
+                    pipeline_id=scope.pipeline_id,
+                    org_id=scope.org_id,
                     completed_node_outputs=completed_node_outputs,
                     guard=guard,
                     node_token_budgets=node_token_budgets,
@@ -3249,9 +3885,9 @@ class PipelineExecutor:
                 config,
                 node_ids,
                 broker,
-                run_id,
-                pipeline_id=pipeline_id,
-                org_id=org_id,
+                scope.run_id,
+                pipeline_id=scope.pipeline_id,
+                org_id=scope.org_id,
                 completed_node_outputs=completed_node_outputs,
                 guard=guard,
                 node_token_budgets=node_token_budgets,
@@ -3262,15 +3898,20 @@ class PipelineExecutor:
 
     async def _load_transient_state(
         self, *, run_id: uuid.UUID, org_id: uuid.UUID
-    ) -> tuple[int, str | None, dict[str, Any] | None, bool]:
+    ) -> tuple[int, str | None, dict[str, Any] | None, bool, str | None]:
         """Reload the run's attempt markers + claim + cancellation state.
 
-        Returns ``(node_attempt_count, current_token, run_markers, cancellation_requested)``.
+        Returns ``(node_attempt_count, current_token, run_markers,
+        cancellation_requested, idempotency_key)``. ``idempotency_key`` is the
+        run's persisted FAR-438 idempotency identity (``<pipeline_id>:<run_number>``)
+        written at create — a re-run reads it back to recompute the SAME per-node
+        keys for the read-before-write dedupe.
         """
         node_attempt_count = 0
         current_token: str | None = None
         run_markers: dict[str, Any] | None = None
         cancellation_requested = False
+        idempotency_key: str | None = None
         async with self._session_factory() as session, session.begin():
             await set_rls_org(session, org_id)
             await set_rls_execution_context(session)
@@ -3280,7 +3921,8 @@ class PipelineExecutor:
                 current_token = current_run.claim_token
                 run_markers = current_run.raw_output_markers
                 cancellation_requested = bool(current_run.cancellation_requested)
-        return node_attempt_count, current_token, run_markers, cancellation_requested
+                idempotency_key = current_run.idempotency_key
+        return node_attempt_count, current_token, run_markers, cancellation_requested, idempotency_key
 
     def _idempotency_gate_ok(
         self,
@@ -3288,18 +3930,75 @@ class PipelineExecutor:
         exc: NodeCancelledError | SandboxNodeFailedError,
         run_markers: dict[str, Any] | None,
         run_id: uuid.UUID,
+        idempotency_key: str | None,
         superseded: bool,
         stalled: bool,
         cancellation_requested: bool,
         single_sandbox_node: bool,
+        index: int | str | None = None,
+        payload: str | bytes | None = None,
     ) -> bool:
-        """FAR-228 guard B — should a transient retry be suppressed by the idempotency gate?"""
+        """FAR-228 guard B + FAR-438 read-before-write — should a transient retry be suppressed?
+
+        Suppresses when EITHER the run's delivery marker already records
+        ``delivery_done`` for the failing node (FAR-228, same-run retry) OR a
+        re-run that reused the run's persisted FAR-438 idempotency key records an
+        already-applied per-node key (``read_before_write_suppression``). The
+        second branch is the UNKNOWN-recovery path: an operator re-run with the
+        SAME persisted key must NOT double-submit the write.
+
+        SCOPE (FAR-458 reconciliation): this executor gate stays confined to the
+        SANDBOX single-node transient-recovery surface — ``single_sandbox_node``
+        below. The CONNECTOR-write UNKNOWN-recovery surface has its OWN decision
+        point: the connector node's write boundary (``make_connector_fn`` →
+        ``_connector_write_gate``), which consults the SAME
+        ``read_before_write_suppression`` before re-sending a previously-delivered
+        write and stamps a ``delivery_done`` marker on success. A connector node
+        does not (and should not) reach this executor transient path, so the gate
+        is intentionally NOT extended to cover connectors here — leaving it
+        sandbox-only avoids falsely gating a connector recovery that never passes
+        through ``_decide_transient_failure``.
+        ``index`` / ``payload`` (FAR-438) are the item-cardinality position and
+        content-version payload handed to ``read_before_write_suppression`` so the
+        derived per-node key matches the key the marker-write side stamped. They
+        must be the SAME arguments the write side used — the transient path has no
+        separate fan-out/content-edit context here (``exc.node_id`` already encodes
+        ``parent+index`` for fan-out children, and there is no connector content
+        payload to fold), so they default to ``None`` and stay consistent with the
+        sandbox marker write.
+
+        TOCTOU note (known, documented): ``run_markers`` is the run's
+        ``raw_output_markers`` read by ``_load_transient_state`` via plain
+        ``get_run`` — NOT under ``SELECT ... FOR UPDATE``. Two executors racing
+        on the same run could both read ``delivery_done`` absent and both decide
+        to suppress/retry. The marker WRITE side (``_write_raw_output_marker``)
+        DOES take ``with_for_update`` on the run row before persisting, so a
+        concurrent writer is serialised there; this read is a bounded, best-effort
+        gate (guarded by ``pipeline.idempotency_gate.check_failed``). If the
+        TOCTOU window becomes a real double-write risk, take ``with_for_update``
+        on this read too.
+        """
         from modulo.settings import get_settings
 
         gate_ok = False
         try:
+            node_id = getattr(exc, "node_id", None)
+            delivered = _should_skip_retry(node_id, run_markers, str(run_id))
+            # read_before_write_suppression is typed ``str`` for both refs and
+            # fail-opens (returns False) on a None/empty run_ref or node_ref —
+            # guard here so a None idempotency_key (no persisted key) never
+            # even attempts the derivation, and to satisfy mypy's arg-types.
+            replay_suppressed = False
+            if idempotency_key and node_id:
+                replay_suppressed = read_before_write_suppression(
+                    run_markers,
+                    run_ref=idempotency_key,
+                    node_ref=node_id,
+                    index=index,
+                    payload=payload,
+                )
             gate_ok = (
-                _should_skip_retry(getattr(exc, "node_id", None), run_markers, str(run_id))
+                (delivered or replay_suppressed)
                 and not superseded
                 and not stalled
                 and not cancellation_requested
@@ -4162,6 +4861,28 @@ class PipelineExecutor:
             broker.publish("run_cancelled", {})
             self._log_accumulation_state(run_id, state.segments_completed, state.node_token_usage)
             return "cancelled", None, None, node_token_usage
+        if isinstance(exc, CompensationFailedError):
+            # FAR-402 P5 (§E): a watched node's compensation target itself failed.
+            # The node wrapper wrapped the watched-node terminal failure into a
+            # forward compensation execution, which then failed — terminalize the
+            # run as COMPENSATION_FAILED (never retried; the run already left the
+            # batch pipeline's normal failure path via the compensation edge).
+            scrubbed = _sanitize_detail(str(exc), limit=5000)
+            _log.warning(
+                "pipeline.compensation_failed",
+                extra={
+                    "run_id": str(run_id),
+                    "node_id": getattr(exc, "node_id", None),
+                    "compensation_target": getattr(exc, "compensation_target", None),
+                },
+            )
+            return _terminal_failure(
+                broker,
+                "compensation_failed",
+                COMPENSATION_FAILED_CODE,
+                scrubbed,
+                node_token_usage,
+            )
         if isinstance(exc, RunawayRunError):
             error_detail = _sanitize_detail(exc, limit=5000)
             _log.warning(
@@ -4212,6 +4933,22 @@ class PipelineExecutor:
                 "failed",
                 "schema_validation_failure",
                 scrubbed,
+                node_token_usage,
+            )
+        if isinstance(exc, RouterNoMatchError):
+            # FAR-402 P1 (F2-A): a Router node had no matching rule and no
+            # default — terminalize the run with the dedicated router_no_match
+            # status (terminal, non-failure; classified as excluded/notify).
+            # NOT retryable: a no-match is a definitive outcome, not a transient
+            # infra failure. ``_stream_graph`` catches the exception BEFORE it
+            # reaches execute()'s dedicated except, so the mapping lives here.
+            error_detail = _sanitize_detail(exc, limit=5000)
+            _log.info("pipeline.router_no_match", extra={"run_id": str(run_id), "detail": error_detail})
+            return _terminal_failure(
+                broker,
+                "router_no_match",
+                "router.no_match",
+                error_detail,
                 node_token_usage,
             )
         _tb = _traceback_detail(exc, limit=5000)

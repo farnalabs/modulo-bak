@@ -24,14 +24,26 @@ the runtime variables supplied per call:
     operations:           { "<resource>": { "method": ..., "path": ..., "headers": {},
                                              "params": {}, "body": {}, "records_path": ...,
                                              "next_cursor_path": ..., "passthrough": ...,
-                                             "idempotency_header": ... } }
+                                             "idempotency_header": ..., "on_unknown": ... } }
     records_path:         "data.items"                         # JMESPath expression into JSON response for records
     next_cursor_path:     "data.next_cursor"                   # optional pagination cursor (JMESPath)
     allowed_hosts:        ["api.example.com"]                  # optional scheme/host allowlist
     passthrough:          false                                # force single-record wrap of the raw body when set
     max_response_size:    <bytes>                              # optional max response body size (default 10 MiB)
     idempotency_header:   <header-name>                        # optional header that makes a
-                                                                 #   non-GET/HEAD request safe to retry
+                                                                  #   non-GET/HEAD request safe to retry
+    on_unknown:           "fail_open"                          # optional per-op idempotency gate mode for the
+                                                                  #   UNKNOWN (couldn't-confirm-delivery) case
+                                                                  #   (FAR-458): "fail_open" (DEFAULT — re-fire on
+                                                                  #   ambiguity, possible duplicate), "fail_closed"
+                                                                  #   (SUPPRESS on ambiguity, possible silent miss),
+                                                                  #   or "off" (never deduped — write always fires).
+                                                                  #   Top-level value applies to every op unless a
+                                                                  #   per-resource op overrides it. A CONFIRMED-
+                                                                  #   delivered write (delivery_done + matching key)
+                                                                  #   is suppressed in every mode except `off`.
+    timeout_seconds:      <number>                             # per-request timeout (default 30.0)
+    verify_tls:           true                                 # verify the server TLS cert (default true)
     fan_out:              {                                     # optional fan-out / iterator mode (FAR-411)
                             "enabled": true,                    #   when truthy + items_path set, write() iterates
                             "items_path": "data.items",         #   JMESPath into payload.data resolving to the
@@ -45,6 +57,18 @@ the runtime variables supplied per call:
                             "requests_per_second": 10.0,        #   refill rate
                             "burst": 20                         #   burst capacity
                           }
+                            #   FAR-439: when a Redis client is wired at the composition
+                            #   root (app.modulo.run multi-worker / fleet), the bucket is
+                            #   SHARED across workers — one budget per <tenant, host+path>
+                            #   — enforced atomically in Redis. The key is derived from the
+                            #   STATIC path template (not the fully-rendered URL) so a
+                            #   templated path or query string never fragments the budget.
+                            #   When Redis is NOT configured (single-worker dev — no fleet)
+                            #   the connector-local per-process bucket is authoritative.
+                            #   When Redis IS configured but unavailable the limiter FAILS
+                            #   CLOSED (after a single retry of the shared charge) rather
+                            #   than silently falling back to N per-process buckets — see
+                            #   modulo.connectors._rate_bucket.
 
 FAN-OUT / ITERATOR (FAR-411)
 ---------------------------
@@ -63,10 +87,15 @@ sequence inside the write ``data``, ``write()`` fans out ONE request per item:
   fan-out is a no-op, not a failure).
 * **Per-destination token bucket** — the ONE outbound-call enforcement point.
   Each item consumes a token from a :class:`modulo.connectors._rate_bucket.TokenBucket`
-  keyed by host; when empty the call awaits refill. This is **per-process**
-  (each uvicorn/SAQ worker owns its own bucket) and **best-effort** — it is
-  NOT Redis-backed in this ticket. Note the divergence: existing connectors
-  (github, linear, …) have no bucket, so REST is deliberately stricter.
+  keyed by host+path; when empty the call awaits refill. Per-process by default
+  (each uvicorn/SAQ worker owns its own bucket), and SHARED across the fleet via
+  Redis when a ``redis_client`` is wired at the composition root (FAR-439): one
+  atomic budget per <tenant, host+path> is enforced across all workers. The key
+  is derived from the STATIC path template so a templated/queried URL never
+  fragments the budget. When Redis is unavailable the limiter FAILS CLOSED
+  (never mints from an uncounted per-process bucket). Note the divergence:
+  existing connectors (github, linear, …) have no bucket, so REST is
+  deliberately stricter.
 * **Per-item outcome state** — the result carries ``outcomes`` (one record per
   item: index, item, status ``success``/``failure``, result/error), plus
   ``success_count``/``failure_count`` and an explicit ``cardinality_over_cap``
@@ -142,16 +171,18 @@ import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import httpx
 import jmespath
 from jinja2.sandbox import SandboxedEnvironment
 
-from modulo.connectors._rate_bucket import TokenBucket
+from modulo.connectors._rate_bucket import PerDestinationRateLimiter, TokenBucket
 from modulo.connectors._retry_headers import parse_retry_after
 from modulo.connectors._safe_page import safe_records_list
 from modulo.connectors.base import (
+    DEFAULT_ON_UNKNOWN,
+    ON_UNKNOWN_MODES,
     ConnectorBase,
     ConnectorPayload,
     ConnectorQuery,
@@ -159,11 +190,23 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.connectors.rest import rest_metrics
+from modulo.core.ssrf import pinned_async_transport_sync
 
 _log = logging.getLogger(__name__)
 
 # Standard HTTP verbs the connector will issue (all else is rejected).
 _ALLOWED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+# FAR-458 connector-write idempotency gate: the per-op ``on_unknown`` modes and
+# default live in ONE place — ``modulo.connectors.base`` (a stdlib-only leaf
+# both this connector's config validation and the pipeline engine's gate read
+# import) so the mode set can never drift between the two. ``fail_open``
+# (default) re-fires a write whose prior delivery could not be confirmed
+# (possible duplicate, usually recoverable), ``fail_closed`` SUPPRESSES that
+# re-fire (possible silent miss; operator reconciles), and ``off`` bypasses the
+# gate entirely. Invalid values are rejected at config-parse time (never
+# silently adopted), so a typo is a loud configuration error rather than a
+# surprise.
 
 # Auth/transport headers the user/agent must never be able to override through a
 # rendered request header (FAR-408 injection guard). ``host``/``content-length``
@@ -196,7 +239,56 @@ _RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 _MAX_RETRY_WAIT = 30.0
 _DOT_INDEX = re.compile(r"\.\d+(?![A-Za-z_])")
 
+# A credential at/above this length is treated as a whole credential-like token
+# for redaction (bounded by any non-word char). Below it (short, word-like creds
+# such as ``data`` / ``admin`` / ``test``), redaction is BOUNDARY-AWARE so a
+# normal word that merely CONTAINS the substring is never mangled — only a true
+# standalone/credential-like value is replaced (FAR-518 no-over-redaction).
+_SHORT_CREDENTIAL_LEN = 8
+
 SsrfValidator = Callable[[str], Awaitable[None] | None]
+
+
+def _normalise_on_unknown(value: Any) -> str:
+    """Validate a REST ``on_unknown`` config value and return its canonical form.
+    ``None`` (absent) defaults to ``DEFAULT_ON_UNKNOWN`` (``"fail_open"`` — the
+    fail-open gate contract). Any other value is normalised (lowercased,
+    stripped) and must be one of ``ON_UNKNOWN_MODES`` — an invalid value raises
+    ``ValueError`` so a misconfigured ``on_unknown`` is a loud config error,
+    never silently adopted. Called at config-parse time (``__init__``) and
+    per-operation (``_operation_spec``) so BOTH a top-level and a
+    per-resource override are validated.
+    """
+    if value is None:
+        return DEFAULT_ON_UNKNOWN
+    v = str(value).strip().lower()
+    if v not in ON_UNKNOWN_MODES:
+        raise ValueError(f"REST on_unknown must be one of {sorted(ON_UNKNOWN_MODES)} — got {value!r}")
+    return v
+
+
+def _canonical_rate_key(base_url: str, path_template: str | None) -> str:
+    """Stable, low-cardinality rate-limit key from ``base_url`` + the STATIC path.
+
+    Prevents a templated path (``/users/{{ id }}``) or a rendered query string
+    from fragmenting the per-destination budget into one sub-budget per rendered
+    value — the whole point of a shared budget is that every value of ``id``
+    draws on the SAME pool. The key keeps the literal template braces so all
+    rendered values share one key, drops query + fragment, lowercases the host,
+    strips the default port, and normalises the trailing slash.
+    """
+    raw = base_url.rstrip("/") + "/" + (path_template or "").lstrip("/")
+    parts = urlsplit(raw)
+    scheme = (parts.scheme or "https").lower()
+    host = (parts.hostname or "").lower().rstrip(".")
+    port = parts.port
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    netloc = host if port is None else f"{host}:{port}"
+    path = parts.path or "/"
+    stripped = path.strip("/")
+    path = f"/{stripped}" if stripped else "/"
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _collect_strings(value: Any) -> list[str]:
@@ -238,8 +330,11 @@ class RESTStatusError(RESTError):
 class RESTConnectError(RESTError):
     """A transport-level failure (connect/timeout/read) — never retried here."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, *, cause_code: str = rest_metrics.CAUSE_CONNECT) -> None:
         super().__init__(message)
+        # Terminal cause-code for this transport failure (see ``rest_metrics``);
+        # the operation-scoped metric sampler classifies it deterministically.
+        self.cause_code = cause_code
 
 
 class RESTResponseTooLargeError(RESTError):
@@ -388,10 +483,10 @@ def _stub_security_guard() -> SecurityGuard:
     inject a real ``SecurityGuard``.
     """
 
-    async def validate_url(url: str) -> None:
+    async def validate_url(_url: str) -> None:
         return None
 
-    def filter_strings(values: Sequence[str], resource: str) -> None:
+    def filter_strings(_values: Sequence[str], resource: str) -> None:
         return None
 
     return SecurityGuard(validate_url=validate_url, filter_strings=filter_strings)
@@ -415,6 +510,7 @@ class RestRequest:
     next_cursor_path: str | None = None
     passthrough: bool = False
     idempotency_header: str | None = None
+    rate_limit_key: str | None = None
 
 
 class RestConnector(ConnectorBase):
@@ -424,7 +520,10 @@ class RestConnector(ConnectorBase):
     dict (see the module docstring for both shapes). ``transport`` and
     ``ssrf_validator`` are test seams — production callers pass neither.
     ``security_guard`` is the injection/SSRF port; the composition root wires the
-    production ``modulo.core`` implementation.
+    production ``modulo.core`` implementation. ``redis_client`` and ``tenant_id``
+    enable the shared per-destination budget (FAR-439): a Redis-backed atomic
+    bucket keyed per <tenant_id, host+path> is enforced across workers, else the
+    connector-local bucket is used.
     """
 
     def __init__(
@@ -438,11 +537,38 @@ class RestConnector(ConnectorBase):
         timeout: float = _DEFAULT_TIMEOUT,
         max_connections: int = 10,
         max_keepalive_connections: int = 5,
+        clock: Callable[[], float] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        random_uniform: Callable[[float, float], float] | None = None,
+        verify_tls: bool | None = None,
+        redis_client: Any = None,
+        tenant_id: str | None = None,
     ) -> None:
         self._config = config or {}
         self._creds = creds or {}
         self._transport = transport
-        self._timeout = float(timeout or _DEFAULT_TIMEOUT)
+        # ``timeout_seconds`` config overrides the ``timeout`` constructor arg
+        # (which the composition root uses to inject a global default); the
+        # connector never uses a config default that would surprise the hub.
+        raw_timeout = self._config.get("timeout_seconds", timeout)
+        self._timeout = float(raw_timeout or _DEFAULT_TIMEOUT)
+        # ``verify_tls`` config (default True) controls whether the pooled client
+        # verifies the server certificate. A self-hosted operator pointing at a
+        # private registry with a self-signed cert may disable it — the SSRF
+        # guard still blocks loopback/metadata targets regardless.
+        self._verify_tls = bool(verify_tls if verify_tls is not None else self._config.get("verify_tls", True))
+        # Single injected clock (FAR-413): ``clock`` is used for latency
+        # instrumentation and any reset-delay math; ``sleep`` is the retry
+        # backoff sleeper. Tests inject fake ``clock``/``sleep`` so timing tests
+        # run on frozen time with no wall-clock dependency (FAR-320 flake lesson).
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or asyncio.sleep
+        # ``random_uniform`` is the backoff-jitter seam: defaulting to
+        # ``random.uniform``, it produces the jitter component of each backoff
+        # delay. Injecting a deterministic callable lets timing tests assert the
+        # exact backoff schedule rather than the ±jitter range (the jitter used
+        # to defeat the deterministic sleep seam).
+        self._random = random_uniform or random.uniform
         self._ssrf_validator = ssrf_validator
         self._security_guard = security_guard or _stub_security_guard()
         self._base_url = str(self._config.get("base_url", "")).rstrip("/")
@@ -455,6 +581,19 @@ class RestConnector(ConnectorBase):
         self._max_connections = int(max_connections)
         self._max_keepalive = int(max_keepalive_connections)
         self._cached_client: httpx.AsyncClient | None = None
+
+        # FAR-458: the connector-write idempotency gate's ``on_unknown`` mode,
+        # validated at config-parse time. The top-level value is the default for
+        # every op (re-applied per-op via the ``_operation_spec`` merge); a
+        # per-resource ``operations[<resource>]`` override is also validated here
+        # (fail fast on a config error), and the effective value is resolved
+        # per-op via :meth:`on_unknown_for` / ``_operation_spec``.
+        _normalise_on_unknown(self._config.get("on_unknown"))
+        _ops = self._config.get("operations")
+        if isinstance(_ops, dict):
+            for _spec in _ops.values():
+                if isinstance(_spec, dict) and "on_unknown" in _spec:
+                    _normalise_on_unknown(_spec["on_unknown"])
 
         # FAR-411 fan-out / iterator config. ``fan_out`` is optional; when absent
         # or disabled the connector behaves exactly as before (single call).
@@ -484,11 +623,20 @@ class RestConnector(ConnectorBase):
         self._fanout_max_retries = min(self._fanout_max_retries, _MAX_SANE_RETRIES)
 
         # FAR-411 per-destination token bucket (single outbound enforcement point).
-        # Best-effort per-process: each uvicorn/SAQ worker owns its own buckets.
+        # FAR-439: shared Redis-backed limiter when a ``redis_client`` is supplied
+        # at the composition root (multi-worker/fleet enforces ONE budget per
+        # <tenant, destination>); otherwise the same per-process local bucket is
+        # used for single-worker dev, where no fleet-wide budget exists to
+        # multiply. A Redis outage on a configured limiter does NOT degrade to the
+        # local bucket — the limiter stays fail-closed (see _rate_bucket).
         raw_rate = self._config.get("rate_limit")
         self._rate_limit_config: dict[str, Any] = raw_rate if isinstance(raw_rate, dict) else {}
-        self._rate_buckets: dict[str, Any] = {}
-        self._rate_lock = asyncio.Lock()
+        self._rate_buckets: dict[str, TokenBucket] = {}
+        self._redis_client = redis_client
+        self._tenant_id = tenant_id
+        # Built lazily on first rate-limit use so a REST connector with no
+        # ``rate_limit`` config never touches Redis or allocation.
+        self._rate_limiter: PerDestinationRateLimiter | None = None
 
     # ── ConnectorBase surface ──────────────────────────────────────────────
 
@@ -497,18 +645,43 @@ class RestConnector(ConnectorBase):
         return ConnectorType.REST
 
     def _client(self) -> httpx.AsyncClient:
-        """Return the lazily-created, connection-pooled client (never closed here)."""
+        """Return the lazily-created, connection-pooled client (never closed here).
+
+        The transport is PINNED (FAR-512) to the tenant-supplied ``base_url``
+        host unless a ``transport`` test seam was injected: the SSRF guard (or
+        ``ssrf_validator`` seam) validated the rendered URL in
+        :meth:`_build_request` / :meth:`_build_health_request`, and this transport
+        connects to the validated address while keeping the original hostname for
+        TLS SNI/cert — so the connection never re-resolves the host at connect
+        time (closes the DNS-rebinding window). ``trust_env=False`` stops a proxy
+        from re-resolving the destination server-side and defeating the pin.
+        Redirects are not followed, so a hop that escapes the pin map is refused
+        by the transport (``UnpinnedHostError``) rather than silently followed.
+        """
         if self._cached_client is None:
             kwargs: dict[str, Any] = {
                 "timeout": self._timeout,
+                "verify": self._verify_tls,
                 "follow_redirects": False,
-                "limits": httpx.Limits(
-                    max_connections=self._max_connections,
-                    max_keepalive_connections=self._max_keepalive,
-                ),
             }
+            limits = httpx.Limits(
+                max_connections=self._max_connections,
+                max_keepalive_connections=self._max_keepalive,
+            )
             if self._transport is not None:
+                # Test seam: honour the injected transport (MockTransport).
                 kwargs["transport"] = self._transport
+            else:
+                # Production: pin the base_url host onto a pinned transport. The
+                # transport is pinned per validated host; REST forwards every
+                # request to the base_url host, so a single pinned host is the
+                # complete reachable set (any other host is refused fail-closed).
+                kwargs["transport"] = pinned_async_transport_sync(
+                    self._base_url,
+                    verify=self._verify_tls,
+                    trust_env=False,
+                    limits=limits,
+                )
             self._cached_client = httpx.AsyncClient(**kwargs)
         return self._cached_client
 
@@ -649,47 +822,83 @@ class RestConnector(ConnectorBase):
         context["item_index"] = index
         return context
 
+    def _get_rate_limiter(self, requests_per_second: float, burst: int) -> PerDestinationRateLimiter:
+        """Return the lazily-built per-destination limiter (one per connector).
+
+        The limiter shares ``self._rate_buckets`` as its connector-local store so
+        the per-process bucket is authoritative when no ``redis_client`` is wired
+        (single-worker dev — no fleet to multiply), and so tests that pre-seed
+        ``_rate_buckets`` keep working. When a ``redis_client`` IS wired the
+        shared limiter fails closed on a Redis outage rather than using this
+        store (see :class:`modulo.connectors._rate_bucket.PerDestinationRateLimiter`).
+        """
+        if self._rate_limiter is None:
+            self._rate_limiter = PerDestinationRateLimiter(
+                rate=requests_per_second,
+                burst=burst,
+                redis_client=self._redis_client,
+                tenant_id=self._tenant_id,
+                buckets=self._rate_buckets,
+            )
+        return self._rate_limiter
+
     async def _acquire_rate_token(self, destination: str, *, deadline_seconds: float | None = None) -> None:
-        """Consume one token from the per-destination bucket (best-effort).
+        """Consume one token from the per-destination bucket (fail-closed).
 
         Each call waits until a token is available (refill is continuous).
         *deadline_seconds*, when provided, bounds the wait: if a token cannot be
         supplied within that window a :class:`RESTRateLimitTimeoutError` is
-        raised rather than spinning forever (the per-item fan-out budget). A
-        missing/disabled ``rate_limit`` config is a no-op. This is per-process —
-        each uvicorn/SAQ worker owns its own bucket; it is NOT Redis-backed in
-        v1 (future work).
+        raised rather than spinning forever (the per-item fan-out budget). The
+        deadline is enforced DURING each ``consume`` (via ``asyncio.wait_for``),
+        not just between hops, so a slow Redis round-trip cannot overshoot it. A
+        missing/disabled ``rate_limit`` config is a no-op. When a ``redis_client``
+        is supplied the shared Redis bucket is authoritative (one budget across
+        workers) and FAILS CLOSED on a Redis outage — it never mints from an
+        uncounted per-process bucket; otherwise the per-process connector-local
+        bucket is used.
+
+        Constraint (intentional fail-loud): ``requests_per_second`` must be ``> 0``
+        and ``burst`` must be ``>= 1``. A ``0``/negative rate or ``< 1`` burst is a
+        hard ``ValueError`` at request time — it deliberately replaces the previous
+        silent "disable the limiter" behaviour (an undocumented ``rate_limit:
+        requests_per_second: 0`` is not a supported way to turn limiting off; omit
+        the ``rate_limit`` block to disable it). Configure these at save time and
+        treat a ``ValueError`` here as a misconfiguration, not a runtime surprise.
         """
         rate = self._rate_limit_config.get("requests_per_second")
         if rate is None:
             return
         requests_per_second = float(rate)
-        burst = int(self._rate_limit_config.get("burst", max(1, int(requests_per_second))))
         if requests_per_second <= 0:
-            return
+            raise ValueError(f"REST rate_limit.requests_per_second must be > 0 (got {requests_per_second})")
+        burst = int(self._rate_limit_config.get("burst", max(1, int(requests_per_second))))
+        if burst < 1:
+            raise ValueError(f"REST rate_limit.burst must be >= 1 (got {burst})")
 
-        if destination not in self._rate_buckets:
-            async with self._rate_lock:
-                if destination not in self._rate_buckets:
-                    self._rate_buckets[destination] = TokenBucket(
-                        rate=requests_per_second,
-                        burst=burst,
-                    )
-        bucket = self._rate_buckets[destination]
+        limiter = self._get_rate_limiter(requests_per_second, burst)
         deadline = time.monotonic() + max(0.0, deadline_seconds) if deadline_seconds is not None else None
-        # consume() returns False when the bucket is empty (consuming nothing);
-        # wait out a bounded refill hop and retry. The deadline bounds the wait so
-        # a saturated per-destination bucket never spins past the per-item budget.
-        while not await bucket.consume():
+        # consume() returns False when the budget is exhausted (consuming nothing);
+        # wait out a bounded refill hop and retry. The deadline bounds EACH Redis
+        # hop via wait_for, so a Redis socket timeout cannot overshoot the deadline.
+        while True:
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     raise RESTRateLimitTimeoutError(
                         f"REST rate-limit wait exceeded deadline {deadline_seconds:.1f}s for {destination}"
                     )
+                try:
+                    ok = await asyncio.wait_for(limiter.consume(destination), timeout=remaining)
+                except TimeoutError as exc:
+                    raise RESTRateLimitTimeoutError(
+                        f"REST rate-limit wait exceeded deadline {deadline_seconds:.1f}s for {destination}"
+                    ) from exc
                 hop = min(1.0 / requests_per_second, 1.0, remaining)
             else:
+                ok = await limiter.consume(destination)
                 hop = min(1.0 / requests_per_second, 1.0)
+            if ok:
+                return
             await asyncio.sleep(hop)
 
     async def _fanout_write(
@@ -791,7 +1000,23 @@ class RestConnector(ConnectorBase):
             "next_cursor_path": merged.get("next_cursor_path"),
             "passthrough": bool(merged.get("passthrough", False)),
             "idempotency_header": merged.get("idempotency_header"),
+            "on_unknown": _normalise_on_unknown(merged.get("on_unknown")),
         }
+
+    def on_unknown_for(self, resource: str) -> str:
+        """Effective ``on_unknown`` mode for a write to *resource* (FAR-458).
+
+        Resolved per-op via the same ``_operation_spec`` merge the write path
+        uses, so a top-level default applies to every op unless a per-resource
+        operation overrides it. Returns ``"fail_open"`` (the fail-open gate
+        contract) on any resolution error — a config problem is surfaced loud
+        during the actual write (``_build_request`` re-derives the spec), never
+        silently changed here. See :meth:`ConnectorBase.on_unknown_for`.
+        """
+        try:
+            return cast(str, self._operation_spec(resource, default_method="POST")["on_unknown"])
+        except ValueError:
+            return DEFAULT_ON_UNKNOWN
 
     # ── Auth ───────────────────────────────────────────────────────────────
 
@@ -822,9 +1047,18 @@ class RestConnector(ConnectorBase):
                 raise ValueError(f"REST api_key auth 'in' must be 'header' or 'query' — got {auth['in']!r}")
             if auth["in"] == "header":
                 header_name = creds.get("header_name")
+                # An empty/whitespace-only name is UNSET, not a name: an empty
+                # header name makes every request fail (httpx rejects it), so
+                # coerce it to None and fall back to the default instead.
+                if isinstance(header_name, str) and not header_name.strip():
+                    header_name = None
                 auth["header_name"] = str(header_name) if header_name is not None else "X-API-Key"
             else:
                 query_param_name = creds.get("query_param_name")
+                # Same unset treatment for the query parameter name: an empty
+                # value must never be used verbatim as a query key.
+                if isinstance(query_param_name, str) and not query_param_name.strip():
+                    query_param_name = None
                 auth["query_param_name"] = str(query_param_name) if query_param_name is not None else "api_key"
         return auth
 
@@ -850,24 +1084,96 @@ class RestConnector(ConnectorBase):
         return headers
 
     def _secret_values(self) -> list[str]:
-        """Credential strings that must be redacted from error detail.
+        """Credential strings that must be redacted from error detail and success data.
+
+        Collects the raw credential fields (username, token, api_key, password,
+        secret) PLUS the derived auth values the connector actually sends on the
+        wire, so a server that reflects the request's Authorization back (in ANY
+        auth mode) is redacted too:
+
+        * ``basic`` — the raw ``username:password``, the computed base64 blob and
+          the full ``Basic <b64>`` header value (the decodable base64 is the
+          credential-bearing artefact a reflected header would leak).
+        * ``bearer`` — the full ``Bearer <token>`` header value.
+        * ``api_key`` — the ``<header_name>: <api_key>`` / ``<param>=<api_key>``
+          wire form, in addition to the raw ``api_key`` value.
 
         Values shorter than 4 chars are ignored — redacting a 1-2 char secret
         would mangle every occurrence of the common substring it appears in.
         """
         secrets: list[str] = []
-        for key in ("token", "api_key", "password", "secret"):
+        for key in ("username", "token", "api_key", "password", "secret"):
             value = self._creds.get(key)
             if isinstance(value, str) and len(value) >= 4:
                 secrets.append(value)
-        return secrets
+        auth = self._auth
+        mode = auth.get("mode")
+        if mode == "basic":
+            raw = f"{auth.get('username', '')}:{auth.get('password', '')}"
+            b64 = base64.b64encode(raw.encode()).decode()
+            if len(raw) >= 4:
+                secrets.append(raw)
+            if len(b64) >= 4:
+                secrets.extend([b64, f"Basic {b64}"])
+        elif mode == "bearer":
+            token = auth.get("token")
+            if token:
+                secrets.append(f"Bearer {token}")
+        elif mode == "api_key":
+            api_key = auth.get("api_key")
+            if api_key:
+                if auth.get("in") == "header":
+                    secrets.append(f"{auth.get('header_name', '')}: {api_key}")
+                else:
+                    secrets.append(f"{auth.get('query_param_name', '')}={api_key}")
+        # Deduplicate while preserving order (raw value + derived forms can overlap).
+        return list(dict.fromkeys(secrets))
 
     def _redact(self, text: str) -> str:
-        """Strip credential values from *text* so error detail never echoes secrets."""
+        """Strip credential values from *text* so error detail never echoes secrets.
+
+        Boundary-aware: a credential is only replaced where it appears as a
+        standalone/credential-like token — a full string equal to the secret, a
+        header/query value, or a ``key: secret`` fragment — NEVER as a substring
+        inside a normal word. Short, word-like credentials (``data``, ``admin``,
+        ``test``, …) are replaced only when flanked by hard value delimiters
+        (quote/colon/equals/comma/braces), NOT by word characters, hyphens, dots
+        or whitespace — so ``{"status": "data synced"}`` and ``data-point`` are
+        left intact, while a reflected ``{"token": "data"}`` IS redacted
+        (FAR-518 no over-redaction).
+        """
         redacted = text
         for secret in self._secret_values():
-            redacted = redacted.replace(secret, "***")
+            if not secret:
+                continue
+            if len(secret) >= _SHORT_CREDENTIAL_LEN:
+                pattern = rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])"
+            else:
+                pattern = rf"(?<![A-Za-z0-9_\-.\s]){re.escape(secret)}(?![A-Za-z0-9_\-.\s])"
+            candidate = re.sub(pattern, "***", redacted)
+            if candidate != redacted:
+                redacted = candidate
+                rest_metrics.record_redaction_event()
         return redacted
+
+    def _redact_value(self, value: Any) -> Any:
+        """Recursively redact credential values from *value* (dicts, lists, scalars).
+
+        Value-based redaction that mirrors :meth:`_redact` — only actual
+        credential strings are stripped, so legitimate response content that never
+        reflects a credential is left untouched (no over-redaction). Used to scrub
+        success-path result data (``_write_result`` records, ``_transform``
+        metadata/records, ``_passthrough_record`` header/body values) so a server
+        that echoes the request's auth back into a response body or header does not
+        leak the credential into the persisted run result / node output.
+        """
+        if isinstance(value, str):
+            return self._redact(value)
+        if isinstance(value, dict):
+            return {k: self._redact_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._redact_value(v) for v in value]
+        return value
 
     def _item_summary(self, item: Any) -> str:
         """A bounded, redacted string summary of a fan-out item for outcome records.
@@ -993,6 +1299,7 @@ class RestConnector(ConnectorBase):
             next_cursor_path=spec["next_cursor_path"],
             passthrough=spec["passthrough"],
             idempotency_header=spec["idempotency_header"],
+            rate_limit_key=_canonical_rate_key(self._base_url, path),
         )
 
     async def _build_health_request(self) -> RestRequest:
@@ -1000,7 +1307,14 @@ class RestConnector(ConnectorBase):
         path = self._config.get("path")
         url = self._base_url + (str(self._render(path, {})) if path else "")
         await self._validate_target_url(url)
-        return RestRequest(method="GET", url=url, headers={}, params={}, body=None)
+        return RestRequest(
+            method="GET",
+            url=url,
+            headers={},
+            params={},
+            body=None,
+            rate_limit_key=_canonical_rate_key(self._base_url, path),
+        )
 
     async def _validate_target_url(self, url: str) -> None:
         """Enforce the scheme/host allowlist and SSRF safety on *url*.
@@ -1028,7 +1342,11 @@ class RestConnector(ConnectorBase):
             if inspect.isawaitable(result):
                 await result
             return
-        await self._security_guard.validate_url(url)
+        try:
+            await self._security_guard.validate_url(url)
+        except ValueError:
+            rest_metrics.record_ssrf_blocked(self._host(url))
+            raise
 
     # ── Send + transform ───────────────────────────────────────────────────
 
@@ -1065,6 +1383,15 @@ class RestConnector(ConnectorBase):
         applies. ``max_retries``, when provided (the fan-out path passes
         ``fan_out.max_retries``), is the retry budget in RETRIES; the loop runs
         ``max_retries + 1`` attempts (clamped to a sane upper bound).
+
+        The latency/outcome metrics are recorded HERE, once per logical operation —
+        a single duration spanning all retry attempts and a single terminal
+        outcome (success, or the cause of the final failure that escaped the
+        retry budget). A failed-then-succeeded operation therefore emits exactly
+        one success sample rather than one per attempt, which would skew
+        success-rate/p95. ``_perform_request`` is a single attempt and records
+        nothing, so the operation-scoped sample is recorded by ``_perform_with_metrics``
+        (non-retryable) or at the terminal outcome of ``_send_retryable``.
         """
         retries = _MAX_RETRIES - 1 if max_retries is None else max_retries
         retries = max(0, min(retries, _MAX_SANE_RETRIES))
@@ -1072,10 +1399,19 @@ class RestConnector(ConnectorBase):
         # timeout so a saturated destination never spins past the per-item budget.
         rate_wait_timeout = request_timeout if request_timeout is not None else self._timeout
         kwargs = self._request_kwargs(request)
+        host = self._host(request.url)
+        start = self._clock()
+
         if not self._is_retryable(request):
-            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
-            return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
-        return await self._send_retryable(client, request, kwargs, rate_wait_timeout, request_timeout, retries + 1)
+            await self._acquire_rate_token(
+                request.rate_limit_key or str(request.url), deadline_seconds=rate_wait_timeout
+            )
+            return await self._perform_with_metrics(
+                client, request, kwargs, host, start, request_timeout=request_timeout
+            )
+        return await self._send_retryable(
+            client, request, kwargs, rate_wait_timeout, request_timeout, retries + 1, host, start
+        )
 
     async def _send_retryable(
         self,
@@ -1085,31 +1421,80 @@ class RestConnector(ConnectorBase):
         rate_wait_timeout: float | None,
         request_timeout: float | None,
         attempts: int,
+        host: str,
+        start: float,
     ) -> tuple[httpx.Response, str]:
         """Retry loop for idempotent verbs — see :meth:`_send` for the contract.
 
-        A token is acquired before every wire attempt so each retry is metered,
-        and a bounded backoff is applied between attempts.
+        A token is acquired before every wire attempt so each retry is metered, a
+        bounded backoff is applied between attempts, and one operation-scoped
+        latency/outcome sample is recorded at the terminal outcome (retries
+        included; ``_perform_request`` records nothing).
         """
         last_delay = 0.0
+        retry_reason = "http_429"
         for attempt in range(attempts):
-            await asyncio.sleep(last_delay)
-            await self._acquire_rate_token(self._base_url, deadline_seconds=rate_wait_timeout)
+            if attempt:
+                await self._sleep(last_delay)
+                rest_metrics.record_retry(retry_reason)
+            await self._acquire_rate_token(
+                request.rate_limit_key or str(request.url), deadline_seconds=rate_wait_timeout
+            )
             try:
-                return await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
+                resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
             except RESTStatusError as exc:
+                retry_reason = "http_429" if exc.status_code == 429 else "http_5xx"
                 if not self._is_status_retryable(exc, attempt, attempts):
+                    self._record_operation(start, host, request, rest_metrics.classify_status(exc.status_code))
                     raise
                 last_delay = self._retry_delay(exc, attempt)
-            except RESTConnectError:
+                continue
+            except RESTConnectError as exc:
+                retry_reason = "transport"
                 if attempt == attempts - 1:
+                    self._record_operation(start, host, request, exc.cause_code)
                     raise
                 last_delay = self._backoff(attempt)
+                continue
+            except RESTResponseTooLargeError:
+                self._record_operation(start, host, request, rest_metrics.CAUSE_TOO_LARGE)
+                raise
+            self._record_operation(start, host, request, rest_metrics.SUCCESS_OUTCOME)
+            return resp, body_text
         raise AssertionError("unreachable")  # pragma: no cover
 
     def _is_status_retryable(self, exc: RESTStatusError, attempt: int, attempts: int) -> bool:
         """Whether a ``RESTStatusError`` should trigger another attempt."""
         return attempt != attempts - 1 and exc.status_code in _RETRYABLE_STATUS
+
+    async def _perform_with_metrics(
+        self,
+        client: httpx.AsyncClient,
+        request: RestRequest,
+        kwargs: dict[str, Any],
+        host: str,
+        start: float,
+        request_timeout: float | None = None,
+    ) -> tuple[httpx.Response, str]:
+        """Run a single (non-retryable) attempt, recording one sample at its terminal outcome."""
+        try:
+            resp, body_text = await self._perform_request(client, request, kwargs, request_timeout=request_timeout)
+        except RESTStatusError as exc:
+            self._record_operation(start, host, request, rest_metrics.classify_status(exc.status_code))
+            raise
+        except RESTConnectError as exc:
+            self._record_operation(start, host, request, exc.cause_code)
+            raise
+        except RESTResponseTooLargeError:
+            self._record_operation(start, host, request, rest_metrics.CAUSE_TOO_LARGE)
+            raise
+        self._record_operation(start, host, request, rest_metrics.SUCCESS_OUTCOME)
+        return resp, body_text
+
+    def _record_operation(self, start: float, host: str, request: RestRequest, outcome: str) -> None:
+        """Record one operation-scoped latency + outcome sample (retries included)."""
+        duration = self._clock() - start
+        rest_metrics.record_request_duration(duration, host=host, method=request.method, outcome=outcome)
 
     def _request_kwargs(self, request: RestRequest) -> dict[str, Any]:
         """Build the httpx kwargs, injecting auth headers + idempotency key once."""
@@ -1150,7 +1535,12 @@ class RestConnector(ConnectorBase):
         kwargs: dict[str, Any],
         request_timeout: float | None = None,
     ) -> tuple[httpx.Response, str]:
-        """A single HTTP attempt: stream, cap the body, then classify the status."""
+        """A single HTTP attempt: stream, cap the body, then classify the status.
+
+        This performs exactly ONE attempt and records NO metrics — the
+        operation-scoped latency/outcome sample is recorded by ``_perform_with_metrics``
+        in ``_send`` at the terminal outcome (see that docstring).
+        """
         body_text = ""
         try:
             stream_kwargs: dict[str, Any] = dict(kwargs)
@@ -1160,7 +1550,8 @@ class RestConnector(ConnectorBase):
                 body_text = await self._consume_body(resp)
         except httpx.HTTPError as exc:
             raise RESTConnectError(
-                self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}")
+                self._redact(f"REST transport error: {request.method} {request.url} — {type(exc).__name__}: {exc}"),
+                cause_code=self._classify_transport_error(exc),
             ) from exc
         if resp.status_code >= 300:
             raise RESTStatusError(
@@ -1170,6 +1561,18 @@ class RestConnector(ConnectorBase):
                 retry_after=parse_retry_after(resp),
             )
         return resp, body_text
+
+    def _classify_transport_error(self, exc: httpx.HTTPError) -> str:
+        if isinstance(exc, httpx.TimeoutException):
+            return rest_metrics.CAUSE_TIMEOUT
+        return rest_metrics.CAUSE_CONNECT
+
+    @staticmethod
+    def _host(url: str) -> str:
+        try:
+            return urlparse(url).hostname or ""
+        except Exception:
+            return ""
 
     async def _consume_body(self, resp: httpx.Response) -> str:
         """Read the body, aborting past ``max_response_size`` (never unbounded)."""
@@ -1188,19 +1591,22 @@ class RestConnector(ConnectorBase):
             chunks.append(chunk)
         return b"".join(chunks).decode(resp.encoding or "utf-8", errors="replace")
 
-    @staticmethod
-    def _backoff(attempt: int) -> float:
-        """Exponential backoff with jitter (0.5s, 1.0s, 2.0s)."""
-        base = 0.5 * (2**attempt)
-        return float(base + random.uniform(0, 0.25))  # noqa: S311 — jitter, not a security secret
+    def _backoff(self, attempt: int) -> float:
+        """Exponential backoff with jitter (0.5s, 1.0s, 2.0s).
 
-    @staticmethod
-    def _retry_delay(exc: RESTStatusError, attempt: int) -> float:
+        The jitter comes from the injected ``random_uniform`` seam (``self._random``,
+        defaulting to ``random.uniform``) so timing tests can assert the exact
+        delay. The core delay is deterministic (``0.5 * 2**attempt``).
+        """
+        base = 0.5 * (2**attempt)
+        return float(base + self._random(0, 0.25))
+
+    def _retry_delay(self, exc: RESTStatusError, attempt: int) -> float:
         if exc.retry_after is not None:
             # Cap an untrusted Retry-After: a server can say 3600 and we must not
             # sleep ~1h per retry. The cap bounds every retry hop (default 30s).
             return min(max(0.0, exc.retry_after), _MAX_RETRY_WAIT)
-        return RestConnector._backoff(attempt)
+        return self._backoff(attempt)
 
     def _status_detail(self, resp: httpx.Response, request: RestRequest, body_text: str) -> str:
         location = resp.headers.get("location", "")
@@ -1255,11 +1661,16 @@ class RestConnector(ConnectorBase):
         retry_after = parse_retry_after(resp)
         if retry_after is not None:
             metadata["retry_after"] = retry_after
+        # Scrub success-path data so a read response that reflects the request's
+        # auth (a bearer token in the body, a query-secret URL in metadata) is
+        # redacted from the persisted run result / node output.
+        redacted_records = self._redact_value(records)
+        redacted_cursor = self._redact(next_cursor) if next_cursor is not None else None
         return ConnectorResult(
-            records=records,
-            next_cursor=next_cursor,
-            total=len(records),
-            metadata=metadata,
+            records=redacted_records,
+            next_cursor=redacted_cursor,
+            total=len(redacted_records),
+            metadata=self._redact_value(metadata),
         )
 
     def _passthrough_record(
@@ -1268,12 +1679,20 @@ class RestConnector(ConnectorBase):
         body_text: str,
         content_type: str,
     ) -> list[dict[str, Any]]:
+        """Wrap the raw body + response headers as a single passthrough record.
+
+        The body and header values are redacted before returning so a passthrough
+        response that reflects the request's auth (the Authorization value echoed
+        back in a header, a credential in the body) is redacted from the persisted
+        run result / node output. Field NAMES are preserved — only actual
+        credential VALUES are stripped (value-based, mirroring ``_redact``).
+        """
         return [
             {
-                "body": body_text,
-                "content_type": content_type,
+                "body": self._redact(body_text),
+                "content_type": self._redact(content_type),
                 "status_code": resp.status_code,
-                "headers": dict(resp.headers.items()),
+                "headers": self._redact_value(dict(resp.headers.items())),
             }
         ]
 
@@ -1300,18 +1719,29 @@ class RestConnector(ConnectorBase):
         return str(value) if isinstance(value, str) and value else None
 
     def _write_result(self, resp: httpx.Response, body_text: str) -> dict[str, Any]:
-        """Map a REST write response onto a JSON-serialisable result dict."""
+        """Map a REST write response onto a JSON-serialisable result dict.
+
+        The result is run through :meth:`_redact_value` before returning so a
+        write response that reflects the request's auth (a bearer token echoed in
+        the JSON body, a credential in a header) is redacted from the persisted
+        run result / node output.
+        """
         if body_text:
             try:
                 parsed = json.loads(body_text)
             except json.JSONDecodeError:
                 parsed = None
             if isinstance(parsed, dict):
-                return parsed
+                return cast(dict[str, Any], self._redact_value(parsed))
             if isinstance(parsed, list):
-                return {"records": parsed}
-        return {
-            "status_code": resp.status_code,
-            "body": body_text,
-            "content_type": resp.headers.get("content-type", ""),
-        }
+                return cast(dict[str, Any], self._redact_value({"records": parsed}))
+        return cast(
+            dict[str, Any],
+            self._redact_value(
+                {
+                    "status_code": resp.status_code,
+                    "body": body_text,
+                    "content_type": resp.headers.get("content-type", ""),
+                }
+            ),
+        )

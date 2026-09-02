@@ -55,16 +55,78 @@
           {{ loading ? $t('common.signing_in') : $t('common.sign_in') }}
         </Button>
       </form>
+
+      <div v-if="ssoState === 'available'" class="space-y-3" data-testid="login-sso-section">
+        <div class="flex items-center gap-3 text-xs text-muted-foreground">
+          <span class="h-px flex-1 bg-border" />
+          <span>{{ $t('views.LoginView.or_continue_with') }}</span>
+          <span class="h-px flex-1 bg-border" />
+        </div>
+        <div class="space-y-2">
+          <a
+            v-for="provider in oidcProviders"
+            :key="provider.provider_id"
+            :href="`/api/v1/auth/oidc/${provider.provider_id}/login`"
+            class="flex w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            :data-testid="`login-sso-oidc-${provider.provider_id}`"
+          >
+            {{ provider.provider_id }}
+          </a>
+          <a
+            v-if="samlEnabled"
+            href="/api/v1/auth/saml/login"
+            class="flex w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            data-testid="login-sso-saml"
+          >
+            SAML
+          </a>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import Button from 'primevue/button'
 import { useMutation } from '../composables/useMutation'
 import { setAccessToken, setRefreshToken } from '../lib/api/client'
+import { setMustChangePassword } from '../lib/mustChangePassword'
+
+interface SsoProviderInfo {
+  provider_id: string
+}
+
+interface SsoProvidersResponse {
+  oidc: SsoProviderInfo[]
+  saml: boolean
+}
+
+// SSO is a licensed (team-tier) surface; the login page renders its provider
+// buttons only when the instance advertises configured providers. A 402 (feature
+// not available) or any fetch failure keeps the page on password login.
+const ssoState = ref<'unknown' | 'available' | 'unavailable'>('unknown')
+const oidcProviders = ref<SsoProviderInfo[]>([])
+const samlEnabled = ref(false)
+
+async function discoverSsoProviders() {
+  try {
+    const res = await fetch('/api/v1/auth/sso/providers')
+    if (!res.ok) {
+      ssoState.value = 'unavailable'
+      return
+    }
+    const data = (await res.json()) as SsoProvidersResponse
+    oidcProviders.value = data.oidc ?? []
+    samlEnabled.value = Boolean(data.saml)
+    ssoState.value = oidcProviders.value.length > 0 || samlEnabled.value ? 'available' : 'unavailable'
+  } catch {
+    ssoState.value = 'unavailable'
+  }
+}
+
+onMounted(discoverSsoProviders)
 
 const router = useRouter()
 const email = ref('')
@@ -83,6 +145,10 @@ const { loading, error, mutate: login } = useMutation(async () => {
   const data = await res.json()
   setAccessToken(data.access_token)
   if (data.refresh_token) setRefreshToken(data.refresh_token)
+  // FAR-460: sync the must-change-password gate from every manual login
+  // response — true forces the full-screen change-password view; false clears
+  // any stale flag so a different account is never trapped behind the gate.
+  setMustChangePassword(data.must_change_password === true)
   router.push('/')
   return data
 })

@@ -6,11 +6,11 @@ import logging
 import uuid
 from copy import deepcopy
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from jsonschema import Draft202012Validator, ValidationError  # type: ignore[import-untyped]
-from jsonschema.exceptions import SchemaError as JsSchemaError  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator, ValidationError
+from jsonschema.exceptions import SchemaError as JsSchemaError
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, ProgrammingError, SQLAlchemyError
@@ -20,7 +20,7 @@ from modulo.api.constants import MSG_RESOURCE_ALREADY_EXISTS, MSG_UNEXPECTED_ERR
 from modulo.api.db_error_handling import handle_db_errors
 from modulo.api.dependencies import get_db_session, require_feature, require_permission
 from modulo.auth.jwt import TenantPrincipal
-from modulo.core.audit_logger import append_audit_event
+from modulo.core.audit_logger import append_audit_event_isolated
 from modulo.core.connector_hub import ConnectorHub
 from modulo.core.model_backend_hub import ModelBackendHub
 from modulo.core.schema_registry import (
@@ -60,11 +60,26 @@ _MSG_SCHEMA_MANAGEMENT_TEMPORARILY_UNAVAILABLE = "Schema management is temporari
 _CODE_SCHEMA_CREATE = "schema.create"
 _MSG_SCHEMA_NOT_FOUND = "Schema not found"
 _CODE_SCHEMA_UPDATE = "schema.update"
+_SCHEMA_ID_PATH = "/{schema_id}"
 
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/schemas", tags=["schemas"])
+
+
+async def _assert_owns_schema(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> "Schema":
+    """Load a schema by id and assert the caller's org owns it.
+
+    The application session is RLS-enforced (the app role is not BYPASSRLS), but
+    we assert ownership explicitly to give consistent 404s on non-Postgres
+    backends that rely on the ORM tenant filter. Raises 404 (not 403) to avoid
+    leaking existence.
+    """
+    schema = await get_schema(session, schema_id)
+    if schema is None or schema.organisation_id != principal.organisation_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+    return schema
 
 
 # ---------------------------------------------------------------------------
@@ -154,10 +169,10 @@ class SchemaVersionListResponse(BaseModel):
 @router.get("", responses={401: {"description": "Unauthorized"}})
 @handle_db_errors("schemas.list_schemas_endpoint")
 async def list_schemas_endpoint(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    folder_id: uuid.UUID | None = Query(default=None),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+    folder_id: Annotated[uuid.UUID | None, Query()] = None,
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaListResponse:
     try:
@@ -203,7 +218,7 @@ async def list_schemas_endpoint(
 @router.get("/counts")
 @handle_db_errors("schemas.counts_endpoint")
 async def schema_counts_endpoint(
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaCountsResponse:
     """Return total schema count and per-folder counts for the caller's org.
@@ -246,7 +261,7 @@ async def schema_counts_endpoint(
 @handle_db_errors("schemas.create_schema_endpoint")
 async def create_schema_endpoint(
     req: SchemaCreate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_CREATE),
 ) -> SchemaResponse:
     try:
@@ -300,11 +315,11 @@ async def create_schema_endpoint(
     return SchemaResponse.model_validate(schema)
 
 
-@router.get("/{schema_id}")
+@router.get(_SCHEMA_ID_PATH)
 @handle_db_errors("schemas.get_schema_endpoint")
 async def get_schema_endpoint(
     schema_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaResponse:
     try:
@@ -339,23 +354,24 @@ async def get_schema_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if schema is None:
+    if schema is None or schema.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
     return SchemaResponse.model_validate(schema)
 
 
-@router.patch("/{schema_id}")
+@router.patch(_SCHEMA_ID_PATH)
 @handle_db_errors("schemas.update_schema_endpoint")
 async def update_schema_endpoint(
     schema_id: uuid.UUID,
     req: SchemaUpdate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_UPDATE),
 ) -> SchemaResponse:
     updates = req.model_dump(exclude_unset=True)
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await update_schema(session, schema_id, updates)
     except IntegrityError:
         logger.exception("schemas.update_integrity")
@@ -394,13 +410,14 @@ async def update_schema_endpoint(
 @handle_db_errors("schemas.deprecate_schema_endpoint")
 async def deprecate_schema_endpoint(
     schema_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_UPDATE),
 ) -> SchemaResponse:
     """Mark a schema as deprecated."""
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
+            await _assert_owns_schema(session, schema_id, principal)
             schema = await deprecate_schema(session, schema_id)
     except IntegrityError:
         logger.exception("schemas.deprecate_schema_endpoint")
@@ -449,13 +466,14 @@ class SchemaFolderMoveRequest(BaseModel):
 async def move_schema_to_folder_endpoint(
     schema_id: uuid.UUID,
     req: SchemaFolderMoveRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_UPDATE),
 ) -> SchemaResponse:
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            schema = await move_schema_to_folder(session, schema_id, req.folder_id)
+            await _assert_owns_schema(session, schema_id, principal)
+            schema = await move_schema_to_folder(session, schema_id, req.folder_id, principal.organisation_id)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -472,18 +490,19 @@ async def move_schema_to_folder_endpoint(
     return SchemaResponse.model_validate(schema)
 
 
-@router.delete("/{schema_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(_SCHEMA_ID_PATH, status_code=status.HTTP_204_NO_CONTENT)
 @handle_db_errors("schemas.delete_schema_endpoint")
 async def delete_schema_endpoint(
     schema_id: uuid.UUID,
-    force: bool = Query(False),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    force: Annotated[bool, Query()] = False,
     principal: TenantPrincipal = require_permission("schema.delete"),
 ) -> None:
     try:
         try:
             async with session.begin():
                 await set_rls_org(session, principal.organisation_id)
+                await _assert_owns_schema(session, schema_id, principal)
                 deleted = await delete_schema(session, schema_id, force=force)
         except SchemaDeletionProtectedError as exc:
             raise HTTPException(
@@ -533,16 +552,16 @@ async def delete_schema_endpoint(
 )
 async def list_schema_versions_endpoint(
     schema_id: uuid.UUID,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaVersionListResponse:
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
             schema = await get_schema(session, schema_id)
-            if schema is None:
+            if schema is None or schema.organisation_id != principal.organisation_id:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
             result = await list_schema_versions(session, schema_id, page=page, page_size=page_size)
     except IntegrityError:
@@ -589,15 +608,13 @@ async def list_schema_versions_endpoint(
 async def create_schema_version_endpoint(
     schema_id: uuid.UUID,
     req: SchemaVersionCreate,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_CREATE),
 ) -> SchemaVersionResponse:
     try:
         async with session.begin():
             await set_rls_org(session, principal.organisation_id)
-            schema = await get_schema(session, schema_id)
-            if schema is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+            await _assert_owns_schema(session, schema_id, principal)
             sv = await create_schema_version(
                 session,
                 org_id=principal.organisation_id,
@@ -646,7 +663,7 @@ async def create_schema_version_endpoint(
 async def get_schema_version_endpoint(
     schema_id: uuid.UUID,
     version: str,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaVersionResponse:
     try:
@@ -681,7 +698,7 @@ async def get_schema_version_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
-    if sv is None:
+    if sv is None or sv.organisation_id != principal.organisation_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema version not found")
     return SchemaVersionResponse.model_validate(sv)
 
@@ -704,11 +721,24 @@ class SchemaFieldListResponse(BaseModel):
     fields: list[SchemaFieldResponse]
 
 
+async def _load_latest_definition(session: AsyncSession, schema_id: uuid.UUID, principal: TenantPrincipal) -> Any:
+    """Load the latest version of a schema, asserting the caller owns it."""
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        schema = await get_schema(session, schema_id)
+        if schema is None or schema.organisation_id != principal.organisation_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
+        sv = await _get_latest_version(session, schema_id)
+        if sv is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema has no versions")
+    return sv
+
+
 @router.get("/{schema_id}/fields")
 @handle_db_errors("schemas.list_schema_fields_endpoint")
 async def list_schema_fields_endpoint(
     schema_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> SchemaFieldListResponse:
     """Return the field list for the latest version of a schema.
@@ -718,14 +748,7 @@ async def list_schema_fields_endpoint(
     name, type, description, and required status.
     """
     try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            schema = await get_schema(session, schema_id)
-            if schema is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_MSG_SCHEMA_NOT_FOUND)
-            sv = await _get_latest_version(session, schema_id)
-            if sv is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schema has no versions")
+        sv = await _load_latest_definition(session, schema_id, principal)
     except IntegrityError:
         logger.exception("schemas.list_schema_fields_endpoint")
         raise HTTPException(
@@ -797,41 +820,30 @@ class SchemaInferResponse(BaseModel):
     rare_fields: list[str] = Field(default_factory=list)
 
 
-def _safe_create_secrets_backend(settings: Settings, log_key: str, error_detail: str) -> Any:
-    """Create the secrets backend, mapping failures to a 500 HTTP response."""
-    try:
-        return create_secrets_backend(fernet_key=settings.fernet_key)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception(log_key)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=error_detail,
-        ) from None
-
-
-async def _infer_definition(
+async def _sample_connector_records(
+    settings: Settings,
     ci: Any,
     req: SchemaInferRequest,
-    secrets_backend: Any,
-    mbs: Any,
-) -> tuple[list[Any], Any, dict[str, Any]]:
-    """Sample connector records and infer a JSON Schema via the LLM backend."""
+    session: AsyncSession,
+) -> list[dict[str, Any]]:
+    """Sample connector data, failing open with informative HTTP errors."""
+    secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
     async with ConnectorHub(secrets_backend=secrets_backend) as ch:
-        try:
-            await ch.initialise([ci])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.infer.connector_init_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to initialise connector for sampling.",
-            ) from None
+        async with session.begin():
+            await set_rls_org(session, ci.organisation_id)
+            try:
+                await ch.initialise([ci])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("schemas.infer.connector_init_failed")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Failed to initialise connector for sampling.",
+                ) from None
         try:
             async with asyncio.timeout(30.0):
-                records = await ch.sample(
+                return await ch.sample(
                     connector_id=req.connector_instance_id,
                     resource=req.sample_query.resource,
                     filters=req.sample_query.filters,
@@ -849,35 +861,88 @@ async def _infer_definition(
                 detail="Failed to sample connector data.",
             ) from None
 
-    async with ModelBackendHub() as mh:
-        try:
-            await mh.initialise(mbs.items, secrets_backend=secrets_backend)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.infer.backend_init_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to initialise model backend for inference.",
-            ) from None
-        if not mh.backend_ids:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No model backends available for inference.",
-            )
-        first_backend_id = next(iter(mh.backend_ids))
-        try:
-            backend = await mh.get(first_backend_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.infer.backend_get_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Selected model backend is unavailable.",
-            ) from None
 
-        service = SchemaInferenceService(backend, connector_type=ci.connector_type_id)
+async def _resolve_model_backend(
+    mh: Any,
+    mbs: Any,
+    secrets_backend: Any,
+    *,
+    session: AsyncSession,
+    organisation_id: uuid.UUID,
+    init_log: str,
+    init_detail: str,
+    empty_detail: str,
+    get_log: str,
+    get_detail: str,
+) -> tuple[Any, uuid.UUID]:
+    """Initialise a ``ModelBackendHub`` and return ``(backend, backend_id)``.
+
+    Maps initialisation and selection failures to informative HTTP errors so
+    schema inference and generation routes stay thin.
+
+    The model-backend API keys live in the secrets table and are decrypted with
+    the org-scoped RLS context, so ``mh.initialise`` must run inside a DB
+    transaction with ``app.organisation_id`` set — otherwise ``get_secret``
+    raises ``RuntimeError('no DB session')`` before the credentials fallback
+    can apply (turning every model-backend init into a blanket 502).
+    """
+    try:
+        async with session.begin():
+            await set_rls_org(session, organisation_id)
+            await mh.initialise(mbs.items, secrets_backend=secrets_backend)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(init_log)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=init_detail,
+        ) from None
+    if not mh.backend_ids:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=empty_detail,
+        )
+    backend_id = next(iter(mh.backend_ids))
+    try:
+        backend = await mh.get(backend_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(get_log)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=get_detail,
+        ) from None
+    return backend, backend_id
+
+
+async def _infer_definition(
+    settings: Settings,
+    mbs: Any,
+    records: list[dict[str, Any]],
+    connector_type: str,
+    *,
+    session: AsyncSession,
+    organisation_id: uuid.UUID,
+) -> tuple[dict[str, Any], uuid.UUID]:
+    """Run LLM schema inference and return ``(definition_json, backend_id)``."""
+    secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
+    async with ModelBackendHub() as mh:
+        backend, first_backend_id = await _resolve_model_backend(
+            mh,
+            mbs,
+            secrets_backend,
+            session=session,
+            organisation_id=organisation_id,
+            init_log="schemas.infer.backend_init_failed",
+            init_detail="Failed to initialise model backend for inference.",
+            empty_detail="No model backends available for inference.",
+            get_log="schemas.infer.backend_get_failed",
+            get_detail="Selected model backend is unavailable.",
+        )
+
+        service = SchemaInferenceService(backend, connector_type=connector_type)
         try:
             definition_json = await service.infer(records)
         except SchemaInferenceError as exc:
@@ -885,52 +950,53 @@ async def _infer_definition(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Schema inference failed: {exc}",
             ) from exc
-    return records, first_backend_id, definition_json
+    return definition_json, first_backend_id
 
 
-async def _append_inference_audit(
-    session: AsyncSession,
-    principal: TenantPrincipal,
-    req: SchemaInferRequest,
-    ci: Any,
-    records: list[Any],
-    first_backend_id: Any,
-) -> None:
-    try:
-        async with session.begin():
-            await append_audit_event(
-                session,
-                org_id=principal.organisation_id,
-                event_type="schema_inference_completed",
-                actor_user_id=principal.account_id,
-                resource_type="connector_instance",
-                resource_id=req.connector_instance_id,
-                payload_json={
-                    "connector_name": ci.name,
-                    "connector_type": ci.connector_type_id,
-                    "resource": req.sample_query.resource,
-                    "sample_count": len(records),
-                    "model_backend_id": str(first_backend_id),
-                },
+async def _resolve_infer_context(
+    session: AsyncSession, principal: TenantPrincipal, req: SchemaInferRequest
+) -> tuple[Any, Any]:
+    """Load and validate the connector + model backends for schema inference."""
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        await set_rls_user_context(session, principal.account_id, principal.org_role)
+
+        ci = await get_connector_instance(session, req.connector_instance_id)
+        if ci is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Connector instance not found",
             )
-    except ProgrammingError:
-        logger.exception("schemas.infer_schema_endpoint")
-        logger.warning("Audit event not recorded — schema inference table missing")
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.infer.audit_failed")
+
+        # Connector-types currently supported for schema inference. Single
+        # source of truth lives in `schema_registry/inference.py` and is
+        # derived from the `ConnectorType` enum + the connector-type-aware
+        # field-extraction categories (PRD §8.16), so this list can't drift
+        # from the category map or the enum.
+        supported_inference_types = SUPPORTED_INFERENCE_TYPES
+        if ci.connector_type_id not in supported_inference_types:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Connector type '{ci.connector_type_id}' does not support schema inference. "
+                f"Supported types: {', '.join(sorted(supported_inference_types))}",
+            )
+
+        mbs = await list_model_backends(session, org_id=principal.organisation_id, page_size=1)
+        if not mbs.items:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No model backends configured; cannot perform inference",
+            )
+        return ci, mbs
 
 
 @router.post("/infer")
 @handle_db_errors("schemas.infer_schema_endpoint")
 async def infer_schema_endpoint(
     req: SchemaInferRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
     principal: TenantPrincipal = require_permission("schema.infer"),
-    settings: Settings = Depends(get_settings),
 ) -> SchemaInferResponse:
     """Sample data from a connector and infer a JSON Schema via LLM.
 
@@ -938,36 +1004,7 @@ async def infer_schema_endpoint(
     save via the standard POST /api/v1/schemas endpoint.
     """
     try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            await set_rls_user_context(session, principal.account_id, principal.org_role)
-
-            ci = await get_connector_instance(session, req.connector_instance_id)
-            if ci is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Connector instance not found",
-                )
-
-            # Connector-types currently supported for schema inference. Single
-            # source of truth lives in `schema_registry/inference.py` and is
-            # derived from the `ConnectorType` enum + the connector-type-aware
-            # field-extraction categories (PRD §8.16), so this list can't drift
-            # from the category map or the enum.
-            supported_inference_types = SUPPORTED_INFERENCE_TYPES
-            if ci.connector_type_id not in supported_inference_types:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Connector type '{ci.connector_type_id}' does not support schema inference. "
-                    f"Supported types: {', '.join(sorted(supported_inference_types))}",
-                )
-
-            mbs = await list_model_backends(session, org_id=principal.organisation_id, page_size=1)
-            if not mbs.items:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No model backends configured; cannot perform inference",
-                )
+        ci, mbs = await _resolve_infer_context(session, principal, req)
     except IntegrityError:
         logger.exception("schemas.infer_schema_endpoint")
         raise HTTPException(
@@ -997,26 +1034,39 @@ async def infer_schema_endpoint(
             detail="Schema inference failed due to an unexpected error.",
         ) from None
 
-    secrets_backend = _safe_create_secrets_backend(
+    records = await _sample_connector_records(settings, ci, req, session)
+    definition_json, first_backend_id = await _infer_definition(
         settings,
-        "schemas.infer.secrets_backend",
-        "Failed to initialize secrets backend for schema inference.",
+        mbs,
+        records,
+        connector_type=ci.connector_type_id,
+        session=session,
+        organisation_id=principal.organisation_id,
     )
 
-    records, first_backend_id, definition_json = await _infer_definition(ci, req, secrets_backend, mbs)
-
-    suggestion_name = f"Inferred from {ci.name}"
-    suggestion_description = (
-        f"Auto-inferred schema from {ci.name} ({req.sample_query.resource}, {len(records)} samples)"
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="connector_instance",
+        resource_id=req.connector_instance_id,
+        event_type="schema_inference_completed",
+        payload={
+            "connector_name": ci.name,
+            "connector_type": ci.connector_type_id,
+            "resource": req.sample_query.resource,
+            "sample_count": len(records),
+            "model_backend_id": str(first_backend_id),
+        },
+        log_key="schemas.infer.audit_failed",
     )
-
-    await _append_inference_audit(session, principal, req, ci, records, first_backend_id)
 
     return SchemaInferResponse(
         definition_json=definition_json,
         sample_count=len(records),
-        suggestion_name=suggestion_name,
-        suggestion_description=suggestion_description,
+        suggestion_name=f"Inferred from {ci.name}",
+        suggestion_description=(
+            f"Auto-inferred schema from {ci.name} ({req.sample_query.resource}, {len(records)} samples)"
+        ),
         rare_fields=flag_rare_fields(records),
     )
 
@@ -1035,39 +1085,29 @@ class SchemaGenerateResponse(BaseModel):
     definition_json: dict[str, Any]
 
 
-async def _generate_definition(
-    req: SchemaGenerateRequest,
-    secrets_backend: Any,
+async def _generate_schema(
+    settings: Settings,
     mbs: Any,
-) -> tuple[Any, dict[str, Any]]:
-    """Generate a JSON Schema draft via the LLM backend."""
+    req: SchemaGenerateRequest,
+    *,
+    session: AsyncSession,
+    organisation_id: uuid.UUID,
+) -> tuple[dict[str, Any], uuid.UUID]:
+    """Run LLM schema generation and return ``(definition_json, backend_id)``."""
+    secrets_backend = create_secrets_backend(fernet_key=settings.fernet_key, session=session)
     async with ModelBackendHub() as mh:
-        try:
-            await mh.initialise(mbs.items, secrets_backend=secrets_backend)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.generate.backend_init_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to initialise model backend for generation.",
-            ) from None
-        if not mh.backend_ids:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No model backends available for generation.",
-            )
-        first_backend_id = next(iter(mh.backend_ids))
-        try:
-            backend = await mh.get(first_backend_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("schemas.generate.backend_get_failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Selected model backend is unavailable.",
-            ) from None
+        backend, first_backend_id = await _resolve_model_backend(
+            mh,
+            mbs,
+            secrets_backend,
+            session=session,
+            organisation_id=organisation_id,
+            init_log="schemas.generate.backend_init_failed",
+            init_detail="Failed to initialise model backend for generation.",
+            empty_detail="No model backends available for generation.",
+            get_log="schemas.generate.backend_get_failed",
+            get_detail="Selected model backend is unavailable.",
+        )
 
         service = SchemaGenerationService(backend)
         try:
@@ -1081,48 +1121,16 @@ async def _generate_definition(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Schema generation failed: {exc}",
             ) from exc
-    return first_backend_id, definition_json
-
-
-async def _append_generation_audit(
-    session: AsyncSession,
-    principal: TenantPrincipal,
-    req: SchemaGenerateRequest,
-    first_backend_id: Any,
-) -> None:
-    try:
-        async with session.begin():
-            await append_audit_event(
-                session,
-                org_id=principal.organisation_id,
-                event_type="schema_generation_completed",
-                actor_user_id=principal.account_id,
-                resource_type="schema",
-                resource_id=None,
-                payload_json={
-                    "description_length": len(req.description),
-                    "example_count": len(req.examples),
-                    "model_backend_id": str(first_backend_id),
-                },
-            )
-    except ProgrammingError:
-        logger.exception("schemas.generate_schema_endpoint")
-        logger.warning("Audit event not recorded — schema generation table missing")
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.generate.audit_failed")
+    return definition_json, first_backend_id
 
 
 @router.post("/generate")
 @handle_db_errors("schemas.generate_schema_endpoint")
 async def generate_schema_endpoint(
     req: SchemaGenerateRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    settings: Annotated[Settings, Depends(get_settings)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_CREATE),
-    settings: Settings = Depends(get_settings),
 ) -> SchemaGenerateResponse:
     """Generate a JSON Schema from a natural language description and optional
     example records via an LLM.
@@ -1169,15 +1177,27 @@ async def generate_schema_endpoint(
             detail="Schema generation failed due to an unexpected error.",
         ) from None
 
-    secrets_backend = _safe_create_secrets_backend(
+    definition_json, first_backend_id = await _generate_schema(
         settings,
-        "schemas.generate.secrets_backend",
-        "Failed to initialize secrets backend for schema generation.",
+        mbs,
+        req,
+        session=session,
+        organisation_id=principal.organisation_id,
     )
 
-    first_backend_id, definition_json = await _generate_definition(req, secrets_backend, mbs)
-
-    await _append_generation_audit(session, principal, req, first_backend_id)
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=None,
+        event_type="schema_generation_completed",
+        payload={
+            "description_length": len(req.description),
+            "example_count": len(req.examples),
+            "model_backend_id": str(first_backend_id),
+        },
+        log_key="schemas.generate.audit_failed",
+    )
 
     return SchemaGenerateResponse(definition_json=definition_json)
 
@@ -1205,61 +1225,88 @@ class SchemaMigrationPlanRequest(BaseModel):
 
 async def _load_migration_versions(
     session: AsyncSession,
+    principal: TenantPrincipal,
     req: SchemaMigrationRequest,
 ) -> tuple[Any, Any]:
-    """Fetch and validate the source/target schema versions for a migration."""
-    from_schema = await get_schema(session, req.from_schema_id)
-    if from_schema is None:
-        raise HTTPException(status_code=404, detail="Source schema not found")
-    from_sv = await _get_latest_version(session, req.from_schema_id)
-    if from_sv is None:
-        raise HTTPException(status_code=404, detail="Source schema has no versions")
+    """Load the latest source and target schema versions within a transaction.
 
-    to_schema = await get_schema(session, req.to_schema_id)
-    if to_schema is None:
-        raise HTTPException(status_code=404, detail="Target schema not found")
-    to_sv = await _get_latest_version(session, req.to_schema_id)
-    if to_sv is None:
-        raise HTTPException(status_code=404, detail="Target schema has no versions")
+    The application session is RLS-enforced (the app role is not BYPASSRLS), so we
+    must set the org context before querying. We additionally assert explicitly
+    that the caller's org owns both the source and target schema before touching
+    any versions (avoiding a cross-org read, and giving consistent 404s on
+    non-Postgres backends that rely on the ORM tenant filter).
+    """
+    async with session.begin():
+        await set_rls_org(session, principal.organisation_id)
+        await _assert_owns_schema(session, req.from_schema_id, principal)
+        from_sv = await _get_latest_version(session, req.from_schema_id)
+        if from_sv is None:
+            raise HTTPException(status_code=404, detail="Source schema has no versions")
+
+        await _assert_owns_schema(session, req.to_schema_id, principal)
+        to_sv = await _get_latest_version(session, req.to_schema_id)
+        if to_sv is None:
+            raise HTTPException(status_code=404, detail="Target schema has no versions")
     return from_sv, to_sv
 
 
-async def _append_migration_audit(
+async def _audit_migration(
     session: AsyncSession,
     principal: TenantPrincipal,
     req: SchemaMigrationRequest,
-    plan: Any,
     dry_run: bool,
+    plan: Any,
 ) -> None:
+    """Best-effort audit append; failures are logged and never break the response."""
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=req.to_schema_id,
+        event_type="schema_migration_completed",
+        payload={
+            "from_schema_id": str(req.from_schema_id),
+            "to_schema_id": str(req.to_schema_id),
+            "dry_run": dry_run,
+            "field_additions": len(plan.field_additions),
+            "field_removals": len(plan.field_removals),
+            "type_changes": len(plan.type_changes),
+            "renames": len(plan.renames),
+        },
+        log_key="schemas.migrate.audit_failed",
+    )
+
+
+def _create_migration_plan(from_definition: dict[str, Any], to_definition: dict[str, Any]) -> Any:
+    """Compute a migration plan, mapping failures to a 500 HTTP response."""
     try:
-        async with session.begin():
-            await append_audit_event(
-                session,
-                org_id=principal.organisation_id,
-                event_type="schema_migration_completed",
-                actor_user_id=principal.account_id,
-                resource_type="schema",
-                resource_id=req.to_schema_id,
-                payload_json={
-                    "from_schema_id": str(req.from_schema_id),
-                    "to_schema_id": str(req.to_schema_id),
-                    "dry_run": dry_run,
-                    "field_additions": len(plan.field_additions),
-                    "field_removals": len(plan.field_removals),
-                    "type_changes": len(plan.type_changes),
-                    "renames": len(plan.renames),
-                },
-            )
-    except ProgrammingError:
-        logger.exception("schemas.migrate_audit")
-        logger.warning("Audit event not recorded — schema migration table missing")
-    except HTTPException as exc:
-        logger.debug("schemas.migrate.audit_http_error", extra={"detail": exc.detail})
+        return create_migration(from_definition, to_definition)
+    except HTTPException:
         raise
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.exception("schemas.migrate.audit_failed")
+        logger.exception("schemas.migrate_create_plan")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to compute migration plan.",
+        ) from None
+
+
+def _apply_migration_safe(data: dict[str, Any], plan: Any) -> Any:
+    """Apply a migration plan to data, mapping failures to a 500 HTTP response."""
+    try:
+        return apply_migration(data, plan)
+    except HTTPException:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("schemas.migrate_apply")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to apply migration to data.",
+        ) from None
 
 
 @router.post(
@@ -1275,9 +1322,9 @@ async def _append_migration_audit(
 @handle_db_errors("schemas.migrate_data_endpoint")
 async def migrate_data_endpoint(
     req: SchemaMigrationRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_UPDATE),
-    dry_run: bool = Query(False, description="If true, preview the migration plan without applying it"),
+    dry_run: Annotated[bool, Query(description="If true, preview the migration plan without applying it")] = False,
 ) -> SchemaMigrationResponse:
     """Migrate data from one schema version to another.
 
@@ -1289,9 +1336,7 @@ async def migrate_data_endpoint(
     applying any transformations.
     """
     try:
-        async with session.begin():
-            await set_rls_org(session, principal.organisation_id)
-            from_sv, to_sv = await _load_migration_versions(session, req)
+        from_sv, to_sv = await _load_migration_versions(session, principal, req)
     except IntegrityError:
         logger.exception("schemas.migrate_data_endpoint")
         raise HTTPException(
@@ -1321,18 +1366,7 @@ async def migrate_data_endpoint(
             detail=MSG_UNEXPECTED_ERROR,
         ) from None
 
-    try:
-        plan = create_migration(from_sv.definition_json, to_sv.definition_json)
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_create_plan")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to compute migration plan.",
-        ) from None
+    plan = _create_migration_plan(from_sv.definition_json, to_sv.definition_json)
 
     plan_dict: dict[str, Any] = {
         "field_additions": plan.field_additions,
@@ -1341,7 +1375,7 @@ async def migrate_data_endpoint(
         "renames": plan.renames,
     }
 
-    await _append_migration_audit(session, principal, req, plan, dry_run)
+    await _audit_migration(session, principal, req, dry_run, plan)
 
     if dry_run:
         plan_dict["dry_run"] = True
@@ -1350,18 +1384,7 @@ async def migrate_data_endpoint(
             plan=plan_dict,
         )
 
-    try:
-        migrated = apply_migration(req.data, plan)
-    except HTTPException:
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_apply")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to apply migration to data.",
-        ) from None
+    migrated = _apply_migration_safe(req.data, plan)
 
     return SchemaMigrationResponse(
         migrated_data=migrated,
@@ -1373,7 +1396,7 @@ async def migrate_data_endpoint(
 @handle_db_errors("schemas.migration_plan_endpoint")
 async def migration_plan_endpoint(
     req: SchemaMigrationPlanRequest,
-    session: AsyncSession = Depends(get_db_session),
+    session: Annotated[AsyncSession, Depends(get_db_session)],
     principal: TenantPrincipal = require_permission(_CODE_SCHEMA_LIST),
 ) -> dict[str, Any]:
     """Preview a migration plan between two schemas without applying it.
@@ -1403,32 +1426,20 @@ async def migration_plan_endpoint(
         "renames": plan.renames,
     }
 
-    try:
-        try:
-            async with session.begin():
-                await append_audit_event(
-                    session,
-                    org_id=principal.organisation_id,
-                    event_type="schema_migration_planned",
-                    actor_user_id=principal.account_id,
-                    resource_type="schema",
-                    payload_json={
-                        "field_additions": len(plan.field_additions),
-                        "field_removals": len(plan.field_removals),
-                        "type_changes": len(plan.type_changes),
-                        "renames": len(plan.renames),
-                    },
-                )
-        except ProgrammingError:
-            logger.exception("schemas.migrate_plan_audit")
-            logger.warning("Audit event not recorded — schema migration table missing")
-    except HTTPException as exc:
-        logger.debug("schemas.migrate_plan.audit_http_error", extra={"detail": exc.detail})
-        raise
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("schemas.migrate_plan.audit_failed")
+    await append_audit_event_isolated(
+        session,
+        principal,
+        resource_type="schema",
+        resource_id=None,
+        event_type="schema_migration_planned",
+        payload={
+            "field_additions": len(plan.field_additions),
+            "field_removals": len(plan.field_removals),
+            "type_changes": len(plan.type_changes),
+            "renames": len(plan.renames),
+        },
+        log_key="schemas.migrate_plan.audit_failed",
+    )
 
     return plan_dict
 
@@ -1461,6 +1472,27 @@ class SchemaValidateResponse(BaseModel):
     errors: list[SchemaValidationError]
 
 
+def _step_json_path(target: Any, part: str) -> Any:
+    """Walk one path segment, returning ``None`` when the location is absent."""
+    if isinstance(target, dict):
+        return target.get(part, {})
+    if isinstance(target, list):
+        try:
+            return target[int(part)]
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
+def _json_path_exists(target: Any, parts: list[str]) -> bool:
+    """Return whether ``parts`` resolves to an existing location in ``target``."""
+    for part in parts:
+        target = _step_json_path(target, part)
+        if target is None:
+            return False
+    return True
+
+
 def _find_json_location(raw: str, error_path: str) -> tuple[int | None, int | None]:
     """Best-effort line/column lookup for a validation error path in raw JSON text."""
     try:
@@ -1469,22 +1501,10 @@ def _find_json_location(raw: str, error_path: str) -> tuple[int | None, int | No
         return None, None
 
     parts = error_path.strip("/").split("/") if error_path else []
-    target = parsed
-    for part in parts:
-        if isinstance(target, dict):
-            target = target.get(part, {})
-        elif isinstance(target, list):
-            try:
-                target = target[int(part)]
-            except (ValueError, IndexError):
-                return None, None
-        else:
-            return None, None
-
-    # Seek the key in raw text
-    if not parts:
+    if not parts or not _json_path_exists(parsed, parts):
         return None, None
 
+    # Seek the key in raw text
     key_to_find = parts[-1]
     lines = raw.split("\n")
     for i, line in enumerate(lines):

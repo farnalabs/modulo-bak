@@ -13,7 +13,10 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.connectors.security import CredentialRedactor, redacting
+from modulo.core.ssrf import pinned_async_client_sync
 
 _SITES: dict[str, str] = {
     "us": "https://api.datadoghq.com",
@@ -32,6 +35,7 @@ class DatadogConnector(ConnectorBase):
         if base is None:
             raise ValueError(f"Unknown Datadog site: {site!r}. Choose from: {', '.join(_SITES)}")
         self._base = base
+        self._redactor = CredentialRedactor([api_key, app_key])
 
     @property
     def connector_type(self) -> ConnectorType:
@@ -39,7 +43,8 @@ class DatadogConnector(ConnectorBase):
 
     def _client(self) -> httpx.AsyncClient:
         base = self._base
-        return httpx.AsyncClient(
+        return pinned_async_client_sync(
+            base,
             base_url=base,
             headers={
                 "DD-API-KEY": self._api_key,
@@ -56,16 +61,21 @@ class DatadogConnector(ConnectorBase):
                     return HealthResult(ok=True, detail="Datadog API key validated")
                 if resp.status_code == 403:
                     return HealthResult(ok=False, detail="Invalid Datadog API key")
-                return HealthResult(ok=False, detail=f"HTTP {resp.status_code}: {resp.text[:200]}")
+                return HealthResult(
+                    ok=False, detail=self._redactor.redact(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 403:
                 return HealthResult(ok=False, detail="Invalid Datadog API key")
-            return HealthResult(ok=False, detail=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}")
+            return HealthResult(
+                ok=False, detail=self._redactor.redact(f"HTTP {exc.response.status_code}: {exc.response.text[:200]}")
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(self._redactor.redact_exc(exc))
 
+    @redacting
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:
             match q.resource:
@@ -82,6 +92,7 @@ class DatadogConnector(ConnectorBase):
                 case _:
                     raise ValueError(f"Unsupported Datadog resource: {q.resource!r}")
 
+    @redacting
     async def write(self, payload: ConnectorPayload) -> dict[str, Any]:
         async with self._client() as c:
             match payload.resource:

@@ -80,7 +80,7 @@ Includes:
 
 ### Pipeline Engine (`modulo/core/pipeline_engine/`)
 
-Built on LangGraph's `StateGraph` with `dict[str, Any]` state. Each pipeline snapshot compiles to a StateGraph at run-start. Nodes map to agents; edges carry HITL gate config or rejection routing.
+Built on LangGraph's `StateGraph` with `dict[str, Any]` state. Each pipeline snapshot compiles to a StateGraph at run-start. Node types: `agent`, `sandbox_agent`, `manual` (human output), `composite` (expand-only), `router` (ordered JMESPath rules + `default`, lowers to the conditional-edge compile path — FAR-402 P1), and `hitl` (human-in-the-loop gate that compiles to the existing synthetic-gate path — FAR-402 P1). `connector` is an internal engine resolution, never an API-authored node type. Edges carry HITL gate config, rejection routing, or a `loop`/`conditional`/`normal`/`reject` edge type.
 
 Key design:
 - Compiled graphs cached by `(pipeline_id, snapshot_id)` with LRU eviction
@@ -111,6 +111,7 @@ Features:
 - `required_team_id` – restricts claims to specific team members
 - Claim expiry background job (default: 60s interval, Postgres advisory lock for single-worker execution)
 - `manual` node type – same as HITL but human provides full output
+- `hitl` node type (FAR-402 P1) – a draggable human-in-the-loop gate; compiles to the same synthetic-gate path as a legacy edge-level HITL gate. `manual` remains the non-gating human-output step.
 
 ### Connector Hub (`modulo/connectors/`)
 
@@ -130,6 +131,7 @@ Abstraction over external tool integrations. ConnectorType defines an abstract c
 | `PagerDutyConnector` | `incident-management` | trigger/acknowledge/resolve incidents |
 | `SentryConnector` | `error-tracking` | list/search issues, create events |
 | `DatadogConnector` | `monitoring` | query metrics, create monitors |
+| `RestConnector` | `rest` | verb-agnostic HTTP read/write against a declared endpoint (see `docs/rest-connector.md`) |
 | *(40+ built-in connectors total — see `modulo/connectors/`)* | | |
 
 ### Model Backend Hub (`modulo/model_backends/`)
@@ -179,7 +181,20 @@ Manages the local and community library of reusable primitives (agents, schemas,
 
 1. **Trigger** – A trigger fires (manual POST, webhook HMAC-verified, cron schedule, or agent_signal). TriggerEngine validates input against the entry agent's `input_schema`. A Run record is created in `pending` status. TriggerEvent is logged.
 
-2. **Snapshot** – The pipeline's current definition is frozen as a PipelineSnapshot (all agent versions, schema pins, connector bindings, model backend pins, environment profile). The run now executes against this immutable snapshot.
+2. **Snapshot** – The pipeline's current definition is frozen as a PipelineSnapshot (all agent versions, schema pins, connector bindings, model backend pins, environment profile). The run now executes against this immutable snapshot; the snapshot is tagged `version_kind='run'`.
+
+   **Live-edit history + release channels (ADR 025 / FAR-402 P6):** the snapshot
+   machinery is reused for versioning beyond run-start freezes. The editor's
+   save action creates a new snapshot tagged `version_kind='edit'` (the live-edit
+   chain), leaving prior rows immutable so rollback is a pointer swap to a prior
+   snapshot. A snapshot also carries a `release_channel` (`none` | `stable` |
+   `canary`); a trigger bound to a `stable`/`canary` channel resolves to the
+   latest snapshot of that channel (`TriggerEngine.resolve_snapshot_id_for_trigger`),
+   while an unbound trigger pins the live graph (current behaviour).
+   `diff_snapshots` surfaces port-signature deltas + a deterministic downstream
+   impact oracle (`compute_port_change_impact`), and a save-time check
+   (`check_port_change_breaking`) flags port changes that would drop/alter data
+   read by a downstream edge.
 
 3. **Compile** – PipelineExecutor loads the snapshot, compiles the `StateGraph`, and caches it by `(pipeline_id, snapshot_id)`.
 
@@ -394,6 +409,7 @@ ADRs at `docs/adr/` document key trade-offs:
 | 017/018 | Centralized Authorization: Shared Permission Registry for REST + MCP | v9 – revised after 7 plan-review-iterate cycles |
 | 019 | Cost Formula Engine + E2B Rate/Fallback Decision | Accepted |
 | 020 | Analytics: run_daily_facts + typed-params query surface | Accepted |
+| 025 | Generic REST Integration Connector | Accepted |
 
 Note: ADR numbers 003/004/005 are shared by two distinct ADR files each (the numbering mirrors the filesystem). ADR 017/018 – Centralized Authorization – exists as both `017-centralized-authorization.md` and `018-centralized-authorization.md` (a duplicated file), so it is listed once here under the combined number.
 

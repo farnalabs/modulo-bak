@@ -27,7 +27,7 @@ FERNET_KEY=<random-44-char-base64>
 
 ```bash
 # Apply database migrations first
-uv run alembic upgrade head
+uv run alembic upgrade heads
 
 # Start the API server
 uv run uvicorn modulo.api.main:app --host 0.0.0.0 --port 8000
@@ -54,7 +54,7 @@ docker compose -f docker-compose.local.yml --profile observability up -d
 | Service | URL | Credentials |
 |---|---|---|
 | Grafana | http://localhost:3000 | `admin` / `admin` |
-| Prometheus | http://localhost:9090 | — |
+| Prometheus | http://localhost:9090 | – |
 
 ### Configuration
 
@@ -67,9 +67,9 @@ Files are in `configs/`:
 | `configs/grafana/dashboards/dashboard.yml` | Dashboard provider that loads JSON models from `configs/grafana/dashboards/` |
 
 Pre-built Grafana dashboards are loaded automatically from `configs/grafana/dashboards/`:
-- `pipeline-performance.json` — run durations, volumes, error rates
-- `hitl-review.json` — HITL gate activity, review speed, approval rates
-- `cost-tracking.json` — LLM spend by org/model/pipeline
+- `pipeline-performance.json` – run durations, volumes, error rates
+- `hitl-review.json` – HITL gate activity, review speed, approval rates
+- `cost-tracking.json` – LLM spend by org/model/pipeline
 
 ### OTel Integration
 
@@ -199,10 +199,10 @@ The export is a JSONL file where:
 - **Line 1**: Metadata header with version, export timestamp, and aggregate
   SHA-256 hash of the entire bundle.
 - **Subsequent lines**: One JSON object per record, with keys:
-  - `__table__` — table name (e.g. `"users"`, `"pipelines"`)
-  - `id` — record primary key (string-formatted UUID)
-  - `data` — full column data for the record
-  - `__hash__` — SHA-256 of the sorted serialised `data`
+  - `__table__` – table name (e.g. `"users"`, `"pipelines"`)
+  - `id` – record primary key (string-formatted UUID)
+  - `data` – full column data for the record
+  - `__hash__` – SHA-256 of the sorted serialised `data`
 
 ### Progress Bars
 
@@ -219,12 +219,12 @@ showing per-table and per-row progress.
 
 ## Break-Glass Admin Recovery Deploy Gate
 
-The break-glass enforcement ships in two deliverables — **(A)** last-admin
+The break-glass enforcement ships in two deliverables – **(A)** last-admin
 prevention + operator role + migration, **(B)** CLI + login-hook consumption +
 SQL-predicate deny. The (B) deploy carries a one-time precondition:
 
 1. **Zero live break-glass rows.** Run `modulo-break-glass status --all`
-   before deploying (B). A non-zero exit (`5`) means a live row exists —
+   before deploying (B). A non-zero exit (`5`) means a live row exists –
    resolve it (`deactivate` / `deactivate --force`) before deploying. See
    `docs/operations/break-glass-admin-recovery-runbook.md`.
 2. **Expired rows must NOT block deploys.** A row past `break_glass_expires_at`
@@ -240,7 +240,7 @@ ongoing monitoring surface.
 
 Cross-Origin Resource Sharing (CORS) is configured via environment variables.
 
-**`CORS_ORIGINS`** — Comma-separated list of allowed origins:
+**`CORS_ORIGINS`** – Comma-separated list of allowed origins:
 
 ```env
 CORS_ORIGINS=http://localhost:5173,https://modulo.example.com
@@ -251,7 +251,7 @@ Each origin must be a full origin including scheme and host, without a trailing 
 - ❌ `https://modulo.example.com/`
 - ❌ `*`
 
-**`CORS_MAX_AGE`** — Preflight cache duration in seconds (default: `600` / 10 minutes):
+**`CORS_MAX_AGE`** – Preflight cache duration in seconds (default: `600` / 10 minutes):
 
 ```env
 CORS_MAX_AGE=3600
@@ -283,20 +283,20 @@ For the production launch checklist, see [`docs/public-launch-checklist.md`](./p
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `DATABASE_URL` | **Yes** | — | `postgresql+asyncpg://user:pass@host:port/db` |
-| `SECRET_KEY` | **Yes** | — | 32+ byte random string for JWT signing |
-| `FERNET_KEY` | **Yes** | — | 44-char base64 Fernet key for credential encryption |
-| `MODULO_USERS` | Alpha | — | Comma-separated `user:pass` pairs for initial user seed |
-| `MODULO_DB` | No | `postgres` | Database backend (`postgres` or `sqlite`) |
-| `REDIS_URL` | For multi-replica | — | `redis://host:port/db` for SAQ broker |
+| `DATABASE_URL` | **Yes** | – | `postgresql+asyncpg://user:pass@host:port/db` |
+| `SECRET_KEY` | **Yes** | – | 32+ byte random string for JWT signing |
+| `FERNET_KEY` | **Yes** | – | 44-char base64 Fernet key for credential encryption |
+| `MODULO_USERS` | Alpha | – | Comma-separated `user:pass` pairs for initial user seed |
+| `MODULO_DB` | No | `postgres` | Database backend (`postgres`, `sqlite`, `mariadb`, or `mysql`) |
+| `REDIS_URL` | No | `redis://localhost:6379/0` | Redis URL for SAQ broker, event coordination, rate limiting |
 | `MODULO_PUBLIC_URL` | For SSO | `http://localhost:8000` | Public-facing URL for OAuth redirects |
 | `CORS_ORIGINS` | No | `http://localhost:5173` | Comma-separated allowed CORS origins |
 | `CORS_MAX_AGE` | No | `600` | Preflight cache max-age in seconds |
 | `MODULO_SECRETS_BACKEND` | No | `fernet` | Secrets backend: `fernet`, `vault`, or `aws` |
-| `MODULO_OIDC_PROVIDERS` | For SSO | — | JSON array of OIDC provider configs |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | — | OTel gRPC/HTTP exporter endpoint |
-| `MODULO_E2B_API_KEY` | For E2B | — | E2B sandbox API key for runtime provider |
-| `MODULO_ADMIN_SECRET` | No | — | Shared secret for `modulo-migrate` CLI auth |
+| `MODULO_OIDC_PROVIDERS` | For SSO | – | JSON array of OIDC provider configs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | No | – | OTel gRPC/HTTP exporter endpoint |
+| `MODULO_E2B_API_KEY` | For E2B | – | E2B sandbox API key for runtime provider |
+| `MODULO_ADMIN_SECRET` | No | – | Shared secret for `modulo-migrate` CLI auth |
 | `OLLAMA_BASE_URL` | For Ollama | `http://localhost:11434` | Ollama server URL |
 
 ---
@@ -307,30 +307,49 @@ Modulo supports three deployment modes depending on your needs.
 
 ### Standalone (single-user, local)
 
-```
-pip install modulo   # or uv tool install modulo
-modulo init          # generates keys, seeds admin user
-modulo start         # starts server, opens browser
+Three environment variables are **required** and have no default — the app
+refuses to start without them:
+
+| Variable | Purpose | How to generate |
+|----------|---------|-----------------|
+| `DATABASE_URL` | SQLAlchemy async DB URL for the application database | `sqlite+aiosqlite:///./modulo.db` for the local SQLite file below |
+| `SECRET_KEY` | 32+ byte random string used to sign JWTs | `$(openssl rand -base64 48)` |
+| `FERNET_KEY` | 44-char base64 Fernet key used to encrypt stored connector credentials | `$(openssl rand -base64 32)` (base64-encoded 32-byte key) |
+
+The command below sets all three inline, so it is runnable as written. `MODULO_ADMIN_PASSWORD`
+seeds the initial admin user (optional but recommended for first login); `MODULO_DB=sqlite`
+selects the SQLite backend so no separate database server is needed.
+
+```bash
+git clone https://github.com/farnalabs/modulo   # or install the farnalabs-modulo package
+cd backend
+uv sync
+DATABASE_URL=sqlite+aiosqlite:///./modulo.db \
+  SECRET_KEY=$(openssl rand -base64 48) \
+  FERNET_KEY=$(openssl rand -base64 32) \
+  MODULO_ADMIN_PASSWORD=changeme \
+  MODULO_DB=sqlite \
+  uv run uvicorn modulo.api.main:app --port 8000
 ```
 
 | Component | How it runs |
 |---|---|
 | Database | SQLite file (`./modulo.db`), no server process needed |
-| Task scheduling | In-process asyncio loops — cron and polling triggers work |
+| Task scheduling | In-process asyncio loops – cron and polling triggers work |
 | Task queue | In-process, no durability across crashes |
-| Rate limiting | In-memory no-op (rate limiting disabled) |
+| Rate limiting | No-op, disabled when Redis is unavailable (all requests allowed) |
 | Concurrency | Single process, single worker |
 
 **What you lose vs. full deployment:**
-- **No horizontal scaling** — one process, one user at a time
-- **No task durability** — if the process crashes mid-run, the run is lost (re-run manually)
-- **No distributed rate limiting** — without Redis the limiter is a per-process no-op, so limits don't coordinate across processes
+- **No horizontal scaling** – one process, one user at a time
+- **No task durability** – if the process crashes mid-run, the run is lost (re-run manually)
+- **No distributed rate limiting** – without Redis the limiter is a per-process no-op, so limits don't coordinate across processes
 
 **What you keep:**
 - Cron-triggered pipelines ✓
 - Polling triggers ✓
 - All pipeline features, evals, HITL, connectors ✓
-- The SQLite DB file is portable — copy it to another machine and `modulo start` picks it up
+- The SQLite DB file is portable – copy it to another machine and restart `uvicorn` from the new location to pick it up
 
 ### Docker Compose (single-server, multi-user)
 
@@ -347,11 +366,11 @@ curl https://modulo.run/install.sh | bash
 | Rate limiting | In-memory no-op (default) or Redis sliding window (with Redis) |
 | Concurrency | Single backend replica, multiple simultaneous requests |
 
-If Redis is configured (`REDIS_URL` set), the app automatically upgrades scheduling, queuing, and rate limiting to use SAQ + Redis. If Redis is absent, everything still works via in-process fallbacks with a startup notice.
+If Redis is configured (`REDIS_URL` set), the app automatically upgrades scheduling, queuing, and rate limiting to use SAQ + Redis. `REDIS_URL` defaults to `redis://localhost:6379/0`; if it is explicitly set to an empty value, startup aborts with a `RuntimeError` (see `api/main.py`) instead of a silent fallback.
 
 ### Kubernetes (production, multi-replica)
 
-The Kubernetes/Helm example deployment configs were removed — they were never
+The Kubernetes/Helm example deployment configs were removed – they were never
 exercised by CI or used in production. Modulo's only managed deployment path is
 Fly.io. For self-hosting, use the Docker Compose configuration
 (`docker-compose.prod.yml`). Kubernetes/Helm support can be re-added later as a
@@ -368,14 +387,14 @@ For more than one backend replica, **Redis is mandatory.** Here's why:
 | Feature | Without Redis | With Redis | What goes wrong at 2+ replicas |
 |---|---|---|---|
 | Cron triggers | In-process asyncio loop | SAQ system worker cron | Both replicas fire every trigger. Runs execute twice. |
-| Polling triggers | In-process asyncio loop | SAQ system worker cron | Same — duplicate execution. |
+| Polling triggers | In-process asyncio loop | SAQ system worker cron | Same – duplicate execution. |
 | Task queue | In-process | SAQ broker (Redis) | Jobs are scheduled in the replica that received the request. If that replica crashes or is scaled down, the job disappears. |
 | Rate limiting | In-memory no-op | Redis sliding window | Without Redis the limiter is disabled (no-op); with Redis, all replicas share one sliding-window counter in Redis |
-| Lock coordination | PG advisory locks | PG advisory locks | These work across replicas via PostgreSQL — no Redis needed for locks. |
+| Lock coordination | PG advisory locks | PG advisory locks | These work across replicas via PostgreSQL – no Redis needed for locks. |
 
 **The pattern:** without Redis, each replica independently runs its own scheduler and rate limiter. They don't coordinate. This is fine for a single replica. For two or more, the system behaves incorrectly.
 
-**The one exception** is PG advisory locks — they coordinate across any number of replicas via PostgreSQL itself, so locking patterns work without Redis regardless of replica count.
+**The one exception** is PG advisory locks – they coordinate across any number of replicas via PostgreSQL itself, so locking patterns work without Redis regardless of replica count.
 
 ### Vertical scaling (bigger machine)
 
@@ -384,9 +403,10 @@ Adding CPU/RAM to a single replica works without Redis. The asyncio event loop h
 ### Configuration
 
 ```env
-# Single replica — no Redis needed
-REDIS_URL=
+# Single replica – no dedicated multi-replica coordination needed.
+# REDIS_URL defaults to redis://localhost:6379/0; do not set it empty (startup aborts).
+REDIS_URL=redis://localhost:6379/0
 
-# Multiple replicas — Redis required
+# Multiple replicas – Redis required for coordination
 REDIS_URL=redis://redis:6379/0
 ```

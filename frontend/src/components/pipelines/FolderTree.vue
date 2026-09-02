@@ -1,8 +1,15 @@
 <template>
-  <div data-testid="folder-tree" class="hidden md:flex w-64 border-r border-border h-screen sticky top-0 overflow-y-auto bg-card flex-col">
+  <!-- Height chain: the parent row is flex-1 min-h-0 inside a page shell
+       capped at the remaining viewport height below the AppLayout chrome
+       (h-[calc(100vh-3.5rem)], the editor-view convention — not the full
+       viewport), so h-full fills the full column height next to a long table
+       and the flex-1 min-h-0 body below scrolls internally when its content
+       exceeds the column. Hidden below md (a mobile folder <select> is
+       offered instead). -->
+  <div data-testid="folder-tree" class="hidden md:flex w-64 border-r border-border h-full min-h-0 bg-card flex-col">
     <div class="p-3 border-b border-border flex items-center justify-between shrink-0">
       <h3 class="text-sm font-semibold text-foreground">{{ labels.folders }}</h3>
-      <button
+      <button type="button"
         data-testid="folder-tree-new"
         class="rounded p-1 hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
         @click="openCreateDialog"
@@ -12,8 +19,8 @@
       </button>
     </div>
 
-    <div class="py-1 flex-1 overflow-y-auto">
-      <button
+    <div class="py-1 flex-1 min-h-0 overflow-y-auto">
+      <button type="button"
         data-testid="folder-tree-all-pipelines"
         class="flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-accent transition-colors text-left"
         :class="[
@@ -81,14 +88,14 @@
 
             <!-- Action buttons (rename, delete) -->
             <div class="ml-auto flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-              <button
+              <button type="button"
                 class="rounded p-0.5 hover:bg-accent-foreground/10 text-muted-foreground hover:text-foreground transition-colors"
                 @click.stop="openRenameDialog(element.folder)"
                 :aria-label="labels.renameFolder"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
               </button>
-              <button
+              <button type="button"
                 class="rounded p-0.5 hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
                 @click.stop="openDeleteConfirm(element.folder)"
                 :aria-label="labels.deleteFolder"

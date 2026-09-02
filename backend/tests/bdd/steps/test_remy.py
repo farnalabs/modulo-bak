@@ -41,7 +41,7 @@ try:
     scenarios("../features/remy/remy_access_control.feature")
     scenarios("../features/remy/remy_context_window.feature")
     scenarios("../features/remy/remy_ui_commands.feature")
-except (FileNotFoundError, OSError):
+except OSError:
     pass
 
 _NOW = datetime.fromisoformat("2025-06-01T12:00:00+00:00")
@@ -72,6 +72,7 @@ def _make_mock_session(**overrides: Any) -> MagicMock:
     s = MagicMock()
     s.id = overrides.get("id", uuid.uuid4())
     s.organisation_id = overrides.get("organisation_id", ORG_ID)
+    s.account_id = overrides.get("account_id", USER_ID)
     s.user_id = overrides.get("user_id", USER_ID)
     # ``account_id`` replaced ``user_id`` as the session owner column
     # (migration 0136). Mirror ``user_id`` so ownership checks in the routes

@@ -1025,6 +1025,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/db-capacity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Db Capacity
+         * @description Return the live DB capacity status (the monitoring source of truth).
+         */
+        get: operations["get_db_capacity_api_v1_admin_db_capacity_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/login": {
         parameters: {
             query?: never;
@@ -1137,6 +1157,22 @@ export interface paths {
         /**
          * Sso Providers
          * @description List configured SSO providers (OIDC) and whether SAML is enabled.
+         *
+         *     Pre-auth discovery endpoint: the login page fetches it BEFORE any user is
+         *     authenticated, so it must never require a user and must never surface an
+         *     auth error. Plan/feature resolution is anonymous (via
+         *     ``_anonymous_plan_context``); when the SSO feature is not enabled /
+         *     unlicensed the endpoint answers a normal 200 with an EMPTY provider list
+         *     (no 401/402) so the login page simply renders no SSO options.
+         *
+         *     OIDC providers are merged from the sso_providers DB table (preferred) and
+         *     the env-var fallback, deduplicated by provider_id. The DB read goes through
+         *     the system session (``modulo_system`` role, instance-global) so the login
+         *     page reflects every org's enabled providers; when the system read returns
+         *     nothing (unprovisioned role), fall back to the app session scoped to the
+         *     first org (single-org self-hosted behaviour). SAML is enabled if any enabled
+         *     SAML provider exists in the DB, or if env-var SAML is fully configured
+         *     (enabled + license + metadata).
          */
         get: operations["sso_providers_api_v1_auth_sso_providers_get"];
         put?: never;
@@ -1526,6 +1562,24 @@ export interface paths {
         get: operations["get_cost_controls_api_v1_admin_costs_controls_get"];
         /** Update Cost Controls */
         put: operations["update_cost_controls_api_v1_admin_costs_controls_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/costs/ceiling": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Spend Ceiling */
+        get: operations["get_spend_ceiling_api_v1_admin_costs_ceiling_get"];
+        /** Set Spend Ceiling */
+        put: operations["set_spend_ceiling_api_v1_admin_costs_ceiling_put"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1967,7 +2021,17 @@ export interface paths {
         /** List Snapshot Endpoint */
         get: operations["list_snapshot_endpoint_api_v1_pipelines__pipeline_id__snapshots_get"];
         put?: never;
-        post?: never;
+        /**
+         * Save Edit Snapshot Endpoint
+         * @description Save a LIVE-EDIT snapshot of the current graph (FAR-402 P6).
+         *
+         *     Creates a new snapshot row tagged ``version_kind='edit'`` so the editor's
+         *     save history is distinct from run-frozen snapshots; the prior snapshot row
+         *     stays immutable, so rollback remains a pointer swap to a prior version. A
+         *     ``draft`` save marks an in-progress editor auto-save; ``channel`` optionally
+         *     tags the edit's release channel.
+         */
+        post: operations["save_edit_snapshot_endpoint_api_v1_pipelines__pipeline_id__snapshots_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5713,6 +5777,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/eval-coverage-gap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Eval Coverage Gap
+         * @description Return the eval coverage-gap signal for a batch or variant group (FAR-381).
+         *
+         *     A pure read-model over the ``VariantGroup -> Run -> EvalResult`` lineage.
+         *     Emits a per-eval verdict only once at least ``min_runs`` terminal runs carry
+         *     eval data (statistical significance — llm-judge scores are high-variance),
+         *     and only when variant outputs diverged past ``threshold`` while that eval
+         *     could not differentiate them. A gap routes to ``recommended_action =
+         *     "improve_evals"`` (the eval suite is the problem, not the variants); all
+         *     other cases are ``"ok"``. Org-scoped (explicit ``organisation_id`` predicate
+         *     on every query; ``set_rls_org`` remains defense-in-depth).
+         */
+        get: operations["eval_coverage_gap_api_v1_eval_coverage_gap_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/evals/suites/{suite_id}/alerting": {
         parameters: {
             query?: never;
@@ -6320,8 +6413,13 @@ export interface paths {
          * @description List runs matching the filter set, with an estimated per-run byte size.
          *
          *     Returns every matching run (including non-terminal ones — the UI shows
-         *     terminal-only as purge-able), the total match count, and an estimated total
-         *     reclaimable byte count across ALL matches.
+         *     terminal-only as purge-able), the total match count, an estimated total
+         *     reclaimable byte count across ALL matches, and — most importantly for the
+         *     purge confirm dialog — a terminal-only ``terminal_total`` and
+         *     ``terminal_estimated_bytes``. The purge deletes *every* matching terminal run
+         *     (unbounded), so the client must derive its confirm count and reclaimable
+         *     figure from these server-side terminal totals, never from the page-capped
+         *     candidate list it happens to hold.
          */
         get: operations["candidates_api_v1_admin_run_retention_candidates_get"];
         put?: never;
@@ -8559,7 +8657,7 @@ export interface components {
          * AnalyticsStatus
          * @enum {string}
          */
-        AnalyticsStatus: "pending" | "running" | "awaiting_human" | "claimed" | "complete" | "failed" | "cancelled" | "eval_failed" | "stalled";
+        AnalyticsStatus: "pending" | "running" | "awaiting_human" | "claimed" | "complete" | "failed" | "cancelled" | "eval_failed" | "stalled" | "budget_exceeded" | "router_no_match";
         /**
          * AnalyticsTriggerType
          * @enum {string}
@@ -8847,6 +8945,51 @@ export interface components {
             total_count: number;
             /** Total Estimated Bytes */
             total_estimated_bytes: number;
+            /**
+             * Terminal Total
+             * @default 0
+             */
+            terminal_total: number;
+            /**
+             * Terminal Estimated Bytes
+             * @default 0
+             */
+            terminal_estimated_bytes: number;
+        };
+        /**
+         * CapabilityScope
+         * @description Node-level least-privilege contract (FAR-402 P4 / FAR-418).
+         *
+         *     A node may NARROW (never widen) what its referenced Agent is granted:
+         *
+         *     * ``allowed_connectors``: connector instance-ids and/or connector types the
+         *       node may resolve from the ConnectorHub. Each connector-TYPE entry must be
+         *       within the Agent's ``connector_type_refs`` (compile-time check); the
+         *       ConnectorHub is fetched with ONLY these connectors (deny-by-default).
+         *     * ``allowed_tools``: MCP/runtime tools the node's agent may invoke — an
+         *       additional narrowing filter wired through ``check_tool_scope``.
+         *     * ``context_scope``: allowlist of ``run_context`` keys the node may read
+         *       (need-to-know boundary).
+         *
+         *     Default is UNRESTRICTED: an absent ``capability_scope`` leaves behaviour
+         *     unchanged (the node may use all of its Agent's grants).
+         */
+        CapabilityScope: {
+            /**
+             * Allowed Connectors
+             * @description Connector instance-ids and/or connector types the node may resolve. Absent/empty = UNRESTRICTED (Agent grants).
+             */
+            allowed_connectors?: string[] | null;
+            /**
+             * Allowed Tools
+             * @description MCP/runtime tools the node's agent may invoke. Absent = NOT narrowed (additional role check still applies).
+             */
+            allowed_tools?: string[] | null;
+            /**
+             * Context Scope
+             * @description Allowlist of run_context keys the node may read. Absent = UNRESTRICTED (full run_context).
+             */
+            context_scope?: string[] | null;
         };
         /** ChangeMemberRoleRequest */
         ChangeMemberRoleRequest: {
@@ -9284,6 +9427,10 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+            /** Degraded At */
+            degraded_at?: string | null;
+            /** Last Skip Error */
+            last_skip_error?: string | null;
         };
         /** ConnectorTypeItem */
         ConnectorTypeItem: {
@@ -9544,6 +9691,15 @@ export interface components {
             }[];
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
             /** Alert Thresholds */
             alert_thresholds?: number[];
             /**
@@ -9889,6 +10045,19 @@ export interface components {
             notifications: components["schemas"]["NotificationResponse"][];
             /** Total Unread */
             total_unread: number;
+        };
+        /** DbCapacityResponse */
+        DbCapacityResponse: {
+            /** Capacity Percent */
+            capacity_percent: number | null;
+            /** Mode */
+            mode: string;
+            /** Alert Level */
+            alert_level: string;
+            /** Used Bytes */
+            used_bytes: number;
+            /** Capacity Bytes */
+            capacity_bytes: number | null;
         };
         /** DeleteOAuthClientResponse */
         DeleteOAuthClientResponse: {
@@ -10485,6 +10654,27 @@ export interface components {
             status?: string | null;
             /** Organisation Id */
             organisation_id?: string | null;
+        };
+        /**
+         * FanOutConfig
+         * @description Declares a scatter (fan-out) on an agent / sandbox_agent node.
+         *
+         *     Only the ``split`` source and the ``max_items`` cardinality ceiling are
+         *     honoured by the runtime — there is no batching/parallelism in P3, so those
+         *     knobs are intentionally absent from the contract rather than accepted and
+         *     silently ignored.
+         */
+        FanOutConfig: {
+            /**
+             * Split
+             * @description Name of the source port / state key to split.
+             */
+            split: string;
+            /**
+             * Max Items
+             * @description Hard ceiling on fan-out cardinality. Defaults to FANOUT_DEFAULT_MAX.
+             */
+            max_items?: number | null;
         };
         /** FeatureFlagInfo */
         FeatureFlagInfo: {
@@ -11126,6 +11316,44 @@ export interface components {
         InstallRequest: {
             /** Target Team Id */
             target_team_id?: string | null;
+        };
+        /**
+         * JoinAggregateSpec
+         * @description Aggregation applied by a join node to its collected branches.
+         */
+        JoinAggregateSpec: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "concat" | "merge_by_key" | "map" | "custom_function";
+            /**
+             * Key
+             * @description Field name for merge_by_key (read from each collected item's output).
+             */
+            key?: string | null;
+            /**
+             * Map Expression
+             * @description JMESPath expression for map aggregation.
+             */
+            map_expression?: string | null;
+        };
+        /**
+         * JoinCollectSpec
+         * @description One upstream branch a join node collects from.
+         *
+         *     Only the parent ``node`` is read by the runtime (it locates the scatter
+         *     manifest and merges every child output of that parent). The ``port`` knob
+         *     was removed from the contract because no code path selected a specific
+         *     output port; collecting all child outputs of the parent is the supported
+         *     semantics.
+         */
+        JoinCollectSpec: {
+            /**
+             * Node
+             * @description Parent (scatter) node id this branch belongs to.
+             */
+            node: string;
         };
         /**
          * JourneyCurrentStage
@@ -12768,7 +12996,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. When a run ends in a configured state and retries remain, the run is re-dispatched automatically instead of terminal-failing.
              */
             retry_policy?: {
                 [key: string]: unknown;
@@ -12844,6 +13072,18 @@ export interface components {
              * @description JMESPath expression for conditional edge routing. Evaluated against pipeline state; if truthy, routes to target.
              */
             condition_expression?: string | null;
+            /**
+             * Source Port
+             * @description Output port on the source node this edge originates from.
+             * @default out
+             */
+            source_port: string;
+            /**
+             * Target Port
+             * @description Input port on the target node this edge delivers into.
+             * @default in
+             */
+            target_port: string;
         };
         /** PipelineGraphNode */
         PipelineGraphNode: {
@@ -12857,7 +13097,7 @@ export interface components {
              * @default agent
              * @enum {string}
              */
-            node_type: "agent" | "manual" | "composite" | "sandbox_agent";
+            node_type: "agent" | "manual" | "composite" | "sandbox_agent" | "router" | "hitl" | "join";
             /** Agent Id */
             agent_id?: string | null;
             position: components["schemas"]["GraphPosition"];
@@ -12866,6 +13106,7 @@ export interface components {
             output_schema_id?: string | null;
             input_schema_pin?: components["schemas"]["SchemaPin"] | null;
             output_schema_pin?: components["schemas"]["SchemaPin"] | null;
+            capability_scope?: components["schemas"]["CapabilityScope"] | null;
             /** Label */
             label?: string | null;
             /** Role */
@@ -12981,6 +13222,44 @@ export interface components {
              * @description Filesystem detector: globs of sandbox paths whose change counts as activity.
              */
             watch_globs?: string[];
+            /**
+             * Router Config
+             * @description Router node config: {mode, rules:[{guard (JMESPath), target|target_port}|{default, target}]}. Required for node_type='router'.
+             */
+            router_config?: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Hitl Config
+             * @description HITL node config (mode, form_schema_ref, reject_target, claim_team_id, claim_expiry_min, human_only, eval_before_interrupt, required_team_id, overdue_threshold_minutes, eval_condition, condition). Compiles to the existing synthetic-gate path. Required for node_type='hitl'.
+             */
+            hitl_config?: {
+                [key: string]: unknown;
+            } | null;
+            fan_out?: components["schemas"]["FanOutConfig"] | null;
+            /** Collect */
+            collect?: components["schemas"]["JoinCollectSpec"][] | null;
+            aggregate?: components["schemas"]["JoinAggregateSpec"] | null;
+            /**
+             * Join Partial Policy
+             * @default collect_and_proceed
+             * @enum {string}
+             */
+            join_partial_policy: "collect_and_proceed" | "fail";
+            /**
+             * Inputs
+             * @description Input ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'in' port at compile time.
+             */
+            inputs?: {
+                [key: string]: unknown;
+            }[] | null;
+            /**
+             * Outputs
+             * @description Output ports. Each entry: {port: str, schema_ref?: str}. None => backfilled with a single default 'out' port at compile time.
+             */
+            outputs?: {
+                [key: string]: unknown;
+            }[] | null;
         };
         /** PipelineGraphResponse */
         PipelineGraphResponse: {
@@ -13099,6 +13378,11 @@ export interface components {
              * @default 0
              */
             snapshot_count: number;
+            /**
+             * Node Count
+             * @default 0
+             */
+            node_count: number;
             /** Archived At */
             archived_at?: string | null;
             /** Owner Team Id */
@@ -13181,7 +13465,7 @@ export interface components {
             } | null;
             /**
              * Retry Policy
-             * @description Retry policy: {on: [stall|timeout|failure], max_retries: 0-5}. Set to {} to clear.
+             * @description Retry policy: {on: [stall|timeout|failure|eval_failed], max_retries: 0-5}. Set to {} to clear.
              */
             retry_policy?: {
                 [key: string]: unknown;
@@ -14158,6 +14442,8 @@ export interface components {
             pipeline_name?: string | null;
             /** Langgraph Thread Id */
             langgraph_thread_id: string;
+            /** Snapshot Id */
+            snapshot_id?: string | null;
             /** Error Detail */
             error_detail?: string | null;
             /** Error Code */
@@ -14860,6 +15146,19 @@ export interface components {
              */
             account_id: string;
         };
+        /** SetSpendCeilingRequest */
+        SetSpendCeilingRequest: {
+            /**
+             * Max Run Cost
+             * @description Per-run hard ceiling in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            max_run_cost?: number | null;
+            /**
+             * Spend Ceiling
+             * @description Org lifetime budget in USD. 0 = block all runs. null = no limit (clears an existing ceiling).
+             */
+            spend_ceiling?: number | null;
+        };
         /** SetSpendLimitRequest */
         SetSpendLimitRequest: {
             /** Daily Spend Limit */
@@ -14940,6 +15239,23 @@ export interface components {
             /** Active */
             active?: boolean | null;
         };
+        /**
+         * SnapshotCreateEdit
+         * @description Body for a live-edit save (FAR-402 P6).
+         *
+         *     ``draft`` marks an in-progress editor auto-save (``False`` = a committed
+         *     edit). ``channel`` optionally tags the edit's release channel (default
+         *     ``none`` — the live-edit chain is not channel-routed unless set).
+         */
+        SnapshotCreateEdit: {
+            /**
+             * Draft
+             * @default false
+             */
+            draft: boolean;
+            /** Channel */
+            channel?: string | null;
+        };
         /** SnapshotDetailResponse */
         SnapshotDetailResponse: {
             /**
@@ -14962,6 +15278,26 @@ export interface components {
             created_at: string | null;
             /** Created By */
             created_by?: string | null;
+            /**
+             * Version Kind
+             * @default run
+             */
+            version_kind: string;
+            /**
+             * Created Kind
+             * @default run
+             */
+            created_kind: string;
+            /**
+             * Draft
+             * @default false
+             */
+            draft: boolean;
+            /**
+             * Channel
+             * @default none
+             */
+            channel: string;
             /** Graph Json */
             graph_json?: {
                 [key: string]: unknown;
@@ -15036,6 +15372,10 @@ export interface components {
             edges_modified: {
                 [key: string]: unknown;
             }[];
+            /** Semantic */
+            semantic?: {
+                [key: string]: unknown;
+            };
         };
         /** SnapshotListResponse */
         SnapshotListResponse: {
@@ -15066,6 +15406,26 @@ export interface components {
             created_at: string | null;
             /** Created By */
             created_by?: string | null;
+            /**
+             * Version Kind
+             * @default run
+             */
+            version_kind: string;
+            /**
+             * Created Kind
+             * @default run
+             */
+            created_kind: string;
+            /**
+             * Draft
+             * @default false
+             */
+            draft: boolean;
+            /**
+             * Channel
+             * @default none
+             */
+            channel: string;
         };
         /** SnapshotTagUpdate */
         SnapshotTagUpdate: {
@@ -15073,6 +15433,20 @@ export interface components {
             tag?: string | null;
             /** Notes */
             notes?: string | null;
+        };
+        /** SpendCeilingResponse */
+        SpendCeilingResponse: {
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
+            /**
+             * Org Cumulative Spend Usd
+             * @default 0
+             */
+            org_cumulative_spend_usd: number;
+            /** Remaining Budget Usd */
+            remaining_budget_usd?: number | null;
         };
         /** SpendLimitResponse */
         SpendLimitResponse: {
@@ -15091,6 +15465,8 @@ export interface components {
             provider_type: string;
             /** Name */
             name: string;
+            /** Provider Id */
+            provider_id?: string | null;
             /** Client Id */
             client_id?: string | null;
             /** Client Secret */
@@ -15132,6 +15508,8 @@ export interface components {
             provider_type: string;
             /** Name */
             name: string;
+            /** Provider Id */
+            provider_id?: string | null;
             /** Client Id */
             client_id?: string | null;
             /** Client Secret */
@@ -15613,6 +15991,10 @@ export interface components {
         UpdateCostControlsRequest: {
             /** Budget */
             budget?: number | null;
+            /** Max Run Cost */
+            max_run_cost?: number | null;
+            /** Spend Ceiling */
+            spend_ceiling?: number | null;
             /** Alert Thresholds */
             alert_thresholds?: number[] | null;
             /** Circuit Breaker Enabled */
@@ -16210,6 +16592,11 @@ export interface components {
              * @default false
              */
             is_system_admin: boolean;
+            /**
+             * Must Change Password
+             * @default false
+             */
+            must_change_password: boolean;
         };
         /** PublishRequest */
         modulo__api__routes__composite_templates__PublishRequest: {
@@ -16582,6 +16969,11 @@ export interface components {
              * @default false
              */
             is_system_admin: boolean;
+            /**
+             * Must Change Password
+             * @default false
+             */
+            must_change_password: boolean;
         };
     };
     responses: never;
@@ -19306,6 +19698,37 @@ export interface operations {
             };
         };
     };
+    get_db_capacity_api_v1_admin_db_capacity_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DbCapacityResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     login_api_v1_auth_login_post: {
         parameters: {
             query?: {
@@ -19814,7 +20237,6 @@ export interface operations {
             query?: {
                 format?: string;
                 offset?: number;
-                limit?: number;
                 dimension?: components["schemas"]["AnalyticsDimension"] | null;
                 trigger_type?: components["schemas"]["AnalyticsTriggerType"] | null;
                 status?: components["schemas"]["AnalyticsStatus"] | null;
@@ -19823,6 +20245,7 @@ export interface operations {
                 folder_id?: string | null;
                 date_from?: string | null;
                 date_to?: string | null;
+                limit?: number;
                 _fresh?: boolean;
             };
             header?: never;
@@ -20168,6 +20591,72 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["CostControlsResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_spend_ceiling_api_v1_admin_costs_ceiling_get: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    set_spend_ceiling_api_v1_admin_costs_ceiling_put: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSpendCeilingRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SpendCeilingResponse"];
                 };
             };
             /** @description Validation Error */
@@ -21395,6 +21884,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SnapshotListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_edit_snapshot_endpoint_api_v1_pipelines__pipeline_id__snapshots_post: {
+        parameters: {
+            query?: {
+                _fresh?: boolean;
+            };
+            header?: never;
+            path: {
+                pipeline_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SnapshotCreateEdit"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotResponse"];
                 };
             };
             /** @description Validation Error */
@@ -30155,6 +30681,73 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not Implemented */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    eval_coverage_gap_api_v1_eval_coverage_gap_get: {
+        parameters: {
+            query?: {
+                /** @description Scope to a variant group */
+                variant_group_id?: string | null;
+                /** @description Scope to a single fired batch */
+                batch_id?: string | null;
+                /** @description Minimum run count before a signal is emitted */
+                min_runs?: number;
+                /** @description Variant-divergence threshold above which variants count as genuinely differing */
+                threshold?: number;
+                _fresh?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Internal Server Error */
             500: {

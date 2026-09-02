@@ -74,6 +74,11 @@ def _session(*, execute_side_effect) -> SimpleNamespace:
     session.refresh = AsyncMock()
     session.begin = MagicMock(return_value=_acm())
     session.begin_nested = MagicMock(return_value=_acm())
+    # backfill_facts / run_maintenance probe the dialect via
+    # ``session.connection().dialect.name`` (e.g. to pick jsonb_* vs json_*
+    # functions) — provide a generic (non-Postgres) connection double so those
+    # code paths can run without a live engine.
+    session.connection = AsyncMock(return_value=SimpleNamespace(dialect=SimpleNamespace(name="sqlite")))
     return session
 
 
@@ -379,7 +384,7 @@ class TestRecordFactForTerminalFailedRun:
         session = _session(execute_side_effect=[])
 
         async def _cancel(*args: object, **kwargs: object) -> None:
-            raise asyncio.CancelledError()
+            raise asyncio.CancelledError
 
         monkeypatch.setattr(analytics_mod, "record_run_facts", _cancel)
         with pytest.raises(asyncio.CancelledError):
@@ -533,6 +538,16 @@ class TestSubtractMonths:
             (date(2024, 3, 31), 1, date(2024, 2, 29)),
             (date(2026, 5, 31), 1, date(2026, 4, 30)),
             (date(2026, 12, 31), 1, date(2026, 11, 30)),
+        ],
+        ids=[
+            "1m-back",
+            "13m-leap-year",
+            "24m-back",
+            "jan-clamp",
+            "mar31-feb",
+            "feb29-leap",
+            "may31-apr",
+            "dec31-nov",
         ],
     )
     def test_subtracts_months_with_day_clamping(self, day: date, months: int, expected: date) -> None:
@@ -717,7 +732,7 @@ class TestBackfillLedger:
         assert "'2026-08-06'" in agg_sql
 
     async def test_returns_zero_when_no_terminal_runs_for_the_day(self) -> None:
-        session = _session(execute_side_effect=[SimpleNamespace(all=lambda: [])])
+        session = _session(execute_side_effect=[SimpleNamespace(all=list)])
         result = await maintenance_mod.backfill_ledger(session, date(2026, 8, 6))
         assert result == 0
         # No orgs to upsert -> the insert statement is never built/executed.

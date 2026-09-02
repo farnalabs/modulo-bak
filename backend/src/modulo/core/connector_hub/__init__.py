@@ -24,6 +24,7 @@ from typing import Any, Self, cast
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
 
+from modulo.connectors._rate_bucket import SharedBudgetUnavailableError
 from modulo.connectors.asana import AsanaConnector
 from modulo.connectors.azure_key_vault import AzureKeyVaultConnector
 from modulo.connectors.azure_pipelines import AzurePipelinesConnector
@@ -85,12 +86,34 @@ from modulo.db.models.connector_instance import ConnectorInstance
 logger = logging.getLogger(__name__)
 
 _SAMPLE_LIMIT: int = 200
+_SKIP_SUMMARY_LIMIT: int = 2000
 _OTEL_ATTR_CONNECTOR_RESOURCE = "connector.resource"
 _LOCALHOST_8080: str = "http://localhost:8080"
 _LOCALHOST_3000: str = "http://localhost:3000"
 _LOCALHOST_5678: str = "http://localhost:5678"
 _LOCALHOST_8111: str = "http://localhost:8111"
 _LOCALHOST_9000: str = "http://localhost:9000"
+
+# FAR-496 read-side heal: the REST create/update endpoints store `credentials`
+# as a bare string, Fernet-encrypted into `credentials_ciphertext`. Token-keyed
+# connector types below read a DIFFERENT credential key in ``_build_connector``,
+# so legacy bare-token ciphertext rows for those types always failed
+# instantiation with "Missing credential key 'token'". The bare-scalar fallback
+# wrap in ``initialise()`` therefore wraps a decrypted bare scalar under the
+# connector type's OWN single credential key (see ``_bare_credential_key``),
+# healing legacy rows at read time — no write-side migration needed. Multi-key
+# types (jira, trello, jenkins, confluence, datadog, rest, ticket-tracker)
+# require JSON-dict credentials and keep the legacy "api_key" default, as do
+# plugin types.
+
+# Process-lifetime dedup for connector skip-warnings (FAR-465): a fresh hub is
+# built per run/request, so one persistently misconfigured connector used to
+# re-log its FULL traceback on every initialise() and flood worker logs. The
+# first sighting of a (instance, type, "ExcType: message") key logs the full
+# traceback; later sightings log a concise repeat line. The key space is
+# bounded by the number of connector instances in the deployment, so the set
+# cannot grow unbounded within a process.
+_SKIP_WARN_SEEN: set[tuple[str, str, str]] = set()
 
 
 class ConnectorNotFoundError(KeyError):
@@ -109,6 +132,100 @@ class ConnectorDecryptError(ValueError):
         self.connector_id = connector_id
 
 
+def resolve_shared_rate_limit_redis(org_id: str | None) -> Any | None:
+    """Resolve the shared rate-limit Redis client for an org, fail-closed (FAR-439).
+
+    This is the single composition root BOTH the run-executor path (through
+    ``ConnectorHub``) and the trigger/polling path (FAR-442) use to wire a shared
+    per-destination rate budget into REST connectors. It returns ``None`` ONLY when
+    a shared budget genuinely does not exist:
+
+    * Redis is not configured (no ``settings.redis_url`` or the DB is SQLite), or
+    * no ``org_id`` is supplied (a non-tenant probe path, e.g. health-check /
+      schema-inference). Wiring a shared budget without a tenant would bucket every
+      organisation under a single ``"default"`` key — a cross-tenant leak. The
+      guard is truthiness-based: an empty-string ``org_id`` is also treated as a
+      non-tenant probe (a non-empty tenant id is required to compose a Redis key).
+
+    On a tenant path (``org_id`` present) where Redis IS configured the client is
+    AUTHORITATIVE and FAIL-CLOSED: a settings-read failure or a client construction
+    failure raises :class:`SharedBudgetUnavailableError` rather than returning
+    ``None``. Returning ``None`` there would make the REST connector fall back to its
+    per-process local bucket, silently reconstructing the fleet-wide ``N x burst``
+    fail-open FAR-439 removed.
+    """
+    try:
+        settings = _read_rate_limit_settings()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _handle_settings_read_failure(exc, org_id)
+        return None
+
+    if _shared_redis_unconfigured(settings):
+        # Redis is genuinely NOT configured — the connector-local bucket is correct
+        # (no shared budget exists to multiply).
+        return None
+    if not org_id:
+        # Non-tenant probe path (None or an empty string): never wire a shared
+        # budget — every org would otherwise land on the "default" tenant key and
+        # share one Redis budget across distinct orgs (cross-tenant leak). These
+        # short-lived probes stay on the connector-local bucket, which is correct.
+        return None
+
+    return _build_shared_redis_client(settings)
+
+
+def _read_rate_limit_settings() -> Any:
+    """Read app settings (the source of ``redis_url`` for the shared budget)."""
+    from modulo.settings import get_settings
+
+    return get_settings()
+
+
+def _handle_settings_read_failure(exc: Exception, org_id: str | None) -> None:
+    """Fail-closed on the tenant path, degrade to the local bucket on a probe path."""
+    if org_id:
+        logger.error(
+            "Settings could not be read on the tenant path — fail-closed (no local-bucket fallback)",
+            exc_info=exc,
+        )
+        raise SharedBudgetUnavailableError(
+            f"settings could not be read to wire the shared rate-limit budget: {exc}"
+        ) from exc
+    logger.warning(
+        "Unable to read settings for the shared Redis rate limiter — using the local bucket",
+        exc_info=exc,
+    )
+
+
+def _shared_redis_unconfigured(settings: Any) -> bool:
+    """True when no shared Redis budget exists and the connector-local bucket is correct."""
+    return not settings.redis_url or settings.modulo_db.lower() == "sqlite"
+
+
+def _build_shared_redis_client(settings: Any) -> Any:
+    """Construct the shared Redis client, fail-closed on any construction error (FAR-439)."""
+    try:
+        from redis.asyncio import Redis
+
+        return Redis.from_url(settings.redis_url, decode_responses=False, socket_connect_timeout=5, socket_timeout=10)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Redis IS configured (tenant path) but the client could not be constructed.
+        # `Redis.from_url` only parses the URL, so a failure here is a
+        # malformed/unsupported `redis_url` — a hard config error. Never degrade to
+        # the local bucket (that would reconstruct the fleet-wide fail-open FAR-439
+        # removed).
+        logger.exception(
+            "Shared Redis client construction failed — fail-closed (no local-bucket fallback)",
+        )
+        raise SharedBudgetUnavailableError(
+            f"shared rate-limit Redis client is configured but could not be constructed: {exc}"
+        ) from exc
+
+
 class ConnectorHub:
     """Decrypts connector credentials once at run-start; discards them on exit.
 
@@ -122,16 +239,44 @@ class ConnectorHub:
         org_id: str | None = None,
         runtime_provider: Any = None,
         runtime_provider_hub: Any = None,
+        request_visibility: str | None = None,
     ) -> None:
         self._secrets_backend = secrets_backend
         self._connectors: dict[uuid.UUID, ConnectorBase] = {}
         self._acls: dict[uuid.UUID, ConnectorACL] = {}
+        # Instances that failed to initialise during the last initialise() call
+        # (FAR-495), mapped to a "{ExcType}: {message}" summary. EVERY failure
+        # class lands here — typed errors and unexpected exceptions alike —
+        # except the fail-closed propagations (SharedBudgetUnavailableError,
+        # CancelledError), which abort the run instead. Callers persist a
+        # degraded marker from this so operators can see broken connectors.
+        self.skipped: dict[uuid.UUID, str] = {}
+        # Instances successfully initialised during the last initialise() call
+        # (FAR-495). The executor clears stale degraded markers for these so a
+        # connector fixed via a config/plugin change stops being flagged
+        # degraded (credential updates clear the marker at the API layer).
+        self.healthy: set[uuid.UUID] = set()
         self._tracer = trace.get_tracer("modulo.connector_hub")
         self._org_id = org_id
         self._runtime_provider = runtime_provider
         self._runtime_provider_hub = runtime_provider_hub
+        # The visibility scope of the CALLER that drives this hub (FAR-516).
+        # "team" for a team-scoped run/node invocation, "org" for an org-scoped
+        # one, None for a non-tenant probe (health-check, schema-inference) or
+        # a caller that does not scope. Threaded into every ACL check so an
+        # org-only connector (visibility == "org") is fail-closed rejected for a
+        # team-scoped invocation at the connector-invocation gate.
+        self._request_visibility = request_visibility
         self._initialised = False
         self._init_lock = asyncio.Lock()
+        # Lazily-built shared Redis client used to wire the REST connector's
+        # shared per-destination rate-limit budget (FAR-439). Owned by the hub
+        # (closed at teardown), never by an individual connector. When the client
+        # is configured but cannot be constructed (bad redis_url), the failure is
+        # recorded so every later call fails closed.
+        self._shared_redis: Any = None
+        self._redis_attempted = False
+        self._redis_error: Exception | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -159,6 +304,57 @@ class ConnectorHub:
                     await result
             except Exception:
                 logger.warning("Failed to close connector", exc_info=True)
+        # The shared Redis client (FAR-439) is owned by the hub, not a connector —
+        # close it here so the rate-limit budget never leaks a pool connection.
+        shared_redis = self._shared_redis
+        self._shared_redis = None
+        if shared_redis is not None:
+            try:
+                await shared_redis.aclose()
+            except Exception:
+                logger.warning("Failed to close shared Redis client", exc_info=True)
+
+    def _shared_redis_client(self) -> Any | None:
+        """Return the lazily-built shared Redis client, or None when NOT configured.
+
+        Thin caching wrapper over :func:`resolve_shared_rate_limit_redis` — the
+        fail-closed composition root used by both the executor hub and the
+        trigger/polling path (FAR-442). The shared client is ONLY wired on a
+        tenant path — a ``ConnectorHub`` constructed with an ``org_id``.
+        Non-executor hubs (health-check probes, schema-inference, determination
+        scanning) carry no ``org_id``: wiring them to Redis would bucket every
+        organisation's rate-limited REST connector under a single ``default``
+        tenant key, sharing ONE budget across distinct orgs (a cross-tenant
+        leak). Those short-lived probes stay on the connector-local per-process
+        bucket, which is correct — there is no fleet-wide budget to multiply.
+
+        When Redis *is* wired (tenant path, ``settings.redis_url`` set and the DB
+        is not SQLite), the shared client is AUTHORITATIVE. Any settings-read or
+        construction failure FAILS CLOSED (raises
+        :class:`SharedBudgetUnavailableError`) and is recorded so every later
+        call fails too; we NEVER degrade a configured Redis to ``None``, because
+        returning ``None`` would make the REST connector fall back to its
+        per-process local bucket, silently reconstructing the fleet-wide
+        ``N x burst`` fail-open FAR-439 removed. Only the genuinely
+        not-configured / non-tenant paths return ``None`` (correct, not a
+        degrade).
+        """
+        if self._redis_error is not None:
+            raise SharedBudgetUnavailableError(
+                f"shared rate-limit Redis client is configured but could not be constructed: {self._redis_error}"
+            ) from self._redis_error
+        if self._shared_redis is not None or self._redis_attempted:
+            return self._shared_redis
+        self._redis_attempted = True
+        try:
+            client = resolve_shared_rate_limit_redis(self._org_id)
+        except SharedBudgetUnavailableError as exc:
+            # Record the failure so EVERY later call also fails closed (never
+            # degrades to the per-process local bucket on a subsequent call).
+            self._redis_error = exc
+            raise
+        self._shared_redis = client
+        return client
 
     def close(self) -> None:
         """Release every held connector and its decrypted credentials.
@@ -176,14 +372,39 @@ class ConnectorHub:
         """
         self._connectors.clear()
         self._acls.clear()
+        self.skipped.clear()
+        self.healthy.clear()
         self._initialised = False
 
-    async def initialise(self, instances: Sequence[ConnectorInstance]) -> None:
+    def _record_skip(self, instance: ConnectorInstance, exc: Exception) -> None:
+        """Record an instance that failed to initialise (FAR-495) so callers can persist a degraded marker.
+
+        The summary is NUL-stripped and truncated to 2000 chars: Postgres
+        rejects NUL bytes in SQL text (a NUL in any summary would fail the
+        whole batch UPDATE so NO instance gets marked), and 2000 matches the
+        sibling ``last_health_check_error`` String(2000) column.
+        """
+        summary = f"{type(exc).__name__}: {exc}"
+        self.skipped[instance.id] = summary.replace("\x00", "")[:_SKIP_SUMMARY_LIMIT]
+
+    async def initialise(
+        self,
+        instances: Sequence[ConnectorInstance],
+        *,
+        allowed_connectors: Sequence[str] | None = None,
+    ) -> None:
         """Decrypt credentials and initialise connectors. Call once at run start.
 
         ACLs are built from instance visibility and allowed_operations columns.
         Connectors that fail to initialise are skipped and logged individually
         so that one misconfigured connector does not block the rest.
+
+        Fetch-time scoping (FAR-418): when *allowed_connectors* is provided it
+        gates the FETCH set BEFORE any credential is decrypted — the hub decrypts
+        only the named instance-ids/types, so connectors outside the scope never
+        expose credentials (deny-by-default within the scope). When *None* (the
+        default) the hub is unrestricted and fetches every instance, preserving
+        the pre-scope behaviour exactly.
         """
         if self._initialised:
             logger.warning("ConnectorHub already initialised — skipping")
@@ -192,7 +413,21 @@ class ConnectorHub:
             if self._initialised:
                 logger.warning("ConnectorHub already initialised — skipping")
                 return
+            # FAR-498: reset the per-initialise tracking state at entry. The
+            # attribute docs promise skipped/healthy describe "the last
+            # initialise() call"; a re-initialisation attempt on a hub whose
+            # previous pass aborted mid-loop (never reached close()) must not
+            # carry stale entries into the new pass. close() also clears them;
+            # this covers the aborted-pass path. Placed AFTER the guard checks
+            # so an already-initialised hub is left untouched. .clear() matches
+            # close()'s mechanism and preserves object identity for any
+            # reference a caller captured.
+            self.skipped.clear()
+            self.healthy.clear()
+            fetch_scope: set[str] | None = set(allowed_connectors) if allowed_connectors is not None else None
             for ci in instances:
+                if fetch_scope is not None and not _in_fetch_scope(ci, fetch_scope):
+                    continue
                 try:
                     try:
                         raw_str = await asyncio.wait_for(
@@ -213,8 +448,11 @@ class ConnectorHub:
                                 plaintext = f.decrypt(ciphertext).decode("utf-8")
                                 # Multi-field creds round-trip: a JSON dict in the
                                 # ciphertext is used as-is (REST auth_mode/token/
-                                # api_key/...); a bare scalar falls back to the
-                                # legacy single api_key wrapper.
+                                # api_key/...); a bare scalar is wrapped under the
+                                # connector type's own single credential key
+                                # (FAR-496 read-side heal — see
+                                # _bare_credential_key), falling back to the
+                                # legacy single api_key wrapper for unlisted types.
                                 try:
                                     parsed_plain = json.loads(plaintext)
                                 except json.JSONDecodeError:
@@ -222,7 +460,13 @@ class ConnectorHub:
                                 if isinstance(parsed_plain, dict):
                                     raw_str = plaintext
                                 else:
-                                    raw_str = json.dumps({"api_key": plaintext})
+                                    # Wrap the bare scalar under the connector
+                                    # type's OWN credential key so token-keyed
+                                    # types (github, linear, slack, ...) heal
+                                    # instead of failing with
+                                    # "Missing credential key 'token'" (FAR-496).
+                                    cred_key = _bare_credential_key(ci.connector_type_id)
+                                    raw_str = json.dumps({cred_key: plaintext})
                             except Exception:
                                 logger.warning(
                                     "Failed to decrypt credentials_ciphertext for connector %s", ci.id, exc_info=True
@@ -245,6 +489,19 @@ class ConnectorHub:
                         creds,
                         runtime_provider=self._runtime_provider,
                         runtime_provider_hub=self._runtime_provider_hub,
+                        # NOTE (FAR-439 trade-off): the shared Redis client is
+                        # constructed for EVERY connector row here, not only for
+                        # rate-limited REST connectors. A malformed ``redis_url``
+                        # therefore fail-closes runs whose connectors would never
+                        # touch the shared budget (GitHub / Linear / non-rate-limited
+                        # REST). This is accepted deliberately: a misconfigured
+                        # Redis URL is a fleet-wide configuration error and must fail
+                        # loud rather than silently per-process for some connectors
+                        # and shared for others. ``get_settings()`` is re-read here
+                        # after the executor already read it; the cache makes this a
+                        # cheap lookup, not a second DB round-trip.
+                        redis_client=self._shared_redis_client(),
+                        tenant_id=str(self._org_id) if self._org_id else None,
                     )
                     acl = ConnectorACL(
                         visibility=ci.visibility,
@@ -255,27 +512,58 @@ class ConnectorHub:
                         tracer=self._tracer,
                         org_id=self._org_id,
                         acl=acl,
+                        request_visibility=self._request_visibility,
                     )
                     self._connectors[ci.id] = traced
                     self._acls[ci.id] = acl
+                    self.healthy.add(ci.id)
                 except (
-                    TimeoutError,
                     ConnectorDecryptError,
                     ValueError,
                     TypeError,
                     KeyError,
-                    json.JSONDecodeError,
                     OSError,
-                ):
-                    logger.warning(
-                        "Skipping connector %s (%s)",
-                        ci.id,
-                        ci.connector_type_id,
-                        exc_info=True,
-                    )
+                ) as exc:
+                    # FAR-495: record the degraded marker (skip) so callers can
+                    # persist it. FAR-465: dedup the skip-warning so one
+                    # misconfigured connector does not flood worker logs with full
+                    # tracebacks on every initialise(). Check-and-add is
+                    # synchronous (no await between) so it is race-free under
+                    # asyncio.
+                    # FAR-495: record the degraded marker so callers can persist
+                    # it. FAR-465: dedup the skip-warning so one misconfigured
+                    # connector does not flood worker logs with full tracebacks
+                    # on every initialise(). Check-and-add is synchronous (no
+                    # await between) so it is race-free under asyncio.
+                    self._record_skip(ci, exc)
+                    skip_key = (str(ci.id), ci.connector_type_id, type(exc).__name__ + ": " + str(exc))
+                    if skip_key in _SKIP_WARN_SEEN:
+                        logger.warning(
+                            "Skipping connector %s (%s) (repeat; full traceback logged earlier)",
+                            ci.id,
+                            ci.connector_type_id,
+                        )
+                    else:
+                        logger.warning(
+                            "Skipping connector %s (%s)",
+                            ci.id,
+                            ci.connector_type_id,
+                            exc_info=True,
+                        )
+                        _SKIP_WARN_SEEN.add(skip_key)
+                except SharedBudgetUnavailableError:
+                    # A configured-but-unconstructable shared Redis client is a
+                    # hard config error (FAR-439): degrade to the local bucket
+                    # would reconstruct the fleet-wide fail-open. Propagate so the
+                    # run fails closed (loudly) instead of silently mis-limiting.
+                    raise
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
+                    # FAR-495: unexpected failures land in `skipped` too — every
+                    # skipped instance must reach the degraded-marker persist,
+                    # regardless of failure class.
+                    self._record_skip(ci, exc)
                     logger.exception(
                         "Unexpected error skipping connector %s (%s) — programming bug",
                         ci.id,
@@ -299,7 +587,7 @@ class ConnectorHub:
         """
         connector = self._get_or_raise(connector_id)
         if operation is not None:
-            self._acls[connector_id].check(operation)
+            self._acls[connector_id].check(operation, request_visibility=self._request_visibility)
         return connector
 
     def acl(self, connector_id: uuid.UUID) -> ConnectorACL:
@@ -347,10 +635,12 @@ class _TracedConnector(ConnectorBase):
         tracer: trace.Tracer,
         org_id: str | None = None,
         acl: ConnectorACL | None = None,
+        request_visibility: str | None = None,
     ) -> None:
         self._inner = inner
         self._tracer = tracer
         self._acl = acl
+        self._request_visibility = request_visibility
         self._base_attrs: dict[str, str] = {}
         if org_id is not None:
             self._base_attrs["connector.org_id"] = org_id
@@ -364,7 +654,7 @@ class _TracedConnector(ConnectorBase):
 
     def _enforce_acl(self, operation: str) -> None:
         if self._acl is not None:
-            self._acl.check(operation)
+            self._acl.check(operation, request_visibility=self._request_visibility)
 
     async def _run_with_tracing(
         self,
@@ -476,6 +766,133 @@ class _TracedConnector(ConnectorBase):
         )
 
 
+def _in_fetch_scope(instance: ConnectorInstance, fetch_scope: set[str]) -> bool:
+    """Return True when a connector instance is inside the run's fetch scope.
+
+    An instance is fetched when its UUID (string) OR its connector type is
+    explicitly named in the scope. The scope is a deny-by-default allow-list:
+    anything not named is never decrypted.
+    """
+    return str(instance.id) in fetch_scope or instance.connector_type_id in fetch_scope
+
+
+# Token-keyed connector types whose single credential is read under the key
+# "token" (see the `_get_cred(creds, "token", type_id)` calls in `_build_connector`
+# below). A bare (non-JSON) ciphertext scalar for these types must be wrapped
+# under "token" on the read-side fallback, NOT the legacy "api_key" wrapper
+# (FAR-496).
+#
+# FAR-526C — single source of truth: these sets DERIVE from
+# ``definitions.py``'s ``credential_fields`` (the canonical credential-key
+# declarations), UNION a curated fallback for the hub-native connector types the
+# library does not carry. A ``_get_cred`` read in ``_build_connector`` that
+# disagrees with the type's declared credential key is now caught by the parity
+# guard in ``tests/unit/connector_hub/test_definitions_credential_parity.py`` at
+# TEST time, not by a connector failing at run time.
+
+
+def _definition_single_credential_types() -> tuple[frozenset[str], dict[str, str]]:
+    """Derive the token-keyed set + single-token key overrides from definitions.
+
+    ``definitions.py``'s ``credential_fields`` is the single source of truth for
+    the credential keys a connector type consumes. A DEFINED type with exactly
+    one credential field is a single-credential connector:
+
+    * the field is the canonical ``token`` → token-keyed (a bare-scalar
+      ciphertext heals under ``token``);
+    * the single field is a non-default token name (``bot_token``,
+      ``personal_access_token``) → token-keyed, with an override mapping the
+      type to its actual key.
+
+    Multi-field types (jira, confluence, rest, datadog, jenkins) and the
+    family/plugin labels (``ci_runner``, ``custom``) carry no single-field
+    contract and are excluded so the derivation never mis-classifies them.
+    Single ``api_key`` fields keep the legacy default wrapper and are excluded.
+    The lazy import keeps ``definitions`` out of the connector-hub import-time
+    coupling (it is pure data).
+    """
+    from modulo.core.library.integrations import __all__ as _integration_exports
+    from modulo.core.library.integrations import definitions as _integration_defs
+
+    family_labels = frozenset({"ci_runner", "custom"})
+    token_types: set[str] = set()
+    overrides: dict[str, str] = {}
+    for name in _integration_exports:
+        definition = getattr(_integration_defs, name)
+        type_id = definition.get("connector_type")
+        if not type_id or type_id in family_labels:
+            continue
+        fields = definition.get("credential_fields") or {}
+        if len(fields) != 1:
+            continue  # multi-field (jira/confluence/rest/datadog/jenkins)
+        key = next(iter(fields))
+        if key == "token":
+            token_types.add(type_id)
+        elif key != "api_key":
+            overrides[type_id] = key  # single non-default token name (e.g. bot_token)
+    return frozenset(token_types), overrides
+
+
+# Hub-native token-keyed connector types with NO library definition (the library
+# carries only the 24 canonical integrations; these are connector types the
+# platform ships outside that catalog). Their single credential is the token, so
+# a bare-scalar ciphertext heals under "token" (FAR-496).
+_HUB_NATIVE_TOKEN_TYPES: frozenset[str] = frozenset(
+    {
+        "gitea",
+        "azure_repos",
+        "github",
+        "github_actions_ci",
+        "gitlab_ci",
+        "linear",
+        "sharepoint",
+        "shortcut",
+        "youtrack",
+        "npm",
+        "pypi",
+        "dropbox_paper",
+        "buildkite",
+        "teamcity",
+        "azure_key_vault",
+        "grafana",
+        "onepassword",
+        "codeclimate",
+        "trivy",
+    }
+)
+
+# Hub-native single-token types whose credential key is not "token".
+_HUB_NATIVE_SINGLE_KEY_OVERRIDES: dict[str, str] = {
+    "asana": "personal_access_token",
+}
+
+_DEFINITION_TOKEN_TYPES, _DEFINITION_KEY_OVERRIDES = _definition_single_credential_types()
+
+# The token-keyed set + overrides are the definitions-derived values UNION the
+# curated hub-native fallback (see the module note above).
+_TOKEN_CRED_TYPES: frozenset[str] = _DEFINITION_TOKEN_TYPES | _HUB_NATIVE_TOKEN_TYPES
+_BARE_CRED_KEY_OVERRIDES: dict[str, str] = _DEFINITION_KEY_OVERRIDES | _HUB_NATIVE_SINGLE_KEY_OVERRIDES
+
+
+def _bare_credential_key(type_id: str) -> str:
+    """Return the credential key a bare (non-JSON) ciphertext scalar is wrapped under.
+
+    Token-keyed connectors read a credential key other than "api_key" (FAR-496):
+    wrapping a bare token under "api_key" guarantees instantiation failure with
+    ``Missing credential key 'token'``. We therefore wrap under the connector
+    type's OWN credential key. api_key-keyed single types (monday, opsgenie, ...)
+    and multi-key types (jira, datadog, rest, confluence, trello, jenkins,
+    ticket-tracker, ...) keep the legacy "api_key" default — multi-key types
+    require a JSON-dict credential anyway, so a bare scalar can never be valid
+    for them and their shape must not change.
+    """
+    if type_id in _BARE_CRED_KEY_OVERRIDES:
+        return _BARE_CRED_KEY_OVERRIDES[type_id]
+    if type_id in _TOKEN_CRED_TYPES:
+        return "token"
+    return "api_key"
+
+
 def _get_cred(creds: dict[str, Any], key: str, type_id: str) -> Any:
     try:
         return creds[key]
@@ -528,6 +945,9 @@ def _build_connector(
     creds: dict[str, Any],
     runtime_provider: Any = None,
     runtime_provider_hub: Any = None,
+    *,
+    redis_client: Any = None,
+    tenant_id: str | None = None,
 ) -> ConnectorBase:
     config = config or {}
     match type_id:
@@ -637,7 +1057,7 @@ def _build_connector(
         case "datadog":
             return DatadogConnector(
                 api_key=_get_cred(creds, "api_key", type_id),
-                app_key=_get_cred(creds, "app_key", type_id),
+                app_key=_get_cred(creds, "application_key", type_id),
                 site=config.get("site", "us"),
             )
         case "sentry":
@@ -687,7 +1107,13 @@ def _build_connector(
             # Multi-field auth (auth_mode/token/api_key/username/password/...)
             # arrives as a JSON dict via secrets_backend OR credentials_ciphertext
             # — not the single api_key fallback (see initialise()).
-            return RestConnector(config=config, creds=creds, security_guard=_core_security_guard())
+            return RestConnector(
+                config=config,
+                creds=creds,
+                security_guard=_core_security_guard(),
+                redis_client=redis_client,
+                tenant_id=tenant_id,
+            )
         case "ticket-tracker":
             provider = config.get("provider", "github")
             if provider == "github":

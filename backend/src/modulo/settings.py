@@ -28,12 +28,18 @@ class Settings(BaseSettings):
     fernet_key_old: str = Field(default="")
     redis_url: str = Field("redis://localhost:6379/0")
     modulo_ws_token_ttl_seconds: int = Field(60)
+    modulo_access_token_minutes: int = Field(default=15, ge=5, le=1440)
     debug: bool = Field(False)
 
     # Alpha auth — at least one of these must be non-empty for login to work.
     modulo_admin_password: str = Field("")
     # Multi-user format: "user1:$2b$12$hash,user2:$2b$12$hash"
     modulo_users: str = Field("")
+    # Gated demo-org seed framework (FAR-450). When True, the FastAPI boot
+    # lifespan seeds the organisations listed in
+    # ``modulo.core.seed_data.demo_data.DEMO_ORGS`` with per-org signed licenses.
+    # False by default — nothing seeds unless an operator opts in.
+    modulo_seed_demo_orgs: bool = Field(False)
 
     modulo_public_url: str = Field("http://localhost:8000")
     modulo_license_key: str = Field("")
@@ -114,6 +120,25 @@ class Settings(BaseSettings):
     modulo_max_local_concurrency: int = Field(2)
 
     # ------------------------------------------------------------------
+    # DB capacity monitor + 98% hard-stop (FAR-425/426)
+    # ------------------------------------------------------------------
+    # "fixed" (self-hosted, ENFORCED), "elastic" (Aurora / horizontally-scaled,
+    # advisory only — no hard-stop), or "disabled". Env var: DB_CAPACITY_MODE.
+    db_capacity_mode: str = Field("fixed")
+    # Total capacity bytes used to compute capacity_percent for mode="fixed".
+    # If left None, no percent is reported (capacity_percent=None, alert "ok"),
+    # the monitor is disabled and the 98% hard-stop never fires — an operator
+    # MUST set DB_CAPACITY_BYTES to enable it. Env var: DB_CAPACITY_BYTES.
+    db_capacity_bytes: int | None = Field(default=None)
+    # Operator bypass for the 98% hard-stop (e.g. a deliberate migration that
+    # must write at/over the limit). Does NOT disable the monitor. Env var:
+    # DB_CAPACITY_BYPASS=1.
+    db_capacity_bypass: bool = Field(False)
+    # The percent of configured capacity at/above which a NEW run is refused
+    # (mode="fixed" only). Env var: DB_CAPACITY_HARD_STOP_PCT.
+    db_capacity_hard_stop_pct: float = Field(98.0, ge=1.0, le=100.0)
+
+    # ------------------------------------------------------------------
     # SAQ (Celery removed in PR C) — plan F4 Settings section
     # ------------------------------------------------------------------
     # SAQ is the ONLY dispatch path — dispatch_run always enqueues to SAQ and
@@ -144,11 +169,20 @@ class Settings(BaseSettings):
     # landing ``complete``. Rollout flag — agent-failure-ux-proposal §15.4.
     modulo_agent_failure_elevation_enabled: bool = Field(True, alias="MODULO_AGENT_FAILURE_ELEVATION_ENABLED")
     # FAR-228 kill-switch for the sandbox idempotency gate (opt-in per node via
-    # PipelineGraphNode.delivery_sentinel). Consumed at BOTH guards: guard A
-    # (node_runner early skip) and guard B (executor retry suppression). When
-    # disabled the gate never fires and transient node failures retry exactly as
-    # before. This flag MUST stay consumed at both call sites.
+    # PipelineGraphNode.delivery_sentinel). Consumed at BOTH sandbox guards: guard
+    # A (node_runner early skip for single sandbox node) and guard B (executor
+    # retry suppression). When disabled the gate never fires and transient node
+    # failures retry exactly as before. NOTE: this flag is consumed at THREE
+    # sites total (the two sandbox guards above plus the FAR-458 connector-write
+    # gate's SHARED predecessor); the connector-write gate now uses its OWN
+    # opt-in flag below.
     modulo_idempotency_gate_enabled: bool = Field(True, alias="MODULO_IDEMPOTENCY_GATE_ENABLED")
+    # FAR-458 connector-write idempotency gate kill-switch. GENUINELY OPT-IN:
+    # defaults to False so a deploy never silently suppresses byte-identical
+    # re-executed connector writes (a behavioural change vs. the pre-FAR-458
+    # contract where every visit fired). Operators enable it explicitly once the
+    # dedup semantics are wanted. Consumed only by ``_connector_write_gate``.
+    modulo_connector_write_gate_enabled: bool = Field(False, alias="MODULO_CONNECTOR_WRITE_GATE_ENABLED")
     # Web UI auth — FAIL-CLOSED (system worker refuses to boot without both).
     saq_auth_password: str | None = Field(default=None, alias="SAQ_AUTH_PASSWORD", repr=False)
     saq_auth_username: str | None = Field(default=None, alias="SAQ_AUTH_USERNAME")
@@ -207,6 +241,16 @@ class Settings(BaseSettings):
     # bounds that accumulation while staying above the max node timeout so a
     # slow-but-healthy first node is never false-failed. Tunable per deploy.
     saq_claimed_nodeless_minutes: int = Field(default=35, alias="SAQ_CLAIMED_NODELESS_MINUTES", ge=5, le=1440)
+    # Budget of successful-claim cycles for claimed-but-nodeless SAQ zombies
+    # whose retry_policy does not cover "stall" (dispatcher_reconcile nodeless
+    # repair, FAR-509). A nodeless zombie executed ZERO nodes, so a re-dispatch
+    # cannot double-execute anything. This bounds the CLAIM CYCLES a zombie
+    # gets (terminal-fail once claim_count exceeds it) — it does NOT bound the
+    # enqueue rate: the rate is throttled separately to at most one re-dispatch
+    # per SAQ_CLAIMED_NODELESS_MINUTES window per run (dispatched_at is
+    # refreshed by every dispatch). A zombie that can never be re-claimed is
+    # ultimately bounded by the mid-graph-wedge age backstop.
+    saq_nodeless_redispatch_budget: int = Field(default=2, alias="SAQ_NODELESS_REDISPATCH_BUDGET", ge=1, le=10)
     # SAQ worker DB pool size (per worker; Postgres budget — F4).
     # Default 30. The pool MUST stay >= SAQ_WORKER_CONCURRENCY + reserve (5):
     # every concurrent run holds a connection in pre-node setup (claim_run_async
@@ -730,27 +774,38 @@ def break_glass_boot_findings(settings: Settings) -> list[tuple[bool, str]]:
         findings.append(
             (
                 True,
-                "MODULO_BREAK_GLASS_ENABLED=true but both MODULO_BREAK_GLASS_SECRET and "
-                "MODULO_BREAK_GLASS_STANDBY_SECRET are empty",
+                (
+                    "MODULO_BREAK_GLASS_ENABLED=true but both MODULO_BREAK_GLASS_SECRET and "
+                    "MODULO_BREAK_GLASS_STANDBY_SECRET are empty"
+                ),
             )
         )
     elif not (has_primary and has_standby):
         findings.append(
             (
                 False,
-                "one of MODULO_BREAK_GLASS_SECRET / MODULO_BREAK_GLASS_STANDBY_SECRET is empty — "
-                "the operator rotation path is degraded",
+                (
+                    "one of MODULO_BREAK_GLASS_SECRET / MODULO_BREAK_GLASS_STANDBY_SECRET is empty — "
+                    "the operator rotation path is degraded"
+                ),
             )
         )
 
     if enabled and not has_url:
-        findings.append((True, "MODULO_BREAK_GLASS_ENABLED=true but MODULO_BREAK_GLASS_DATABASE_URL is empty"))
+        findings.append(
+            (
+                True,
+                "MODULO_BREAK_GLASS_ENABLED=true but MODULO_BREAK_GLASS_DATABASE_URL is empty",
+            )
+        )
     elif not has_url:
         findings.append(
             (
                 False,
-                "MODULO_BREAK_GLASS_DATABASE_URL is empty — the break-glass CLI "
-                "deactivate/force/status commands are inoperable while disabled",
+                (
+                    "MODULO_BREAK_GLASS_DATABASE_URL is empty — the break-glass CLI "
+                    "deactivate/force/status commands are inoperable while disabled"
+                ),
             )
         )
     return findings

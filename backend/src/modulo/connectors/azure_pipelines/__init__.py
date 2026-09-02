@@ -18,6 +18,7 @@ from modulo.connectors.base import (
     ConnectorType,
     HealthResult,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 _AZURE_DEVOPS_API = "https://dev.azure.com"
 
@@ -63,7 +64,13 @@ class AzurePipelinesConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            _AZURE_DEVOPS_API,
             base_url=_AZURE_DEVOPS_API,
             headers=self._headers(),
             timeout=30,
@@ -122,6 +129,8 @@ class AzurePipelinesConnector(ConnectorBase):
             return HealthResult(ok=False, detail="Azure Pipelines API timeout")
         except httpx.ConnectError:
             return HealthResult(ok=False, detail="Azure Pipelines API connection error")
+        except ValueError as exc:
+            return HealthResult(ok=False, detail=str(exc)[:200])
 
     async def trigger_run(
         self,

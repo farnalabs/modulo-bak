@@ -404,7 +404,7 @@ def _validate_primitive_items(items: list[LibraryPrimitive]) -> list[LibraryPrim
     except Exception:
         _log.exception("LibraryPrimitiveResponse.model_validate failed on %d items", len(items))
         if items:
-            _log.error(
+            _log.exception(
                 "first item type=%s id=%s",
                 type(items[0]).__name__,
                 getattr(items[0], "id", "?"),
@@ -725,7 +725,7 @@ async def export_pipeline_endpoint(
     try:
         async with session.begin():
             await _set_rls_context(session, principal)
-            pipeline = await get_pipeline(session, pipeline_id)
+            pipeline = await get_pipeline(session, pipeline_id, organisation_id=principal.organisation_id)
             if pipeline is None:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1118,7 +1118,7 @@ async def confirm_import_endpoint(
     """
     try:
         bundle = json.loads(req.bundle_json)
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid bundle JSON",
@@ -1437,7 +1437,10 @@ def _add_pipeline_edges(
                 source_node_id=uuid.UUID(edge_data["source_node_id"]),
                 target_node_id=uuid.UUID(edge_data["target_node_id"]),
                 edge_type=edge_data["edge_type"],
+                condition_expression=edge_data.get("condition_expression"),
                 hitl_gate_config=edge_data.get("hitl_gate_config"),
+                source_port=edge_data.get("source_port", "out"),
+                target_port=edge_data.get("target_port", "in"),
             )
         )
 
@@ -1608,7 +1611,7 @@ class CommunityContributionListResponse(BaseModel):
 async def community_contribute_endpoint(
     req: CommunityContributeRequest,
     session: AsyncSession = Depends(get_db_session),
-    principal: TenantPrincipal = Depends(get_current_tenant_user),
+    principal: TenantPrincipal = require_permission(_CODE_LIBRARY_MANAGE),
 ) -> LibraryPrimitiveResponse:
     """Submit a community library contribution."""
     try:

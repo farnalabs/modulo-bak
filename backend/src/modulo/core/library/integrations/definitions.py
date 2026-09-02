@@ -4,6 +4,14 @@ Each dict provides the metadata, default configuration, credential
 field descriptions, and tool-group classification needed to register
 a :class:`~modulo.db.models.library_primitive.LibraryPrimitive` with
 ``primitive_type='integration'``.
+
+``credential_fields`` is the single source of truth for the credential keys a
+connector type consumes: ``_build_connector`` in ``modulo.core.connector_hub``
+must read exactly these keys via ``_get_cred``. The parity guard in
+``tests/unit/connector_hub/test_definitions_credential_parity.py`` enforces this
+for every type that has a direct hub read. A key declared here but read under a
+different name in the hub means a connector configured via its definition is
+silently skipped at ``initialise()``.
 """
 
 from __future__ import annotations
@@ -35,15 +43,10 @@ SENTRY_INTEGRATION: dict[str, Any] = {
         "retry_backoff_base_seconds": 1,
     },
     "credential_fields": {
-        "auth_token": {
+        "token": {
             "type": "string",
             "description": "Sentry authentication token (org-level)",
             "required": True,
-        },
-        "dsn": {
-            "type": "string",
-            "description": "Sentry DSN for event ingestion",
-            "required": False,
         },
     },
     "tool_group": "monitoring",
@@ -68,14 +71,9 @@ BITBUCKET_INTEGRATION: dict[str, Any] = {
         "default_branch": "main",
     },
     "credential_fields": {
-        "app_password": {
+        "token": {
             "type": "string",
-            "description": "Bitbucket app password with repo and PR permissions",
-            "required": True,
-        },
-        "username": {
-            "type": "string",
-            "description": "Bitbucket account username",
+            "description": "Bitbucket app password or OAuth 2.0 bearer token with repo and PR permissions",
             "required": True,
         },
     },
@@ -101,7 +99,7 @@ AZURE_DEVOPS_INTEGRATION: dict[str, Any] = {
         "api_version": "7.1",
     },
     "credential_fields": {
-        "personal_access_token": {
+        "token": {
             "type": "string",
             "description": "Azure DevOps PAT with Code (Read/Write) and Build (Read) scopes",
             "required": True,
@@ -153,6 +151,12 @@ PROMETHEUS_INTEGRATION: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 # 5. datadog
 # ---------------------------------------------------------------------------
+# FAR-515 compat note: the credential key for the application key is
+# ``application_key`` (NOT ``app_key``, which ``_build_connector`` used to read).
+# Existing stored credentials keyed as ``app_key`` will no longer resolve at the
+# hub — those rows must be re-credentialed under ``application_key``. We do NOT
+# migrate stored credentials in this change; any affected connector is skipped at
+# ``initialise()`` until re-credentialed.
 DATADOG_INTEGRATION: dict[str, Any] = {
     "name": "Datadog",
     "description": (
@@ -206,15 +210,10 @@ PAGERDUTY_INTEGRATION: dict[str, Any] = {
         "escalation_policy_id": "",
     },
     "credential_fields": {
-        "api_token": {
+        "token": {
             "type": "string",
             "description": "PagerDuty API token (v2)",
             "required": True,
-        },
-        "routing_key": {
-            "type": "string",
-            "description": "Events API v2 routing key for trigger/acknowledge/resolve",
-            "required": False,
         },
     },
     "tool_group": "incident_management",
@@ -272,7 +271,7 @@ GITLAB_INTEGRATION: dict[str, Any] = {
         "default_branch": "main",
     },
     "credential_fields": {
-        "personal_access_token": {
+        "token": {
             "type": "string",
             "description": "GitLab personal access token with api scope",
             "required": True,
@@ -305,11 +304,6 @@ SLACK_INTEGRATION: dict[str, Any] = {
             "type": "string",
             "description": "Slack bot token (xoxb-...) with chat:write and channels:read scopes",
             "required": True,
-        },
-        "signing_secret": {
-            "type": "string",
-            "description": "Slack signing secret for request verification",
-            "required": False,
         },
     },
     "tool_group": "messaging",
@@ -367,7 +361,7 @@ NOTION_INTEGRATION: dict[str, Any] = {
         "database_id": "",
     },
     "credential_fields": {
-        "internal_integration_secret": {
+        "token": {
             "type": "string",
             "description": "Notion internal integration token (secret_...)",
             "required": True,
@@ -464,7 +458,7 @@ N8N_INTEGRATION: dict[str, Any] = {
         "workflow_activation": True,
     },
     "credential_fields": {
-        "api_key": {
+        "token": {
             "type": "string",
             "description": "n8n API key",
             "required": True,
@@ -533,20 +527,10 @@ TEAMS_INTEGRATION: dict[str, Any] = {
         "notification_style": "adaptive_card",
     },
     "credential_fields": {
-        "webhook_url": {
+        "token": {
             "type": "string",
-            "description": "Teams incoming webhook URL",
-            "required": False,
-        },
-        "bot_app_id": {
-            "type": "string",
-            "description": "Teams bot application ID (for proactive messaging)",
-            "required": False,
-        },
-        "bot_app_password": {
-            "type": "string",
-            "description": "Teams bot application password",
-            "required": False,
+            "description": "Teams bot application token (for Microsoft Graph API access)",
+            "required": True,
         },
     },
     "tool_group": "messaging",
@@ -570,20 +554,10 @@ DISCORD_INTEGRATION: dict[str, Any] = {
         "default_channel_id": "",
     },
     "credential_fields": {
-        "bot_token": {
+        "token": {
             "type": "string",
             "description": "Discord bot token",
             "required": True,
-        },
-        "webhook_id": {
-            "type": "string",
-            "description": "Discord webhook ID (for simple posting without bot)",
-            "required": False,
-        },
-        "webhook_token": {
-            "type": "string",
-            "description": "Discord webhook token",
-            "required": False,
         },
     },
     "tool_group": "messaging",
@@ -615,7 +589,7 @@ JENKINS_INTEGRATION: dict[str, Any] = {
             "description": "Jenkins username",
             "required": True,
         },
-        "api_token": {
+        "token": {
             "type": "string",
             "description": "Jenkins API token (preferred over password)",
             "required": True,
@@ -678,7 +652,7 @@ SNYK_INTEGRATION: dict[str, Any] = {
         "severity_threshold": "medium",
     },
     "credential_fields": {
-        "api_token": {
+        "token": {
             "type": "string",
             "description": "Snyk API token",
             "required": True,
@@ -796,11 +770,197 @@ CIRCLECI_INTEGRATION: dict[str, Any] = {
         "retry_backoff_base_seconds": 1,
     },
     "credential_fields": {
-        "personal_api_token": {
+        "token": {
             "type": "string",
             "description": "CircleCI personal API token",
             "required": True,
         },
     },
     "tool_group": "ci_cd",
+}
+
+
+# ---------------------------------------------------------------------------
+# 25. generic-rest
+# ---------------------------------------------------------------------------
+REST_INTEGRATION: dict[str, Any] = {
+    "name": "Generic REST",
+    "description": (
+        "Verb-agnostic generic HTTP integration. Point Modulo at an arbitrary "
+        "REST endpoint (URL, method, headers, body, records extraction) and have "
+        "pipeline nodes call it with runtime variables rendered into the request. "
+        "No per-vendor client — just a templated HTTP call. Supports bearer, "
+        "api_key (header or query) and basic auth, SSRF/allowlist guarding, "
+        "response-size capping, and idempotent retry."
+    ),
+    "version": "1.0.0",
+    "author": "Modulo",
+    "tags": ["generic", "http", "rest", "integration", "canonical"],
+    "connector_type": "rest",
+    "default_config": {
+        "base_url": "",
+        "method": "GET",
+        "path": "",
+        "headers": {},
+        "params": {},
+        "body": {},
+        "records_path": "",
+        "next_cursor_path": "",
+        "passthrough": False,
+        "max_response_size": 10485760,
+        "idempotency_header": "",
+        "on_unknown": "fail_open",
+        "allowed_hosts": [],
+        "timeout_seconds": 30,
+        "verify_tls": True,
+    },
+    # Structured operational-config metadata (FAR-466). This is the schema the
+    # AdminConnectorsView REST form renders from: flat, discoverable fields are
+    # first-class controls; genuinely templated/advanced fields remain a JSON
+    # editor (advanced_fields). Authentication is deliberately separated into
+    # its own credential payload (auth + credential_fields) — never conflated
+    # with operational config.
+    "config_schema": {
+        "type": "object",
+        "title": "Generic REST operational configuration",
+        "description": (
+            "Modelled on the AdminConnectorsView REST form: the form's flat, "
+            "discoverable operational config fields are modelled on the "
+            "``fields`` map below, and advanced/templated fields stay in the "
+            "JSON editor (``advanced_fields``). Authentication is a separate "
+            "credential payload (auth_mode + per-mode secret fields) — the form "
+            "never conflates it with operational config. This schema is "
+            "advisory documentation, not an authoritative renderer; the form is "
+            "the consumer and a parity guard keeps the two in sync."
+        ),
+        "fields": {
+            "base_url": {
+                "type": "string",
+                "default": "",
+                "description": "Root URL of the REST endpoint (no trailing slash).",
+            },
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+                "default": "GET",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "default": 30,
+                "description": "Per-request timeout in seconds.",
+            },
+            "verify_tls": {
+                "type": "boolean",
+                "default": True,
+                "description": "Verify the TLS certificate of the target.",
+            },
+            "on_unknown": {
+                "type": "string",
+                "enum": ["fail_open", "fail_closed", "off"],
+                "default": "fail_open",
+                "description": (
+                    "Connector-write idempotency mode for the FAR-458 read-before-write "
+                    "dedup gate. Controls what happens to a write whose prior delivery "
+                    "could not be confirmed (ambiguous). Inert unless the opt-in "
+                    "MODULO_CONNECTOR_WRITE_GATE_ENABLED killswitch is enabled."
+                ),
+                "help": (
+                    "fail_open (default): re-fire the write on ambiguous delivery — "
+                    "possible duplicate, usually recoverable. fail_closed: suppress the "
+                    "write on ambiguous delivery — possible silent miss the operator must "
+                    "reconcile. off: bypass the gate entirely, the write always fires "
+                    "(never deduped). Only takes effect when the "
+                    "MODULO_CONNECTOR_WRITE_GATE_ENABLED killswitch is enabled; otherwise "
+                    "all connector writes fire normally."
+                ),
+            },
+            "records_path": {
+                "type": "string",
+                "default": "",
+                "description": "JMESPath expression (e.g. data.items) locating the records list in the response.",
+            },
+            "allowed_hosts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "default": [],
+                "description": "Egress/SSRF allowlist of hostnames permitted in rendered URLs.",
+            },
+        },
+        # Authentication profile. Stored with the connector credentials (never in
+        # operational config). The enum mirrors the REST connector's
+        # ``_normalise_auth`` — a public/unauthenticated profile is not supported
+        # by the connector, so no 'none' option is offered. Requiredness of the
+        # per-mode secret fields is resolved per ``auth_mode`` by
+        # ``_normalise_auth`` (a field is required only for its matching mode),
+        # not by the static ``required`` flags in ``credential_fields``.
+        "auth": {
+            "description": "Authentication profile stored with the connector credentials.",
+            "auth_mode": {
+                "type": "string",
+                "enum": ["bearer", "api_key", "basic"],
+                "default": "bearer",
+            },
+            "credential_fields": {
+                "bearer": ["token"],
+                "basic": ["username", "password"],
+                "api_key": ["api_key", "in", "header_name", "query_param_name"],
+            },
+        },
+        "advanced_fields": [
+            "path",
+            "headers",
+            "params",
+            "body",
+            "operations",
+            "next_cursor_path",
+            "passthrough",
+            "max_response_size",
+            "idempotency_header",
+            "fan_out",
+            "rate_limit",
+        ],
+    },
+    "credential_fields": {
+        "auth_mode": {
+            "type": "string",
+            "description": "Authentication mode: 'bearer', 'api_key', or 'basic'",
+            "required": True,
+        },
+        "token": {
+            "type": "string",
+            "description": "Bearer token (used when auth_mode='bearer')",
+            "required": False,
+        },
+        "api_key": {
+            "type": "string",
+            "description": "API key value (used when auth_mode='api_key')",
+            "required": False,
+        },
+        "in": {
+            "type": "string",
+            "description": "Where to send the API key: 'header' or 'query'",
+            "required": False,
+        },
+        "header_name": {
+            "type": "string",
+            "description": "Header name for a header-mode API key (default 'X-API-Key')",
+            "required": False,
+        },
+        "query_param_name": {
+            "type": "string",
+            "description": "Query-parameter name for a query-mode API key (default 'api_key')",
+            "required": False,
+        },
+        "username": {
+            "type": "string",
+            "description": "Basic auth username (used when auth_mode='basic')",
+            "required": False,
+        },
+        "password": {
+            "type": "string",
+            "description": "Basic auth password (used when auth_mode='basic')",
+            "required": False,
+        },
+    },
+    "tool_group": "integration",
 }

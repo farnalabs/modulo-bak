@@ -12,10 +12,23 @@ from modulo.connectors.base import (
     ConnectorResult,
     ConnectorType,
     HealthResult,
+    health_check_failure,
 )
+from modulo.core.ssrf import pinned_async_client_sync
 
 
 class OnePasswordConnector(ConnectorBase):
+    """1Password Connect connector.
+
+    NOTE — the default ``base_url`` is loopback, which the outbound SSRF guard
+    blocks unless the operator opts in with
+    ``SSRF_ALLOW_PRIVATE_RANGES=127.0.0.0/8,::1/128`` (both entries: ``localhost``
+    resolves to IPv4 and IPv6 on dual-stack hosts). Without the opt-in, building
+    the client raises ``ValueError`` naming the blocked address, and
+    ``health_check`` reports it as unhealthy. See
+    ``docs/configuration-reference.md`` → "Outbound Egress Guard (SSRF)".
+    """
+
     def __init__(self, token: str, base_url: str = "http://localhost:8080") -> None:
         self._token = token
         self._base = base_url.rstrip("/")
@@ -31,7 +44,13 @@ class OnePasswordConnector(ConnectorBase):
         }
 
     def _client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
+        # PINNED TRANSPORT (FAR-520): validate + resolve the base_url's host
+        # synchronously and pin the validated IP onto the transport, so the
+        # connection never re-resolves the host at connect time (closes the
+        # DNS-rebinding window). ``trust_env=False`` stops a proxy from
+        # re-resolving the destination server-side and defeating the pin.
+        return pinned_async_client_sync(
+            self._base,
             base_url=self._base,
             headers=self._headers(),
             timeout=30,
@@ -49,7 +68,7 @@ class OnePasswordConnector(ConnectorBase):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return HealthResult(ok=False, detail=str(exc)[:200])
+            return health_check_failure(exc)
 
     async def query(self, q: ConnectorQuery) -> ConnectorResult:
         async with self._client() as c:

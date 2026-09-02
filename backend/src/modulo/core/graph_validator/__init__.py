@@ -68,7 +68,10 @@ _KNOWN_SANDBOX_TEMPLATES = frozenset({"opencode", "modulo-opencode"})
 
 # Pipeline retry_policy events + budget bound (kept in sync with the API
 # schema in api/routes/pipelines.py and the executor's _retry_after_policy).
-_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure"})
+# "eval_failed" re-dispatches a guardrail-blocked run (final_status
+# "eval_failed" / error_code "eval.blocked"); the FAR-228 idempotency gate
+# (guard A) makes that re-dispatch safe for delivery nodes.
+_RETRY_POLICY_EVENTS = frozenset({"stall", "timeout", "failure", "eval_failed"})
 _RETRY_POLICY_MAX_RETRIES = 5
 
 # REST connector fan-out effective defaults. The connector defaults
@@ -553,6 +556,32 @@ def _check_sandbox_timeout(node: dict[str, Any], nid: str, result: ValidationRes
         )
 
 
+def _check_sandbox_timeout_e2b_cap(node: dict[str, Any], nid: str, result: ValidationResult) -> None:
+    """Sandbox check: timeout_seconds must stay under the E2B 1-hour cap (FAR-511).
+
+    The e2b SDK upgrade shipped in the Aug 30 deploy (Python 3.14) began
+    enforcing E2B's 1-hour sandbox timeout cap: a sandbox_agent node with
+    ``timeout_seconds`` above the cap now fails provisioning with
+    ``400: Timeout cannot be greater than 1 hours`` (previously accepted).
+    Reject anything above 3300 at save time so there is provisioning headroom;
+    do NOT clamp — the author must pick a value explicitly.
+    """
+    timeout = node.get("timeout_seconds")
+    if timeout is None:
+        return
+    try:
+        t = int(timeout) if not isinstance(timeout, int) else timeout
+    except (ValueError, TypeError):
+        return
+    if t > 3300:
+        result.error(
+            "SANDBOX_TIMEOUT_EXCEEDS_E2B_CAP",
+            f"Sandbox agent node '{nid}' timeout_seconds {t} exceeds the E2B sandbox "
+            "cap (1 hour); use <= 3300 to leave provisioning headroom",
+            node_id=nid,
+        )
+
+
 def _check_sandbox_stall_timeout(node: dict[str, Any], nid: str, result: ValidationResult) -> None:
     """Sandbox check 7: stall_timeout_seconds must be positive and not exceed timeout_seconds."""
     stall_timeout = node.get("stall_timeout_seconds")
@@ -1018,7 +1047,7 @@ def _edge_source(edge: dict[str, Any]) -> str:
 
 
 def _check_llm_routing_labels(
-    node: dict[str, Any],
+    _node: dict[str, Any],
     edges: list[dict[str, Any]],
     nid: str,
     result: ValidationResult,
@@ -1116,9 +1145,11 @@ class GraphValidator:
             return result
 
         self._check_edges(graph_json, result)
+        self._check_ports(graph_json, result)
         self._check_sandbox_agent_config(graph_json, result)
         self._check_node_idempotent(graph_json, result)
-        await self._check_node_send_budget(graph_json, connector_bindings or [], session, result)
+        self._check_failure_and_retry(graph_json, result)
+        await self._check_node_send_budget_bindings(graph_json, connector_bindings or [], session, result)
         self._check_parallel_run_context_writes(graph_json, result)
         self._check_schema_compatibility(graph_json, result)
         await self._check_connector_bindings(connector_bindings or [], session, result)
@@ -1205,10 +1236,20 @@ class GraphValidator:
 
         # Node idempotency flag check (FAR-295).
         self._check_node_idempotent(snapshot.graph_json, result)
-        await self._check_node_send_budget(snapshot.graph_json, snapshot.connector_bindings_json, session, result)
+
+        # Failure & retry + compensation rules (FAR-402 P5 §4F).
+        self._check_failure_and_retry(snapshot.graph_json, result)
+
+        await self._check_node_send_budget_bindings(
+            snapshot.graph_json, snapshot.connector_bindings_json, session, result
+        )
 
         # Edge validation.
         self._check_edges(snapshot.graph_json, result)
+
+        # Port-addressed typed state (FAR-416 / F1): fan-in safety +
+        # port-type validation. Backward-compatible for legacy graphs.
+        self._check_ports(snapshot.graph_json, result)
 
         # Parallel fan-out / run_context writes (warnings are stripped by
         # _strip_warnings below, but the check runs for consistency).
@@ -2376,6 +2417,7 @@ class GraphValidator:
             _check_sandbox_jinja(node, nid, result)
             _check_sandbox_template(node, nid, result)
             _check_sandbox_timeout(node, nid, result)
+            _check_sandbox_timeout_e2b_cap(node, nid, result)
             _check_sandbox_stall_timeout(node, nid, result)
             _check_sandbox_context_files(node, nid, result)
             _check_sandbox_env_vars(node, nid, _reserved_env_prefixes, result)
@@ -2415,10 +2457,102 @@ class GraphValidator:
                 )
 
     # ------------------------------------------------------------------
+    # Failure & retry (FAR-402 P5 / §4F)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_failure_and_retry(graph_json: dict[str, Any], result: ValidationResult) -> None:
+        """Compile-time failure/retry + compensation rules (FAR-402 P5 §4F).
+
+        1. Per-node ``retry`` config must be well-formed.
+        2. Per-edge transition ``retry`` config must be well-formed.
+        3. An edge may not declare BOTH a transition ``retry`` and an
+           ``on_failure_target`` (mutually exclusive per failure).
+        4. An edge's ``on_failure_target`` must reference an existing node.
+        5. The compensation graph must be ACYCLIC (a cycle is a typed error,
+           rejected at compile time, not at run time).
+
+        All checks are additive over the existing graph — a graph with no
+        ``retry``/``on_failure_target`` config compiles exactly as before.
+        """
+        # Lazy import: the shim modules (pipeline_engine) import the executor
+        # which imports this package at module-load time; importing
+        # retry_compensation eagerly would re-enter that deadlock. At call time
+        # the package is already initialised.
+        from modulo.core.pipeline_engine import retry_compensation as _rc
+
+        nodes = graph_json.get("nodes", []) if isinstance(graph_json, dict) else []
+        edges = graph_json.get("edges", []) if isinstance(graph_json, dict) else []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            nid = _string_or_default(node.get("id"))
+            _rc.validate_node_retry_config(node, nid, result)
+        for edge in edges:
+            if not isinstance(edge, dict):
+                continue
+            edge_id = _string_or_default(edge.get("source", edge.get("source_node_id")))
+            _rc.validate_edge_retry_config(edge, edge_id, result)
+            _rc.validate_edge_mutual_exclusion(edge, result)
+        _rc.validate_compensation_target_exists(
+            [e for e in edges if isinstance(e, dict)],
+            [n for n in nodes if isinstance(n, dict)],
+            result,
+        )
+        _rc.validate_compensation_acyclic(graph_json, result)
+
+    # ------------------------------------------------------------------
+
+    # Node send budget reconcile — FAR-410 flat node-key path.
+    # Kept so the branch's direct unit tests (GraphValidator._check_node_send_budget)
+    # still exercise the flat-key reconcile; the validate path uses the
+    # connector-config reconcile in :meth:`_check_node_send_budget_bindings`.
+    @staticmethod
+    def _check_node_send_budget(graph_json: dict[str, Any], result: ValidationResult) -> None:
+        """Warn when a fan-out node's send budget exceeds its wait_for budget (FAR-410).
+
+        A connector node may fan out over ``fanout_cardinality`` items and run
+        each with a ``per_item_budget`` — but all of that must fit inside the
+        node's total ``wait_for`` budget (``node_wait_for`` or ``timeout_seconds``
+        when no explicit wait_for is set). When the per-item sends cannot
+        sequentially fit in the budget, retries collide with the node deadline
+        and every attempt gets cancelled mid-send (UNKNOWN outcomes). This is a
+        save-time warning, not a hard error: nodes without these config keys
+        (every existing graph) are unaffected, and it is advisory rather than
+        a blocker so an operator can still save while they reconcile.
+        """
+        for node in graph_json.get("nodes", []) or []:
+            if not isinstance(node, dict):
+                continue
+            fanout = node.get("fanout_cardinality")
+            per_item = node.get("per_item_budget")
+            if fanout is None and per_item is None:
+                continue
+            nid = _string_or_default(node.get("id"))
+            fanout_val = _as_positive_number(fanout)
+            per_item_val = _as_positive_number(per_item)
+            if fanout_val is None or per_item_val is None:
+                continue
+            wait_for = _as_positive_number(node.get("node_wait_for"))
+            if wait_for is None:
+                wait_for = _as_positive_number(node.get("timeout_seconds"))
+            if wait_for is None:
+                continue
+            total = fanout_val * per_item_val
+            if total > wait_for:
+                result.warning(
+                    "NODE_SEND_BUDGET_OVERSUBSCRIBED",
+                    f"Node '{nid}': fanout_cardinality={fanout_val} x per_item_budget={per_item_val} "
+                    f"({total:.1f}s) exceeds node wait_for budget {wait_for:.1f}s — retries will be "
+                    "cancelled mid-send, producing UNKNOWN outcomes. Raise node_wait_for or lower "
+                    "per_item_budget.",
+                    node_id=nid,
+                )
+
     # Node send budget reconcile (FAR-410 / FAR-411)
     # ------------------------------------------------------------------
 
-    async def _check_node_send_budget(
+    async def _check_node_send_budget_bindings(
         self,
         graph_json: dict[str, Any],
         connector_bindings: list[dict[str, Any]] | None,
@@ -2564,7 +2698,7 @@ class GraphValidator:
     def check_retry_policy(policy: Any, result: ValidationResult) -> None:
         """Validate a pipeline's ``retry_policy``, emitting an ERROR when malformed.
 
-        Valid shape: ``{"on": ["stall"|"timeout"|"failure"], "max_retries": 0-5}``.
+        Valid shape: ``{"on": ["stall"|"timeout"|"failure"|"eval_failed"], "max_retries": 0-5}``.
         ``None``/``{}`` (no policy) passes. A malformed policy would silently
         disable retries at run time, so it is surfaced as a hard error here.
         """
@@ -2573,14 +2707,15 @@ class GraphValidator:
         if not isinstance(policy, dict):
             result.error(
                 "RETRY_POLICY_MALFORMED",
-                "retry_policy must be an object like {'on': ['stall','timeout','failure'], 'max_retries': 0-5}",
+                "retry_policy must be an object like "
+                "{'on': ['stall','timeout','failure','eval_failed'], 'max_retries': 0-5}",
             )
             return
         events = policy.get("on", [])
         if not isinstance(events, list) or any(not isinstance(e, str) for e in events):
             result.error(
                 "RETRY_POLICY_MALFORMED",
-                "retry_policy 'on' must be a list of strings from ['stall','timeout','failure']",
+                "retry_policy 'on' must be a list of strings from ['stall','timeout','failure','eval_failed']",
             )
         else:
             unknown = set(events) - _RETRY_POLICY_EVENTS
@@ -2588,7 +2723,7 @@ class GraphValidator:
                 result.error(
                     "RETRY_POLICY_MALFORMED",
                     f"retry_policy 'on' contains unknown values {sorted(unknown)}; "
-                    "allowed values are ['stall','timeout','failure']",
+                    "allowed values are ['stall','timeout','failure','eval_failed']",
                 )
         max_retries = policy.get("max_retries", 0)
         if not _is_valid_retry_budget(max_retries):
@@ -2642,6 +2777,25 @@ class GraphValidator:
                     f"Node ID '{nid_str}' does not look like a standard UUID format",
                     node_id=nid_str,
                 )
+
+    # ------------------------------------------------------------------
+    # Port-addressed typed state (FAR-416 / F1)
+    # ------------------------------------------------------------------
+
+    def _check_ports(self, graph_json: dict[str, Any], result: ValidationResult) -> None:
+        """Compile-time port rules: fan-in safety + port-type validation.
+
+        Delegates to :func:`validate_port_topology`. Fully-legacy graphs (no
+        explicit port metadata) keep their backward-compatible behaviour —
+        the rule is lenient so existing flat-dict pipelines compile identically.
+        """
+        # Lazy import: importing the submodule would otherwise trigger
+        # modulo.core.pipeline_engine.__init__ (which imports the executor, which
+        # imports this package) and create a circular-import deadlock at
+        # module-load time. At call time the package is already initialised.
+        from modulo.core.pipeline_engine.port_resolver import validate_port_topology
+
+        validate_port_topology(graph_json, result)
 
     # ------------------------------------------------------------------
     # Parallel fan-out / run_context writes (FAR-171)
