@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 from modulo.api.middleware.deprecation_headers import DeprecationHeaderMiddleware
 
+# A sunset date safely in the future, so the "sunset header is set" assertions
+# keep exercising the not-yet-expired path regardless of when the suite runs.
 _FUTURE_SUNSET = (date.today() + timedelta(days=365)).isoformat()
 
 
