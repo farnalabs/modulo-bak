@@ -1734,6 +1734,99 @@ def test_recover_node_without_undecided_row_dispatches_unstamped(client: TestCli
     assert "gate_id" not in dispatched
 
 
+def test_recover_node_prefers_matching_node_row_over_stale_undecided_rows(
+    client: TestClient, mock_session: AsyncMock
+) -> None:
+    """FAR-541 (iteration 4, FIX B): with MULTIPLE undecided claim rows the
+    stamp pick prefers the row matching the node being recovered — a stale
+    undecided row (normal: recover_node never marks bypassed rows decided)
+    can no longer hijack the pick with a foreign identity (foreign stamp ->
+    consumer bounce -> markers poison retries)."""
+    run = _make_run(status="awaiting_human")
+    undecided = MagicMock()
+    # Query order (FIX B): matching-node row first, then newest-first.
+    undecided.scalars.return_value.all.return_value = ["node-old-stale", "manual-node-1", ""]
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ) as mock_dispatch,
+    ):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/manual-node-1/recover",
+            json={"input_data": {"answer": 42}},
+        )
+
+    assert resp.status_code == 200
+    assert mock_dispatch.await_args.kwargs["resume_data"]["gate_id"] == "manual-node-1"
+
+
+def test_recover_node_without_matching_row_picks_deterministically(client: TestClient, mock_session: AsyncMock) -> None:
+    """FAR-541 (iteration 4, FIX B): when NO undecided row matches the node
+    being recovered, the stamp is the first row of the query-ordered list —
+    the SQL orders newest-first (``claimed_at DESC NULLS LAST, id DESC``) so
+    the FRESH row wins deterministically over stale ones, and the pick is
+    stable when rows share a claim timestamp (same tiebreak as
+    ``_latest_committed_decision_row``)."""
+    run = _make_run(status="awaiting_human")
+    undecided = MagicMock()
+    # The query (ordered newest-first) returned the fresh row first.
+    undecided.scalars.return_value.all.return_value = ["fresh-guardrail-row", "stale-manual-row"]
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ) as mock_dispatch,
+    ):
+        resp = client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/some-other-node/recover",
+            json={},
+        )
+
+    assert resp.status_code == 200
+    assert mock_dispatch.await_args.kwargs["resume_data"]["gate_id"] == "fresh-guardrail-row"
+
+
+def test_recover_node_undecided_rows_query_orders_matching_then_newest(
+    client: TestClient, mock_session: AsyncMock
+) -> None:
+    """FAR-541 (iteration 4, FIX B): the undecided-rows query is deterministic
+    — matching-node-id rows first, then ``claimed_at DESC NULLS LAST``,
+    tiebroken on ``id`` DESC (mirroring ``_latest_committed_decision_row``)."""
+    run = _make_run(status="awaiting_human")
+    undecided = MagicMock()
+    undecided.scalars.return_value.all.return_value = ["manual-node-1"]
+    mock_session.execute = AsyncMock(return_value=undecided)
+    with (
+        patch("modulo.api.routes.runs.set_rls_org"),
+        patch("modulo.api.routes.runs.recover_node", new_callable=AsyncMock, return_value=run),
+        patch(
+            "modulo.api.routes.runs.dispatch_run",
+            new_callable=AsyncMock,
+            return_value=("enqueued", "job-id"),
+        ),
+    ):
+        client.post(
+            f"/api/v1/runs/{_RUN_ID}/nodes/manual-node-1/recover",
+            json={"input_data": {"a": 1}},
+        )
+
+    stmt = mock_session.execute.await_args_list[0].args[0]
+    compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+    order_by = compiled.split("ORDER BY")[-1]
+    assert "gate_id = 'manual-node-1' DESC" in order_by
+    assert "claimed_at DESC NULLS LAST" in order_by
+    assert "id DESC" in order_by
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/runs/{run_id}/guardrail-override — FAR-208 remediation
 # ---------------------------------------------------------------------------

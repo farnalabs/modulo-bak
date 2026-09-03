@@ -381,7 +381,11 @@ class HITLManager:
         Logs a ``hitl.output_modified`` audit event documenting the change,
         then logs the standard ``hitl.output_delivered`` event.
 
-        Raises on missing token, expired token, or decided gate.
+        Raises on missing token, expired token, or decided gate, and
+        ``DecisionPayloadError`` when the supplied *decision_payload* violates
+        the payload contract (FAR-541 iteration 4: ``_decide`` is the single
+        stamp authority — foreign-stamped, non-serialisable, and oversized
+        payloads are refused).
         """
         if decision_payload is None:
             decision_payload = {"action": "approved", "modified_output": modified_output}
@@ -421,7 +425,11 @@ class HITLManager:
     ) -> HitlClaim:
         """Record approval and log a ``hitl.output_delivered`` audit event.
 
-        Raises on missing token, expired token, or decided gate.
+        Raises on missing token, expired token, or decided gate, and
+        ``DecisionPayloadError`` when the supplied *decision_payload* violates
+        the payload contract (FAR-541 iteration 4: ``_decide`` is the single
+        stamp authority — foreign-stamped, non-serialisable, and oversized
+        payloads are refused).
         """
         if decision_payload is None:
             decision_payload = {"action": "approved"}
@@ -459,7 +467,11 @@ class HITLManager:
     ) -> HitlClaim:
         """Record rejection and log a ``hitl.output_rejected`` audit event.
 
-        Raises on missing token, expired token, or decided gate.
+        Raises on missing token, expired token, or decided gate, and
+        ``DecisionPayloadError`` when the supplied *decision_payload* violates
+        the payload contract (FAR-541 iteration 4: ``_decide`` is the single
+        stamp authority — foreign-stamped, non-serialisable, and oversized
+        payloads are refused).
         """
         if decision_payload is None:
             decision_payload = {"action": "rejected"}
@@ -507,7 +519,11 @@ class HITLManager:
         the expected output schema (if available) and the run resumes past the
         HITL gate with the manually-supplied value.
 
-        Raises on missing token, expired token, or decided gate.
+        Raises on missing token, expired token, or decided gate, and
+        ``DecisionPayloadError`` when the supplied *decision_payload* violates
+        the payload contract (FAR-541 iteration 4: ``_decide`` is the single
+        stamp authority — foreign-stamped, non-serialisable, and oversized
+        payloads are refused).
         Sets ``delivered_at`` on the claim after successful audit logging.
         On audit failure the exception propagates and the transaction rolls back.
         """

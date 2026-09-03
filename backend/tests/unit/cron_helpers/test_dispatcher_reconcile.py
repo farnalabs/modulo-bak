@@ -553,10 +553,13 @@ class TestReconcilePredicateMatrix:
 class TestHitlResumeOrSkipPredicateMatrix:
     """Direct predicate matrix for ``_resolve_hitl_resume_or_skip`` (FAR-541).
 
-    The claimed exemption is REMOVED: a claimed row behaves exactly like an
-    awaiting_human row — it resumes only from a committed gate decision
-    (mid-resume crash recovery preserved), and a claimed-but-undecided run is
-    skipped rather than re-dispatched with an empty decision.
+    A claimed row behaves exactly like an awaiting_human row — it resumes only
+    from a committed decision the guard accepts. As of iteration 4 (FIX C) a
+    claimed-UNDECIDED row always skips: under ``uq_hitl_claims_run_gate`` the
+    old "claimed + same-gate committed decision" match was structurally dead
+    (a claimed-undecided row and a DECIDED row for the same gate cannot
+    coexist), and claimed-run crash recovery routes through the
+    no-undecided-rows guard branch once the decision commits.
     """
 
     def _row(self, status: str) -> SimpleNamespace:
@@ -581,8 +584,12 @@ class TestHitlResumeOrSkipPredicateMatrix:
 
     @pytest.mark.asyncio
     async def test_claimed_with_committed_decision_resumes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Crash recovery preserved: claimed + committed decision -> resume with
-        resume_data reconstructed from the committed decision payload."""
+        """Plumbing preserved: a claimed run whose guard passes (no
+        claimed-undecided row — e.g. the claim expired/reset — plus a
+        committed decision) resumes with resume_data reconstructed from the
+        committed decision payload. The claimed-undecided + decided-same-gate
+        resume was structurally dead (FIX C) and lives no more; claimed-run
+        crash recovery routes through the no-undecided-rows guard branch."""
         payload = {"action": "rejected", "reason": "needs work"}
         skip, data, summary, guard, resume = await self._resolve(
             monkeypatch, "claimed", committed=True, resume_data=payload
@@ -659,24 +666,25 @@ class TestHitlResumeOrSkipPredicateMatrix:
         assert summary["skipped"] == 1
 
     @pytest.mark.asyncio
-    async def test_cross_gate_matched_decision_resumes(self) -> None:
-        """The mirror of the C1 incident: the human decided EXACTLY the claimed
-        pending gate (stamp matches) and the resume job was lost -> the
-        reconcile resumes it with the stamped payload."""
-        payload = {"action": "approved", "gate_id": "hitl_gate_c_d"}
+    async def test_cross_gate_matched_decision_resume_was_structurally_dead(self) -> None:
+        """FAR-541 iteration 4 (FIX C): the old "claimed + same-gate committed
+        decision -> resume" branch was STRUCTURALLY DEAD — under
+        ``uq_hitl_claims_run_gate`` (UNIQUE (run_id, gate_id)) a
+        claimed-UNDECIDED row and a DECIDED row for the same gate cannot
+        coexist, so that test mocked a constraint-violating impossible state.
+        The REAL claimed state a committed decision can coexist with is the
+        C1 shape: a claimed-UNDECIDED row for gate B (the run's pending gate)
+        + a committed decision for the EARLIER gate A -> SKIP (never replay A
+        onto B). Guard-level: the skip comes straight from the claimed
+        branch, before any identity comparison."""
         session = AsyncMock()
         session.execute = AsyncMock(
             side_effect=[
-                _result_row(("approved", payload, "hitl_gate_c_d")),
-                _result_row(("hitl_gate_c_d",)),  # the claimed pending gate
-                _result_row(("approved", payload, "hitl_gate_c_d")),  # resume-data reconstruction
+                _result_row(("approved", {"action": "approved", "gate_id": "hitl_gate_a_b"}, "hitl_gate_a_b")),
+                _result_row(("hitl_gate_c_d",)),  # gate B: claimed, undecided
             ]
         )
-        summary: dict[str, Any] = {"skipped": 0}
-        row = SimpleNamespace(id=RUN_AWAITING, status="claimed")
-        skip, data = await ch._resolve_hitl_resume_or_skip(session, ORG, row, summary)
-        assert skip is False
-        assert data == payload
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
 
 
 class TestNodelessRedispatchBudget:
@@ -1408,7 +1416,9 @@ class TestAwaitingHumanHasCommittedDecision:
     approved/rejected/deliver_manual, so a column-keyed check would be dead
     code and could never protect a manual-output decision whose payload was
     lost. FAR-541 iteration 2 adds gate SCOPING: the decision must resolve the
-    gate the run is currently waiting at (the claimed-undecided claim row)."""
+    identity the run is currently waiting at (claimed-undecided rows skip
+    unconditionally as of iteration 4 / FIX C; the no-undecided-rows branch
+    accepts only identity-consumable actions)."""
 
     _LATEST_SQL = "SELECT decision, decision_payload, gate_id FROM hitl_claims"
     _CLAIMED_SQL = "SELECT gate_id FROM hitl_claims"
@@ -1442,16 +1452,21 @@ class TestAwaitingHumanHasCommittedDecision:
 
     @pytest.mark.asyncio
     async def test_legacy_payload_less_approved_is_committed(self) -> None:
-        """A legacy/pre-migration approved row with a NULL payload degrades to
-        ``{"action": "approved"}`` — a plain approval needs no payload. Its
-        gate identity comes from the decision ROW's ``gate_id``."""
+        """FAR-541 iteration 4 (FIX C): a legacy/pre-migration approved row
+        with a NULL payload is STRANDED — the claimed-branch identity match
+        that used to accept it via the decision ROW's gate id is structurally
+        dead under ``uq_hitl_claims_run_gate`` (a claimed-undecided row and a
+        DECIDED row for the same gate cannot coexist), and the
+        no-undecided-rows crash-recovery branch requires a stamp. Accepted
+        residue (see the guard's docstring)."""
         session = self._mock_session(
             [
                 ("approved", None, "gate-b"),
-                ("gate-b",),  # claimed-undecided pending gate == the decided gate
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
             ]
         )
-        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
 
     @pytest.mark.asyncio
     async def test_legacy_payload_less_approved_different_gate_skipped(self) -> None:
@@ -1467,20 +1482,28 @@ class TestAwaitingHumanHasCommittedDecision:
 
     @pytest.mark.asyncio
     async def test_legacy_payload_less_rejected_is_committed(self) -> None:
+        """FAR-541 iteration 4 (FIX C): a legacy payload-less REJECTED row is
+        equally stranded in the no-undecided-rows crash-recovery branch — a
+        stamp is required to verify the identity (accepted residue)."""
         session = self._mock_session(
             [
                 ("rejected", None, "gate-b"),
-                ("gate-b",),
+                None,
+                None,
             ]
         )
-        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
 
     @pytest.mark.asyncio
     async def test_plain_approve_with_payload_is_committed(self) -> None:
+        """A stamped plain approval (no extra members) resumes in the
+        no-undecided-rows crash-recovery branch (the run is parked at the
+        decided gate's interrupt with its resume job lost)."""
         session = self._mock_session(
             [
-                ("approved", {"action": "approved", "gate_id": "gate-b"}, "gate-b"),
-                ("gate-b",),
+                ("approved", {"action": "approved", "gate_id": "hitl_gate_b"}, "hitl_gate_b"),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
             ]
         )
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
@@ -1554,10 +1577,16 @@ class TestAwaitingHumanHasCommittedDecision:
 
     @pytest.mark.asyncio
     async def test_manual_output_with_output_is_committed(self) -> None:
+        """FAR-541 iteration 4 (FIX A): a committed ``manual_output`` decision
+        at a MANUAL-NODE park (identity = the node id, no undecided rows — the
+        resume job was lost) RESUMES: the manual consumer completes the node
+        on any payload stamped with its node id, so skipping would wedge the
+        run forever (re-decide 409s, recover-node bounces)."""
         session = self._mock_session(
             [
                 ("approved", {"action": "manual_output", "gate_id": "node-1", "output": {"answer": 42}}, "node-1"),
-                ("node-1",),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
             ]
         )
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
@@ -1589,15 +1618,17 @@ class TestAwaitingHumanHasCommittedDecision:
         """The approve-with-modification API (routes/hitl.py) submits
         ``approved`` plus a ``modified_output`` member (FAR-541 iteration 3:
         the retired ``approved_with_modification`` action was never produced by
-        any writer and its special-case branch is pruned)."""
+        any writer and its special-case branch is pruned) — it resumes in the
+        no-undecided-rows crash-recovery branch."""
         session = self._mock_session(
             [
                 (
                     "approved",
-                    {"action": "approved", "gate_id": "gate-b", "modified_output": {"v": 1}},
-                    "gate-b",
+                    {"action": "approved", "gate_id": "hitl_gate_b", "modified_output": {"v": 1}},
+                    "hitl_gate_b",
                 ),
-                ("gate-b",),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
             ]
         )
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True
@@ -1624,13 +1655,49 @@ class TestAwaitingHumanHasCommittedDecision:
 
     @pytest.mark.asyncio
     async def test_manual_output_no_undecided_rows_skipped(self) -> None:
-        """FAR-541 iteration 3 (FIX 6a): a ``manual_output`` decision is not a
-        gate verdict — in the no-undecided-rows branch it must SKIP, else
-        resuming it would bounce off the gate consumer's fail-closed action
-        check and re-dispatch-loop."""
+        """FAR-541 (FIX A, iteration 4): a ``manual_output`` decision parked at
+        a GATE identity is not a verdict the gate consumer accepts — in the
+        no-undecided-rows branch it must SKIP, else resuming it would bounce
+        off the gate consumer's fail-closed action check and re-dispatch-loop.
+        (Manual-node parks DO resume — see
+        ``test_manual_output_with_output_is_committed``.)"""
         session = self._mock_session(
             [
-                ("approved", {"action": "manual_output", "gate_id": "gate-b", "output": {"a": 1}}, "gate-b"),
+                ("approved", {"action": "manual_output", "gate_id": "hitl_gate_b", "output": {"a": 1}}, "hitl_gate_b"),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
+            ]
+        )
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
+
+    @pytest.mark.asyncio
+    async def test_manual_output_guardrail_park_no_undecided_rows_skipped(self) -> None:
+        """FAR-541 (FIX A, iteration 4): a ``manual_output`` decision parked at
+        a GUARDRAIL conformance identity is equally skipped — the conformance
+        consumer's override allowlist (approved/deliver_manual/skip/replay)
+        does not include ``manual_output``, so resuming would re-interrupt and
+        re-dispatch-loop."""
+        session = self._mock_session(
+            [
+                (
+                    "approved",
+                    {"action": "manual_output", "gate_id": "guardrail_conformance_g1", "output": {"a": 1}},
+                    "guardrail_conformance_g1",
+                ),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
+            ]
+        )
+        assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_empty_string_stamp_no_undecided_rows_skipped(self) -> None:
+        """FAR-541 (F-5, iteration 4): a legacy ``""``-stamped payload is
+        FALSY — it must skip here (cannot be verified) instead of passing the
+        stamp check and bouncing off the consumer once."""
+        session = self._mock_session(
+            [
+                ("approved", {"action": "approved", "gate_id": ""}, ""),
                 None,  # no claimed-undecided row
                 None,  # no undecided rows at all
             ]
@@ -1663,11 +1730,37 @@ class TestAwaitingHumanHasCommittedDecision:
         assert "ORDER BY decision_at DESC NULLS LAST, claimed_at DESC NULLS LAST, id DESC LIMIT 1" in sql
 
     @pytest.mark.asyncio
-    async def test_deliver_manual_with_payload_is_committed(self) -> None:
+    async def test_pending_claimed_gate_query_orders_deterministically(self) -> None:
+        """FAR-541 iteration 4 (FIX B): the claimed-undecided pending-gate
+        query is deterministic too — claimed_at DESC NULLS LAST, tiebroken on
+        id DESC (mirroring the latest-decision query) — so the picked row is
+        stable when two claimed-undecided rows share a claim timestamp."""
         session = self._mock_session(
             [
-                ("deliver_manual", {"action": "deliver_manual", "gate_id": "gate-b", "output": {"z": 3}}, "gate-b"),
-                ("gate-b",),
+                ("approved", {"action": "approved", "gate_id": "hitl_gate_b"}, "hitl_gate_b"),
+                ("hitl_gate_b",),  # a claimed-undecided row exists -> 2nd query fires
+            ]
+        )
+        await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING)
+        claimed_sql = str(session.execute.await_args_list[1].args[0])
+        assert "ORDER BY claimed_at DESC NULLS LAST, id DESC LIMIT 1" in claimed_sql
+
+    @pytest.mark.asyncio
+    async def test_deliver_manual_with_payload_is_committed(self) -> None:
+        """A stamped ``deliver_manual`` decision resumes in the
+        no-undecided-rows crash-recovery branch (a gate-consumable verdict
+        action). The old claimed-branch coexistence this test mocked (decided
+        row + claimed-undecided row, same gate) is constraint-forbidden —
+        FIX C removed that dead branch."""
+        session = self._mock_session(
+            [
+                (
+                    "deliver_manual",
+                    {"action": "deliver_manual", "gate_id": "hitl_gate_b", "output": {"z": 3}},
+                    "hitl_gate_b",
+                ),
+                None,  # no claimed-undecided row
+                None,  # no undecided rows at all
             ]
         )
         assert await ch._awaiting_human_has_committed_decision(session, ORG, RUN_AWAITING) is True

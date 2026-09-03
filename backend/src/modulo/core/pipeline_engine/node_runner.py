@@ -2446,7 +2446,10 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
     must not clear (or reject on) this safety gate: a mismatched or missing
     stamp leaves the block standing and re-interrupts — the run keeps waiting
     for a decision that resolves THIS block (``conformance.foreign_decision_ignored``
-    warning; gate ids only, never payload content).
+    warning; gate ids only, never payload content). When the re-interrupt's
+    resume value replays in the same execution pass (the human has since
+    decided), that value is re-checked instead of falling through — see
+    :func:`_recheck_after_conformance_interrupt` (FAR-541 iteration 4, F-6).
 
     On a STAMPED ``rejected`` the run FAILS CLOSED: the capability the block
     protected is still unavailable, so the node must NOT execute.
@@ -2479,7 +2482,7 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
         # Fail closed: the block STANDS — re-interrupt so the run keeps waiting
         # for a decision stamped for THIS block (a foreign decision never
         # clears a guardrail block).
-        interrupt(
+        replay = interrupt(
             {
                 "gate_id": blocked_gate or node_id,
                 "node_id": node_id,
@@ -2487,7 +2490,7 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
                 "reason": "awaiting a human decision for this conformance block",
             }
         )
-        return True
+        return _recheck_after_conformance_interrupt(state, node_id, replay)
     if action == "rejected":
         from modulo.core.guardrails import GuardrailBlockedError
 
@@ -2503,7 +2506,7 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
             "conformance.unknown_override_ignored",
             extra={"node_id": node_id, "decision_gate_id": stamped_gate, "action": action},
         )
-        interrupt(
+        replay = interrupt(
             {
                 "gate_id": blocked_gate or node_id,
                 "node_id": node_id,
@@ -2511,10 +2514,33 @@ def _handle_conformance_resume(state: dict[str, Any], node_id: str) -> bool:
                 "reason": "awaiting a recognized override decision for this conformance block",
             }
         )
-        return True
+        return _recheck_after_conformance_interrupt(state, node_id, replay)
     state["_conformance_blocked_node"] = None
     state["_conformance_blocked_gate"] = None
     return False
+
+
+def _recheck_after_conformance_interrupt(state: dict[str, Any], node_id: str, replay: Any) -> bool:
+    """Re-check a REPLAYED conformance resume (mirrors the gate node's pattern).
+
+    When ``interrupt()`` RETURNS a value (rather than pausing the graph), the
+    graph resumed within this execution pass and the value is the human's
+    decision — falling through to ``True`` here would terminalize the run
+    (``GuardrailBlockedError``) while the block is still standing, silently
+    discarding the decision the human just committed (FAR-541 iteration 4,
+    F-6). Mirror the gate node's recursive re-entry
+    (``return await _hitl_gate({**state, "_hitl_decision": decision})``): feed
+    the replayed value back through :func:`_handle_conformance_resume` — the
+    LIVE state dict is updated in place so the marker-clearing mutations land
+    on the state the caller observes. A second foreign replay re-interrupts
+    (the run keeps waiting) — the recursion advances one human decision per
+    pass, exactly like the gate. A non-dict replay is not a decision; keep
+    the block standing.
+    """
+    if isinstance(replay, dict):
+        state["_hitl_decision"] = replay
+        return _handle_conformance_resume(state, node_id)
+    return True
 
 
 async def _handle_conformance_block(

@@ -116,6 +116,7 @@ from modulo.core.hitl_manager import (
     AlreadyClaimedError,
     ClaimTokenExpiredError,
     ClaimTokenInvalidError,
+    DecisionPayloadError,
     GateAlreadyDecidedError,
     GateNotFoundError,
     HITLManager,
@@ -3479,6 +3480,11 @@ def _hitl_error_response(exc: BaseException, run_id: str, gate_id: str) -> dict[
         return {"error": "claim_token_expired", "detail": "Re-claim the gate"}
     if isinstance(exc, GateAlreadyDecidedError):
         return {"error": "already_decided", "detail": "Gate already has a final decision"}
+    if isinstance(exc, DecisionPayloadError):
+        # FAR-541 (iteration 4): ``_decide`` refusals surface as the MCP error
+        # shape (mirroring the HTTP API's 422) instead of an unhandled
+        # exception.
+        return {"error": "invalid_decision_payload", "detail": str(exc)}
     if isinstance(exc, ProgrammingError):
         _log.exception("review_hitl failed")
         return {"error": "migration_required", "detail": "DB migration required. Run alembic upgrade head."}
@@ -3535,6 +3541,7 @@ async def _review_hitl_impl(
             ClaimTokenInvalidError,
             ClaimTokenExpiredError,
             GateAlreadyDecidedError,
+            DecisionPayloadError,
             ProgrammingError,
         ) as exc:
             return _hitl_error_response(exc, run_id, gate_id)

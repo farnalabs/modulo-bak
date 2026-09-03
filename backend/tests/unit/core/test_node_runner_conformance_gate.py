@@ -281,6 +281,66 @@ async def test_gate_resume_foreign_decision_marker_block_not_cleared(monkeypatch
     interrupt.assert_called_once()
 
 
+async def test_gate_resume_replayed_decision_is_rechecked_and_clears_block(monkeypatch: pytest.MonkeyPatch):
+    """FAR-541 iteration 4 (F-6): when the re-interrupt's resume value REPLAYS
+    in the same execution pass (the human decided after the foreign-resume
+    re-interrupt), the replayed decision is re-checked instead of falling
+    through to ``True`` — a fall-through would terminalize the run with
+    ``GuardrailBlockedError`` while the block is still standing. Mirrors the
+    gate node's recursive re-entry."""
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    _patch_audit(monkeypatch)
+    interrupt = _patch_interrupt(monkeypatch)
+    interrupt.return_value = {"action": "approved", "gate_id": "guardrail_conformance_g_block"}
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": "approved", "gate_id": "some_other_gate"},
+    }
+
+    blocked = await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert blocked is False
+    assert state["_conformance_blocked_node"] is None
+    assert state["_conformance_blocked_gate"] is None
+    check.assert_not_awaited()
+    interrupt.assert_called_once()
+
+
+async def test_gate_resume_second_foreign_replay_reinterrupts_keeps_waiting(monkeypatch: pytest.MonkeyPatch):
+    """FAR-541 iteration 4 (F-6): a SECOND foreign replay re-interrupts (the
+    block stands, the run keeps waiting) instead of falling through to
+    ``True`` — the recursion advances one human decision per pass, exactly
+    like the gate node."""
+
+    class _GraphInterruptError(Exception):
+        """Stands in for LangGraph's pause on the next interrupt call."""
+
+    _set_ctx(monkeypatch)
+    check = _patch_check_node_start(monkeypatch, None)
+    _patch_audit(monkeypatch)
+    interrupt = MagicMock(
+        side_effect=[
+            {"action": "approved", "gate_id": "some_other_gate"},  # 1st replay: still foreign
+            _GraphInterruptError(),  # 2nd interrupt: the graph pauses again
+        ]
+    )
+    monkeypatch.setattr(nr, "interrupt", interrupt)
+    state = {
+        "_conformance_blocked_node": _NODE_ID,
+        "_conformance_blocked_gate": "guardrail_conformance_g_block",
+        "_hitl_decision": {"action": "approved", "gate_id": "yet_another_gate"},
+    }
+
+    with pytest.raises(_GraphInterruptError):
+        await nr._run_conformance_gate(state, node_id=_NODE_ID)
+
+    assert state["_conformance_blocked_node"] == _NODE_ID
+    check.assert_not_awaited()
+    assert interrupt.call_count == 2
+
+
 async def test_gate_resume_unstamped_decision_block_not_cleared(monkeypatch: pytest.MonkeyPatch):
     """FAR-541: a decision without a stamp cannot be attributed to this block
     — the block stands and the node re-interrupts."""

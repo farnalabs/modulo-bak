@@ -2038,13 +2038,26 @@ async def recover_run_node(
             # by the guardrail gate id) are stamped into the recovery payload,
             # which the manual-node and conformance consumers accept. A legacy
             # ""-keyed row (pre-stamping interrupt) never wins the stamp.
+            # FAR-541 iteration 4 (FIX B): the query is deterministic — a row
+            # matching the node being recovered wins, otherwise newest-first
+            # (``claimed_at DESC NULLS LAST, id DESC``, mirroring
+            # ``_latest_committed_decision_row``) — stale undecided rows
+            # (normal: recover_node never marks bypassed rows decided) can no
+            # longer hijack the stamp pick with a foreign identity, and the
+            # pick is stable when rows share a claim timestamp.
             undecided_gate_ids: list[str] = list(
                 (
                     await session.execute(
-                        select(HitlClaim.gate_id).where(
+                        select(HitlClaim.gate_id)
+                        .where(
                             HitlClaim.run_id == run_id,
                             HitlClaim.organisation_id == principal.organisation_id,
                             HitlClaim.decision.is_(None),
+                        )
+                        .order_by(
+                            (HitlClaim.gate_id == node_id).desc(),
+                            HitlClaim.claimed_at.desc().nullslast(),
+                            HitlClaim.id.desc(),
                         )
                     )
                 )
@@ -2056,7 +2069,13 @@ async def recover_run_node(
                     status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                     detail="Node is a pending HITL gate; use the HITL approve/reject endpoints for gate nodes.",
                 )
-            stamp_gate_id = next((gate for gate in undecided_gate_ids if gate), None)
+            # The matching-node row wins when present (the query orders it
+            # first); the explicit Python-side preference keeps the pick
+            # correct and auditable even if the SQL ordering drifts.
+            stamp_gate_id = next(
+                (gate for gate in undecided_gate_ids if gate == node_id),
+                next((gate for gate in undecided_gate_ids if gate), None),
+            )
             try:
                 run = await recover_node(
                     session,
