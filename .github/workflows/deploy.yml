@@ -581,6 +581,9 @@ jobs:
             launch_attempt=$(( launch_attempt + 1 ))
             # stderr goes to a file (not into RUN_OUTPUT) so the " Machine ID:"
             # parse below keeps seeing stdout exactly as it did before.
+            # --detach means RC=0 iff creation succeeded, so a retried attempt
+            # does not leak a second machine; the single destroy below is
+            # sufficient to clean up the one machine this loop creates.
             RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app staging-modulo --restart=no \
               --entrypoint /bin/bash \
               --vm-size shared-cpu-1x --memory 1024 \
@@ -591,7 +594,13 @@ jobs:
             if [ "$LAUNCH_RC" -eq 0 ]; then
               break
             fi
-            if ! grep -qE 'MANIFEST_UNKNOWN|manifest unknown|failed to get manifest' \
+            # Case-insensitive and tolerant of flyctl wording drift
+            # ("failed to get image manifest", which the literal
+            # "failed to get manifest" does NOT match as a substring), and
+            # matches the "not found [http 404]" text that flyctl prints on
+            # the same error line. Without this the retry would silently
+            # degrade back to fail-fast if the wording changed.
+            if ! grep -qiE 'MANIFEST_UNKNOWN|manifest unknown|failed to get [a-z ]*manifest|not found \[http 404\]' \
               /tmp/premigrate-launch-err.txt 2>/dev/null; then
               break
             fi
@@ -1330,6 +1339,9 @@ jobs:
             launch_attempt=$(( launch_attempt + 1 ))
             # stderr goes to a file (not into RUN_OUTPUT) so the " Machine ID:"
             # parse below keeps seeing stdout exactly as it did before.
+            # --detach means RC=0 iff creation succeeded, so a retried attempt
+            # does not leak a second machine; the single destroy below is
+            # sufficient to clean up the one machine this loop creates.
             RUN_OUTPUT="$(fly machine run "${PREMIGRATE_IMAGE_REF}" --app app-modulo --restart=no \
               --entrypoint /bin/bash \
               --vm-size shared-cpu-1x --memory 1024 \
@@ -1340,7 +1352,13 @@ jobs:
             if [ "$LAUNCH_RC" -eq 0 ]; then
               break
             fi
-            if ! grep -qE 'MANIFEST_UNKNOWN|manifest unknown|failed to get manifest' \
+            # Case-insensitive and tolerant of flyctl wording drift
+            # ("failed to get image manifest", which the literal
+            # "failed to get manifest" does NOT match as a substring), and
+            # matches the "not found [http 404]" text that flyctl prints on
+            # the same error line. Without this the retry would silently
+            # degrade back to fail-fast if the wording changed.
+            if ! grep -qiE 'MANIFEST_UNKNOWN|manifest unknown|failed to get [a-z ]*manifest|not found \[http 404\]' \
               /tmp/premigrate-launch-err.txt 2>/dev/null; then
               break
             fi
