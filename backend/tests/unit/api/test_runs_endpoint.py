@@ -1821,7 +1821,7 @@ def test_recover_node_undecided_rows_query_orders_matching_then_newest(
 
     stmt = mock_session.execute.await_args_list[0].args[0]
     compiled = str(stmt.compile(compile_kwargs={"literal_binds": True}))
-    order_by = compiled.split("ORDER BY")[-1]
+    order_by = compiled.rsplit("ORDER BY", maxsplit=1)[-1]
     assert "gate_id = 'manual-node-1' DESC" in order_by
     assert "claimed_at DESC NULLS LAST" in order_by
     assert "id DESC" in order_by
