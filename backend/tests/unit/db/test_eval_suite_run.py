@@ -390,7 +390,8 @@ def _tenant_filtered_session() -> Session:
     return Session(engine)
 
 
-def test_org_isolation_positive_control(_tenant_filter_registered: None) -> None:
+@pytest.mark.usefixtures("_tenant_filter_registered")
+def test_org_isolation_positive_control() -> None:
     session = _tenant_filtered_session()
     org_a = uuid.uuid4()
     org_b = uuid.uuid4()
@@ -408,7 +409,8 @@ def test_org_isolation_positive_control(_tenant_filter_registered: None) -> None
     session.close()
 
 
-def test_org_isolation_no_tenant_key_sees_all(_tenant_filter_registered: None) -> None:
+@pytest.mark.usefixtures("_tenant_filter_registered")
+def test_org_isolation_no_tenant_key_sees_all() -> None:
     session = _tenant_filtered_session()
     session.add_all([_new_run(uuid.uuid4()), _new_run(uuid.uuid4())])
     session.commit()
